@@ -1,14 +1,45 @@
-docs/private
+docs/private/
+.claude/
 
+# Rust
+/target/
+*.rs.bk
 
-# Added by cargo
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.pdb
+*.so
+*.dylib
+*.dll
+.python-version
+.coverage
+.coverage.*
+.hypothesis/
+.ipynb_checkpoints/
+.mypy_cache/
+.nox/
+.pyre/
+.pytest_cache/
+.ruff_cache/
+.tox/
+.venv/
+ENV/
+env/
+htmlcov/
+pip-wheel-metadata/
+site/
+venv/
 
-/target
-/.venv
-/.tmp
-/.wheelhouse
-/.py-install
-/bindings/python/.venv
-/bindings/python/python/bytehaul/__pycache__
-/bindings/python/python/bytehaul/_bytehaul.pyd
-/bindings/python/python/bytehaul/_bytehaul.pdb
+# Python packaging / build outputs
+.eggs/
+*.egg
+*.egg-info/
+build/
+dist/
+
+# Local project workdirs
+/.py-install/
+/.tmp/
+/.wheelhouse/
