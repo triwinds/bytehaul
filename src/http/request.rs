@@ -26,5 +26,29 @@ pub(crate) fn build_range_request(
 ) -> reqwest::RequestBuilder {
     let mut req = build_get_request(client, url, headers, timeout);
     req = req.header("Range", format!("bytes={start}-{end}"));
+    req = req.header("Accept-Encoding", "identity");
     req
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_range_request_forces_identity_encoding() {
+        let client = reqwest::Client::new();
+        let req = build_range_request(
+            &client,
+            "https://example.com/file.bin",
+            &HashMap::new(),
+            Duration::from_secs(5),
+            0,
+            99,
+        )
+        .build()
+        .unwrap();
+
+        assert_eq!(req.headers().get("range").unwrap(), "bytes=0-99");
+        assert_eq!(req.headers().get("accept-encoding").unwrap(), "identity");
+    }
 }

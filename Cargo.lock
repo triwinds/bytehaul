@@ -78,6 +78,7 @@ dependencies = [
  "bytes",
  "crc32fast",
  "futures",
+ "http 1.4.0",
  "parking_lot",
  "rand",
  "reqwest",

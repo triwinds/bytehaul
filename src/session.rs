@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
-use tokio::sync::{mpsc, watch, Semaphore};
+use tokio::sync::{mpsc, oneshot, watch, Semaphore};
 
 use crate::checksum::verify_checksum;
 use crate::config::DownloadSpec;
@@ -21,7 +21,7 @@ use crate::storage::control::ControlSnapshot;
 use crate::storage::file::{create_output_file, open_existing_file};
 use crate::storage::piece_map::PieceMap;
 use crate::storage::segment::Segment;
-use crate::storage::writer::{WriteCommand, WriterControl, WriterTask};
+use crate::storage::writer::{WriterCommand, WriterTask};
 
 const CONTROL_SAVE_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -129,7 +129,10 @@ async fn run_download_inner(
                 )
                 .await;
                 if let Ok((resp, meta)) = probe_result {
-                    if resp.status().as_u16() == 206 && validate_metadata(&meta, &ctrl) {
+                    if resp.status().as_u16() == 206
+                        && range_response_allowed(&meta)
+                        && validate_metadata(&meta, &ctrl)
+                    {
                         return run_multi_worker(
                             client,
                             &spec,
@@ -156,7 +159,10 @@ async fn run_download_inner(
             )
             .await;
             if let Ok((resp, meta)) = probe_result {
-                if resp.status().as_u16() == 206 && validate_metadata(&meta, &ctrl) {
+                if resp.status().as_u16() == 206
+                    && range_response_allowed(&meta)
+                    && validate_metadata(&meta, &ctrl)
+                {
                     return run_single_connection(
                         resp,
                         &meta,
@@ -181,7 +187,7 @@ async fn run_download_inner(
         let piece_end = spec.piece_size.saturating_sub(1);
         // Probe for Range support — no retry since this is exploratory
         if let Ok((resp, meta)) = worker.send_range(0, piece_end).await {
-            if resp.status().as_u16() == 206 {
+            if resp.status().as_u16() == 206 && range_response_allowed(&meta) {
                 if let Some(total_size) = meta.content_range_total {
                     if total_size > spec.min_split_size {
                         let piece_map = PieceMap::new(total_size, spec.piece_size);
@@ -214,7 +220,7 @@ async fn run_download_inner(
                     speed_limit,
                 )
                 .await;
-            } else {
+            } else if resp.status().as_u16() != 206 {
                 // Got 200 — Range not supported; stream this response
                 return run_single_connection(
                     resp,
@@ -280,13 +286,11 @@ async fn run_single_connection(
 
     // Memory budget semaphore: permits = memory_budget bytes
     let budget = Arc::new(Semaphore::new(spec.memory_budget));
-    let (write_tx, write_rx) = mpsc::channel::<WriteCommand>(spec.channel_buffer);
-    let (ctrl_tx, ctrl_rx) = mpsc::channel::<WriterControl>(16);
+    let (write_tx, write_rx) = mpsc::channel::<WriterCommand>(spec.channel_buffer);
     let written_bytes = Arc::new(AtomicU64::new(start_offset));
     let writer_handle = tokio::spawn(
         WriterTask::new(
             write_rx,
-            ctrl_rx,
             file,
             written_bytes.clone(),
             budget.clone(),
@@ -315,17 +319,16 @@ async fn run_single_connection(
         total_size,
         start_offset,
         if use_control {
-            Some((&written_bytes, control_path, &snap_template))
+            Some((control_path, &snap_template))
         } else {
             None
         },
-        &budget,
+        budget.clone(),
         &speed_limit,
     )
     .await;
 
     drop(write_tx);
-    drop(ctrl_tx);
     let writer_result = writer_handle
         .await
         .map_err(|e| DownloadError::Other(format!("writer panicked: {e}")))?;
@@ -354,13 +357,13 @@ async fn run_single_connection(
 /// Stream a single HTTP response body to the writer channel.
 async fn stream_single(
     response: reqwest::Response,
-    write_tx: &mpsc::Sender<WriteCommand>,
+    write_tx: &mpsc::Sender<WriterCommand>,
     progress_tx: &watch::Sender<ProgressSnapshot>,
     cancel_rx: watch::Receiver<bool>,
     total_size: Option<u64>,
     start_offset: u64,
-    control: Option<(&Arc<AtomicU64>, &Path, &ControlSnapshot)>,
-    budget: &Arc<Semaphore>,
+    control: Option<(&Path, &ControlSnapshot)>,
+    budget: Arc<Semaphore>,
     speed_limit: &SpeedLimit,
 ) -> Result<(), DownloadError> {
     let mut stream = response.bytes_stream();
@@ -389,11 +392,12 @@ async fn stream_single(
             }
 
             _ = save_ticker.tick(), if control.is_some() => {
-                if let Some((wb, cp, tmpl)) = &control {
-                    let w = wb.load(Ordering::Acquire);
-                    let mut s = (*tmpl).clone();
-                    s.downloaded_bytes = w;
-                    let _ = s.save(cp).await;
+                if let Some((cp, tmpl)) = &control {
+                    if let Ok(w) = flush_all_and_wait(write_tx, true).await {
+                        let mut s = (*tmpl).clone();
+                        s.downloaded_bytes = w;
+                        let _ = s.save(cp).await;
+                    }
                 }
             }
 
@@ -404,17 +408,17 @@ async fn stream_single(
                         // Rate limiting
                         speed_limit.acquire(len).await;
                         // Acquire budget permits before buffering data
-                        let _permit = budget
+                        let permit = budget
                             .acquire_many(len as u32)
                             .await
                             .map_err(|_| DownloadError::Other("budget semaphore closed".into()))?;
-                        _permit.forget(); // permits returned by writer after flush
 
                         let offset = downloaded;
                         downloaded += len as u64;
-                        if write_tx.send(WriteCommand { offset, data, piece_id: None }).await.is_err() {
+                        if write_tx.send(WriterCommand::Data { offset, data, piece_id: None }).await.is_err() {
                             return Err(DownloadError::ChannelClosed);
                         }
+                        permit.forget(); // permits returned by writer after flush
                         let elapsed = start_time.elapsed().as_secs_f64();
                         let speed = if elapsed > 0.0 { downloaded as f64 / elapsed } else { 0.0 };
                         progress_tx.send_modify(|p| {
@@ -462,13 +466,11 @@ async fn run_multi_worker(
     let budget = Arc::new(Semaphore::new(spec.memory_budget));
 
     // Writer with cache
-    let (write_tx, write_rx) = mpsc::channel::<WriteCommand>(spec.channel_buffer);
-    let (ctrl_tx, ctrl_rx) = mpsc::channel::<WriterControl>(64);
+    let (write_tx, write_rx) = mpsc::channel::<WriterCommand>(spec.channel_buffer);
     let written_bytes = Arc::new(AtomicU64::new(0));
     let writer_handle = tokio::spawn(
         WriterTask::new(
             write_rx,
-            ctrl_rx,
             file,
             written_bytes.clone(),
             budget.clone(),
@@ -499,6 +501,7 @@ async fn run_multi_worker(
     let mut abort_handles = Vec::with_capacity(num_workers);
     let mut workers = FuturesUnordered::new();
     let mut probe_response = probe_response;
+    let save_write_tx = write_tx.clone();
 
     for worker_id in 0..num_workers {
         let first = if worker_id == 0 {
@@ -517,7 +520,6 @@ async fn run_multi_worker(
             spec.retry_max_delay,
             scheduler.clone(),
             write_tx.clone(),
-            ctrl_tx.clone(),
             downloaded.clone(),
             cancel_rx.clone(),
             budget.clone(),
@@ -530,7 +532,6 @@ async fn run_multi_worker(
 
     // Drop our sender so writer can finish once workers are done
     drop(write_tx);
-    drop(ctrl_tx);
 
     // ── Monitor loop ──
     let mut cancel_rx = cancel_rx;
@@ -555,7 +556,7 @@ async fn run_multi_worker(
             }
 
             _ = save_ticker.tick(), if spec.resume => {
-                save_multi_control(spec, meta, &scheduler, total_size, control_path).await;
+                save_multi_control(spec, meta, &scheduler, total_size, control_path, Some(&save_write_tx)).await;
             }
 
             _ = progress_interval.tick() => {
@@ -601,6 +602,8 @@ async fn run_multi_worker(
         while workers.next().await.is_some() {}
     }
 
+    drop(save_write_tx);
+
     // Wait for writer
     let writer_result = writer_handle
         .await
@@ -608,7 +611,7 @@ async fn run_multi_worker(
 
     if let Some(e) = download_error {
         if spec.resume {
-            save_multi_control(spec, meta, &scheduler, total_size, control_path).await;
+            save_multi_control(spec, meta, &scheduler, total_size, control_path, None).await;
         }
         return Err(e);
     }
@@ -616,7 +619,7 @@ async fn run_multi_worker(
 
     if !scheduler.lock().all_done() {
         if spec.resume {
-            save_multi_control(spec, meta, &scheduler, total_size, control_path).await;
+            save_multi_control(spec, meta, &scheduler, total_size, control_path, None).await;
         }
         return Err(DownloadError::Other("download incomplete".into()));
     }
@@ -640,7 +643,14 @@ async fn save_multi_control(
     scheduler: &Scheduler,
     total_size: u64,
     control_path: &Path,
+    write_tx: Option<&mpsc::Sender<WriterCommand>>,
 ) {
+    if let Some(write_tx) = write_tx {
+        if flush_all_and_wait(write_tx, true).await.is_err() {
+            return;
+        }
+    }
+
     let snap = {
         let sched = scheduler.lock();
         ControlSnapshot {
@@ -672,8 +682,7 @@ async fn worker_loop(
     retry_base_delay: Duration,
     retry_max_delay: Duration,
     scheduler: Scheduler,
-    write_tx: mpsc::Sender<WriteCommand>,
-    ctrl_tx: mpsc::Sender<WriterControl>,
+    write_tx: mpsc::Sender<WriterCommand>,
     downloaded: Arc<AtomicU64>,
     cancel_rx: watch::Receiver<bool>,
     budget: Arc<Semaphore>,
@@ -694,7 +703,6 @@ async fn worker_loop(
         };
 
         let mut attempt = 0u32;
-        let mut last_error: Option<DownloadError> = None;
 
         loop {
             let result = if let Some((resp, pid)) = first_response.take() {
@@ -717,10 +725,8 @@ async fn worker_loop(
 
             match result {
                 Ok(()) => {
-                    // Signal writer to flush this piece's cached data
-                    let _ = ctrl_tx.send(WriterControl::FlushPiece(segment.piece_id)).await;
+                    flush_piece_and_wait(&write_tx, segment.piece_id).await?;
                     scheduler.lock().complete(segment.piece_id);
-                    last_error = None;
                     break;
                 }
                 Err(e) => {
@@ -740,8 +746,6 @@ async fn worker_loop(
                         exp.min(retry_max_delay)
                     };
 
-                    last_error = Some(e);
-
                     // Wait with cancellation awareness
                     tokio::select! {
                         biased;
@@ -756,11 +760,6 @@ async fn worker_loop(
                 }
             }
         }
-
-        if let Some(e) = last_error {
-            scheduler.lock().reclaim(segment.piece_id);
-            return Err(e);
-        }
     }
 }
 
@@ -772,7 +771,7 @@ async fn download_segment(
     headers: &std::collections::HashMap<String, String>,
     timeout: Duration,
     segment: &Segment,
-    write_tx: &mpsc::Sender<WriteCommand>,
+    write_tx: &mpsc::Sender<WriterCommand>,
     downloaded: &Arc<AtomicU64>,
     cancel_rx: &mut watch::Receiver<bool>,
     budget: &Arc<Semaphore>,
@@ -809,6 +808,21 @@ async fn download_segment(
         });
     }
 
+    let meta = ResponseMeta::from_response(&response);
+    if !range_response_allowed(&meta) {
+        return Err(DownloadError::ResumeMismatch(
+            "range responses with content-encoding are not supported".into(),
+        ));
+    }
+    if meta.content_range_total.is_none()
+        || meta.content_range_start != Some(segment.start)
+        || meta.content_range_end != Some(segment.end - 1)
+    {
+        return Err(DownloadError::ResumeMismatch(
+            "server returned a mismatched Content-Range".into(),
+        ));
+    }
+
     stream_segment(response, segment, write_tx, downloaded, cancel_rx, budget, speed_limit).await
 }
 
@@ -816,7 +830,7 @@ async fn download_segment(
 async fn stream_segment(
     response: reqwest::Response,
     segment: &Segment,
-    write_tx: &mpsc::Sender<WriteCommand>,
+    write_tx: &mpsc::Sender<WriterCommand>,
     downloaded: &Arc<AtomicU64>,
     cancel_rx: &mut watch::Receiver<bool>,
     budget: &Arc<Semaphore>,
@@ -842,15 +856,19 @@ async fn stream_segment(
                         // Rate limiting
                         speed_limit.acquire(len).await;
                         // Acquire budget permits before buffering
-                        let _permit = budget
+                        let permit = budget
                             .acquire_many(len as u32)
                             .await
                             .map_err(|_| DownloadError::Other("budget semaphore closed".into()))?;
-                        _permit.forget(); // permits returned by writer after flush
 
-                        if write_tx.send(WriteCommand { offset, data, piece_id: Some(segment.piece_id) }).await.is_err() {
+                        if write_tx.send(WriterCommand::Data {
+                            offset,
+                            data,
+                            piece_id: Some(segment.piece_id),
+                        }).await.is_err() {
                             return Err(DownloadError::ChannelClosed);
                         }
+                        permit.forget(); // permits returned by writer after flush
                         offset += len as u64;
                         downloaded.fetch_add(len as u64, Ordering::Relaxed);
                     }
@@ -868,6 +886,11 @@ async fn stream_segment(
 // ──────────────────────────────────────────────────────────────
 
 fn validate_metadata(meta: &ResponseMeta, ctrl: &ControlSnapshot) -> bool {
+    if let Some(total) = meta.content_range_total {
+        if total != ctrl.total_size {
+            return false;
+        }
+    }
     if let (Some(expected), Some(actual)) = (&ctrl.etag, &meta.etag) {
         if expected != actual {
             return false;
@@ -879,4 +902,41 @@ fn validate_metadata(meta: &ResponseMeta, ctrl: &ControlSnapshot) -> bool {
         }
     }
     true
+}
+
+fn range_response_allowed(meta: &ResponseMeta) -> bool {
+    !matches!(
+        meta.content_encoding.as_deref(),
+        Some(encoding) if !encoding.eq_ignore_ascii_case("identity")
+    )
+}
+
+async fn flush_piece_and_wait(
+    write_tx: &mpsc::Sender<WriterCommand>,
+    piece_id: usize,
+) -> Result<(), DownloadError> {
+    let (ack_tx, ack_rx) = oneshot::channel();
+    write_tx
+        .send(WriterCommand::FlushPiece {
+            piece_id,
+            ack: ack_tx,
+        })
+        .await
+        .map_err(|_| DownloadError::ChannelClosed)?;
+    ack_rx.await.map_err(|_| DownloadError::ChannelClosed)
+}
+
+async fn flush_all_and_wait(
+    write_tx: &mpsc::Sender<WriterCommand>,
+    sync_data: bool,
+) -> Result<u64, DownloadError> {
+    let (ack_tx, ack_rx) = oneshot::channel();
+    write_tx
+        .send(WriterCommand::FlushAll {
+            sync_data,
+            ack: ack_tx,
+        })
+        .await
+        .map_err(|_| DownloadError::ChannelClosed)?;
+    ack_rx.await.map_err(|_| DownloadError::ChannelClosed)
 }
