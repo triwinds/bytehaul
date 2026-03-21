@@ -32,6 +32,12 @@ pub struct DownloadSpec {
     pub resume: bool,
     pub piece_size: u64,
     pub min_split_size: u64,
+    /// Maximum retry attempts per segment (0 = no retries).
+    pub max_retries: u32,
+    /// Base delay for exponential backoff between retries.
+    pub retry_base_delay: Duration,
+    /// Maximum delay cap for exponential backoff.
+    pub retry_max_delay: Duration,
 }
 
 impl DownloadSpec {
@@ -49,6 +55,9 @@ impl DownloadSpec {
             resume: true,
             piece_size: 1024 * 1024,           // 1 MiB
             min_split_size: 10 * 1024 * 1024,  // 10 MiB
+            max_retries: 5,
+            retry_base_delay: Duration::from_secs(1),
+            retry_max_delay: Duration::from_secs(30),
         }
     }
 }

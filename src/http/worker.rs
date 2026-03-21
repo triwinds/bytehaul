@@ -28,10 +28,7 @@ impl HttpWorker {
 
         let status = response.status();
         if !status.is_success() {
-            return Err(DownloadError::HttpStatus {
-                status: status.as_u16(),
-                message: status.canonical_reason().unwrap_or("unknown").to_string(),
-            });
+            return Err(make_http_error(&response, status.as_u16()));
         }
 
         let meta = ResponseMeta::from_response(&response);
@@ -55,13 +52,30 @@ impl HttpWorker {
             return Ok((response, meta));
         }
         if status.as_u16() != 206 {
-            return Err(DownloadError::HttpStatus {
-                status: status.as_u16(),
-                message: status.canonical_reason().unwrap_or("unknown").to_string(),
-            });
+            return Err(make_http_error(&response, status.as_u16()));
         }
 
         let meta = ResponseMeta::from_response(&response);
         Ok((response, meta))
     }
+}
+
+/// Build an appropriate HttpStatus error, embedding Retry-After hint for 429/503.
+fn make_http_error(response: &reqwest::Response, status: u16) -> DownloadError {
+    let retry_after = response
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok());
+
+    let message = match retry_after {
+        Some(secs) => format!("retry-after:{secs}"),
+        None => response
+            .status()
+            .canonical_reason()
+            .unwrap_or("unknown")
+            .to_string(),
+    };
+
+    DownloadError::HttpStatus { status, message }
 }

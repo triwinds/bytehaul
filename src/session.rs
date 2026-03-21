@@ -23,6 +23,48 @@ use crate::storage::writer::{WriteCommand, WriterControl, WriterTask};
 
 const CONTROL_SAVE_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Retry an async operation with exponential backoff.
+async fn retry_with_backoff<F, Fut, T>(
+    max_retries: u32,
+    base_delay: Duration,
+    max_delay: Duration,
+    cancel_rx: &mut watch::Receiver<bool>,
+    mut op: F,
+) -> Result<T, DownloadError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, DownloadError>>,
+{
+    let mut attempt = 0u32;
+    loop {
+        match op().await {
+            Ok(val) => return Ok(val),
+            Err(e) => {
+                if !e.is_retryable() || attempt >= max_retries {
+                    return Err(e);
+                }
+                attempt += 1;
+                let backoff = if let Some(retry_secs) = e.retry_after_secs() {
+                    Duration::from_secs(retry_secs)
+                } else {
+                    base_delay
+                        .saturating_mul(1u32 << attempt.min(10))
+                        .min(max_delay)
+                };
+                tokio::select! {
+                    biased;
+                    result = cancel_rx.changed() => {
+                        if result.is_ok() && *cancel_rx.borrow_and_update() {
+                            return Err(DownloadError::Cancelled);
+                        }
+                    }
+                    _ = tokio::time::sleep(backoff) => {}
+                }
+            }
+        }
+    }
+}
+
 // ──────────────────────────────────────────────────────────────
 //  Entry point
 // ──────────────────────────────────────────────────────────────
@@ -35,6 +77,7 @@ pub(crate) async fn run_download(
 ) -> Result<(), DownloadError> {
     let control_path = ControlSnapshot::control_path(&spec.output_path);
     let worker = HttpWorker::new(client.clone(), &spec);
+    let mut cancel_rx = cancel_rx;
 
     // ── Phase 1: attempt resume ──────────────────────────────
     let resume_ctrl = if spec.resume {
@@ -55,7 +98,15 @@ pub(crate) async fn run_download(
             );
             if let Some(probe_piece) = piece_map.next_missing_excluding(&HashSet::new()) {
                 let (start, end) = piece_map.piece_range(probe_piece);
-                if let Ok((resp, meta)) = worker.send_range(start, end - 1).await {
+                let probe_result = retry_with_backoff(
+                    spec.max_retries,
+                    spec.retry_base_delay,
+                    spec.retry_max_delay,
+                    &mut cancel_rx,
+                    || worker.send_range(start, end - 1),
+                )
+                .await;
+                if let Ok((resp, meta)) = probe_result {
                     if resp.status().as_u16() == 206 && validate_metadata(&meta, &ctrl) {
                         return run_multi_worker(
                             client,
@@ -73,9 +124,15 @@ pub(crate) async fn run_download(
                 }
             }
         } else if ctrl.downloaded_bytes > 0 && ctrl.downloaded_bytes < ctrl.total_size {
-            if let Ok((resp, meta)) =
-                worker.send_range(ctrl.downloaded_bytes, ctrl.total_size - 1).await
-            {
+            let probe_result = retry_with_backoff(
+                spec.max_retries,
+                spec.retry_base_delay,
+                spec.retry_max_delay,
+                &mut cancel_rx,
+                || worker.send_range(ctrl.downloaded_bytes, ctrl.total_size - 1),
+            )
+            .await;
+            if let Ok((resp, meta)) = probe_result {
                 if resp.status().as_u16() == 206 && validate_metadata(&meta, &ctrl) {
                     return run_single_connection(
                         resp,
@@ -98,6 +155,7 @@ pub(crate) async fn run_download(
     // ── Phase 2: fresh download ──────────────────────────────
     if spec.max_connections > 1 {
         let piece_end = spec.piece_size.saturating_sub(1);
+        // Probe for Range support — no retry since this is exploratory
         if let Ok((resp, meta)) = worker.send_range(0, piece_end).await {
             if resp.status().as_u16() == 206 {
                 if let Some(total_size) = meta.content_range_total {
@@ -117,8 +175,19 @@ pub(crate) async fn run_download(
                         .await;
                     }
                 }
-                // File too small for splitting — fall through to GET
-                drop(resp);
+                // File too small for splitting — use this response as single connection
+                let total = meta.content_range_total;
+                return run_single_connection(
+                    resp,
+                    &meta,
+                    &spec,
+                    0,
+                    &progress_tx,
+                    cancel_rx,
+                    &control_path,
+                    total,
+                )
+                .await;
             } else {
                 // Got 200 — Range not supported; stream this response
                 return run_single_connection(
@@ -137,7 +206,14 @@ pub(crate) async fn run_download(
     }
 
     // ── Fallback: plain GET ──────────────────────────────────
-    let (resp, meta) = worker.send_get().await?;
+    let (resp, meta) = retry_with_backoff(
+        spec.max_retries,
+        spec.retry_base_delay,
+        spec.retry_max_delay,
+        &mut cancel_rx,
+        || worker.send_get(),
+    )
+    .await?;
     run_single_connection(
         resp,
         &meta,
@@ -402,6 +478,9 @@ async fn run_multi_worker(
             spec.url.clone(),
             spec.headers.clone(),
             spec.read_timeout,
+            spec.max_retries,
+            spec.retry_base_delay,
+            spec.retry_max_delay,
             scheduler.clone(),
             write_tx.clone(),
             ctrl_tx.clone(),
@@ -554,6 +633,9 @@ async fn worker_loop(
     url: String,
     headers: std::collections::HashMap<String, String>,
     timeout: Duration,
+    max_retries: u32,
+    retry_base_delay: Duration,
+    retry_max_delay: Duration,
     scheduler: Scheduler,
     write_tx: mpsc::Sender<WriteCommand>,
     ctrl_tx: mpsc::Sender<WriterControl>,
@@ -575,34 +657,73 @@ async fn worker_loop(
             None => return Ok(()),
         };
 
-        let result = if let Some((resp, pid)) = first_response.take() {
-            if pid == segment.piece_id {
-                stream_segment(resp, &segment, &write_tx, &downloaded, &mut cancel_rx, &budget).await
+        let mut attempt = 0u32;
+        let mut last_error: Option<DownloadError> = None;
+
+        loop {
+            let result = if let Some((resp, pid)) = first_response.take() {
+                if pid == segment.piece_id {
+                    stream_segment(resp, &segment, &write_tx, &downloaded, &mut cancel_rx, &budget).await
+                } else {
+                    download_segment(
+                        &client, &url, &headers, timeout, &segment, &write_tx, &downloaded,
+                        &mut cancel_rx, &budget,
+                    )
+                    .await
+                }
             } else {
                 download_segment(
                     &client, &url, &headers, timeout, &segment, &write_tx, &downloaded,
                     &mut cancel_rx, &budget,
                 )
                 .await
-            }
-        } else {
-            download_segment(
-                &client, &url, &headers, timeout, &segment, &write_tx, &downloaded,
-                &mut cancel_rx, &budget,
-            )
-            .await
-        };
+            };
 
-        match result {
-            Ok(()) => {
-                // Signal writer to flush this piece's cached data
-                let _ = ctrl_tx.send(WriterControl::FlushPiece(segment.piece_id)).await;
-                scheduler.lock().complete(segment.piece_id);
+            match result {
+                Ok(()) => {
+                    // Signal writer to flush this piece's cached data
+                    let _ = ctrl_tx.send(WriterControl::FlushPiece(segment.piece_id)).await;
+                    scheduler.lock().complete(segment.piece_id);
+                    last_error = None;
+                    break;
+                }
+                Err(e) => {
+                    if !e.is_retryable() || attempt >= max_retries {
+                        scheduler.lock().reclaim(segment.piece_id);
+                        return Err(e);
+                    }
+
+                    attempt += 1;
+
+                    // Compute backoff delay
+                    let backoff = if let Some(retry_secs) = e.retry_after_secs() {
+                        Duration::from_secs(retry_secs)
+                    } else {
+                        let exp = retry_base_delay
+                            .saturating_mul(1u32 << attempt.min(10));
+                        exp.min(retry_max_delay)
+                    };
+
+                    last_error = Some(e);
+
+                    // Wait with cancellation awareness
+                    tokio::select! {
+                        biased;
+                        result = cancel_rx.changed() => {
+                            if result.is_ok() && *cancel_rx.borrow_and_update() {
+                                scheduler.lock().reclaim(segment.piece_id);
+                                return Err(DownloadError::Cancelled);
+                            }
+                        }
+                        _ = tokio::time::sleep(backoff) => {}
+                    }
+                }
             }
-            Err(e) => {
-                scheduler.lock().reclaim(segment.piece_id);
-                return Err(e);
-            }
+        }
+
+        if let Some(e) = last_error {
+            scheduler.lock().reclaim(segment.piece_id);
+            return Err(e);
         }
     }
 }
@@ -624,6 +745,26 @@ async fn download_segment(
     let response = req.send().await?;
 
     let status = response.status().as_u16();
+    if status == 200 {
+        // Server returned full content instead of partial — Range not supported
+        return Err(DownloadError::HttpStatus {
+            status: 200,
+            message: "server returned 200 instead of 206; Range not supported".into(),
+        });
+    }
+    if status == 429 || status == 503 {
+        // Extract Retry-After for backoff
+        let retry_after = response
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.trim().parse::<u64>().ok());
+        let message = match retry_after {
+            Some(secs) => format!("retry-after:{secs}"),
+            None => format!("HTTP {status}"),
+        };
+        return Err(DownloadError::HttpStatus { status, message });
+    }
     if status != 206 {
         return Err(DownloadError::HttpStatus {
             status,
