@@ -334,6 +334,8 @@ impl PyDownloader {
             max_download_speed,
             checksum_sha256,
         )?;
+        let runtime = shared_runtime()?;
+        let _guard = runtime.enter();
         let handle = self.inner.download(spec);
         Ok(PyDownloadTask {
             handle: Arc::new(Mutex::new(Some(handle))),
