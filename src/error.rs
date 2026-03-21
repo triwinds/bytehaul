@@ -67,3 +67,117 @@ impl DownloadError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_retryable_http_status_codes() {
+        let retryable = [429, 500, 502, 503, 504];
+        for status in retryable {
+            let e = DownloadError::HttpStatus {
+                status,
+                message: "test".into(),
+            };
+            assert!(e.is_retryable(), "status {status} should be retryable");
+        }
+
+        let not_retryable = [400, 401, 403, 404, 405];
+        for status in not_retryable {
+            let e = DownloadError::HttpStatus {
+                status,
+                message: "test".into(),
+            };
+            assert!(!e.is_retryable(), "status {status} should not be retryable");
+        }
+    }
+
+    #[test]
+    fn test_is_retryable_io_errors() {
+        let retryable_kinds = [
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::ConnectionAborted,
+            std::io::ErrorKind::TimedOut,
+            std::io::ErrorKind::UnexpectedEof,
+        ];
+        for kind in retryable_kinds {
+            let e = DownloadError::Io(std::io::Error::new(kind, "test"));
+            assert!(e.is_retryable(), "{kind:?} should be retryable");
+        }
+
+        let not_retryable = DownloadError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "test",
+        ));
+        assert!(!not_retryable.is_retryable());
+    }
+
+    #[test]
+    fn test_is_retryable_other_variants() {
+        assert!(!DownloadError::Cancelled.is_retryable());
+        assert!(!DownloadError::ChannelClosed.is_retryable());
+        assert!(!DownloadError::Other("test".into()).is_retryable());
+        assert!(!DownloadError::ResumeMismatch("test".into()).is_retryable());
+        assert!(!DownloadError::ControlFileCorrupted("test".into()).is_retryable());
+        assert!(!DownloadError::ChecksumMismatch {
+            expected: "a".into(),
+            actual: "b".into(),
+        }.is_retryable());
+    }
+
+    #[test]
+    fn test_retry_after_secs_with_hint() {
+        let e = DownloadError::HttpStatus {
+            status: 429,
+            message: "retry-after:30".into(),
+        };
+        assert_eq!(e.retry_after_secs(), Some(30));
+
+        let e = DownloadError::HttpStatus {
+            status: 503,
+            message: "retry-after:5".into(),
+        };
+        assert_eq!(e.retry_after_secs(), Some(5));
+    }
+
+    #[test]
+    fn test_retry_after_secs_without_hint() {
+        let e = DownloadError::HttpStatus {
+            status: 429,
+            message: "Too Many Requests".into(),
+        };
+        assert_eq!(e.retry_after_secs(), None);
+
+        let e = DownloadError::HttpStatus {
+            status: 500,
+            message: "retry-after:10".into(),
+        };
+        assert_eq!(e.retry_after_secs(), None);
+    }
+
+    #[test]
+    fn test_retry_after_secs_non_http_status() {
+        assert_eq!(DownloadError::Cancelled.retry_after_secs(), None);
+        assert_eq!(DownloadError::ChannelClosed.retry_after_secs(), None);
+    }
+
+    #[test]
+    fn test_error_display() {
+        let e = DownloadError::Cancelled;
+        assert_eq!(format!("{e}"), "download cancelled");
+
+        let e = DownloadError::ChecksumMismatch {
+            expected: "aaa".into(),
+            actual: "bbb".into(),
+        };
+        assert!(format!("{e}").contains("aaa"));
+        assert!(format!("{e}").contains("bbb"));
+
+        let e = DownloadError::HttpStatus {
+            status: 404,
+            message: "Not Found".into(),
+        };
+        assert!(format!("{e}").contains("404"));
+    }
+}

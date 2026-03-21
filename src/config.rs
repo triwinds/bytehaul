@@ -74,3 +74,40 @@ impl DownloadSpec {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_download_spec_defaults() {
+        let spec = DownloadSpec::new("https://example.com/file", "/tmp/file");
+        assert_eq!(spec.url, "https://example.com/file");
+        assert_eq!(spec.output_path, PathBuf::from("/tmp/file"));
+        assert_eq!(spec.max_connections, 4);
+        assert_eq!(spec.connect_timeout, Duration::from_secs(30));
+        assert_eq!(spec.read_timeout, Duration::from_secs(60));
+        assert_eq!(spec.memory_budget, 64 * 1024 * 1024);
+        assert_eq!(spec.file_allocation, FileAllocation::Prealloc);
+        assert_eq!(spec.channel_buffer, 64);
+        assert!(spec.resume);
+        assert_eq!(spec.piece_size, 1024 * 1024);
+        assert_eq!(spec.min_split_size, 10 * 1024 * 1024);
+        assert_eq!(spec.max_retries, 5);
+        assert_eq!(spec.max_download_speed, 0);
+        assert!(spec.checksum.is_none());
+        assert!(spec.headers.is_empty());
+    }
+
+    #[test]
+    fn test_file_allocation_default() {
+        assert_eq!(FileAllocation::default(), FileAllocation::Prealloc);
+    }
+
+    #[test]
+    fn test_checksum_debug() {
+        let c = Checksum::Sha256("abc123".into());
+        let debug = format!("{c:?}");
+        assert!(debug.contains("abc123"));
+    }
+}

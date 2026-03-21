@@ -63,3 +63,81 @@ fn preallocate_sync(file: &std::fs::File, size: u64) -> Result<(), std::io::Erro
     f.seek(SeekFrom::Start(0))?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_create_output_file_no_prealloc() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.bin");
+        let _file =
+            create_output_file(&path, Some(1000), FileAllocation::None)
+                .await
+                .unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(meta.len(), 0); // No pre-allocation
+    }
+
+    #[tokio::test]
+    async fn test_create_output_file_prealloc() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test_prealloc.bin");
+        let _file =
+            create_output_file(&path, Some(1000), FileAllocation::Prealloc)
+                .await
+                .unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(meta.len(), 1000);
+    }
+
+    #[tokio::test]
+    async fn test_create_output_file_creates_parent_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sub").join("dir").join("test.bin");
+        let _file =
+            create_output_file(&path, None, FileAllocation::None)
+                .await
+                .unwrap();
+        assert!(path.exists());
+    }
+
+    #[tokio::test]
+    async fn test_open_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("existing.bin");
+        std::fs::write(&path, b"hello").unwrap();
+        let _file = open_existing_file(&path).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_open_existing_file_not_found() {
+        let result = open_existing_file(std::path::Path::new("/nonexistent/file")).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_create_output_file_prealloc_zero_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("zero.bin");
+        let _file =
+            create_output_file(&path, Some(0), FileAllocation::Prealloc)
+                .await
+                .unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(meta.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_create_output_file_no_total_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nosize.bin");
+        let _file =
+            create_output_file(&path, None, FileAllocation::Prealloc)
+                .await
+                .unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(meta.len(), 0);
+    }
+}

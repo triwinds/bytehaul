@@ -158,4 +158,45 @@ mod tests {
         assert!(pm2.is_complete(3));
         assert!(!pm2.is_complete(4));
     }
+
+    #[test]
+    fn test_all_done() {
+        let mut pm = PieceMap::new(2_000_000, 1_000_000);
+        assert!(!pm.all_done());
+        pm.mark_complete(0);
+        assert!(!pm.all_done());
+        pm.mark_complete(1);
+        assert!(pm.all_done());
+    }
+
+    #[test]
+    fn test_total_size_and_accessors() {
+        let pm = PieceMap::new(2_500_000, 1_000_000);
+        assert_eq!(pm.total_size(), 2_500_000);
+        assert_eq!(pm.piece_size(), 1_000_000);
+        assert_eq!(pm.piece_count(), 3);
+        assert_eq!(pm.remaining_count(), 3);
+        assert_eq!(pm.completed_count(), 0);
+    }
+
+    #[test]
+    fn test_mark_complete_out_of_bounds() {
+        let mut pm = PieceMap::new(1_000_000, 1_000_000);
+        // Should not panic for out-of-bounds piece_id
+        pm.mark_complete(999);
+        assert!(!pm.is_complete(999));
+    }
+
+    #[test]
+    fn test_is_complete_out_of_bounds() {
+        let pm = PieceMap::new(1_000_000, 1_000_000);
+        assert!(!pm.is_complete(999));
+    }
+
+    #[test]
+    fn test_completed_bytes_partial() {
+        let mut pm = PieceMap::new(2_500_000, 1_000_000);
+        pm.mark_complete(2); // last piece is 500,000 bytes
+        assert_eq!(pm.completed_bytes(), 500_000);
+    }
 }

@@ -95,3 +95,57 @@ impl SpeedLimit {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_speed_limit_unlimited() {
+        let sl = SpeedLimit::new(0);
+        assert!(matches!(sl, SpeedLimit::Unlimited));
+        // Should be a no-op
+        sl.acquire(1_000_000).await;
+    }
+
+    #[tokio::test]
+    async fn test_speed_limit_limited() {
+        let sl = SpeedLimit::new(1_000_000);
+        assert!(matches!(sl, SpeedLimit::Limited(_)));
+        // Acquire small amount — should not block noticeably
+        sl.acquire(100).await;
+    }
+
+    #[tokio::test]
+    async fn test_rate_limiter_basic() {
+        let rl = RateLimiter::new(100_000);
+        // Acquire within bucket capacity
+        rl.acquire(100).await;
+    }
+
+    #[tokio::test]
+    async fn test_rate_limiter_clone() {
+        let rl = RateLimiter::new(50_000);
+        let rl2 = rl.clone();
+        // Both should work
+        rl.acquire(100).await;
+        rl2.acquire(100).await;
+    }
+
+    #[tokio::test]
+    async fn test_rate_limiter_large_chunk() {
+        // Test acquiring more than bucket capacity
+        let rl = RateLimiter::new(10_000_000);
+        let start = tokio::time::Instant::now();
+        rl.acquire(1_000).await;
+        // Should complete quickly with large rate
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn test_speed_limit_clone() {
+        let sl = SpeedLimit::new(1000);
+        let sl2 = sl.clone();
+        sl2.acquire(10).await;
+    }
+}

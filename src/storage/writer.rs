@@ -146,3 +146,172 @@ impl WriterTask {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_writer_direct_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.bin");
+        let file = tokio::fs::File::create(&path).await.unwrap();
+
+        let budget = Arc::new(tokio::sync::Semaphore::new(1024 * 1024));
+        let written = Arc::new(AtomicU64::new(0));
+        let (tx, rx) = mpsc::channel(16);
+
+        let writer = WriterTask::new(rx, file, written.clone(), budget.clone(), 1024 * 1024);
+        let handle = tokio::spawn(writer.run());
+
+        // Send data with no piece_id (direct write)
+        tx.send(WriterCommand::Data {
+            offset: 0,
+            data: Bytes::from(vec![0xAA; 100]),
+            piece_id: None,
+        })
+        .await
+        .unwrap();
+
+        tx.send(WriterCommand::Data {
+            offset: 100,
+            data: Bytes::from(vec![0xBB; 100]),
+            piece_id: None,
+        })
+        .await
+        .unwrap();
+
+        drop(tx);
+        handle.await.unwrap().unwrap();
+
+        let content = std::fs::read(&path).unwrap();
+        assert_eq!(content.len(), 200);
+        assert!(content[..100].iter().all(|&b| b == 0xAA));
+        assert!(content[100..].iter().all(|&b| b == 0xBB));
+        assert_eq!(written.load(Ordering::Acquire), 200);
+    }
+
+    #[tokio::test]
+    async fn test_writer_with_piece_cache_and_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test_piece.bin");
+        // Pre-create file with enough space
+        std::fs::write(&path, vec![0u8; 200]).unwrap();
+        let file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .await
+            .unwrap();
+
+        let budget = Arc::new(tokio::sync::Semaphore::new(1024 * 1024));
+        let written = Arc::new(AtomicU64::new(0));
+        let (tx, rx) = mpsc::channel(16);
+
+        let writer = WriterTask::new(rx, file, written.clone(), budget.clone(), 1024 * 1024);
+        let handle = tokio::spawn(writer.run());
+
+        // Send data with piece_id (cached write)
+        tx.send(WriterCommand::Data {
+            offset: 0,
+            data: Bytes::from(vec![0xCC; 100]),
+            piece_id: Some(0),
+        })
+        .await
+        .unwrap();
+
+        // Flush piece
+        let (ack_tx, ack_rx) = oneshot::channel();
+        tx.send(WriterCommand::FlushPiece {
+            piece_id: 0,
+            ack: ack_tx,
+        })
+        .await
+        .unwrap();
+        ack_rx.await.unwrap();
+
+        drop(tx);
+        handle.await.unwrap().unwrap();
+
+        let content = std::fs::read(&path).unwrap();
+        assert!(content[..100].iter().all(|&b| b == 0xCC));
+    }
+
+    #[tokio::test]
+    async fn test_writer_flush_all_with_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test_flush_all.bin");
+        std::fs::write(&path, vec![0u8; 200]).unwrap();
+        let file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .await
+            .unwrap();
+
+        let budget = Arc::new(tokio::sync::Semaphore::new(1024 * 1024));
+        let written = Arc::new(AtomicU64::new(0));
+        let (tx, rx) = mpsc::channel(16);
+
+        let writer = WriterTask::new(rx, file, written.clone(), budget.clone(), 1024 * 1024);
+        let handle = tokio::spawn(writer.run());
+
+        tx.send(WriterCommand::Data {
+            offset: 0,
+            data: Bytes::from(vec![0xDD; 50]),
+            piece_id: Some(0),
+        })
+        .await
+        .unwrap();
+
+        // Flush all with sync
+        let (ack_tx, ack_rx) = oneshot::channel();
+        tx.send(WriterCommand::FlushAll {
+            sync_data: true,
+            ack: ack_tx,
+        })
+        .await
+        .unwrap();
+        let written_val = ack_rx.await.unwrap();
+        assert!(written_val >= 50);
+
+        drop(tx);
+        handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_writer_high_watermark_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test_hwm.bin");
+        std::fs::write(&path, vec![0u8; 1024]).unwrap();
+        let file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .await
+            .unwrap();
+
+        let budget = Arc::new(tokio::sync::Semaphore::new(1024 * 1024));
+        let written = Arc::new(AtomicU64::new(0));
+        let (tx, rx) = mpsc::channel(16);
+
+        // Set a very low high-water mark to force automatic flush
+        let writer = WriterTask::new(rx, file, written.clone(), budget.clone(), 50);
+        let handle = tokio::spawn(writer.run());
+
+        // Send data that exceeds the high watermark
+        tx.send(WriterCommand::Data {
+            offset: 0,
+            data: Bytes::from(vec![0xEE; 100]),
+            piece_id: Some(0),
+        })
+        .await
+        .unwrap();
+
+        // Give writer time to process
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        drop(tx);
+        handle.await.unwrap().unwrap();
+
+        let content = std::fs::read(&path).unwrap();
+        assert!(content[..100].iter().all(|&b| b == 0xEE));
+    }
+}

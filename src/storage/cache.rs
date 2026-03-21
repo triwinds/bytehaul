@@ -240,4 +240,105 @@ mod tests {
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].data.len(), 200);
     }
+
+    #[test]
+    fn test_drain_piece_empty() {
+        let mut cache = WriteBackCache::new();
+        let blocks = cache.drain_piece(99);
+        assert!(blocks.is_empty());
+    }
+
+    #[test]
+    fn test_insert_empty_data() {
+        let mut cache = WriteBackCache::new();
+        cache.insert(0, 0, Bytes::new());
+        assert_eq!(cache.total_bytes(), 0);
+        let blocks = cache.drain_piece(0);
+        assert!(blocks.is_empty());
+    }
+
+    #[test]
+    fn test_overlap_with_next_range() {
+        let mut cache = WriteBackCache::new();
+        // Insert a range at offset 100
+        cache.insert(0, 100, Bytes::from(vec![2u8; 50]));
+        // Insert a range at offset 0 that overlaps with the one at 100
+        cache.insert(0, 0, Bytes::from(vec![1u8; 120]));
+
+        let blocks = cache.drain_piece(0);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].offset, 0);
+        assert_eq!(blocks[0].data.len(), 150); // 0..120 merged with 100..150
+    }
+
+    #[test]
+    fn test_coalesce_multiple_ranges() {
+        let mut cache = WriteBackCache::new();
+        // Create three separate ranges
+        cache.insert(0, 0, Bytes::from(vec![1u8; 50]));
+        cache.insert(0, 100, Bytes::from(vec![2u8; 50]));
+        cache.insert(0, 200, Bytes::from(vec![3u8; 50]));
+        // Now insert something that bridges all three
+        cache.insert(0, 40, Bytes::from(vec![4u8; 170]));
+
+        let blocks = cache.drain_piece(0);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].offset, 0);
+        assert_eq!(blocks[0].data.len(), 250);
+    }
+
+    #[test]
+    fn test_insert_contiguous_extends_previous() {
+        let mut cache = WriteBackCache::new();
+        cache.insert(0, 0, Bytes::from(vec![1u8; 100]));
+        // Exactly contiguous
+        cache.insert(0, 100, Bytes::from(vec![2u8; 100]));
+        let blocks = cache.drain_piece(0);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].data.len(), 200);
+    }
+
+    #[test]
+    fn test_fully_overlapping_insert() {
+        let mut cache = WriteBackCache::new();
+        cache.insert(0, 0, Bytes::from(vec![1u8; 200]));
+        // Insert completely within existing range
+        cache.insert(0, 50, Bytes::from(vec![2u8; 50]));
+        let blocks = cache.drain_piece(0);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].offset, 0);
+        assert_eq!(blocks[0].data.len(), 200);
+    }
+
+    #[test]
+    fn test_drain_all_sorts_by_offset() {
+        let mut cache = WriteBackCache::new();
+        cache.insert(5, 5000, Bytes::from(vec![1u8; 10]));
+        cache.insert(0, 0, Bytes::from(vec![2u8; 10]));
+        cache.insert(3, 3000, Bytes::from(vec![3u8; 10]));
+
+        let blocks = cache.drain_all();
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0].offset, 0);
+        assert_eq!(blocks[1].offset, 3000);
+        assert_eq!(blocks[2].offset, 5000);
+        assert_eq!(cache.total_bytes(), 0);
+    }
+
+    #[test]
+    fn test_coalesce_stops_at_gap() {
+        let mut cache = WriteBackCache::new();
+        // Three ranges with a gap between second and third
+        cache.insert(0, 0, Bytes::from(vec![1u8; 50]));
+        cache.insert(0, 50, Bytes::from(vec![2u8; 50]));
+        cache.insert(0, 200, Bytes::from(vec![3u8; 50]));
+
+        let blocks = cache.drain_piece(0);
+        // First two should merge, third should be separate
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].offset, 0);
+        assert_eq!(blocks[0].data.len(), 100);
+        assert_eq!(blocks[1].offset, 200);
+        assert_eq!(blocks[1].data.len(), 50);
+    }
 }

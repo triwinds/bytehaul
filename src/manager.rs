@@ -88,3 +88,46 @@ impl DownloadHandle {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_downloader_builder_default() {
+        let downloader = Downloader::builder().build().unwrap();
+        // Should construct without errors
+        drop(downloader);
+    }
+
+    #[test]
+    fn test_downloader_builder_custom_timeout() {
+        let downloader = Downloader::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
+        drop(downloader);
+    }
+
+    #[tokio::test]
+    async fn test_download_handle_progress_default() {
+        let downloader = Downloader::builder().build().unwrap();
+        let spec = crate::config::DownloadSpec::new(
+            "http://127.0.0.1:1/nonexistent",
+            std::env::temp_dir().join("bytehaul_test_never_created"),
+        );
+        let handle = downloader.download(spec);
+
+        // Initial progress should be pending
+        let progress = handle.progress();
+        assert_eq!(progress.state, crate::progress::DownloadState::Pending);
+
+        // Test subscribe_progress
+        let _rx = handle.subscribe_progress();
+
+        handle.cancel();
+        // Wait should return an error (cancelled or connection refused)
+        let result = handle.wait().await;
+        assert!(result.is_err());
+    }
+}

@@ -169,4 +169,115 @@ mod tests {
         let ctrl_path = dir.path().join("nope.bytehaul");
         ControlSnapshot::delete(&ctrl_path).await.unwrap();
     }
+
+    #[tokio::test]
+    async fn test_control_path_derivation() {
+        let path = std::path::PathBuf::from("/tmp/myfile.bin");
+        let ctrl = ControlSnapshot::control_path(&path);
+        assert!(ctrl.to_str().unwrap().ends_with(".bytehaul"));
+    }
+
+    #[tokio::test]
+    async fn test_load_bad_magic() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctrl_path = dir.path().join("bad_magic.bytehaul");
+        // Write a file with wrong magic but enough header bytes
+        let mut data = vec![0u8; 20];
+        data[0..4].copy_from_slice(&0xDEADBEEFu32.to_le_bytes());
+        data[4..8].copy_from_slice(&1u32.to_le_bytes());
+        data[8..12].copy_from_slice(&0u32.to_le_bytes());
+        data[12..16].copy_from_slice(&0u32.to_le_bytes());
+        std::fs::write(&ctrl_path, &data).unwrap();
+
+        let result = ControlSnapshot::load(&ctrl_path).await;
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(err_msg.contains("bad magic"));
+    }
+
+    #[tokio::test]
+    async fn test_load_bad_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctrl_path = dir.path().join("bad_ver.bytehaul");
+        let mut data = vec![0u8; 20];
+        data[0..4].copy_from_slice(&MAGIC.to_le_bytes());
+        data[4..8].copy_from_slice(&99u32.to_le_bytes()); // wrong version
+        data[8..12].copy_from_slice(&0u32.to_le_bytes());
+        data[12..16].copy_from_slice(&0u32.to_le_bytes());
+        std::fs::write(&ctrl_path, &data).unwrap();
+
+        let result = ControlSnapshot::load(&ctrl_path).await;
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(err_msg.contains("unsupported version"));
+    }
+
+    #[tokio::test]
+    async fn test_load_truncated_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctrl_path = dir.path().join("truncated.bytehaul");
+        let mut data = vec![0u8; 16];
+        data[0..4].copy_from_slice(&MAGIC.to_le_bytes());
+        data[4..8].copy_from_slice(&VERSION.to_le_bytes());
+        data[8..12].copy_from_slice(&1000u32.to_le_bytes()); // claims 1000 bytes of payload
+        data[12..16].copy_from_slice(&0u32.to_le_bytes());
+        std::fs::write(&ctrl_path, &data).unwrap();
+
+        let result = ControlSnapshot::load(&ctrl_path).await;
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(err_msg.contains("truncated"));
+    }
+
+    #[tokio::test]
+    async fn test_load_checksum_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctrl_path = dir.path().join("bad_crc.bytehaul");
+
+        // First save a valid snapshot
+        let snapshot = ControlSnapshot {
+            url: "https://example.com/file.bin".to_string(),
+            total_size: 100,
+            piece_size: 100,
+            piece_count: 1,
+            completed_bitset: vec![0],
+            downloaded_bytes: 0,
+            etag: None,
+            last_modified: None,
+        };
+        snapshot.save(&ctrl_path).await.unwrap();
+
+        // Corrupt the payload but keep the header intact
+        let mut data = std::fs::read(&ctrl_path).unwrap();
+        if data.len() > HEADER_SIZE + 2 {
+            data[HEADER_SIZE + 1] ^= 0xFF; // flip a byte in payload
+        }
+        std::fs::write(&ctrl_path, &data).unwrap();
+
+        let result = ControlSnapshot::load(&ctrl_path).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_delete_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctrl_path = dir.path().join("to_delete.bytehaul");
+        std::fs::write(&ctrl_path, b"some data").unwrap();
+        assert!(ctrl_path.exists());
+        ControlSnapshot::delete(&ctrl_path).await.unwrap();
+        assert!(!ctrl_path.exists());
+    }
+
+    #[tokio::test]
+    async fn test_load_too_short() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctrl_path = dir.path().join("short.bytehaul");
+        // Write less than HEADER_SIZE bytes
+        std::fs::write(&ctrl_path, b"short").unwrap();
+
+        let result = ControlSnapshot::load(&ctrl_path).await;
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(err_msg.contains("too short"));
+    }
 }

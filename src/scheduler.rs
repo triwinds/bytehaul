@@ -76,3 +76,85 @@ impl SchedulerState {
         self.piece_map.to_bitset_bytes()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::piece_map::PieceMap;
+
+    #[test]
+    fn test_scheduler_assign_and_complete() {
+        let pm = PieceMap::new(3_000_000, 1_000_000);
+        let mut sched = SchedulerState::new(pm);
+        assert!(!sched.all_done());
+        assert_eq!(sched.remaining_count(), 3);
+        assert_eq!(sched.piece_count(), 3);
+        assert_eq!(sched.piece_size(), 1_000_000);
+        assert_eq!(sched.total_size(), 3_000_000);
+        assert_eq!(sched.completed_bytes(), 0);
+
+        let seg = sched.assign().unwrap();
+        assert_eq!(seg.piece_id, 0);
+        assert_eq!(seg.start, 0);
+        assert_eq!(seg.end, 1_000_000);
+
+        sched.complete(0);
+        assert_eq!(sched.remaining_count(), 2);
+        assert_eq!(sched.completed_bytes(), 1_000_000);
+    }
+
+    #[test]
+    fn test_scheduler_reclaim() {
+        let pm = PieceMap::new(2_000_000, 1_000_000);
+        let mut sched = SchedulerState::new(pm);
+
+        let seg = sched.assign().unwrap();
+        assert_eq!(seg.piece_id, 0);
+        // Worker failed, reclaim the piece
+        sched.reclaim(0);
+
+        // Should be able to assign piece 0 again
+        let seg = sched.assign().unwrap();
+        assert_eq!(seg.piece_id, 0);
+    }
+
+    #[test]
+    fn test_scheduler_all_done() {
+        let pm = PieceMap::new(2_000_000, 1_000_000);
+        let mut sched = SchedulerState::new(pm);
+
+        let seg0 = sched.assign().unwrap();
+        let seg1 = sched.assign().unwrap();
+        assert!(sched.assign().is_none());
+
+        sched.complete(seg0.piece_id);
+        sched.complete(seg1.piece_id);
+        assert!(sched.all_done());
+    }
+
+    #[test]
+    fn test_scheduler_inflight_exclusion() {
+        let pm = PieceMap::new(3_000_000, 1_000_000);
+        let mut sched = SchedulerState::new(pm);
+
+        let seg0 = sched.assign().unwrap();
+        assert_eq!(seg0.piece_id, 0);
+        let seg1 = sched.assign().unwrap();
+        assert_eq!(seg1.piece_id, 1);
+        let seg2 = sched.assign().unwrap();
+        assert_eq!(seg2.piece_id, 2);
+        assert!(sched.assign().is_none());
+    }
+
+    #[test]
+    fn test_scheduler_snapshot_bitset() {
+        let pm = PieceMap::new(3_000_000, 1_000_000);
+        let mut sched = SchedulerState::new(pm);
+
+        sched.assign().unwrap();
+        sched.complete(0);
+
+        let bitset = sched.snapshot_bitset();
+        assert!(!bitset.is_empty());
+    }
+}

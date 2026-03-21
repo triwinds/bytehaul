@@ -763,6 +763,59 @@ async fn worker_loop(
     }
 }
 
+/// Check the HTTP status of a segment response and return an appropriate error
+/// for non-206 statuses.
+fn check_segment_status(
+    status: u16,
+    retry_after_header: Option<&str>,
+) -> Result<(), DownloadError> {
+    if status == 200 {
+        // Server returned full content instead of partial — Range not supported
+        return Err(DownloadError::HttpStatus {
+            status: 200,
+            message: "server returned 200 instead of 206; Range not supported".into(),
+        });
+    }
+    if status == 429 || status == 503 {
+        // Extract Retry-After for backoff
+        let retry_after = retry_after_header
+            .and_then(|s| s.trim().parse::<u64>().ok());
+        let message = match retry_after {
+            Some(secs) => format!("retry-after:{secs}"),
+            None => format!("HTTP {status}"),
+        };
+        return Err(DownloadError::HttpStatus { status, message });
+    }
+    if status != 206 {
+        return Err(DownloadError::HttpStatus {
+            status,
+            message: format!("expected 206, got {status}"),
+        });
+    }
+    Ok(())
+}
+
+/// Validate that a segment response's metadata matches the expected range.
+fn validate_segment_meta(
+    meta: &ResponseMeta,
+    segment: &Segment,
+) -> Result<(), DownloadError> {
+    if !range_response_allowed(meta) {
+        return Err(DownloadError::ResumeMismatch(
+            "range responses with content-encoding are not supported".into(),
+        ));
+    }
+    if meta.content_range_total.is_none()
+        || meta.content_range_start != Some(segment.start)
+        || meta.content_range_end != Some(segment.end - 1)
+    {
+        return Err(DownloadError::ResumeMismatch(
+            "server returned a mismatched Content-Range".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Download a segment by sending a fresh Range request.
 #[allow(clippy::too_many_arguments)]
 async fn download_segment(
@@ -781,47 +834,14 @@ async fn download_segment(
     let response = req.send().await?;
 
     let status = response.status().as_u16();
-    if status == 200 {
-        // Server returned full content instead of partial — Range not supported
-        return Err(DownloadError::HttpStatus {
-            status: 200,
-            message: "server returned 200 instead of 206; Range not supported".into(),
-        });
-    }
-    if status == 429 || status == 503 {
-        // Extract Retry-After for backoff
-        let retry_after = response
-            .headers()
-            .get("retry-after")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.trim().parse::<u64>().ok());
-        let message = match retry_after {
-            Some(secs) => format!("retry-after:{secs}"),
-            None => format!("HTTP {status}"),
-        };
-        return Err(DownloadError::HttpStatus { status, message });
-    }
-    if status != 206 {
-        return Err(DownloadError::HttpStatus {
-            status,
-            message: format!("expected 206, got {status}"),
-        });
-    }
+    let retry_after = response
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok().map(|s| s.to_owned()));
+    check_segment_status(status, retry_after.as_deref())?;
 
     let meta = ResponseMeta::from_response(&response);
-    if !range_response_allowed(&meta) {
-        return Err(DownloadError::ResumeMismatch(
-            "range responses with content-encoding are not supported".into(),
-        ));
-    }
-    if meta.content_range_total.is_none()
-        || meta.content_range_start != Some(segment.start)
-        || meta.content_range_end != Some(segment.end - 1)
-    {
-        return Err(DownloadError::ResumeMismatch(
-            "server returned a mismatched Content-Range".into(),
-        ));
-    }
+    validate_segment_meta(&meta, segment)?;
 
     stream_segment(response, segment, write_tx, downloaded, cancel_rx, budget, speed_limit).await
 }
@@ -939,4 +959,493 @@ async fn flush_all_and_wait(
         .await
         .map_err(|_| DownloadError::ChannelClosed)?;
     ack_rx.await.map_err(|_| DownloadError::ChannelClosed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_range_response_allowed_no_encoding() {
+        let meta = ResponseMeta {
+            content_length: None,
+            content_range_start: None,
+            content_range_end: None,
+            content_range_total: None,
+            accept_ranges: false,
+            etag: None,
+            last_modified: None,
+            content_encoding: None,
+        };
+        assert!(range_response_allowed(&meta));
+    }
+
+    #[test]
+    fn test_range_response_allowed_identity() {
+        let meta = ResponseMeta {
+            content_length: None,
+            content_range_start: None,
+            content_range_end: None,
+            content_range_total: None,
+            accept_ranges: false,
+            etag: None,
+            last_modified: None,
+            content_encoding: Some("identity".into()),
+        };
+        assert!(range_response_allowed(&meta));
+    }
+
+    #[test]
+    fn test_range_response_disallowed_gzip() {
+        let meta = ResponseMeta {
+            content_length: None,
+            content_range_start: None,
+            content_range_end: None,
+            content_range_total: None,
+            accept_ranges: false,
+            etag: None,
+            last_modified: None,
+            content_encoding: Some("gzip".into()),
+        };
+        assert!(!range_response_allowed(&meta));
+    }
+
+    #[test]
+    fn test_validate_metadata_matching() {
+        let meta = ResponseMeta {
+            content_length: None,
+            content_range_start: None,
+            content_range_end: None,
+            content_range_total: Some(1000),
+            accept_ranges: true,
+            etag: Some("\"abc\"".into()),
+            last_modified: Some("Thu, 01 Jan 2026 00:00:00 GMT".into()),
+            content_encoding: None,
+        };
+        let ctrl = ControlSnapshot {
+            url: "https://example.com".into(),
+            total_size: 1000,
+            piece_size: 1000,
+            piece_count: 1,
+            completed_bitset: vec![0],
+            downloaded_bytes: 0,
+            etag: Some("\"abc\"".into()),
+            last_modified: Some("Thu, 01 Jan 2026 00:00:00 GMT".into()),
+        };
+        assert!(validate_metadata(&meta, &ctrl));
+    }
+
+    #[test]
+    fn test_validate_metadata_size_mismatch() {
+        let meta = ResponseMeta {
+            content_length: None,
+            content_range_start: None,
+            content_range_end: None,
+            content_range_total: Some(2000),
+            accept_ranges: true,
+            etag: None,
+            last_modified: None,
+            content_encoding: None,
+        };
+        let ctrl = ControlSnapshot {
+            url: "https://example.com".into(),
+            total_size: 1000,
+            piece_size: 1000,
+            piece_count: 1,
+            completed_bitset: vec![0],
+            downloaded_bytes: 0,
+            etag: None,
+            last_modified: None,
+        };
+        assert!(!validate_metadata(&meta, &ctrl));
+    }
+
+    #[test]
+    fn test_validate_metadata_etag_mismatch() {
+        let meta = ResponseMeta {
+            content_length: None,
+            content_range_start: None,
+            content_range_end: None,
+            content_range_total: Some(1000),
+            accept_ranges: true,
+            etag: Some("\"new\"".into()),
+            last_modified: None,
+            content_encoding: None,
+        };
+        let ctrl = ControlSnapshot {
+            url: "https://example.com".into(),
+            total_size: 1000,
+            piece_size: 1000,
+            piece_count: 1,
+            completed_bitset: vec![0],
+            downloaded_bytes: 0,
+            etag: Some("\"old\"".into()),
+            last_modified: None,
+        };
+        assert!(!validate_metadata(&meta, &ctrl));
+    }
+
+    #[test]
+    fn test_validate_metadata_last_modified_mismatch() {
+        let meta = ResponseMeta {
+            content_length: None,
+            content_range_start: None,
+            content_range_end: None,
+            content_range_total: Some(1000),
+            accept_ranges: true,
+            etag: None,
+            last_modified: Some("Fri, 02 Jan 2026".into()),
+            content_encoding: None,
+        };
+        let ctrl = ControlSnapshot {
+            url: "https://example.com".into(),
+            total_size: 1000,
+            piece_size: 1000,
+            piece_count: 1,
+            completed_bitset: vec![0],
+            downloaded_bytes: 0,
+            etag: None,
+            last_modified: Some("Thu, 01 Jan 2026".into()),
+        };
+        assert!(!validate_metadata(&meta, &ctrl));
+    }
+
+    #[test]
+    fn test_validate_metadata_no_total_in_response() {
+        let meta = ResponseMeta {
+            content_length: None,
+            content_range_start: None,
+            content_range_end: None,
+            content_range_total: None,
+            accept_ranges: true,
+            etag: None,
+            last_modified: None,
+            content_encoding: None,
+        };
+        let ctrl = ControlSnapshot {
+            url: "https://example.com".into(),
+            total_size: 1000,
+            piece_size: 1000,
+            piece_count: 1,
+            completed_bitset: vec![0],
+            downloaded_bytes: 0,
+            etag: None,
+            last_modified: None,
+        };
+        assert!(validate_metadata(&meta, &ctrl));
+    }
+
+    #[tokio::test]
+    async fn test_retry_with_backoff_immediate_success() {
+        let (_, mut cancel_rx) = watch::channel(false);
+        let result: Result<i32, DownloadError> = retry_with_backoff(
+            3,
+            Duration::from_millis(10),
+            Duration::from_millis(100),
+            &mut cancel_rx,
+            || async { Ok(42) },
+        )
+        .await;
+        assert_eq!(result.unwrap(), 42);
+    }
+
+    #[tokio::test]
+    async fn test_retry_with_backoff_non_retryable() {
+        let (_, mut cancel_rx) = watch::channel(false);
+        let result: Result<i32, DownloadError> = retry_with_backoff(
+            3,
+            Duration::from_millis(10),
+            Duration::from_millis(100),
+            &mut cancel_rx,
+            || async { Err(DownloadError::Cancelled) },
+        )
+        .await;
+        assert!(matches!(result, Err(DownloadError::Cancelled)));
+    }
+
+    #[tokio::test]
+    async fn test_retry_with_backoff_retries_then_succeeds() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let (_, mut cancel_rx) = watch::channel(false);
+        let attempts = Arc::new(AtomicU32::new(0));
+        let attempts_clone = attempts.clone();
+
+        let result: Result<i32, DownloadError> = retry_with_backoff(
+            3,
+            Duration::from_millis(1),
+            Duration::from_millis(10),
+            &mut cancel_rx,
+            move || {
+                let attempts = attempts_clone.clone();
+                async move {
+                    let n = attempts.fetch_add(1, Ordering::Relaxed);
+                    if n < 2 {
+                        Err(DownloadError::HttpStatus {
+                            status: 503,
+                            message: "Service Unavailable".into(),
+                        })
+                    } else {
+                        Ok(42)
+                    }
+                }
+            },
+        )
+        .await;
+        assert_eq!(result.unwrap(), 42);
+        assert_eq!(attempts.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test]
+    async fn test_retry_with_backoff_exhausts_retries() {
+        let (_, mut cancel_rx) = watch::channel(false);
+        let result: Result<i32, DownloadError> = retry_with_backoff(
+            2,
+            Duration::from_millis(1),
+            Duration::from_millis(10),
+            &mut cancel_rx,
+            || async {
+                Err(DownloadError::HttpStatus {
+                    status: 503,
+                    message: "Service Unavailable".into(),
+                })
+            },
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(DownloadError::HttpStatus { status: 503, .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_retry_with_backoff_with_retry_after_hint() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let (_, mut cancel_rx) = watch::channel(false);
+        let attempts = Arc::new(AtomicU32::new(0));
+        let attempts_clone = attempts.clone();
+
+        let result: Result<i32, DownloadError> = retry_with_backoff(
+            3,
+            Duration::from_millis(1),
+            Duration::from_millis(10),
+            &mut cancel_rx,
+            move || {
+                let attempts = attempts_clone.clone();
+                async move {
+                    let n = attempts.fetch_add(1, Ordering::Relaxed);
+                    if n < 1 {
+                        Err(DownloadError::HttpStatus {
+                            status: 429,
+                            message: "retry-after:1".into(),
+                        })
+                    } else {
+                        Ok(99)
+                    }
+                }
+            },
+        )
+        .await;
+        assert_eq!(result.unwrap(), 99);
+    }
+
+    #[tokio::test]
+    async fn test_retry_with_backoff_cancelled() {
+        let (cancel_tx, mut cancel_rx) = watch::channel(false);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            let _ = cancel_tx.send(true);
+        });
+
+        let result: Result<i32, DownloadError> = retry_with_backoff(
+            10,
+            Duration::from_secs(10),
+            Duration::from_secs(60),
+            &mut cancel_rx,
+            || async {
+                Err(DownloadError::HttpStatus {
+                    status: 503,
+                    message: "retry-after:60".into(),
+                })
+            },
+        )
+        .await;
+        assert!(matches!(result, Err(DownloadError::Cancelled)));
+    }
+
+    #[tokio::test]
+    async fn test_flush_piece_and_wait_closed_channel() {
+        let (tx, rx) = mpsc::channel::<WriterCommand>(1);
+        drop(rx);
+        let result = flush_piece_and_wait(&tx, 0).await;
+        assert!(matches!(result, Err(DownloadError::ChannelClosed)));
+    }
+
+    #[tokio::test]
+    async fn test_flush_all_and_wait_closed_channel() {
+        let (tx, rx) = mpsc::channel::<WriterCommand>(1);
+        drop(rx);
+        let result = flush_all_and_wait(&tx, false).await;
+        assert!(matches!(result, Err(DownloadError::ChannelClosed)));
+    }
+
+    // ── check_segment_status tests ──
+
+    #[test]
+    fn test_check_segment_status_206_ok() {
+        assert!(check_segment_status(206, None).is_ok());
+    }
+
+    #[test]
+    fn test_check_segment_status_200_range_not_supported() {
+        let err = check_segment_status(200, None).unwrap_err();
+        match err {
+            DownloadError::HttpStatus { status, message } => {
+                assert_eq!(status, 200);
+                assert!(message.contains("Range not supported"));
+            }
+            _ => panic!("expected HttpStatus"),
+        }
+    }
+
+    #[test]
+    fn test_check_segment_status_429_with_retry_after() {
+        let err = check_segment_status(429, Some("5")).unwrap_err();
+        match err {
+            DownloadError::HttpStatus { status, message } => {
+                assert_eq!(status, 429);
+                assert_eq!(message, "retry-after:5");
+            }
+            _ => panic!("expected HttpStatus"),
+        }
+    }
+
+    #[test]
+    fn test_check_segment_status_503_without_retry_after() {
+        let err = check_segment_status(503, None).unwrap_err();
+        match err {
+            DownloadError::HttpStatus { status, message } => {
+                assert_eq!(status, 503);
+                assert_eq!(message, "HTTP 503");
+            }
+            _ => panic!("expected HttpStatus"),
+        }
+    }
+
+    #[test]
+    fn test_check_segment_status_503_with_non_numeric_retry_after() {
+        let err = check_segment_status(503, Some("later")).unwrap_err();
+        match err {
+            DownloadError::HttpStatus { status, message } => {
+                assert_eq!(status, 503);
+                assert_eq!(message, "HTTP 503");
+            }
+            _ => panic!("expected HttpStatus"),
+        }
+    }
+
+    #[test]
+    fn test_check_segment_status_404_other() {
+        let err = check_segment_status(404, None).unwrap_err();
+        match err {
+            DownloadError::HttpStatus { status, message } => {
+                assert_eq!(status, 404);
+                assert!(message.contains("expected 206, got 404"));
+            }
+            _ => panic!("expected HttpStatus"),
+        }
+    }
+
+    // ── validate_segment_meta tests ──
+
+    #[test]
+    fn test_validate_segment_meta_ok() {
+        let meta = ResponseMeta {
+            content_length: Some(1000),
+            content_range_start: Some(0),
+            content_range_end: Some(999),
+            content_range_total: Some(5000),
+            accept_ranges: true,
+            etag: None,
+            last_modified: None,
+            content_encoding: None,
+        };
+        let segment = Segment { piece_id: 0, start: 0, end: 1000 };
+        assert!(validate_segment_meta(&meta, &segment).is_ok());
+    }
+
+    #[test]
+    fn test_validate_segment_meta_gzip_encoding() {
+        let meta = ResponseMeta {
+            content_length: Some(1000),
+            content_range_start: Some(0),
+            content_range_end: Some(999),
+            content_range_total: Some(5000),
+            accept_ranges: true,
+            etag: None,
+            last_modified: None,
+            content_encoding: Some("gzip".into()),
+        };
+        let segment = Segment { piece_id: 0, start: 0, end: 1000 };
+        assert!(matches!(
+            validate_segment_meta(&meta, &segment),
+            Err(DownloadError::ResumeMismatch(_))
+        ));
+    }
+
+    #[test]
+    fn test_validate_segment_meta_no_total() {
+        let meta = ResponseMeta {
+            content_length: Some(1000),
+            content_range_start: Some(0),
+            content_range_end: Some(999),
+            content_range_total: None,
+            accept_ranges: true,
+            etag: None,
+            last_modified: None,
+            content_encoding: None,
+        };
+        let segment = Segment { piece_id: 0, start: 0, end: 1000 };
+        assert!(matches!(
+            validate_segment_meta(&meta, &segment),
+            Err(DownloadError::ResumeMismatch(_))
+        ));
+    }
+
+    #[test]
+    fn test_validate_segment_meta_wrong_start() {
+        let meta = ResponseMeta {
+            content_length: Some(1000),
+            content_range_start: Some(100),
+            content_range_end: Some(999),
+            content_range_total: Some(5000),
+            accept_ranges: true,
+            etag: None,
+            last_modified: None,
+            content_encoding: None,
+        };
+        let segment = Segment { piece_id: 0, start: 0, end: 1000 };
+        assert!(matches!(
+            validate_segment_meta(&meta, &segment),
+            Err(DownloadError::ResumeMismatch(_))
+        ));
+    }
+
+    #[test]
+    fn test_validate_segment_meta_wrong_end() {
+        let meta = ResponseMeta {
+            content_length: Some(1000),
+            content_range_start: Some(0),
+            content_range_end: Some(500),
+            content_range_total: Some(5000),
+            accept_ranges: true,
+            etag: None,
+            last_modified: None,
+            content_encoding: None,
+        };
+        let segment = Segment { piece_id: 0, start: 0, end: 1000 };
+        assert!(matches!(
+            validate_segment_meta(&meta, &segment),
+            Err(DownloadError::ResumeMismatch(_))
+        ));
+    }
 }

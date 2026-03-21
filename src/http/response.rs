@@ -110,4 +110,63 @@ mod tests {
         assert_eq!(meta.content_range_end, None);
         assert_eq!(meta.content_range_total, None);
     }
+
+    #[test]
+    fn test_accept_ranges_bytes() {
+        let response = reqwest::Response::from(
+            http::Response::builder()
+                .status(200)
+                .header("accept-ranges", "bytes")
+                .body("test")
+                .unwrap(),
+        );
+        let meta = ResponseMeta::from_response(&response);
+        assert!(meta.accept_ranges);
+    }
+
+    #[test]
+    fn test_accept_ranges_none() {
+        let response = reqwest::Response::from(
+            http::Response::builder()
+                .status(200)
+                .header("accept-ranges", "none")
+                .body("test")
+                .unwrap(),
+        );
+        let meta = ResponseMeta::from_response(&response);
+        assert!(!meta.accept_ranges);
+    }
+
+    #[test]
+    fn test_etag_and_last_modified() {
+        let response = reqwest::Response::from(
+            http::Response::builder()
+                .status(200)
+                .header("etag", "\"abc123\"")
+                .header("last-modified", "Thu, 01 Jan 2026 00:00:00 GMT")
+                .body("test")
+                .unwrap(),
+        );
+        let meta = ResponseMeta::from_response(&response);
+        assert_eq!(meta.etag.as_deref(), Some("\"abc123\""));
+        assert_eq!(
+            meta.last_modified.as_deref(),
+            Some("Thu, 01 Jan 2026 00:00:00 GMT")
+        );
+    }
+
+    #[test]
+    fn test_content_range_unknown_total() {
+        let response = reqwest::Response::from(
+            http::Response::builder()
+                .status(206)
+                .header("content-range", "bytes 0-99/*")
+                .body("test")
+                .unwrap(),
+        );
+        let meta = ResponseMeta::from_response(&response);
+        assert_eq!(meta.content_range_start, Some(0));
+        assert_eq!(meta.content_range_end, Some(99));
+        assert_eq!(meta.content_range_total, None);
+    }
 }
