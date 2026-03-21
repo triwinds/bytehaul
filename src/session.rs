@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, watch, Semaphore};
 
 use crate::config::DownloadSpec;
 use crate::error::DownloadError;
@@ -19,7 +19,7 @@ use crate::storage::control::ControlSnapshot;
 use crate::storage::file::{create_output_file, open_existing_file};
 use crate::storage::piece_map::PieceMap;
 use crate::storage::segment::Segment;
-use crate::storage::writer::{WriteCommand, WriterTask};
+use crate::storage::writer::{WriteCommand, WriterControl, WriterTask};
 
 const CONTROL_SAVE_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -173,10 +173,22 @@ async fn run_single_connection(
         create_output_file(&spec.output_path, total_size, spec.file_allocation).await?
     };
 
+    // Memory budget semaphore: permits = memory_budget bytes
+    let budget = Arc::new(Semaphore::new(spec.memory_budget));
     let (write_tx, write_rx) = mpsc::channel::<WriteCommand>(spec.channel_buffer);
+    let (ctrl_tx, ctrl_rx) = mpsc::channel::<WriterControl>(16);
     let written_bytes = Arc::new(AtomicU64::new(start_offset));
-    let writer_handle =
-        tokio::spawn(WriterTask::new(write_rx, file, written_bytes.clone()).run());
+    let writer_handle = tokio::spawn(
+        WriterTask::new(
+            write_rx,
+            ctrl_rx,
+            file,
+            written_bytes.clone(),
+            budget.clone(),
+            spec.memory_budget,
+        )
+        .run(),
+    );
 
     let ts = total_size.unwrap_or(0);
     let snap_template = ControlSnapshot {
@@ -202,10 +214,12 @@ async fn run_single_connection(
         } else {
             None
         },
+        &budget,
     )
     .await;
 
     drop(write_tx);
+    drop(ctrl_tx);
     let writer_result = writer_handle
         .await
         .map_err(|e| DownloadError::Other(format!("writer panicked: {e}")))?;
@@ -240,6 +254,7 @@ async fn stream_single(
     total_size: Option<u64>,
     start_offset: u64,
     control: Option<(&Arc<AtomicU64>, &Path, &ControlSnapshot)>,
+    budget: &Arc<Semaphore>,
 ) -> Result<(), DownloadError> {
     let mut stream = response.bytes_stream();
     let mut downloaded: u64 = start_offset;
@@ -278,9 +293,17 @@ async fn stream_single(
             chunk = stream.next() => {
                 match chunk {
                     Some(Ok(data)) => {
+                        let len = data.len();
+                        // Acquire budget permits before buffering data
+                        let _permit = budget
+                            .acquire_many(len as u32)
+                            .await
+                            .map_err(|_| DownloadError::Other("budget semaphore closed".into()))?;
+                        _permit.forget(); // permits returned by writer after flush
+
                         let offset = downloaded;
-                        downloaded += data.len() as u64;
-                        if write_tx.send(WriteCommand { offset, data }).await.is_err() {
+                        downloaded += len as u64;
+                        if write_tx.send(WriteCommand { offset, data, piece_id: None }).await.is_err() {
                             return Err(DownloadError::ChannelClosed);
                         }
                         let elapsed = start_time.elapsed().as_secs_f64();
@@ -325,11 +348,24 @@ async fn run_multi_worker(
         create_output_file(&spec.output_path, Some(total_size), spec.file_allocation).await?
     };
 
-    // Writer
+    // Memory budget semaphore
+    let budget = Arc::new(Semaphore::new(spec.memory_budget));
+
+    // Writer with cache
     let (write_tx, write_rx) = mpsc::channel::<WriteCommand>(spec.channel_buffer);
+    let (ctrl_tx, ctrl_rx) = mpsc::channel::<WriterControl>(64);
     let written_bytes = Arc::new(AtomicU64::new(0));
-    let writer_handle =
-        tokio::spawn(WriterTask::new(write_rx, file, written_bytes.clone()).run());
+    let writer_handle = tokio::spawn(
+        WriterTask::new(
+            write_rx,
+            ctrl_rx,
+            file,
+            written_bytes.clone(),
+            budget.clone(),
+            spec.memory_budget,
+        )
+        .run(),
+    );
 
     // Scheduler
     let initial_downloaded = piece_map.completed_bytes();
@@ -368,8 +404,10 @@ async fn run_multi_worker(
             spec.read_timeout,
             scheduler.clone(),
             write_tx.clone(),
+            ctrl_tx.clone(),
             downloaded.clone(),
             cancel_rx.clone(),
+            budget.clone(),
             first,
         ));
         abort_handles.push(handle.abort_handle());
@@ -378,6 +416,7 @@ async fn run_multi_worker(
 
     // Drop our sender so writer can finish once workers are done
     drop(write_tx);
+    drop(ctrl_tx);
 
     // ── Monitor loop ──
     let mut cancel_rx = cancel_rx;
@@ -517,8 +556,10 @@ async fn worker_loop(
     timeout: Duration,
     scheduler: Scheduler,
     write_tx: mpsc::Sender<WriteCommand>,
+    ctrl_tx: mpsc::Sender<WriterControl>,
     downloaded: Arc<AtomicU64>,
     cancel_rx: watch::Receiver<bool>,
+    budget: Arc<Semaphore>,
     first_response: Option<(reqwest::Response, usize)>,
 ) -> Result<(), DownloadError> {
     let mut cancel_rx = cancel_rx;
@@ -536,24 +577,26 @@ async fn worker_loop(
 
         let result = if let Some((resp, pid)) = first_response.take() {
             if pid == segment.piece_id {
-                stream_segment(resp, &segment, &write_tx, &downloaded, &mut cancel_rx).await
+                stream_segment(resp, &segment, &write_tx, &downloaded, &mut cancel_rx, &budget).await
             } else {
                 download_segment(
                     &client, &url, &headers, timeout, &segment, &write_tx, &downloaded,
-                    &mut cancel_rx,
+                    &mut cancel_rx, &budget,
                 )
                 .await
             }
         } else {
             download_segment(
                 &client, &url, &headers, timeout, &segment, &write_tx, &downloaded,
-                &mut cancel_rx,
+                &mut cancel_rx, &budget,
             )
             .await
         };
 
         match result {
             Ok(()) => {
+                // Signal writer to flush this piece's cached data
+                let _ = ctrl_tx.send(WriterControl::FlushPiece(segment.piece_id)).await;
                 scheduler.lock().complete(segment.piece_id);
             }
             Err(e) => {
@@ -575,6 +618,7 @@ async fn download_segment(
     write_tx: &mpsc::Sender<WriteCommand>,
     downloaded: &Arc<AtomicU64>,
     cancel_rx: &mut watch::Receiver<bool>,
+    budget: &Arc<Semaphore>,
 ) -> Result<(), DownloadError> {
     let req = build_range_request(client, url, headers, timeout, segment.start, segment.end - 1);
     let response = req.send().await?;
@@ -587,7 +631,7 @@ async fn download_segment(
         });
     }
 
-    stream_segment(response, segment, write_tx, downloaded, cancel_rx).await
+    stream_segment(response, segment, write_tx, downloaded, cancel_rx, budget).await
 }
 
 /// Stream an already-opened response into the writer channel.
@@ -597,6 +641,7 @@ async fn stream_segment(
     write_tx: &mpsc::Sender<WriteCommand>,
     downloaded: &Arc<AtomicU64>,
     cancel_rx: &mut watch::Receiver<bool>,
+    budget: &Arc<Semaphore>,
 ) -> Result<(), DownloadError> {
     let mut stream = response.bytes_stream();
     let mut offset = segment.start;
@@ -614,12 +659,19 @@ async fn stream_segment(
             chunk = stream.next() => {
                 match chunk {
                     Some(Ok(data)) => {
-                        let len = data.len() as u64;
-                        if write_tx.send(WriteCommand { offset, data }).await.is_err() {
+                        let len = data.len();
+                        // Acquire budget permits before buffering
+                        let _permit = budget
+                            .acquire_many(len as u32)
+                            .await
+                            .map_err(|_| DownloadError::Other("budget semaphore closed".into()))?;
+                        _permit.forget(); // permits returned by writer after flush
+
+                        if write_tx.send(WriteCommand { offset, data, piece_id: Some(segment.piece_id) }).await.is_err() {
                             return Err(DownloadError::ChannelClosed);
                         }
-                        offset += len;
-                        downloaded.fetch_add(len, Ordering::Relaxed);
+                        offset += len as u64;
+                        downloaded.fetch_add(len as u64, Ordering::Relaxed);
                     }
                     Some(Err(e)) => return Err(DownloadError::Http(e)),
                     None => break,
