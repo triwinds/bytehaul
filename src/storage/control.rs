@@ -13,10 +13,13 @@ const HEADER_SIZE: usize = 16; // magic(4) + version(4) + payload_len(4) + check
 pub(crate) struct ControlSnapshot {
     pub url: String,
     pub total_size: u64,
+    pub piece_size: u64,
+    pub piece_count: usize,
+    pub completed_bitset: Vec<u8>,
+    /// For single-connection resume: the byte offset written so far.
     pub downloaded_bytes: u64,
     pub etag: Option<String>,
     pub last_modified: Option<String>,
-    pub piece_size: u64,
 }
 
 impl ControlSnapshot {
@@ -132,10 +135,12 @@ mod tests {
         let snapshot = ControlSnapshot {
             url: "https://example.com/file.bin".to_string(),
             total_size: 1_000_000,
+            piece_size: 1_000_000,
+            piece_count: 1,
+            completed_bitset: vec![0],
             downloaded_bytes: 500_000,
             etag: Some("\"abc123\"".to_string()),
             last_modified: Some("Thu, 01 Jan 2026 00:00:00 GMT".to_string()),
-            piece_size: 1_000_000,
         };
 
         snapshot.save(&ctrl_path).await.unwrap();

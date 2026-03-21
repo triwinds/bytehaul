@@ -3,6 +3,7 @@ mod error;
 mod http;
 mod manager;
 mod progress;
+mod scheduler;
 mod session;
 mod storage;
 

@@ -30,6 +30,8 @@ pub struct DownloadSpec {
     pub file_allocation: FileAllocation,
     pub channel_buffer: usize,
     pub resume: bool,
+    pub piece_size: u64,
+    pub min_split_size: u64,
 }
 
 impl DownloadSpec {
@@ -45,6 +47,8 @@ impl DownloadSpec {
             file_allocation: FileAllocation::default(),
             channel_buffer: 64,
             resume: true,
+            piece_size: 1024 * 1024,           // 1 MiB
+            min_split_size: 10 * 1024 * 1024,  // 10 MiB
         }
     }
 }

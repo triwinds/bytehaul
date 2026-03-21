@@ -2,6 +2,8 @@
 #[derive(Debug, Clone)]
 pub(crate) struct ResponseMeta {
     pub content_length: Option<u64>,
+    /// Total file size parsed from `Content-Range` header (206 responses).
+    pub content_range_total: Option<u64>,
     pub accept_ranges: bool,
     pub etag: Option<String>,
     pub last_modified: Option<String>,
@@ -33,8 +35,20 @@ impl ResponseMeta {
             .and_then(|v| v.to_str().ok())
             .map(String::from);
 
+        let content_range_total = headers
+            .get("content-range")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| {
+                let total_part = s.rsplit('/').next()?;
+                if total_part == "*" {
+                    return None;
+                }
+                total_part.trim().parse::<u64>().ok()
+            });
+
         Self {
             content_length: response.content_length(),
+            content_range_total,
             accept_ranges,
             etag,
             last_modified,
