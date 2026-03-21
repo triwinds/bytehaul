@@ -9,6 +9,6 @@ name = "_bytehaul"
 crate-type = ["cdylib"]
 
 [dependencies]
-bytehaul = { path = "../.." }
+bytehaul = { path = "../..", version = "0.1.0" }
 pyo3 = { version = "0.23", features = ["abi3-py39", "extension-module"] }
 tokio = { version = "1", features = ["full"] }
