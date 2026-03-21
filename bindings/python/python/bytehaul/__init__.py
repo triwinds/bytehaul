@@ -1,3 +1,17 @@
-from ._bytehaul import __version__
+from ._bytehaul import (
+    __version__,
+    BytehaulError,
+    CancelledError,
+    ConfigError,
+    DownloadFailedError,
+    download,
+)
 
-__all__ = ["__version__"]
+__all__ = [
+    "__version__",
+    "BytehaulError",
+    "CancelledError",
+    "ConfigError",
+    "DownloadFailedError",
+    "download",
+]
