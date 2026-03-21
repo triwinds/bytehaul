@@ -42,6 +42,7 @@ impl PieceMap {
     pub fn piece_size(&self) -> u64 {
         self.piece_size
     }
+    #[allow(dead_code)]
     pub fn total_size(&self) -> u64 {
         self.total_size
     }
@@ -56,6 +57,7 @@ impl PieceMap {
         (start, end)
     }
 
+    #[allow(dead_code)]
     pub fn is_complete(&self, piece_id: usize) -> bool {
         piece_id < self.piece_count && self.completed[piece_id]
     }

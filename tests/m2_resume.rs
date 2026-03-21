@@ -89,9 +89,8 @@ fn slow_range_server(
                 let served = served2.clone();
                 async move {
                     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-                    if let Ok(ref c) = chunk {
-                        served.fetch_add(c.len() as u64, Ordering::Relaxed);
-                    }
+                    let Ok(ref c) = chunk;
+                    served.fetch_add(c.len() as u64, Ordering::Relaxed);
                     chunk
                 }
             });

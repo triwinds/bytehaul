@@ -6,6 +6,7 @@ pub(crate) struct ResponseMeta {
     pub content_range_end: Option<u64>,
     /// Total file size parsed from `Content-Range` header (206 responses).
     pub content_range_total: Option<u64>,
+    #[allow(dead_code)]
     pub accept_ranges: bool,
     pub etag: Option<String>,
     pub last_modified: Option<String>,

@@ -2,6 +2,8 @@
 
 A Rust async HTTP download library with resume, multi-connection, write-back cache, rate limiting, and checksum verification.
 
+[简体中文 README](docs/README.zh-CN.md)
+
 ## Features
 
 - **Single & multi-connection downloads** — automatic Range probing and fallback

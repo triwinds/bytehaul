@@ -90,10 +90,6 @@ impl WriteBackCache {
         blocks
     }
 
-    /// Check if there is any cached data for the given piece.
-    pub fn has_piece(&self, piece_id: usize) -> bool {
-        self.pieces.contains_key(&piece_id)
-    }
 }
 
 impl PieceCacheEntry {

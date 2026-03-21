@@ -66,6 +66,7 @@ impl SchedulerState {
         self.piece_map.piece_size()
     }
 
+    #[allow(dead_code)]
     pub fn total_size(&self) -> u64 {
         self.piece_map.total_size()
     }

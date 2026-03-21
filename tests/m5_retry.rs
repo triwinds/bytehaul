@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
-use bytehaul::{DownloadSpec, DownloadState, Downloader, FileAllocation};
+use bytehaul::{DownloadSpec, Downloader, FileAllocation};
 use warp::Filter;
 
 /// Server that fails the first N requests with 503, then serves normally.

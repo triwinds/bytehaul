@@ -34,14 +34,6 @@ impl RateLimiter {
         }
     }
 
-    /// Returns true if this limiter is unlimited (no throttling).
-    pub fn is_unlimited(&self) -> bool {
-        // Check capacity via the Arc — no need to lock for a one-time check
-        // We use a simpler approach: rate was set from bytes_per_sec
-        // Cannot read without lock, so just always go through acquire.
-        false
-    }
-
     /// Acquire permission to send `n` bytes. Sleeps if tokens are insufficient.
     /// Handles chunks larger than bucket capacity by sleeping proportionally.
     pub async fn acquire(&self, n: usize) {
