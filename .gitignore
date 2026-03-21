@@ -8,6 +8,7 @@ docs/private
 /.tmp
 /.wheelhouse
 /.py-install
+/bindings/python/.venv
 /bindings/python/python/bytehaul/__pycache__
 /bindings/python/python/bytehaul/_bytehaul.pyd
 /bindings/python/python/bytehaul/_bytehaul.pdb

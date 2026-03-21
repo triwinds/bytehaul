@@ -13,6 +13,14 @@ classifiers = [
 ]
 dynamic = ["version"]
 
+[dependency-groups]
+dev = [
+    "maturin>=1.7,<2.0",
+]
+
 [tool.maturin]
 python-source = "python"
 module-name = "bytehaul._bytehaul"
+
+[tool.uv]
+default-groups = ["dev"]
