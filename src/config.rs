@@ -29,6 +29,7 @@ pub struct DownloadSpec {
     pub memory_budget: usize,
     pub file_allocation: FileAllocation,
     pub channel_buffer: usize,
+    pub resume: bool,
 }
 
 impl DownloadSpec {
@@ -43,6 +44,7 @@ impl DownloadSpec {
             memory_budget: 64 * 1024 * 1024, // 64 MiB
             file_allocation: FileAllocation::default(),
             channel_buffer: 64,
+            resume: true,
         }
     }
 }

@@ -4,6 +4,17 @@ use std::path::Path;
 use crate::config::FileAllocation;
 use crate::error::DownloadError;
 
+/// Open an existing file for writing (without truncation) for resume.
+pub(crate) async fn open_existing_file(
+    path: &Path,
+) -> Result<tokio::fs::File, DownloadError> {
+    let file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .await?;
+    Ok(file)
+}
+
 /// Create (or truncate) the output file, optionally pre-allocating space.
 pub(crate) async fn create_output_file(
     path: &Path,
