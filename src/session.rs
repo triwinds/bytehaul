@@ -8,12 +8,14 @@ use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 use tokio::sync::{mpsc, watch, Semaphore};
 
+use crate::checksum::verify_checksum;
 use crate::config::DownloadSpec;
 use crate::error::DownloadError;
 use crate::http::request::build_range_request;
 use crate::http::response::ResponseMeta;
 use crate::http::worker::HttpWorker;
 use crate::progress::{DownloadState, ProgressSnapshot};
+use crate::rate_limiter::SpeedLimit;
 use crate::scheduler::{Scheduler, SchedulerState};
 use crate::storage::control::ControlSnapshot;
 use crate::storage::file::{create_output_file, open_existing_file};
@@ -75,9 +77,29 @@ pub(crate) async fn run_download(
     progress_tx: watch::Sender<ProgressSnapshot>,
     cancel_rx: watch::Receiver<bool>,
 ) -> Result<(), DownloadError> {
+    let checksum = spec.checksum.clone();
+    let output_path = spec.output_path.clone();
+
+    run_download_inner(client, spec, &progress_tx, cancel_rx).await?;
+
+    // Post-download checksum verification
+    if let Some(ref expected) = checksum {
+        verify_checksum(&output_path, expected).await?;
+    }
+
+    Ok(())
+}
+
+async fn run_download_inner(
+    client: reqwest::Client,
+    spec: DownloadSpec,
+    progress_tx: &watch::Sender<ProgressSnapshot>,
+    cancel_rx: watch::Receiver<bool>,
+) -> Result<(), DownloadError> {
     let control_path = ControlSnapshot::control_path(&spec.output_path);
     let worker = HttpWorker::new(client.clone(), &spec);
     let mut cancel_rx = cancel_rx;
+    let speed_limit = SpeedLimit::new(spec.max_download_speed);
 
     // ── Phase 1: attempt resume ──────────────────────────────
     let resume_ctrl = if spec.resume {
@@ -118,6 +140,7 @@ pub(crate) async fn run_download(
                             &progress_tx,
                             cancel_rx,
                             &control_path,
+                            speed_limit,
                         )
                         .await;
                     }
@@ -143,6 +166,7 @@ pub(crate) async fn run_download(
                         cancel_rx,
                         &control_path,
                         Some(ctrl.total_size),
+                        speed_limit,
                     )
                     .await;
                 }
@@ -171,6 +195,7 @@ pub(crate) async fn run_download(
                             &progress_tx,
                             cancel_rx,
                             &control_path,
+                            speed_limit,
                         )
                         .await;
                     }
@@ -186,6 +211,7 @@ pub(crate) async fn run_download(
                     cancel_rx,
                     &control_path,
                     total,
+                    speed_limit,
                 )
                 .await;
             } else {
@@ -199,6 +225,7 @@ pub(crate) async fn run_download(
                     cancel_rx,
                     &control_path,
                     meta.content_length,
+                    speed_limit,
                 )
                 .await;
             }
@@ -223,6 +250,7 @@ pub(crate) async fn run_download(
         cancel_rx,
         &control_path,
         meta.content_length,
+        speed_limit,
     )
     .await
 }
@@ -240,6 +268,7 @@ async fn run_single_connection(
     cancel_rx: watch::Receiver<bool>,
     control_path: &Path,
     total_size: Option<u64>,
+    speed_limit: SpeedLimit,
 ) -> Result<(), DownloadError> {
     let use_control = spec.resume && total_size.is_some();
 
@@ -291,6 +320,7 @@ async fn run_single_connection(
             None
         },
         &budget,
+        &speed_limit,
     )
     .await;
 
@@ -331,6 +361,7 @@ async fn stream_single(
     start_offset: u64,
     control: Option<(&Arc<AtomicU64>, &Path, &ControlSnapshot)>,
     budget: &Arc<Semaphore>,
+    speed_limit: &SpeedLimit,
 ) -> Result<(), DownloadError> {
     let mut stream = response.bytes_stream();
     let mut downloaded: u64 = start_offset;
@@ -370,6 +401,8 @@ async fn stream_single(
                 match chunk {
                     Some(Ok(data)) => {
                         let len = data.len();
+                        // Rate limiting
+                        speed_limit.acquire(len).await;
                         // Acquire budget permits before buffering data
                         let _permit = budget
                             .acquire_many(len as u32)
@@ -416,6 +449,7 @@ async fn run_multi_worker(
     progress_tx: &watch::Sender<ProgressSnapshot>,
     cancel_rx: watch::Receiver<bool>,
     control_path: &Path,
+    speed_limit: SpeedLimit,
 ) -> Result<(), DownloadError> {
     // File
     let file = if piece_map.completed_count() > 0 {
@@ -487,6 +521,7 @@ async fn run_multi_worker(
             downloaded.clone(),
             cancel_rx.clone(),
             budget.clone(),
+            speed_limit.clone(),
             first,
         ));
         abort_handles.push(handle.abort_handle());
@@ -642,6 +677,7 @@ async fn worker_loop(
     downloaded: Arc<AtomicU64>,
     cancel_rx: watch::Receiver<bool>,
     budget: Arc<Semaphore>,
+    speed_limit: SpeedLimit,
     first_response: Option<(reqwest::Response, usize)>,
 ) -> Result<(), DownloadError> {
     let mut cancel_rx = cancel_rx;
@@ -663,18 +699,18 @@ async fn worker_loop(
         loop {
             let result = if let Some((resp, pid)) = first_response.take() {
                 if pid == segment.piece_id {
-                    stream_segment(resp, &segment, &write_tx, &downloaded, &mut cancel_rx, &budget).await
+                    stream_segment(resp, &segment, &write_tx, &downloaded, &mut cancel_rx, &budget, &speed_limit).await
                 } else {
                     download_segment(
                         &client, &url, &headers, timeout, &segment, &write_tx, &downloaded,
-                        &mut cancel_rx, &budget,
+                        &mut cancel_rx, &budget, &speed_limit,
                     )
                     .await
                 }
             } else {
                 download_segment(
                     &client, &url, &headers, timeout, &segment, &write_tx, &downloaded,
-                    &mut cancel_rx, &budget,
+                    &mut cancel_rx, &budget, &speed_limit,
                 )
                 .await
             };
@@ -740,6 +776,7 @@ async fn download_segment(
     downloaded: &Arc<AtomicU64>,
     cancel_rx: &mut watch::Receiver<bool>,
     budget: &Arc<Semaphore>,
+    speed_limit: &SpeedLimit,
 ) -> Result<(), DownloadError> {
     let req = build_range_request(client, url, headers, timeout, segment.start, segment.end - 1);
     let response = req.send().await?;
@@ -772,7 +809,7 @@ async fn download_segment(
         });
     }
 
-    stream_segment(response, segment, write_tx, downloaded, cancel_rx, budget).await
+    stream_segment(response, segment, write_tx, downloaded, cancel_rx, budget, speed_limit).await
 }
 
 /// Stream an already-opened response into the writer channel.
@@ -783,6 +820,7 @@ async fn stream_segment(
     downloaded: &Arc<AtomicU64>,
     cancel_rx: &mut watch::Receiver<bool>,
     budget: &Arc<Semaphore>,
+    speed_limit: &SpeedLimit,
 ) -> Result<(), DownloadError> {
     let mut stream = response.bytes_stream();
     let mut offset = segment.start;
@@ -801,6 +839,8 @@ async fn stream_segment(
                 match chunk {
                     Some(Ok(data)) => {
                         let len = data.len();
+                        // Rate limiting
+                        speed_limit.acquire(len).await;
                         // Acquire budget permits before buffering
                         let _permit = budget
                             .acquire_many(len as u32)

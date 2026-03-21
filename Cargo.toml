@@ -15,6 +15,7 @@ bitvec = { version = "1", features = ["serde"] }
 parking_lot = "0.12"
 tracing = "0.1"
 crc32fast = "1"
+sha2 = "0.10"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

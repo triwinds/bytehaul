@@ -17,6 +17,13 @@ impl Default for FileAllocation {
     }
 }
 
+/// Checksum algorithm for post-download verification.
+#[derive(Debug, Clone)]
+pub enum Checksum {
+    /// SHA-256 digest (hex-encoded, lowercase).
+    Sha256(String),
+}
+
 /// Specification for a download task.
 #[derive(Debug, Clone)]
 pub struct DownloadSpec {
@@ -38,6 +45,10 @@ pub struct DownloadSpec {
     pub retry_base_delay: Duration,
     /// Maximum delay cap for exponential backoff.
     pub retry_max_delay: Duration,
+    /// Maximum download speed in bytes/sec. 0 = unlimited.
+    pub max_download_speed: u64,
+    /// Optional checksum for post-download verification.
+    pub checksum: Option<Checksum>,
 }
 
 impl DownloadSpec {
@@ -58,6 +69,8 @@ impl DownloadSpec {
             max_retries: 5,
             retry_base_delay: Duration::from_secs(1),
             retry_max_delay: Duration::from_secs(30),
+            max_download_speed: 0,
+            checksum: None,
         }
     }
 }
