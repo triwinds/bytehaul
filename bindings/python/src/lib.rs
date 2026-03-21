@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use bytehaul::{Checksum, DownloadError, DownloadSpec, Downloader, FileAllocation};
+use bytehaul::{Checksum, DownloadError, DownloadSpec, FileAllocation};
 use pyo3::create_exception;
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
@@ -151,6 +151,200 @@ fn map_download_error(error: DownloadError) -> PyErr {
     }
 }
 
+// ---------------------------------------------------------------------------
+// ProgressSnapshot Python wrapper
+// ---------------------------------------------------------------------------
+
+#[pyclass(frozen, name = "ProgressSnapshot")]
+struct PyProgressSnapshot {
+    #[pyo3(get)]
+    total_size: Option<u64>,
+    #[pyo3(get)]
+    downloaded: u64,
+    #[pyo3(get)]
+    state: String,
+    #[pyo3(get)]
+    speed: f64,
+    #[pyo3(get)]
+    elapsed_secs: Option<f64>,
+}
+
+#[pymethods]
+impl PyProgressSnapshot {
+    fn __repr__(&self) -> String {
+        format!(
+            "ProgressSnapshot(state='{}', downloaded={}, total_size={}, speed={:.1}, elapsed_secs={})",
+            self.state,
+            self.downloaded,
+            match self.total_size {
+                Some(s) => s.to_string(),
+                None => "None".to_string(),
+            },
+            self.speed,
+            match self.elapsed_secs {
+                Some(e) => format!("{e:.2}"),
+                None => "None".to_string(),
+            },
+        )
+    }
+}
+
+fn snapshot_to_py(snap: &bytehaul::ProgressSnapshot) -> PyProgressSnapshot {
+    use bytehaul::DownloadState;
+    let state = match snap.state {
+        DownloadState::Pending => "pending",
+        DownloadState::Downloading => "downloading",
+        DownloadState::Completed => "completed",
+        DownloadState::Failed => "failed",
+        DownloadState::Cancelled => "cancelled",
+        DownloadState::Paused => "paused",
+    };
+    PyProgressSnapshot {
+        total_size: snap.total_size,
+        downloaded: snap.downloaded,
+        state: state.to_string(),
+        speed: snap.speed_bytes_per_sec,
+        elapsed_secs: snap.start_time.map(|t| t.elapsed().as_secs_f64()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DownloadTask — wraps DownloadHandle
+// ---------------------------------------------------------------------------
+
+#[pyclass(name = "DownloadTask")]
+struct PyDownloadTask {
+    handle: Arc<Mutex<Option<bytehaul::DownloadHandle>>>,
+}
+
+#[pymethods]
+impl PyDownloadTask {
+    fn progress(&self) -> PyResult<PyProgressSnapshot> {
+        let guard = self.handle.lock().unwrap();
+        match guard.as_ref() {
+            Some(h) => Ok(snapshot_to_py(&h.progress())),
+            None => Err(BytehaulError::new_err(
+                "task already consumed by wait()",
+            )),
+        }
+    }
+
+    fn cancel(&self) -> PyResult<()> {
+        let guard = self.handle.lock().unwrap();
+        match guard.as_ref() {
+            Some(h) => {
+                h.cancel();
+                Ok(())
+            }
+            None => Ok(()),
+        }
+    }
+
+    fn wait(&self, py: Python<'_>) -> PyResult<()> {
+        let handle = {
+            let mut guard = self.handle.lock().unwrap();
+            guard.take().ok_or_else(|| {
+                BytehaulError::new_err("task already consumed by wait()")
+            })?
+        };
+        let runtime = shared_runtime()?;
+        py.allow_threads(move || {
+            runtime.block_on(handle.wait()).map_err(map_download_error)
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Downloader — wraps Rust Downloader
+// ---------------------------------------------------------------------------
+
+#[pyclass(name = "Downloader")]
+struct PyDownloader {
+    inner: bytehaul::Downloader,
+}
+
+#[pymethods]
+impl PyDownloader {
+    #[new]
+    #[pyo3(signature = (connect_timeout = None))]
+    fn new(connect_timeout: Option<f64>) -> PyResult<Self> {
+        let mut builder = bytehaul::Downloader::builder();
+        if let Some(ct) = connect_timeout {
+            builder = builder.connect_timeout(duration_from_secs("connect_timeout", ct)?);
+        }
+        let inner = builder.build().map_err(map_download_error)?;
+        Ok(Self { inner })
+    }
+
+    #[pyo3(
+        signature = (
+            url,
+            output_path,
+            headers = None,
+            max_connections = None,
+            connect_timeout = None,
+            read_timeout = None,
+            memory_budget = None,
+            file_allocation = None,
+            resume = None,
+            piece_size = None,
+            min_split_size = None,
+            max_retries = None,
+            retry_base_delay = None,
+            retry_max_delay = None,
+            max_download_speed = None,
+            checksum_sha256 = None
+        )
+    )]
+    #[allow(clippy::too_many_arguments)]
+    fn download(
+        &self,
+        url: String,
+        output_path: PathBuf,
+        headers: Option<HashMap<String, String>>,
+        max_connections: Option<u32>,
+        connect_timeout: Option<f64>,
+        read_timeout: Option<f64>,
+        memory_budget: Option<usize>,
+        file_allocation: Option<String>,
+        resume: Option<bool>,
+        piece_size: Option<u64>,
+        min_split_size: Option<u64>,
+        max_retries: Option<u32>,
+        retry_base_delay: Option<f64>,
+        retry_max_delay: Option<f64>,
+        max_download_speed: Option<u64>,
+        checksum_sha256: Option<String>,
+    ) -> PyResult<PyDownloadTask> {
+        let spec = build_download_spec(
+            url,
+            output_path,
+            headers,
+            max_connections,
+            connect_timeout,
+            read_timeout,
+            memory_budget,
+            file_allocation,
+            resume,
+            piece_size,
+            min_split_size,
+            max_retries,
+            retry_base_delay,
+            retry_max_delay,
+            max_download_speed,
+            checksum_sha256,
+        )?;
+        let handle = self.inner.download(spec);
+        Ok(PyDownloadTask {
+            handle: Arc::new(Mutex::new(Some(handle))),
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Top-level download() convenience function (M1 API)
+// ---------------------------------------------------------------------------
+
 #[pyfunction(
     signature = (
         url,
@@ -212,7 +406,7 @@ fn download(
     let runtime = shared_runtime()?;
 
     py.allow_threads(move || {
-        let downloader = Downloader::builder()
+        let downloader = bytehaul::Downloader::builder()
             .connect_timeout(spec.connect_timeout)
             .build()
             .map_err(map_download_error)?;
@@ -223,6 +417,10 @@ fn download(
         })
     })
 }
+
+// ---------------------------------------------------------------------------
+// Module registration
+// ---------------------------------------------------------------------------
 
 fn register_exceptions(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("BytehaulError", py.get_type::<BytehaulError>())?;
@@ -237,5 +435,8 @@ fn _bytehaul(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
     register_exceptions(py, module)?;
     module.add_function(wrap_pyfunction!(download, module)?)?;
+    module.add_class::<PyDownloader>()?;
+    module.add_class::<PyDownloadTask>()?;
+    module.add_class::<PyProgressSnapshot>()?;
     Ok(())
 }

@@ -5,6 +5,9 @@ from ._bytehaul import (
     ConfigError,
     DownloadFailedError,
     download,
+    Downloader,
+    DownloadTask,
+    ProgressSnapshot,
 )
 
 __all__ = [
@@ -14,4 +17,7 @@ __all__ = [
     "ConfigError",
     "DownloadFailedError",
     "download",
+    "Downloader",
+    "DownloadTask",
+    "ProgressSnapshot",
 ]
