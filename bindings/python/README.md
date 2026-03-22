@@ -157,3 +157,8 @@ Cross-platform (via CI):
 ```
 
 The project uses `abi3-py39`, so a single wheel per platform covers all Python 3.9+ versions.
+
+## License
+
+MIT. See the repository LICENSE file.
+
