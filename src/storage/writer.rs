@@ -136,9 +136,7 @@ impl WriterTask {
     }
 
     async fn write_block(&mut self, offset: u64, data: &[u8]) -> Result<(), DownloadError> {
-        self.file
-            .seek(std::io::SeekFrom::Start(offset))
-            .await?;
+        self.file.seek(std::io::SeekFrom::Start(offset)).await?;
         self.file.write_all(data).await?;
         let end = offset + data.len() as u64;
         // Update high-water mark

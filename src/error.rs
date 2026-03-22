@@ -34,8 +34,7 @@ impl DownloadError {
     pub fn is_retryable(&self) -> bool {
         match self {
             DownloadError::Http(e) => {
-                e.is_timeout() || e.is_connect() || e.is_request()
-                    || e.is_body()
+                e.is_timeout() || e.is_connect() || e.is_request() || e.is_body()
             }
             DownloadError::HttpStatus { status, .. } => {
                 matches!(status, 429 | 500 | 502 | 503 | 504)
@@ -58,7 +57,9 @@ impl DownloadError {
         if let DownloadError::HttpStatus { status, message } = self {
             if *status == 429 || *status == 503 {
                 // The message may contain a Retry-After value set during response parsing
-                message.strip_prefix("retry-after:").and_then(|s| s.trim().parse().ok())
+                message
+                    .strip_prefix("retry-after:")
+                    .and_then(|s| s.trim().parse().ok())
             } else {
                 None
             }
@@ -106,10 +107,8 @@ mod tests {
             assert!(e.is_retryable(), "{kind:?} should be retryable");
         }
 
-        let not_retryable = DownloadError::Io(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "test",
-        ));
+        let not_retryable =
+            DownloadError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "test"));
         assert!(!not_retryable.is_retryable());
     }
 
@@ -123,7 +122,8 @@ mod tests {
         assert!(!DownloadError::ChecksumMismatch {
             expected: "a".into(),
             actual: "b".into(),
-        }.is_retryable());
+        }
+        .is_retryable());
     }
 
     #[test]

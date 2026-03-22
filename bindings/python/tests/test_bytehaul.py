@@ -118,6 +118,10 @@ class TestConfigValidation:
         with pytest.raises(ConfigError, match="file_allocation"):
             download(f"{server}/ok", str(tmp_path / "out"), file_allocation="invalid")
 
+    def test_dns_servers_invalid(self, server, tmp_path):
+        with pytest.raises(ConfigError, match="dns_servers"):
+            download(f"{server}/ok", str(tmp_path / "out"), dns_servers=["not-an-ip"])
+
 
 # ---------------------------------------------------------------------------
 # download() convenience API tests
@@ -150,6 +154,16 @@ class TestDownloadFunction:
         )
         assert out.read_bytes() == SAMPLE_BODY
 
+    def test_with_network_options(self, server, tmp_path):
+        out = tmp_path / "netopts.bin"
+        download(
+            f"{server}/ok",
+            str(out),
+            dns_servers=["1.1.1.1"],
+            enable_ipv6=False,
+        )
+        assert out.read_bytes() == SAMPLE_BODY
+
 
 # ---------------------------------------------------------------------------
 # Downloader / DownloadTask object API tests
@@ -168,6 +182,14 @@ class TestDownloaderAPI:
     def test_invalid_timeout(self):
         with pytest.raises(ConfigError):
             Downloader(connect_timeout=-5.0)
+
+    def test_create_with_network_options(self):
+        d = Downloader(dns_servers=["1.1.1.1"], enable_ipv6=False)
+        assert d is not None
+
+    def test_invalid_dns_servers(self):
+        with pytest.raises(ConfigError, match="dns_servers"):
+            Downloader(dns_servers=["bad dns"])
 
     def test_download_and_wait(self, server, tmp_path):
         out = tmp_path / "dl.bin"

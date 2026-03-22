@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -40,6 +41,75 @@ fn duration_from_secs(field: &str, value: f64) -> PyResult<Duration> {
         return Err(config_error(format!("{field} must be >= 0")));
     }
     Ok(Duration::from_secs_f64(value))
+}
+
+fn parse_socket_addr(field: &str, value: &str) -> PyResult<SocketAddr> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(config_error(format!("{field} entries cannot be empty")));
+    }
+
+    if let Ok(addr) = value.parse::<SocketAddr>() {
+        return Ok(addr);
+    }
+
+    let ip_text = if value.starts_with('[') && value.ends_with(']') {
+        &value[1..value.len() - 1]
+    } else {
+        value
+    };
+
+    if let Ok(ip) = ip_text.parse::<IpAddr>() {
+        return Ok(SocketAddr::new(ip, 53));
+    }
+
+    Err(config_error(format!(
+        "{field} entries must be IPs or socket addresses, got: {value}"
+    )))
+}
+
+fn parse_dns_servers(dns_servers: Option<Vec<String>>) -> PyResult<Vec<SocketAddr>> {
+    match dns_servers {
+        Some(dns_servers) => dns_servers
+            .into_iter()
+            .map(|server| parse_socket_addr("dns_servers", &server))
+            .collect(),
+        None => Ok(Vec::new()),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_client_options(
+    mut builder: bytehaul::DownloaderBuilder,
+    connect_timeout: Option<f64>,
+    proxy: Option<String>,
+    http_proxy: Option<String>,
+    https_proxy: Option<String>,
+    dns_servers: Option<Vec<String>>,
+    enable_ipv6: Option<bool>,
+) -> PyResult<bytehaul::DownloaderBuilder> {
+    if let Some(connect_timeout) = connect_timeout {
+        builder = builder.connect_timeout(duration_from_secs("connect_timeout", connect_timeout)?);
+    }
+    if let Some(proxy) = proxy {
+        builder = builder.all_proxy(proxy);
+    }
+    if let Some(http_proxy) = http_proxy {
+        builder = builder.http_proxy(http_proxy);
+    }
+    if let Some(https_proxy) = https_proxy {
+        builder = builder.https_proxy(https_proxy);
+    }
+
+    let dns_servers = parse_dns_servers(dns_servers)?;
+    if !dns_servers.is_empty() {
+        builder = builder.dns_servers(dns_servers);
+    }
+    if let Some(enable_ipv6) = enable_ipv6 {
+        builder = builder.enable_ipv6(enable_ipv6);
+    }
+
+    Ok(builder)
 }
 
 fn non_zero_u32(field: &str, value: u32) -> PyResult<u32> {
@@ -223,9 +293,7 @@ impl PyDownloadTask {
         let guard = self.handle.lock().unwrap();
         match guard.as_ref() {
             Some(h) => Ok(snapshot_to_py(&h.progress())),
-            None => Err(BytehaulError::new_err(
-                "task already consumed by wait()",
-            )),
+            None => Err(BytehaulError::new_err("task already consumed by wait()")),
         }
     }
 
@@ -243,14 +311,12 @@ impl PyDownloadTask {
     fn wait(&self, py: Python<'_>) -> PyResult<()> {
         let handle = {
             let mut guard = self.handle.lock().unwrap();
-            guard.take().ok_or_else(|| {
-                BytehaulError::new_err("task already consumed by wait()")
-            })?
+            guard
+                .take()
+                .ok_or_else(|| BytehaulError::new_err("task already consumed by wait()"))?
         };
         let runtime = shared_runtime()?;
-        py.allow_threads(move || {
-            runtime.block_on(handle.wait()).map_err(map_download_error)
-        })
+        py.allow_threads(move || runtime.block_on(handle.wait()).map_err(map_download_error))
     }
 }
 
@@ -266,12 +332,31 @@ struct PyDownloader {
 #[pymethods]
 impl PyDownloader {
     #[new]
-    #[pyo3(signature = (connect_timeout = None))]
-    fn new(connect_timeout: Option<f64>) -> PyResult<Self> {
-        let mut builder = bytehaul::Downloader::builder();
-        if let Some(ct) = connect_timeout {
-            builder = builder.connect_timeout(duration_from_secs("connect_timeout", ct)?);
-        }
+    #[pyo3(signature = (
+        connect_timeout = None,
+        proxy = None,
+        http_proxy = None,
+        https_proxy = None,
+        dns_servers = None,
+        enable_ipv6 = None
+    ))]
+    fn new(
+        connect_timeout: Option<f64>,
+        proxy: Option<String>,
+        http_proxy: Option<String>,
+        https_proxy: Option<String>,
+        dns_servers: Option<Vec<String>>,
+        enable_ipv6: Option<bool>,
+    ) -> PyResult<Self> {
+        let builder = apply_client_options(
+            bytehaul::Downloader::builder(),
+            connect_timeout,
+            proxy,
+            http_proxy,
+            https_proxy,
+            dns_servers,
+            enable_ipv6,
+        )?;
         let inner = builder.build().map_err(map_download_error)?;
         Ok(Self { inner })
     }
@@ -354,6 +439,11 @@ impl PyDownloader {
         headers = None,
         max_connections = None,
         connect_timeout = None,
+        proxy = None,
+        http_proxy = None,
+        https_proxy = None,
+        dns_servers = None,
+        enable_ipv6 = None,
         read_timeout = None,
         memory_budget = None,
         file_allocation = None,
@@ -375,6 +465,11 @@ fn download(
     headers: Option<HashMap<String, String>>,
     max_connections: Option<u32>,
     connect_timeout: Option<f64>,
+    proxy: Option<String>,
+    http_proxy: Option<String>,
+    https_proxy: Option<String>,
+    dns_servers: Option<Vec<String>>,
+    enable_ipv6: Option<bool>,
     read_timeout: Option<f64>,
     memory_budget: Option<usize>,
     file_allocation: Option<String>,
@@ -408,10 +503,17 @@ fn download(
     let runtime = shared_runtime()?;
 
     py.allow_threads(move || {
-        let downloader = bytehaul::Downloader::builder()
-            .connect_timeout(spec.connect_timeout)
-            .build()
-            .map_err(map_download_error)?;
+        let builder = apply_client_options(
+            bytehaul::Downloader::builder(),
+            Some(spec.connect_timeout.as_secs_f64()),
+            proxy,
+            http_proxy,
+            https_proxy,
+            dns_servers,
+            enable_ipv6,
+        )?;
+
+        let downloader = builder.build().map_err(map_download_error)?;
 
         runtime.block_on(async move {
             let handle = downloader.download(spec);
@@ -442,3 +544,6 @@ fn _bytehaul(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyProgressSnapshot>()?;
     Ok(())
 }
+
+#[cfg(test)]
+mod lib_tests;

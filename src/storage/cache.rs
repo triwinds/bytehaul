@@ -89,7 +89,6 @@ impl WriteBackCache {
         blocks.sort_by_key(|b| b.offset);
         blocks
     }
-
 }
 
 impl PieceCacheEntry {
@@ -98,9 +97,7 @@ impl PieceCacheEntry {
         let end = offset + data.len() as u64;
 
         // Find the insertion point
-        let pos = self
-            .ranges
-            .partition_point(|(o, _)| *o < offset);
+        let pos = self.ranges.partition_point(|(o, _)| *o < offset);
 
         // Check if we can extend the previous range
         if pos > 0 {
@@ -340,5 +337,23 @@ mod tests {
         assert_eq!(blocks[0].data.len(), 100);
         assert_eq!(blocks[1].offset, 200);
         assert_eq!(blocks[1].data.len(), 50);
+    }
+
+    #[test]
+    fn test_coalesce_breaks_when_next_range_is_still_gapped() {
+        let mut cache = WriteBackCache::new();
+        cache.insert(0, 0, Bytes::from(vec![1u8; 50]));
+        cache.insert(0, 100, Bytes::from(vec![2u8; 50]));
+        cache.insert(0, 200, Bytes::from(vec![3u8; 50]));
+
+        // This extends the first range, but still leaves a gap before the second.
+        cache.insert(0, 40, Bytes::from(vec![4u8; 40]));
+
+        let blocks = cache.drain_piece(0);
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0].offset, 0);
+        assert_eq!(blocks[0].data.len(), 80);
+        assert_eq!(blocks[1].offset, 100);
+        assert_eq!(blocks[2].offset, 200);
     }
 }

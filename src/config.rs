@@ -64,8 +64,8 @@ impl DownloadSpec {
             file_allocation: FileAllocation::default(),
             channel_buffer: 64,
             resume: true,
-            piece_size: 1024 * 1024,           // 1 MiB
-            min_split_size: 10 * 1024 * 1024,  // 10 MiB
+            piece_size: 1024 * 1024,          // 1 MiB
+            min_split_size: 10 * 1024 * 1024, // 10 MiB
             max_retries: 5,
             retry_base_delay: Duration::from_secs(1),
             retry_max_delay: Duration::from_secs(30),

@@ -18,13 +18,15 @@ Commands below assume you are running them from the repository root.
 
 ```bash
 uv sync --project bindings/python
-uv run --project bindings/python maturin develop
+cd bindings/python
+uv run --project . maturin develop -m Cargo.toml
 ```
 
 ### Build wheel
 
 ```bash
-uv run --project bindings/python maturin build --release
+cd bindings/python
+uv run --project . maturin build --release -m Cargo.toml
 ```
 
 ## Usage
@@ -49,12 +51,28 @@ bytehaul.download(
 )
 ```
 
+### Network settings
+
+```python
+bytehaul.download(
+    "https://example.com/file.bin",
+    "output.bin",
+    proxy="http://127.0.0.1:7890",
+    dns_servers=["1.1.1.1", "8.8.8.8:53"],
+    enable_ipv6=False,
+)
+```
+
 ### Object API with progress and cancellation
 
 ```python
 from bytehaul import Downloader
 
-downloader = Downloader(connect_timeout=15.0)
+downloader = Downloader(
+    connect_timeout=15.0,
+    dns_servers=["1.1.1.1"],
+    enable_ipv6=False,
+)
 task = downloader.download("https://example.com/large.bin", "large.bin")
 
 # Poll progress
@@ -89,7 +107,7 @@ except DownloadFailedError as e:
 
 Blocking convenience function. Downloads a file and returns when complete.
 
-### `Downloader(connect_timeout=None)`
+### `Downloader(connect_timeout=None, proxy=None, http_proxy=None, https_proxy=None, dns_servers=None, enable_ipv6=None)`
 
 Reusable downloader instance.
 
@@ -134,12 +152,25 @@ Frozen snapshot of download progress.
 | `max_download_speed`| `int`            | `0` (unlimited)|
 | `checksum_sha256`   | `str \| None`    | `None`        |
 
+### Network options
+
+Use these on `Downloader(...)` for the object API, or pass them directly to the blocking `download(...)` helper.
+
+| Parameter      | Type                | Default |
+|----------------|---------------------|---------|
+| `proxy`        | `str \| None`      | `None`  |
+| `http_proxy`   | `str \| None`      | `None`  |
+| `https_proxy`  | `str \| None`      | `None`  |
+| `dns_servers`  | `list[str] \| None`| `None`  |
+| `enable_ipv6`  | `bool \| None`     | `True`  |
+
 ## Running tests
 
 ```bash
 uv sync --project bindings/python
-uv run --project bindings/python maturin develop
-uv run --project bindings/python pytest tests/ -v
+cd bindings/python
+uv run --project . maturin develop -m Cargo.toml
+uv run --project . pytest tests/ -v
 ```
 
 ## Building wheels for release
@@ -147,7 +178,8 @@ uv run --project bindings/python pytest tests/ -v
 Single platform:
 
 ```bash
-uv run --project bindings/python maturin build --release
+cd bindings/python
+uv run --project . maturin build --release -m Cargo.toml
 ```
 
 Cross-platform (via CI):

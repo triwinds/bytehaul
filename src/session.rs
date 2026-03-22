@@ -628,7 +628,11 @@ async fn run_multi_worker(
     // Final progress update
     let d = downloaded.load(Ordering::Relaxed);
     let elapsed = start_time.elapsed().as_secs_f64();
-    let speed = if elapsed > 0.0 { d as f64 / elapsed } else { 0.0 };
+    let speed = if elapsed > 0.0 {
+        d as f64 / elapsed
+    } else {
+        0.0
+    };
     progress_tx.send_modify(|p| {
         p.downloaded = d;
         p.speed_bytes_per_sec = speed;
@@ -707,18 +711,43 @@ async fn worker_loop(
         loop {
             let result = if let Some((resp, pid)) = first_response.take() {
                 if pid == segment.piece_id {
-                    stream_segment(resp, &segment, &write_tx, &downloaded, &mut cancel_rx, &budget, &speed_limit).await
+                    stream_segment(
+                        resp,
+                        &segment,
+                        &write_tx,
+                        &downloaded,
+                        &mut cancel_rx,
+                        &budget,
+                        &speed_limit,
+                    )
+                    .await
                 } else {
                     download_segment(
-                        &client, &url, &headers, timeout, &segment, &write_tx, &downloaded,
-                        &mut cancel_rx, &budget, &speed_limit,
+                        &client,
+                        &url,
+                        &headers,
+                        timeout,
+                        &segment,
+                        &write_tx,
+                        &downloaded,
+                        &mut cancel_rx,
+                        &budget,
+                        &speed_limit,
                     )
                     .await
                 }
             } else {
                 download_segment(
-                    &client, &url, &headers, timeout, &segment, &write_tx, &downloaded,
-                    &mut cancel_rx, &budget, &speed_limit,
+                    &client,
+                    &url,
+                    &headers,
+                    timeout,
+                    &segment,
+                    &write_tx,
+                    &downloaded,
+                    &mut cancel_rx,
+                    &budget,
+                    &speed_limit,
                 )
                 .await
             };
@@ -741,8 +770,7 @@ async fn worker_loop(
                     let backoff = if let Some(retry_secs) = e.retry_after_secs() {
                         Duration::from_secs(retry_secs)
                     } else {
-                        let exp = retry_base_delay
-                            .saturating_mul(1u32 << attempt.min(10));
+                        let exp = retry_base_delay.saturating_mul(1u32 << attempt.min(10));
                         exp.min(retry_max_delay)
                     };
 
@@ -778,8 +806,7 @@ fn check_segment_status(
     }
     if status == 429 || status == 503 {
         // Extract Retry-After for backoff
-        let retry_after = retry_after_header
-            .and_then(|s| s.trim().parse::<u64>().ok());
+        let retry_after = retry_after_header.and_then(|s| s.trim().parse::<u64>().ok());
         let message = match retry_after {
             Some(secs) => format!("retry-after:{secs}"),
             None => format!("HTTP {status}"),
@@ -796,10 +823,7 @@ fn check_segment_status(
 }
 
 /// Validate that a segment response's metadata matches the expected range.
-fn validate_segment_meta(
-    meta: &ResponseMeta,
-    segment: &Segment,
-) -> Result<(), DownloadError> {
+fn validate_segment_meta(meta: &ResponseMeta, segment: &Segment) -> Result<(), DownloadError> {
     if !range_response_allowed(meta) {
         return Err(DownloadError::ResumeMismatch(
             "range responses with content-encoding are not supported".into(),
@@ -830,7 +854,14 @@ async fn download_segment(
     budget: &Arc<Semaphore>,
     speed_limit: &SpeedLimit,
 ) -> Result<(), DownloadError> {
-    let req = build_range_request(client, url, headers, timeout, segment.start, segment.end - 1);
+    let req = build_range_request(
+        client,
+        url,
+        headers,
+        timeout,
+        segment.start,
+        segment.end - 1,
+    );
     let response = req.send().await?;
 
     let status = response.status().as_u16();
@@ -843,7 +874,16 @@ async fn download_segment(
     let meta = ResponseMeta::from_response(&response);
     validate_segment_meta(&meta, segment)?;
 
-    stream_segment(response, segment, write_tx, downloaded, cancel_rx, budget, speed_limit).await
+    stream_segment(
+        response,
+        segment,
+        write_tx,
+        downloaded,
+        cancel_rx,
+        budget,
+        speed_limit,
+    )
+    .await
 }
 
 /// Stream an already-opened response into the writer channel.
@@ -1369,7 +1409,11 @@ mod tests {
             last_modified: None,
             content_encoding: None,
         };
-        let segment = Segment { piece_id: 0, start: 0, end: 1000 };
+        let segment = Segment {
+            piece_id: 0,
+            start: 0,
+            end: 1000,
+        };
         assert!(validate_segment_meta(&meta, &segment).is_ok());
     }
 
@@ -1385,7 +1429,11 @@ mod tests {
             last_modified: None,
             content_encoding: Some("gzip".into()),
         };
-        let segment = Segment { piece_id: 0, start: 0, end: 1000 };
+        let segment = Segment {
+            piece_id: 0,
+            start: 0,
+            end: 1000,
+        };
         assert!(matches!(
             validate_segment_meta(&meta, &segment),
             Err(DownloadError::ResumeMismatch(_))
@@ -1404,7 +1452,11 @@ mod tests {
             last_modified: None,
             content_encoding: None,
         };
-        let segment = Segment { piece_id: 0, start: 0, end: 1000 };
+        let segment = Segment {
+            piece_id: 0,
+            start: 0,
+            end: 1000,
+        };
         assert!(matches!(
             validate_segment_meta(&meta, &segment),
             Err(DownloadError::ResumeMismatch(_))
@@ -1423,7 +1475,11 @@ mod tests {
             last_modified: None,
             content_encoding: None,
         };
-        let segment = Segment { piece_id: 0, start: 0, end: 1000 };
+        let segment = Segment {
+            piece_id: 0,
+            start: 0,
+            end: 1000,
+        };
         assert!(matches!(
             validate_segment_meta(&meta, &segment),
             Err(DownloadError::ResumeMismatch(_))
@@ -1442,7 +1498,11 @@ mod tests {
             last_modified: None,
             content_encoding: None,
         };
-        let segment = Segment { piece_id: 0, start: 0, end: 1000 };
+        let segment = Segment {
+            piece_id: 0,
+            start: 0,
+            end: 1000,
+        };
         assert!(matches!(
             validate_segment_meta(&meta, &segment),
             Err(DownloadError::ResumeMismatch(_))

@@ -60,6 +60,24 @@ spec.checksum = Some(Checksum::Sha256(
 ));
 ```
 
+### 网络层配置
+
+```rust
+use std::net::SocketAddr;
+use bytehaul::Downloader;
+
+let downloader = Downloader::builder()
+    .all_proxy("http://127.0.0.1:7890")
+    .dns_servers([
+        SocketAddr::from(([1, 1, 1, 1], 53)),
+        SocketAddr::from(([8, 8, 8, 8], 53)),
+    ])
+    .enable_ipv6(false)
+    .build()?;
+```
+
+`DownloadSpec::connect_timeout` 仍然可用；如果单个任务覆盖了它，bytehaul 会为该任务临时构建一个等价 client。
+
 ## 进度监控
 
 ```rust

@@ -4,8 +4,9 @@
 Run from the repository root:
 
     uv sync --project bindings/python
-    uv run --project bindings/python maturin develop
-    uv run --project bindings/python python example/python_demo.py
+    cd bindings/python
+    uv run --project . maturin develop -m Cargo.toml
+    uv run --project . python ../example/python_demo.py
 """
 
 from __future__ import annotations

@@ -3,6 +3,7 @@ mod config;
 mod error;
 mod http;
 mod manager;
+mod network;
 mod progress;
 mod rate_limiter;
 mod scheduler;
@@ -13,4 +14,3 @@ pub use config::{Checksum, DownloadSpec, FileAllocation};
 pub use error::DownloadError;
 pub use manager::{DownloadHandle, Downloader, DownloaderBuilder};
 pub use progress::{DownloadState, ProgressSnapshot};
-

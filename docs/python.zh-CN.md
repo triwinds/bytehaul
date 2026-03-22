@@ -25,7 +25,8 @@ uv sync --project bindings/python
 将 Rust 扩展编译并安装到当前 `uv` 管理的环境中：
 
 ```bash
-uv run --project bindings/python maturin develop
+cd bindings/python
+uv run --project . maturin develop -m Cargo.toml
 ```
 
 安装完成后，就可以直接在 Python 中导入 `bytehaul`。
@@ -35,7 +36,8 @@ uv run --project bindings/python maturin develop
 如果你需要分发或本地验证 wheel，可以执行：
 
 ```bash
-uv run --project bindings/python maturin build --release
+cd bindings/python
+uv run --project . maturin build --release -m Cargo.toml
 ```
 
 `maturin` 会在命令输出中打印 wheel 的生成路径。
@@ -68,6 +70,32 @@ bytehaul.download(
 ```
 
 `output_path` 同时支持 `str` 和 `pathlib.Path`。
+
+### 配置代理、DNS 和 IPv6
+
+```python
+import bytehaul
+
+bytehaul.download(
+    "https://example.com/file.bin",
+    "output.bin",
+    proxy="http://127.0.0.1:7890",
+    dns_servers=["1.1.1.1", "8.8.8.8:53"],
+    enable_ipv6=False,
+)
+```
+
+对象 API 下，这些网络层参数应放在 `Downloader(...)` 构造器上：
+
+```python
+from bytehaul import Downloader
+
+downloader = Downloader(
+    connect_timeout=15.0,
+    dns_servers=["1.1.1.1"],
+    enable_ipv6=False,
+)
+```
 
 ### 使用对象 API 获取进度和取消下载
 
@@ -120,7 +148,7 @@ except DownloadFailedError as exc:
 
 阻塞式便捷函数。调用后会一直等待，直到下载完成或失败。
 
-### `Downloader(connect_timeout=None)`
+### `Downloader(connect_timeout=None, proxy=None, http_proxy=None, https_proxy=None, dns_servers=None, enable_ipv6=None)`
 
 可复用的下载器实例。
 
@@ -165,16 +193,28 @@ except DownloadFailedError as exc:
 | `max_download_speed` | `int` | `0` | 最大下载速度，`0` 表示不限速 |
 | `checksum_sha256` | `str \| None` | `None` | 下载完成后的 SHA-256 校验值 |
 
+## 网络层参数
+
+| 参数 | 类型 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `proxy` | `str \| None` | `None` | 为所有 HTTP/HTTPS 请求设置统一代理 |
+| `http_proxy` | `str \| None` | `None` | 仅为 HTTP 请求设置代理 |
+| `https_proxy` | `str \| None` | `None` | 仅为 HTTPS 请求设置代理 |
+| `dns_servers` | `list[str] \| None` | `None` | 自定义 DNS 服务器，支持 `IP` 或 `IP:PORT` |
+| `enable_ipv6` | `bool \| None` | `True` | 是否允许解析和连接 IPv6 地址 |
+
 ## 运行测试
 
 ```bash
-uv run --project bindings/python pytest
+cd bindings/python
+uv run --project . pytest
 ```
 
 如果刚拉起环境，建议先执行一次：
 
 ```bash
 uv sync --project bindings/python
-uv run --project bindings/python maturin develop
-uv run --project bindings/python pytest
+cd bindings/python
+uv run --project . maturin develop -m Cargo.toml
+uv run --project . pytest
 ```

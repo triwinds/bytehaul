@@ -85,15 +85,17 @@ fn slow_range_server(
                 .map(|c| Ok(c.to_vec()))
                 .collect();
             let served2 = served.clone();
-            let stream = futures::stream::iter(chunks).then(move |chunk: Result<Vec<u8>, std::convert::Infallible>| {
-                let served = served2.clone();
-                async move {
-                    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-                    let Ok(ref c) = chunk;
-                    served.fetch_add(c.len() as u64, Ordering::Relaxed);
-                    chunk
-                }
-            });
+            let stream = futures::stream::iter(chunks).then(
+                move |chunk: Result<Vec<u8>, std::convert::Infallible>| {
+                    let served = served2.clone();
+                    async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                        let Ok(ref c) = chunk;
+                        served.fetch_add(c.len() as u64, Ordering::Relaxed);
+                        chunk
+                    }
+                },
+            );
             let body = warp::hyper::Body::wrap_stream(stream);
 
             let status = if start > 0 { 206 } else { 200 };
@@ -142,7 +144,10 @@ async fn test_resume_after_cancel() {
     let partial_size = std::fs::metadata(&output_path)
         .map(|m| m.len())
         .unwrap_or(0);
-    assert!(partial_size > 0, "should have written some data before cancel");
+    assert!(
+        partial_size > 0,
+        "should have written some data before cancel"
+    );
 
     // Control file should exist
     let ctrl_path = output_path.with_file_name("resumed.bin.bytehaul");
@@ -171,14 +176,13 @@ async fn test_resume_etag_mismatch_restarts() {
     let data_v1 = Arc::new(content_v1);
     let d1 = data_v1.clone();
 
-    let route1 = warp::path("etagfile")
-        .map(move || {
-            warp::http::Response::builder()
-                .header("content-length", d1.len().to_string())
-                .header("etag", "\"version-A\"")
-                .body(d1.to_vec())
-                .unwrap()
-        });
+    let route1 = warp::path("etagfile").map(move || {
+        warp::http::Response::builder()
+            .header("content-length", d1.len().to_string())
+            .header("etag", "\"version-A\"")
+            .body(d1.to_vec())
+            .unwrap()
+    });
     let (addr, server1) = warp::serve(route1).bind_ephemeral(([127, 0, 0, 1], 0));
     tokio::spawn(server1);
 
@@ -191,7 +195,7 @@ async fn test_resume_etag_mismatch_restarts() {
         &format!("http://{addr}/etagfile"),
         50_000,
         25_000,
-        Some("\"version-OLD\""),  // mismatched etag
+        Some("\"version-OLD\""), // mismatched etag
         None,
     );
     // Write partial data
@@ -268,7 +272,8 @@ mod bytehaul_test_support {
             let mut file = std::fs::File::create(path).unwrap();
             file.write_all(&0x4259_4845u32.to_le_bytes()).unwrap(); // magic
             file.write_all(&1u32.to_le_bytes()).unwrap(); // version
-            file.write_all(&(encoded.len() as u32).to_le_bytes()).unwrap();
+            file.write_all(&(encoded.len() as u32).to_le_bytes())
+                .unwrap();
             file.write_all(&checksum.to_le_bytes()).unwrap();
             file.write_all(&encoded).unwrap();
             file.sync_all().unwrap();

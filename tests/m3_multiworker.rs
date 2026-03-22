@@ -23,7 +23,10 @@ fn range_file_server(
                     let parts: Vec<&str> = range.split('-').collect();
                     let start: u64 = parts[0].parse().unwrap_or(0);
                     let end: u64 = if parts.len() > 1 && !parts[1].is_empty() {
-                        parts[1].parse::<u64>().unwrap_or(total as u64 - 1).min(total as u64 - 1)
+                        parts[1]
+                            .parse::<u64>()
+                            .unwrap_or(total as u64 - 1)
+                            .min(total as u64 - 1)
                     } else {
                         total as u64 - 1
                     };
@@ -209,7 +212,10 @@ async fn test_multi_worker_resume_after_cancel() {
                     let parts: Vec<&str> = range.split('-').collect();
                     let s: u64 = parts[0].parse().unwrap_or(0);
                     let e: u64 = if parts.len() > 1 && !parts[1].is_empty() {
-                        parts[1].parse::<u64>().unwrap_or(total as u64 - 1).min(total as u64 - 1)
+                        parts[1]
+                            .parse::<u64>()
+                            .unwrap_or(total as u64 - 1)
+                            .min(total as u64 - 1)
                     } else {
                         total as u64 - 1
                     };
@@ -222,11 +228,12 @@ async fn test_multi_worker_resume_after_cancel() {
             let chunk_size = 32 * 1024; // 32 KB chunks
             let chunks: Vec<Result<Vec<u8>, std::convert::Infallible>> =
                 slice.chunks(chunk_size).map(|c| Ok(c.to_vec())).collect();
-            let stream =
-                futures::stream::iter(chunks).then(|chunk: Result<Vec<u8>, std::convert::Infallible>| async move {
+            let stream = futures::stream::iter(chunks).then(
+                |chunk: Result<Vec<u8>, std::convert::Infallible>| async move {
                     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                     chunk
-                });
+                },
+            );
             let body = warp::hyper::Body::wrap_stream(stream);
 
             let is_range = start > 0 || end < total as u64 - 1;
@@ -278,5 +285,8 @@ async fn test_multi_worker_resume_after_cancel() {
     assert_eq!(downloaded.len(), expected.len());
     assert_eq!(downloaded, expected);
 
-    assert!(!ctrl_path.exists(), "control file should be deleted on success");
+    assert!(
+        !ctrl_path.exists(),
+        "control file should be deleted on success"
+    );
 }

@@ -29,8 +29,7 @@ async fn test_download_with_prealloc() {
     let content: Vec<u8> = vec![0x42; 50_000];
     let expected = content.clone();
 
-    let route =
-        warp::path("preallocfile").map(move || warp::http::Response::new(content.clone()));
+    let route = warp::path("preallocfile").map(move || warp::http::Response::new(content.clone()));
     let (addr, server) = warp::serve(route).bind_ephemeral(([127, 0, 0, 1], 0));
     tokio::spawn(server);
 
@@ -53,8 +52,7 @@ async fn test_download_progress_reports() {
     let content: Vec<u8> = vec![0xAB; 80_000];
     let expected_len = content.len() as u64;
 
-    let route =
-        warp::path("progressfile").map(move || warp::http::Response::new(content.clone()));
+    let route = warp::path("progressfile").map(move || warp::http::Response::new(content.clone()));
     let (addr, server) = warp::serve(route).bind_ephemeral(([127, 0, 0, 1], 0));
     tokio::spawn(server);
 

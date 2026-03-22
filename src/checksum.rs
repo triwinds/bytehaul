@@ -75,9 +75,14 @@ mod tests {
         let path = dir.path().join("test.bin");
         tokio::fs::write(&path, b"hello world").await.unwrap();
 
-        let expected = Checksum::Sha256("0000000000000000000000000000000000000000000000000000000000000000".into());
+        let expected = Checksum::Sha256(
+            "0000000000000000000000000000000000000000000000000000000000000000".into(),
+        );
         let result = verify_checksum(&path, &expected).await;
-        assert!(matches!(result, Err(DownloadError::ChecksumMismatch { .. })));
+        assert!(matches!(
+            result,
+            Err(DownloadError::ChecksumMismatch { .. })
+        ));
     }
 
     #[tokio::test]

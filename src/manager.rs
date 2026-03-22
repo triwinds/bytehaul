@@ -5,37 +5,73 @@ use tokio::task::JoinHandle;
 
 use crate::config::DownloadSpec;
 use crate::error::DownloadError;
+use crate::network::ClientNetworkConfig;
 use crate::progress::ProgressSnapshot;
 use crate::session;
 
 /// Top-level downloader that manages shared resources (e.g. HTTP client).
 pub struct Downloader {
     client: reqwest::Client,
+    client_config: ClientNetworkConfig,
 }
 
 /// Builder for [`Downloader`].
 pub struct DownloaderBuilder {
-    connect_timeout: Duration,
+    client_config: ClientNetworkConfig,
 }
 
 impl DownloaderBuilder {
     pub fn connect_timeout(mut self, timeout: Duration) -> Self {
-        self.connect_timeout = timeout;
+        self.client_config.connect_timeout = timeout;
+        self
+    }
+
+    pub fn all_proxy(mut self, proxy: impl Into<String>) -> Self {
+        self.client_config.all_proxy = Some(proxy.into());
+        self
+    }
+
+    pub fn http_proxy(mut self, proxy: impl Into<String>) -> Self {
+        self.client_config.http_proxy = Some(proxy.into());
+        self
+    }
+
+    pub fn https_proxy(mut self, proxy: impl Into<String>) -> Self {
+        self.client_config.https_proxy = Some(proxy.into());
+        self
+    }
+
+    pub fn dns_server(mut self, server: std::net::SocketAddr) -> Self {
+        self.client_config.dns_servers.push(server);
+        self
+    }
+
+    pub fn dns_servers<I>(mut self, servers: I) -> Self
+    where
+        I: IntoIterator<Item = std::net::SocketAddr>,
+    {
+        self.client_config.dns_servers = servers.into_iter().collect();
+        self
+    }
+
+    pub fn enable_ipv6(mut self, enabled: bool) -> Self {
+        self.client_config.enable_ipv6 = enabled;
         self
     }
 
     pub fn build(self) -> Result<Downloader, DownloadError> {
-        let client = reqwest::Client::builder()
-            .connect_timeout(self.connect_timeout)
-            .build()?;
-        Ok(Downloader { client })
+        let client = self.client_config.build_client()?;
+        Ok(Downloader {
+            client,
+            client_config: self.client_config,
+        })
     }
 }
 
 impl Downloader {
     pub fn builder() -> DownloaderBuilder {
         DownloaderBuilder {
-            connect_timeout: Duration::from_secs(30),
+            client_config: ClientNetworkConfig::default(),
         }
     }
 
@@ -43,9 +79,17 @@ impl Downloader {
     pub fn download(&self, spec: DownloadSpec) -> DownloadHandle {
         let (progress_tx, progress_rx) = watch::channel(ProgressSnapshot::default());
         let (cancel_tx, cancel_rx) = watch::channel(false);
-        let client = self.client.clone();
+        let shared_client = self.client.clone();
+        let client_config = self.client_config.clone();
 
         let task = tokio::spawn(async move {
+            let client = if spec.connect_timeout == client_config.connect_timeout {
+                shared_client
+            } else {
+                client_config
+                    .with_connect_timeout(spec.connect_timeout)
+                    .build_client()?
+            };
             session::run_download(client, spec, progress_tx, cancel_rx).await
         });
 
@@ -109,6 +153,17 @@ mod tests {
         drop(downloader);
     }
 
+    #[test]
+    fn test_downloader_builder_proxy_and_dns_options() {
+        let downloader = Downloader::builder()
+            .all_proxy("http://127.0.0.1:7890")
+            .dns_server(std::net::SocketAddr::from(([1, 1, 1, 1], 53)))
+            .enable_ipv6(false)
+            .build()
+            .unwrap();
+        drop(downloader);
+    }
+
     #[tokio::test]
     async fn test_download_handle_progress_default() {
         let downloader = Downloader::builder().build().unwrap();
@@ -129,5 +184,62 @@ mod tests {
         // Wait should return an error (cancelled or connection refused)
         let result = handle.wait().await;
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_downloader_builder_sets_scheme_specific_proxies_and_dns_servers() {
+        let servers = vec![
+            std::net::SocketAddr::from(([1, 1, 1, 1], 53)),
+            std::net::SocketAddr::from(([8, 8, 8, 8], 53)),
+        ];
+
+        let builder = Downloader::builder()
+            .http_proxy("http://127.0.0.1:8080")
+            .https_proxy("http://127.0.0.1:8443")
+            .dns_servers(servers.clone());
+
+        assert_eq!(
+            builder.client_config.http_proxy.as_deref(),
+            Some("http://127.0.0.1:8080")
+        );
+        assert_eq!(
+            builder.client_config.https_proxy.as_deref(),
+            Some("http://127.0.0.1:8443")
+        );
+        assert_eq!(builder.client_config.dns_servers, servers);
+    }
+
+    #[tokio::test]
+    async fn test_download_rebuilds_client_for_spec_timeout_override() {
+        let downloader = Downloader::builder().build().unwrap();
+        let mut spec = crate::config::DownloadSpec::new(
+            "http://127.0.0.1:1/nonexistent",
+            std::env::temp_dir().join("bytehaul_test_timeout_override"),
+        );
+        spec.connect_timeout = Duration::from_secs(1);
+
+        let handle = downloader.download(spec);
+        let result = handle.wait().await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_download_handle_wait_maps_panics() {
+        let (progress_tx, progress_rx) = watch::channel(ProgressSnapshot::default());
+        let (cancel_tx, _) = watch::channel(false);
+        drop(progress_tx);
+
+        let handle = DownloadHandle {
+            progress_rx,
+            cancel_tx,
+            task: tokio::spawn(async {
+                panic!("boom");
+                #[allow(unreachable_code)]
+                Ok(())
+            }),
+        };
+
+        let err = handle.wait().await.unwrap_err().to_string();
+        assert!(err.contains("task panicked"));
     }
 }

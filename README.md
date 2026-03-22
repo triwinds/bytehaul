@@ -19,6 +19,8 @@ A Rust async HTTP download library with resume, multi-connection, write-back cac
 - **Cancellation** — cooperative cancel via watch channel
 - **Progress reporting** — real-time speed, downloaded bytes, state
 
+- **Shared network configuration** - proxy, custom DNS servers, and IPv6 toggle on the downloader client
+
 ## Quick Start
 
 ```rust
@@ -59,6 +61,24 @@ spec.checksum = Some(Checksum::Sha256(
     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".into(),
 ));
 ```
+
+Network stack settings live on the shared downloader client:
+
+```rust
+use std::net::SocketAddr;
+use bytehaul::Downloader;
+
+let downloader = Downloader::builder()
+    .all_proxy("http://127.0.0.1:7890")
+    .dns_servers([
+        SocketAddr::from(([1, 1, 1, 1], 53)),
+        SocketAddr::from(([8, 8, 8, 8], 53)),
+    ])
+    .enable_ipv6(false)
+    .build()?;
+```
+
+`DownloadSpec::connect_timeout` is still supported. If a task overrides it, bytehaul builds an equivalent client just for that download.
 
 ## Progress Monitoring
 

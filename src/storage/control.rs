@@ -280,4 +280,11 @@ mod tests {
         let err_msg = format!("{}", result.unwrap_err());
         assert!(err_msg.contains("too short"));
     }
+
+    #[tokio::test]
+    async fn test_delete_directory_returns_io_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = ControlSnapshot::delete(dir.path()).await.unwrap_err();
+        assert!(matches!(err, DownloadError::Io(_)));
+    }
 }

@@ -11,6 +11,7 @@ resolver = "2"
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["stream"] }
+hickory-resolver = { version = "0.25", default-features = false, features = ["tokio", "system-config"] }
 bytes = "1"
 futures = "0.3"
 thiserror = "2"

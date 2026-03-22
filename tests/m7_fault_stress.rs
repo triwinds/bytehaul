@@ -10,7 +10,10 @@ use warp::Filter;
 // ──────────────────────────────────────────────────────────────
 
 /// Server that drops the connection after sending `cutoff` bytes.
-fn cutoff_server(data: Vec<u8>, cutoff: usize) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+fn cutoff_server(
+    data: Vec<u8>,
+    cutoff: usize,
+) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
     let route = warp::path("file").map(move || {
         let partial = data[..cutoff].to_vec();
         warp::http::Response::builder()
@@ -197,10 +200,7 @@ fn range_server(data: Vec<u8>) -> (std::net::SocketAddr, tokio::task::JoinHandle
                 let slice = &data[start as usize..=end as usize];
                 warp::http::Response::builder()
                     .status(206)
-                    .header(
-                        "content-range",
-                        format!("bytes {start}-{end}/{total}"),
-                    )
+                    .header("content-range", format!("bytes {start}-{end}/{total}"))
                     .header("content-length", slice.len().to_string())
                     .header("etag", "\"stress-test\"")
                     .body(slice.to_vec())

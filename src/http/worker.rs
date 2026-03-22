@@ -41,8 +41,14 @@ impl HttpWorker {
         start: u64,
         end: u64,
     ) -> Result<(reqwest::Response, ResponseMeta), DownloadError> {
-        let req =
-            request::build_range_request(&self.client, &self.url, &self.headers, self.timeout, start, end);
+        let req = request::build_range_request(
+            &self.client,
+            &self.url,
+            &self.headers,
+            self.timeout,
+            start,
+            end,
+        );
         let response = req.send().await?;
 
         let status = response.status();
