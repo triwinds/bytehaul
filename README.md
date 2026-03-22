@@ -2,7 +2,10 @@
 
 A Rust async HTTP download library with resume, multi-connection, write-back cache, rate limiting, and checksum verification.
 
-[简体中文 README](docs/README.zh-CN.md)
+## Documentation
+
+- [简体中文 README](docs/README.zh-CN.md)
+- [Python bindings guide](bindings/python/README.md)
 
 ## Features
 

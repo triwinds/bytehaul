@@ -2,27 +2,29 @@
 
 Python bindings for the [bytehaul](https://github.com/user/rust-aria2) Rust download library.
 
+[中文使用文档](../../docs/python.zh-CN.md)
+
 ## Requirements
 
 - Python 3.9+
 - Rust toolchain (for building from source)
+- `uv`
+
+Commands below assume you are running them from the repository root.
 
 ## Installation
 
 ### From source (development)
 
 ```bash
-cd bindings/python
-uv sync
-uv run maturin develop
+uv sync --project bindings/python
+uv run --project bindings/python maturin develop
 ```
 
 ### Build wheel
 
 ```bash
-cd bindings/python
-uv run maturin build --release
-# Wheel output in target/wheels/
+uv run --project bindings/python maturin build --release
 ```
 
 ## Usage
@@ -135,10 +137,9 @@ Frozen snapshot of download progress.
 ## Running tests
 
 ```bash
-cd bindings/python
-uv sync
-uv run maturin develop
-uv run pytest tests/ -v
+uv sync --project bindings/python
+uv run --project bindings/python maturin develop
+uv run --project bindings/python pytest tests/ -v
 ```
 
 ## Building wheels for release
@@ -146,7 +147,7 @@ uv run pytest tests/ -v
 Single platform:
 
 ```bash
-maturin build --release
+uv run --project bindings/python maturin build --release
 ```
 
 Cross-platform (via CI):

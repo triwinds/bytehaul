@@ -2,7 +2,10 @@
 
 Rust 异步 HTTP 下载库，支持断点续传、多连接并发、回写缓存、限速和校验。
 
-[English README](../README.md)
+## 文档
+
+- [English README](../README.md)
+- [Python 使用文档](python.zh-CN.md)
 
 ## 功能特性
 
