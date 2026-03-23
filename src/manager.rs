@@ -3,8 +3,9 @@ use std::time::Duration;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-use crate::config::DownloadSpec;
+use crate::config::{DownloadSpec, LogLevel};
 use crate::error::DownloadError;
+use crate::logging::next_download_id;
 use crate::network::ClientNetworkConfig;
 use crate::progress::ProgressSnapshot;
 use crate::session;
@@ -13,11 +14,13 @@ use crate::session;
 pub struct Downloader {
     client: reqwest::Client,
     client_config: ClientNetworkConfig,
+    log_level: LogLevel,
 }
 
 /// Builder for [`Downloader`].
 pub struct DownloaderBuilder {
     client_config: ClientNetworkConfig,
+    log_level: LogLevel,
 }
 
 impl DownloaderBuilder {
@@ -59,11 +62,29 @@ impl DownloaderBuilder {
         self
     }
 
+    pub fn log_level(mut self, level: LogLevel) -> Self {
+        self.log_level = level;
+        self
+    }
+
     pub fn build(self) -> Result<Downloader, DownloadError> {
+        let log_level = self.log_level;
         let client = self.client_config.build_client()?;
+        log_debug!(
+            log_level,
+            log_level = %log_level,
+            connect_timeout_ms = self.client_config.connect_timeout.as_millis() as u64,
+            has_proxy = self.client_config.all_proxy.is_some()
+                || self.client_config.http_proxy.is_some()
+                || self.client_config.https_proxy.is_some(),
+            custom_dns_count = self.client_config.dns_servers.len(),
+            ipv6 = self.client_config.enable_ipv6,
+            "downloader built"
+        );
         Ok(Downloader {
             client,
             client_config: self.client_config,
+            log_level,
         })
     }
 }
@@ -72,6 +93,7 @@ impl Downloader {
     pub fn builder() -> DownloaderBuilder {
         DownloaderBuilder {
             client_config: ClientNetworkConfig::default(),
+            log_level: LogLevel::default(),
         }
     }
 
@@ -81,6 +103,18 @@ impl Downloader {
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let shared_client = self.client.clone();
         let client_config = self.client_config.clone();
+        let log_level = self.log_level;
+        let download_id = next_download_id();
+
+        log_info!(
+            log_level,
+            download_id,
+            url = %spec.url,
+            output = %spec.output_path.display(),
+            max_connections = spec.max_connections,
+            resume = spec.resume,
+            "download task created"
+        );
 
         let task = tokio::spawn(async move {
             let client = if spec.connect_timeout == client_config.connect_timeout {
@@ -90,7 +124,8 @@ impl Downloader {
                     .with_connect_timeout(spec.connect_timeout)
                     .build_client()?
             };
-            session::run_download(client, spec, progress_tx, cancel_rx).await
+            session::run_download(client, spec, log_level, download_id, progress_tx, cancel_rx)
+                .await
         });
 
         DownloadHandle {
@@ -145,6 +180,15 @@ mod tests {
     }
 
     #[test]
+    fn test_downloader_builder_with_log_level() {
+        let downloader = Downloader::builder()
+            .log_level(crate::config::LogLevel::Debug)
+            .build()
+            .unwrap();
+        drop(downloader);
+    }
+
+    #[test]
     fn test_downloader_builder_custom_timeout() {
         let downloader = Downloader::builder()
             .connect_timeout(Duration::from_secs(10))
@@ -182,6 +226,22 @@ mod tests {
 
         handle.cancel();
         // Wait should return an error (cancelled or connection refused)
+        let result = handle.wait().await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_download_with_logging_enabled() {
+        let downloader = Downloader::builder()
+            .log_level(crate::config::LogLevel::Debug)
+            .build()
+            .unwrap();
+        let spec = crate::config::DownloadSpec::new(
+            "http://127.0.0.1:1/nonexistent",
+            std::env::temp_dir().join("bytehaul_test_log_enabled"),
+        );
+        let handle = downloader.download(spec);
+        handle.cancel();
         let result = handle.wait().await;
         assert!(result.is_err());
     }

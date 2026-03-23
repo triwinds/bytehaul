@@ -6,6 +6,7 @@ use crate::error::DownloadError;
 
 /// Open an existing file for writing (without truncation) for resume.
 pub(crate) async fn open_existing_file(path: &Path) -> Result<tokio::fs::File, DownloadError> {
+    tracing::debug!(path = %path.display(), "opening existing file for resume");
     let file = tokio::fs::OpenOptions::new().write(true).open(path).await?;
     Ok(file)
 }
@@ -16,6 +17,7 @@ pub(crate) async fn create_output_file(
     total_size: Option<u64>,
     allocation: FileAllocation,
 ) -> Result<tokio::fs::File, DownloadError> {
+    tracing::debug!(path = %path.display(), total_size = total_size, allocation = ?allocation, "creating output file");
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }

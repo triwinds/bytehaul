@@ -9,6 +9,7 @@ pub(crate) async fn verify_checksum(
     path: &std::path::Path,
     expected: &Checksum,
 ) -> Result<(), DownloadError> {
+    tracing::debug!(path = %path.display(), algorithm = "sha256", "starting checksum verification");
     let mut file = tokio::fs::File::open(path)
         .await
         .map_err(DownloadError::Io)?;

@@ -37,6 +37,12 @@ impl Default for ClientNetworkConfig {
 
 impl ClientNetworkConfig {
     pub(crate) fn build_client(&self) -> Result<reqwest::Client, DownloadError> {
+        #[cfg(not(tarpaulin))]
+        tracing::debug!(connect_timeout_ms = self.connect_timeout.as_millis() as u64,
+            has_proxy = self.all_proxy.is_some() || self.http_proxy.is_some() || self.https_proxy.is_some(),
+            custom_dns = !self.dns_servers.is_empty(),
+            enable_ipv6 = self.enable_ipv6,
+            "building HTTP client");
         let mut builder = reqwest::Client::builder().connect_timeout(self.connect_timeout);
 
         // Add scheme-specific proxies first so they win over a later catch-all proxy.

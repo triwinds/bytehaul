@@ -9,7 +9,7 @@ use futures::StreamExt;
 use tokio::sync::{mpsc, oneshot, watch, Semaphore};
 
 use crate::checksum::verify_checksum;
-use crate::config::DownloadSpec;
+use crate::config::{DownloadSpec, LogLevel};
 use crate::error::DownloadError;
 use crate::http::request::build_range_request;
 use crate::http::response::ResponseMeta;
@@ -74,25 +74,45 @@ where
 pub(crate) async fn run_download(
     client: reqwest::Client,
     spec: DownloadSpec,
+    log_level: LogLevel,
+    download_id: u64,
     progress_tx: watch::Sender<ProgressSnapshot>,
     cancel_rx: watch::Receiver<bool>,
 ) -> Result<(), DownloadError> {
     let checksum = spec.checksum.clone();
     let output_path = spec.output_path.clone();
 
-    run_download_inner(client, spec, &progress_tx, cancel_rx).await?;
+    let result =
+        run_download_inner(client, spec, log_level, download_id, &progress_tx, cancel_rx).await;
+
+    if let Err(ref e) = result {
+        log_error!(log_level, download_id, error = %e, "download failed");
+        return result;
+    }
 
     // Post-download checksum verification
     if let Some(ref expected) = checksum {
-        verify_checksum(&output_path, expected).await?;
+        log_info!(log_level, download_id, algorithm = "sha256", "checksum verification started");
+        match verify_checksum(&output_path, expected).await {
+            Ok(()) => {
+                log_info!(log_level, download_id, "checksum verification passed");
+            }
+            Err(e) => {
+                log_error!(log_level, download_id, error = %e, "checksum verification failed");
+                return Err(e);
+            }
+        }
     }
 
+    log_info!(log_level, download_id, "download completed successfully");
     Ok(())
 }
 
 async fn run_download_inner(
     client: reqwest::Client,
     spec: DownloadSpec,
+    log_level: LogLevel,
+    download_id: u64,
     progress_tx: &watch::Sender<ProgressSnapshot>,
     cancel_rx: watch::Receiver<bool>,
 ) -> Result<(), DownloadError> {
@@ -103,7 +123,20 @@ async fn run_download_inner(
 
     // ── Phase 1: attempt resume ──────────────────────────────
     let resume_ctrl = if spec.resume {
-        ControlSnapshot::load(&control_path).await.ok()
+        match ControlSnapshot::load(&control_path).await {
+            Ok(ctrl) => {
+                log_debug!(
+                    log_level,
+                    download_id,
+                    downloaded_bytes = ctrl.downloaded_bytes,
+                    total_size = ctrl.total_size,
+                    piece_count = ctrl.piece_count,
+                    "control file loaded"
+                );
+                Some(ctrl)
+            }
+            Err(_) => None,
+        }
     } else {
         None
     };
@@ -133,6 +166,14 @@ async fn run_download_inner(
                         && range_response_allowed(&meta)
                         && validate_metadata(&meta, &ctrl)
                     {
+                        log_info!(
+                            log_level,
+                            download_id,
+                            strategy = "resumed multi",
+                            total_size = ctrl.total_size,
+                            completed_pieces = piece_map.completed_count(),
+                            "download strategy selected"
+                        );
                         return run_multi_worker(
                             client,
                             &spec,
@@ -144,6 +185,8 @@ async fn run_download_inner(
                             cancel_rx,
                             &control_path,
                             speed_limit,
+                            log_level,
+                            download_id,
                         )
                         .await;
                     }
@@ -163,6 +206,14 @@ async fn run_download_inner(
                     && range_response_allowed(&meta)
                     && validate_metadata(&meta, &ctrl)
                 {
+                    log_info!(
+                        log_level,
+                        download_id,
+                        strategy = "resumed single",
+                        start_offset = ctrl.downloaded_bytes,
+                        total_size = ctrl.total_size,
+                        "download strategy selected"
+                    );
                     return run_single_connection(
                         resp,
                         &meta,
@@ -173,12 +224,15 @@ async fn run_download_inner(
                         &control_path,
                         Some(ctrl.total_size),
                         speed_limit,
+                        log_level,
+                        download_id,
                     )
                     .await;
                 }
             }
         }
         // Resume failed — discard
+        log_warn!(log_level, download_id, "control file discarded, restarting download");
         let _ = ControlSnapshot::delete(&control_path).await;
     }
 
@@ -190,6 +244,15 @@ async fn run_download_inner(
             if resp.status().as_u16() == 206 && range_response_allowed(&meta) {
                 if let Some(total_size) = meta.content_range_total {
                     if total_size > spec.min_split_size {
+                        log_info!(
+                            log_level,
+                            download_id,
+                            strategy = "fresh multi",
+                            total_size,
+                            max_connections = spec.max_connections,
+                            piece_size = spec.piece_size,
+                            "download strategy selected"
+                        );
                         let piece_map = PieceMap::new(total_size, spec.piece_size);
                         return run_multi_worker(
                             client,
@@ -202,12 +265,22 @@ async fn run_download_inner(
                             cancel_rx,
                             &control_path,
                             speed_limit,
+                            log_level,
+                            download_id,
                         )
                         .await;
                     }
                 }
                 // File too small for splitting — use this response as single connection
                 let total = meta.content_range_total;
+                log_info!(
+                    log_level,
+                    download_id,
+                    strategy = "fresh single",
+                    total_size = total,
+                    reason = "file below min_split_size",
+                    "download strategy selected"
+                );
                 return run_single_connection(
                     resp,
                     &meta,
@@ -218,10 +291,19 @@ async fn run_download_inner(
                     &control_path,
                     total,
                     speed_limit,
+                    log_level,
+                    download_id,
                 )
                 .await;
             } else if resp.status().as_u16() != 206 {
                 // Got 200 — Range not supported; stream this response
+                log_info!(
+                    log_level,
+                    download_id,
+                    strategy = "fresh single",
+                    reason = "range not supported (200 response)",
+                    "download strategy selected"
+                );
                 return run_single_connection(
                     resp,
                     &meta,
@@ -232,6 +314,8 @@ async fn run_download_inner(
                     &control_path,
                     meta.content_length,
                     speed_limit,
+                    log_level,
+                    download_id,
                 )
                 .await;
             }
@@ -239,6 +323,13 @@ async fn run_download_inner(
     }
 
     // ── Fallback: plain GET ──────────────────────────────────
+    log_info!(
+        log_level,
+        download_id,
+        strategy = "fresh single",
+        reason = "fallback GET (single connection or range probe failed)",
+        "download strategy selected"
+    );
     let (resp, meta) = retry_with_backoff(
         spec.max_retries,
         spec.retry_base_delay,
@@ -257,6 +348,8 @@ async fn run_download_inner(
         &control_path,
         meta.content_length,
         speed_limit,
+        log_level,
+        download_id,
     )
     .await
 }
@@ -275,8 +368,15 @@ async fn run_single_connection(
     control_path: &Path,
     total_size: Option<u64>,
     speed_limit: SpeedLimit,
+    log_level: LogLevel,
+    download_id: u64,
 ) -> Result<(), DownloadError> {
     let use_control = spec.resume && total_size.is_some();
+    log_debug!(log_level, download_id = download_id,
+        start_offset = start_offset,
+        total_size = total_size.unwrap_or(0),
+        resume_control = use_control,
+        "single-connection download started");
 
     let file = if start_offset > 0 {
         open_existing_file(&spec.output_path).await?
@@ -341,6 +441,8 @@ async fn run_single_connection(
             let _ = s.save(control_path).await;
         }
         if !matches!(e, DownloadError::Cancelled) {
+            log_error!(log_level, download_id = download_id, error = %e,
+                "single-connection download failed");
             progress_tx.send_modify(|p| p.state = DownloadState::Failed);
         }
         return stream_result;
@@ -350,6 +452,7 @@ async fn run_single_connection(
     if use_control {
         let _ = ControlSnapshot::delete(control_path).await;
     }
+    log_debug!(log_level, download_id = download_id, "single-connection download completed");
     progress_tx.send_modify(|p| p.state = DownloadState::Completed);
     Ok(())
 }
@@ -454,6 +557,8 @@ async fn run_multi_worker(
     cancel_rx: watch::Receiver<bool>,
     control_path: &Path,
     speed_limit: SpeedLimit,
+    log_level: LogLevel,
+    download_id: u64,
 ) -> Result<(), DownloadError> {
     // File
     let file = if piece_map.completed_count() > 0 {
@@ -497,6 +602,10 @@ async fn run_multi_worker(
     // Spawn workers
     let remaining = scheduler.lock().remaining_count();
     let num_workers = (spec.max_connections as usize).min(remaining).max(1);
+    log_info!(log_level, download_id = download_id,
+        workers = num_workers, remaining_pieces = remaining,
+        total_size = total_size, initial_downloaded = initial_downloaded,
+        "multi-worker download started");
 
     let mut abort_handles = Vec::with_capacity(num_workers);
     let mut workers = FuturesUnordered::new();
@@ -525,6 +634,8 @@ async fn run_multi_worker(
             budget.clone(),
             speed_limit.clone(),
             first,
+            log_level,
+            download_id,
         ));
         abort_handles.push(handle.abort_handle());
         workers.push(handle);
@@ -548,6 +659,7 @@ async fn run_multi_worker(
 
             result = cancel_rx.changed() => {
                 if result.is_ok() && *cancel_rx.borrow_and_update() {
+                    log_info!(log_level, download_id = download_id, "multi-worker download cancelled");
                     for ah in &abort_handles { ah.abort(); }
                     progress_tx.send_modify(|p| p.state = DownloadState::Cancelled);
                     download_error = Some(DownloadError::Cancelled);
@@ -576,12 +688,16 @@ async fn run_multi_worker(
                     }
                     Some(Ok(Err(e))) => {
                         if download_error.is_none() && !matches!(e, DownloadError::ChannelClosed) {
+                            log_warn!(log_level, download_id = download_id,
+                                error = %e, "worker failed");
                             download_error = Some(e);
                         }
                         if workers.is_empty() { break; }
                     }
                     Some(Err(join_err)) => {
                         if !join_err.is_cancelled() {
+                            log_error!(log_level, download_id = download_id,
+                                error = %join_err, "worker panicked");
                             download_error = Some(DownloadError::Other(
                                 format!("worker panicked: {join_err}"),
                             ));
@@ -613,6 +729,8 @@ async fn run_multi_worker(
         if spec.resume {
             save_multi_control(spec, meta, &scheduler, total_size, control_path, None).await;
         }
+        log_error!(log_level, download_id = download_id, error = %e,
+            "multi-worker download failed");
         return Err(e);
     }
     writer_result?;
@@ -621,6 +739,7 @@ async fn run_multi_worker(
         if spec.resume {
             save_multi_control(spec, meta, &scheduler, total_size, control_path, None).await;
         }
+        log_error!(log_level, download_id = download_id, "multi-worker download incomplete");
         return Err(DownloadError::Other("download incomplete".into()));
     }
 
@@ -633,6 +752,9 @@ async fn run_multi_worker(
     } else {
         0.0
     };
+    log_info!(log_level, download_id = download_id,
+        total_bytes = d, elapsed_secs = format!("{elapsed:.2}"),
+        "multi-worker download completed");
     progress_tx.send_modify(|p| {
         p.downloaded = d;
         p.speed_bytes_per_sec = speed;
@@ -677,7 +799,7 @@ async fn save_multi_control(
 
 #[allow(clippy::too_many_arguments)]
 async fn worker_loop(
-    _worker_id: usize,
+    worker_id: usize,
     client: reqwest::Client,
     url: String,
     headers: std::collections::HashMap<String, String>,
@@ -692,19 +814,29 @@ async fn worker_loop(
     budget: Arc<Semaphore>,
     speed_limit: SpeedLimit,
     first_response: Option<(reqwest::Response, usize)>,
+    log_level: LogLevel,
+    download_id: u64,
 ) -> Result<(), DownloadError> {
     let mut cancel_rx = cancel_rx;
     let mut first_response = first_response;
+    log_debug!(log_level, download_id = download_id, worker_id = worker_id, "worker started");
 
     loop {
         if *cancel_rx.borrow() {
+            log_debug!(log_level, download_id = download_id, worker_id = worker_id, "worker cancelled");
             return Err(DownloadError::Cancelled);
         }
 
         let segment = match scheduler.lock().assign() {
             Some(seg) => seg,
-            None => return Ok(()),
+            None => {
+                log_debug!(log_level, download_id = download_id, worker_id = worker_id, "no more segments, worker exiting");
+                return Ok(());
+            }
         };
+
+        log_debug!(log_level, download_id = download_id, worker_id = worker_id,
+            piece_id = segment.piece_id, "assigned piece");
 
         let mut attempt = 0u32;
 
@@ -756,10 +888,15 @@ async fn worker_loop(
                 Ok(()) => {
                     flush_piece_and_wait(&write_tx, segment.piece_id).await?;
                     scheduler.lock().complete(segment.piece_id);
+                    log_debug!(log_level, download_id = download_id, worker_id = worker_id,
+                        piece_id = segment.piece_id, "piece completed");
                     break;
                 }
                 Err(e) => {
                     if !e.is_retryable() || attempt >= max_retries {
+                        log_warn!(log_level, download_id = download_id, worker_id = worker_id,
+                            piece_id = segment.piece_id, error = %e,
+                            "segment failed, reclaiming (non-retryable or max retries exceeded)");
                         scheduler.lock().reclaim(segment.piece_id);
                         return Err(e);
                     }
@@ -773,6 +910,11 @@ async fn worker_loop(
                         let exp = retry_base_delay.saturating_mul(1u32 << attempt.min(10));
                         exp.min(retry_max_delay)
                     };
+
+                    log_warn!(log_level, download_id = download_id, worker_id = worker_id,
+                        piece_id = segment.piece_id, attempt = attempt, error = %e,
+                        backoff_ms = backoff.as_millis() as u64,
+                        "segment failed, retrying after backoff");
 
                     // Wait with cancellation awareness
                     tokio::select! {

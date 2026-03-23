@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use bytehaul::{DownloadSpec, DownloadState, Downloader, FileAllocation};
+use bytehaul::{DownloadSpec, DownloadState, Downloader, FileAllocation, LogLevel};
 use warp::Filter;
 
 /// Test server that supports Range requests for a known file.
@@ -289,4 +289,33 @@ async fn test_multi_worker_resume_after_cancel() {
         !ctrl_path.exists(),
         "control file should be deleted on success"
     );
+}
+
+#[tokio::test]
+async fn test_multi_connection_with_logging() {
+    let content: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+    let expected = content.clone();
+
+    let (addr, server) = range_file_server("logmulti", content);
+    tokio::spawn(server);
+
+    let dir = tempfile::tempdir().unwrap();
+    let output_path = dir.path().join("log_multi.bin");
+
+    let downloader = Downloader::builder()
+        .log_level(LogLevel::Debug)
+        .build()
+        .unwrap();
+    let mut spec = DownloadSpec::new(format!("http://{addr}/logmulti"), &output_path);
+    spec.max_connections = 4;
+    spec.piece_size = 50_000;
+    spec.min_split_size = 1;
+    spec.file_allocation = FileAllocation::None;
+
+    let handle = downloader.download(spec);
+    handle.wait().await.unwrap();
+
+    let downloaded = std::fs::read(&output_path).unwrap();
+    assert_eq!(downloaded.len(), expected.len());
+    assert_eq!(downloaded, expected);
 }

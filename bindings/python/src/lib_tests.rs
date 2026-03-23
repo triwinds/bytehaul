@@ -137,6 +137,18 @@ fn test_socket_dns_and_file_allocation_parsing() {
         .unwrap_err()
         .to_string()
         .contains("file_allocation"));
+
+    // log_level parsing
+    assert_eq!(parse_log_level("off").unwrap(), LogLevel::Off);
+    assert_eq!(parse_log_level("error").unwrap(), LogLevel::Error);
+    assert_eq!(parse_log_level("warn").unwrap(), LogLevel::Warn);
+    assert_eq!(parse_log_level("info").unwrap(), LogLevel::Info);
+    assert_eq!(parse_log_level("debug").unwrap(), LogLevel::Debug);
+    assert_eq!(parse_log_level("TRACE").unwrap(), LogLevel::Trace);
+    assert!(parse_log_level("invalid")
+        .unwrap_err()
+        .to_string()
+        .contains("log_level"));
 }
 
 #[test]
@@ -279,7 +291,7 @@ fn test_error_mapping_snapshot_conversion_and_repr() {
 #[test]
 fn test_download_task_methods_and_consumption_errors() {
     init_python();
-    let downloader = PyDownloader::new(None, None, None, None, None, None).unwrap();
+    let downloader = PyDownloader::new(None, None, None, None, None, None, None).unwrap();
     let task = downloader
         .download(
             "http://127.0.0.1:1/unreachable".into(),
@@ -334,6 +346,18 @@ fn test_download_task_methods_and_consumption_errors() {
 }
 
 #[test]
+fn test_py_downloader_with_log_level() {
+    init_python();
+    // Test with explicit log_level
+    let d = PyDownloader::new(None, None, None, None, None, None, Some("debug".into())).unwrap();
+    drop(d);
+    // Test invalid log_level
+    let result = PyDownloader::new(None, None, None, None, None, None, Some("invalid".into()));
+    assert!(result.is_err());
+    assert!(result.err().unwrap().to_string().contains("log_level"));
+}
+
+#[test]
 fn test_py_downloader_download_success_and_module_registration() {
     init_python();
     let configured = PyDownloader::new(
@@ -343,6 +367,7 @@ fn test_py_downloader_download_success_and_module_registration() {
         Some("http://127.0.0.1:8443".into()),
         Some(vec!["1.1.1.1".into()]),
         Some(false),
+        None,
     )
     .unwrap();
     drop(configured);
@@ -354,7 +379,7 @@ fn test_py_downloader_download_success_and_module_registration() {
 
     let mut headers = HashMap::new();
     headers.insert("X-Test".into(), "1".into());
-    let downloader = PyDownloader::new(None, None, None, None, None, None).unwrap();
+    let downloader = PyDownloader::new(None, None, None, None, None, None, None).unwrap();
     let task = downloader
         .download(
             format!("{base_url}/file.bin"),
@@ -443,6 +468,7 @@ fn test_top_level_download_success_and_failure() {
             Some(0.5),
             Some(0),
             None,
+            Some("debug".into()),
         )
         .unwrap();
     });
@@ -455,6 +481,7 @@ fn test_top_level_download_success_and_failure() {
             py,
             "http://127.0.0.1:1/fail".into(),
             unique_path("top-level-error"),
+            None,
             None,
             None,
             None,

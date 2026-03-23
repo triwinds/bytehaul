@@ -32,6 +32,7 @@ impl ControlSnapshot {
 
     /// Save the snapshot atomically: write to tmp → fsync → rename.
     pub async fn save(&self, control_path: &Path) -> Result<(), DownloadError> {
+        tracing::debug!(path = %control_path.display(), downloaded_bytes = self.downloaded_bytes, "saving control file");
         let snapshot = self.clone();
         let path = control_path.to_path_buf();
         tokio::task::spawn_blocking(move || save_sync(&snapshot, &path))
@@ -41,6 +42,7 @@ impl ControlSnapshot {
 
     /// Load and validate a control snapshot from disk.
     pub async fn load(control_path: &Path) -> Result<Self, DownloadError> {
+        tracing::debug!(path = %control_path.display(), "loading control file");
         let path = control_path.to_path_buf();
         tokio::task::spawn_blocking(move || load_sync(&path))
             .await
@@ -49,6 +51,7 @@ impl ControlSnapshot {
 
     /// Delete the control file if it exists.
     pub async fn delete(control_path: &Path) -> Result<(), DownloadError> {
+        tracing::debug!(path = %control_path.display(), "deleting control file");
         match tokio::fs::remove_file(control_path).await {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),

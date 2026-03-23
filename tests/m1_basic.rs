@@ -1,4 +1,4 @@
-use bytehaul::{DownloadSpec, DownloadState, Downloader, FileAllocation};
+use bytehaul::{DownloadSpec, DownloadState, Downloader, FileAllocation, LogLevel};
 use warp::Filter;
 
 #[tokio::test]
@@ -135,4 +135,30 @@ async fn test_download_404() {
     let handle = downloader.download(spec);
     let result = handle.wait().await;
     assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn test_basic_download_with_logging() {
+    let content: Vec<u8> = (0..10_000u32).map(|i| (i % 251) as u8).collect();
+    let expected = content.clone();
+
+    let route = warp::path("logtest").map(move || warp::http::Response::new(content.clone()));
+    let (addr, server) = warp::serve(route).bind_ephemeral(([127, 0, 0, 1], 0));
+    tokio::spawn(server);
+
+    let dir = tempfile::tempdir().unwrap();
+    let output_path = dir.path().join("log_download.bin");
+
+    let downloader = Downloader::builder()
+        .log_level(LogLevel::Debug)
+        .build()
+        .unwrap();
+    let mut spec = DownloadSpec::new(format!("http://{addr}/logtest"), &output_path);
+    spec.file_allocation = FileAllocation::None;
+
+    let handle = downloader.download(spec);
+    handle.wait().await.unwrap();
+
+    let downloaded = std::fs::read(&output_path).unwrap();
+    assert_eq!(downloaded, expected);
 }

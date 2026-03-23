@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Once};
 use std::time::Duration;
 
-use bytehaul::{Checksum, DownloadError, DownloadSpec, FileAllocation};
+use bytehaul::{Checksum, DownloadError, DownloadSpec, FileAllocation, LogLevel};
 use pyo3::create_exception;
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
@@ -141,6 +141,28 @@ fn parse_file_allocation(value: &str) -> PyResult<FileAllocation> {
             "file_allocation must be one of: 'none', 'prealloc'",
         )),
     }
+}
+
+fn parse_log_level(value: &str) -> PyResult<LogLevel> {
+    value.parse::<LogLevel>().map_err(|_| {
+        config_error("log_level must be one of: 'off', 'error', 'warn', 'info', 'debug', 'trace'")
+    })
+}
+
+static TRACING_INIT: Once = Once::new();
+
+fn init_tracing(level: LogLevel) {
+    if matches!(level, LogLevel::Off) {
+        return;
+    }
+    TRACING_INIT.call_once(|| {
+        let filter = level.to_tracing_level_filter();
+        tracing_subscriber::fmt()
+            .with_max_level(filter)
+            .with_target(true)
+            .with_thread_ids(false)
+            .init();
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -338,7 +360,8 @@ impl PyDownloader {
         http_proxy = None,
         https_proxy = None,
         dns_servers = None,
-        enable_ipv6 = None
+        enable_ipv6 = None,
+        log_level = None
     ))]
     fn new(
         connect_timeout: Option<f64>,
@@ -347,8 +370,14 @@ impl PyDownloader {
         https_proxy: Option<String>,
         dns_servers: Option<Vec<String>>,
         enable_ipv6: Option<bool>,
+        log_level: Option<String>,
     ) -> PyResult<Self> {
-        let builder = apply_client_options(
+        let level = match &log_level {
+            Some(s) => parse_log_level(s)?,
+            None => LogLevel::Off,
+        };
+        init_tracing(level);
+        let mut builder = apply_client_options(
             bytehaul::Downloader::builder(),
             connect_timeout,
             proxy,
@@ -357,6 +386,7 @@ impl PyDownloader {
             dns_servers,
             enable_ipv6,
         )?;
+        builder = builder.log_level(level);
         let inner = builder.build().map_err(map_download_error)?;
         Ok(Self { inner })
     }
@@ -454,7 +484,8 @@ impl PyDownloader {
         retry_base_delay = None,
         retry_max_delay = None,
         max_download_speed = None,
-        checksum_sha256 = None
+        checksum_sha256 = None,
+        log_level = None
     )
 )]
 #[allow(clippy::too_many_arguments)]
@@ -481,7 +512,13 @@ fn download(
     retry_max_delay: Option<f64>,
     max_download_speed: Option<u64>,
     checksum_sha256: Option<String>,
+    log_level: Option<String>,
 ) -> PyResult<()> {
+    let level = match &log_level {
+        Some(s) => parse_log_level(s)?,
+        None => LogLevel::Off,
+    };
+    init_tracing(level);
     let spec = build_download_spec(
         url,
         output_path,
@@ -503,7 +540,7 @@ fn download(
     let runtime = shared_runtime()?;
 
     py.allow_threads(move || {
-        let builder = apply_client_options(
+        let mut builder = apply_client_options(
             bytehaul::Downloader::builder(),
             Some(spec.connect_timeout.as_secs_f64()),
             proxy,
@@ -512,6 +549,7 @@ fn download(
             dns_servers,
             enable_ipv6,
         )?;
+        builder = builder.log_level(level);
 
         let downloader = builder.build().map_err(map_download_error)?;
 
