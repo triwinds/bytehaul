@@ -81,12 +81,16 @@ jobs:
         include:
           - os: ubuntu-latest
             label: linux-x86_64
+            interpreter: python3.9
           - os: windows-latest
             label: windows-x86_64
+            interpreter: python
           - os: macos-15-intel
             label: macos-x86_64
+            interpreter: python
           - os: macos-15
             label: macos-arm64
+            interpreter: python
 
     steps:
       - name: Check out source
@@ -94,11 +98,22 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Set up Python
+        if: runner.os != 'Linux'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+
       - name: Build wheel
         uses: PyO3/maturin-action@v1
         with:
           command: build
-          args: --release --manifest-path bindings/python/Cargo.toml --out dist --compatibility pypi
+          args: >-
+            --release
+            --manifest-path bindings/python/Cargo.toml
+            --out dist
+            --compatibility pypi
+            --interpreter ${{ matrix.interpreter }}
           manylinux: auto
 
       - name: Upload wheel
