@@ -24,6 +24,11 @@ classifiers = [
 ]
 dynamic = ["version"]
 
+[project.urls]
+Homepage = "https://github.com/triwinds/bytehaul"
+Repository = "https://github.com/triwinds/bytehaul"
+Documentation = "https://github.com/triwinds/bytehaul/tree/main/bindings/python"
+
 [dependency-groups]
 dev = [
     "maturin>=1.7,<2.0",
@@ -39,4 +44,3 @@ default-groups = ["dev"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-

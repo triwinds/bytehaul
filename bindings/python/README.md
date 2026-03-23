@@ -1,6 +1,6 @@
 # bytehaul
 
-Python bindings for the [bytehaul](https://github.com/user/rust-aria2) Rust download library.
+Python bindings for the [bytehaul](https://github.com/triwinds/bytehaul) Rust download library.
 
 [中文使用文档](../../docs/python.zh-CN.md)
 

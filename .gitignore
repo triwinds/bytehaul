@@ -38,6 +38,7 @@ venv/
 *.egg-info/
 build/
 dist/
+*.profraw
 
 # Local project workdirs
 /.py-install/

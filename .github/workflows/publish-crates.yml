@@ -1,0 +1,70 @@
+name: Publish Rust Crate
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-crates-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish bytehaul to crates.io
+    runs-on: ubuntu-latest
+
+    environment:
+      name: crates-io
+      url: https://crates.io/crates/bytehaul
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Ensure tag matches crate version
+        run: |
+          python - <<'PY'
+          import os
+          import pathlib
+          import tomllib
+
+          tag = os.environ["GITHUB_REF_NAME"]
+          if not tag.startswith("v"):
+              raise SystemExit(f"Expected a v-prefixed tag, got {tag!r}")
+
+          version = tag[1:]
+          manifest = tomllib.loads(pathlib.Path("Cargo.toml").read_text("utf-8"))
+          actual = manifest["package"]["version"]
+          if actual != version:
+              raise SystemExit(f"Tag version {version} does not match Cargo.toml version {actual}")
+
+          print(f"Validated release tag v{version} for crate bytehaul.")
+          PY
+
+      - name: Verify package contents
+        run: cargo package --list -p bytehaul
+
+      - name: Dry-run publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: cargo publish --dry-run -p bytehaul --locked --registry crates-io
+
+      - name: Publish crate
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: cargo publish -p bytehaul --locked --registry crates-io

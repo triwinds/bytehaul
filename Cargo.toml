@@ -2,7 +2,21 @@
 name = "bytehaul"
 version = "0.1.0"
 edition = "2021"
+description = "Async HTTP download library with resume, multi-connection, rate limiting, and checksum verification"
 license = "MIT"
+readme = "README.md"
+repository = "https://github.com/triwinds/bytehaul"
+documentation = "https://docs.rs/bytehaul"
+keywords = ["download", "http", "async", "resume", "range"]
+categories = ["asynchronous", "network-programming", "web-programming::http-client"]
+publish = ["crates-io"]
+exclude = [
+    "/.claude/**",
+    "/.github/**",
+    "/.uv-cache/**",
+    "/AGENTS.md",
+    "/docs/private/**",
+]
 
 [workspace]
 members = ["bindings/python"]

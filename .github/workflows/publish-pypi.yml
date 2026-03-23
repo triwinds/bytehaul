@@ -1,0 +1,159 @@
+# PyPI Trusted Publisher configuration:
+#   Owner: triwinds
+#   Repository: bytehaul
+#   Workflow file: publish-pypi.yml
+#   Environment: pypi
+name: Publish Python Package
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-pypi-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify-release:
+    name: Verify release metadata
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Ensure tag matches package versions
+        run: |
+          python - <<'PY'
+          import os
+          import pathlib
+          import tomllib
+
+          tag = os.environ["GITHUB_REF_NAME"]
+          if not tag.startswith("v"):
+              raise SystemExit(f"Expected a v-prefixed tag, got {tag!r}")
+
+          version = tag[1:]
+          root_manifest = tomllib.loads(pathlib.Path("Cargo.toml").read_text("utf-8"))
+          python_manifest = tomllib.loads(pathlib.Path("bindings/python/Cargo.toml").read_text("utf-8"))
+          pyproject = tomllib.loads(pathlib.Path("bindings/python/pyproject.toml").read_text("utf-8"))
+
+          expected = {
+              "workspace crate": root_manifest["package"]["version"],
+              "python binding crate": python_manifest["package"]["version"],
+          }
+
+          mismatches = {
+              name: actual
+              for name, actual in expected.items()
+              if actual != version
+          }
+          if mismatches:
+              details = ", ".join(f"{name}={actual}" for name, actual in mismatches.items())
+              raise SystemExit(f"Tag version {version} does not match manifest versions: {details}")
+
+          if pyproject["project"]["name"] != "bytehaul":
+              raise SystemExit("The PyPI project name changed; update the workflow environment URL.")
+
+          print(f"Validated release tag v{version} for PyPI project {pyproject['project']['name']}.")
+          PY
+
+  build-wheels:
+    name: Build wheel (${{ matrix.label }})
+    needs: verify-release
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            label: linux-x86_64
+          - os: windows-latest
+            label: windows-x86_64
+          - os: macos-15-intel
+            label: macos-x86_64
+          - os: macos-15
+            label: macos-arm64
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --release --manifest-path bindings/python/Cargo.toml --out dist --compatibility pypi
+          manylinux: auto
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-package-distributions-${{ matrix.label }}
+          path: dist/*
+          if-no-files-found: error
+
+  build-sdist:
+    name: Build source distribution
+    needs: verify-release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --manifest-path bindings/python/Cargo.toml --out dist
+
+      - name: Upload sdist
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-package-distributions-sdist
+          path: dist/*
+          if-no-files-found: error
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs:
+      - build-wheels
+      - build-sdist
+    runs-on: ubuntu-latest
+
+    environment:
+      name: pypi
+      url: https://pypi.org/project/bytehaul/
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Download all distributions
+        uses: actions/download-artifact@v4
+        with:
+          pattern: python-package-distributions-*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish distributions
+        uses: pypa/gh-action-pypi-publish@release/v1
