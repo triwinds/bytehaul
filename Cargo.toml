@@ -22,6 +22,9 @@ exclude = [
 members = ["bindings/python"]
 resolver = "2"
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tarpaulin)'] }
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", default-features = false, features = ["stream", "charset", "http2", "macos-system-configuration", "rustls-tls-native-roots"] }

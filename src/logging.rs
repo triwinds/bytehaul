@@ -53,6 +53,7 @@ macro_rules! log_debug {
 }
 
 /// Emit a `trace!` event only if the task-level `log_level` permits it.
+#[allow(unused_macros)]
 macro_rules! log_trace {
     ($log_level:expr, $($arg:tt)*) => {
         if $log_level.enabled(tracing::Level::TRACE) {
@@ -61,12 +62,6 @@ macro_rules! log_trace {
         }
     };
 }
-
-pub(crate) use log_debug;
-pub(crate) use log_error;
-pub(crate) use log_info;
-pub(crate) use log_trace;
-pub(crate) use log_warn;
 
 #[cfg(test)]
 mod tests {
