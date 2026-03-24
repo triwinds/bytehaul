@@ -38,6 +38,7 @@ dev = [
 [tool.maturin]
 python-source = "python"
 module-name = "bytehaul._bytehaul"
+bindings = "pyo3"
 
 [tool.uv]
 default-groups = ["dev"]

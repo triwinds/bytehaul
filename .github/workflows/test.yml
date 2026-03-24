@@ -42,10 +42,10 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-
 
       - name: Run unit tests
-        run: cargo test --workspace --all-targets
+        run: cargo test -p bytehaul --all-targets
 
       - name: Run doc tests
-        run: cargo test --workspace --doc
+        run: cargo test -p bytehaul --doc
 
   python-tests:
     name: Python binding tests
@@ -72,7 +72,9 @@ jobs:
         run: uv sync --project bindings/python
 
       - name: Build Python extension (dev)
-        run: uv run --project bindings/python maturin develop
+        working-directory: bindings/python
+        run: uv run maturin develop --bindings pyo3
 
       - name: Run Python tests
-        run: uv run --project bindings/python pytest
+        working-directory: bindings/python
+        run: uv run pytest
