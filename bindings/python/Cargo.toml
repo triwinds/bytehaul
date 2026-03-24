@@ -1,6 +1,6 @@
 [package]
 name = "bytehaul-python"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Python extension module for the bytehaul async download library"
 publish = false
@@ -14,7 +14,7 @@ name = "_bytehaul"
 crate-type = ["cdylib"]
 
 [dependencies]
-bytehaul = { path = "../..", version = "0.1.1" }
+bytehaul = { path = "../..", version = "0.1.2" }
 pyo3 = { version = "0.23", features = ["abi3-py39", "extension-module"] }
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"

@@ -1,6 +1,6 @@
 [package]
 name = "bytehaul"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Async HTTP download library with resume, multi-connection, rate limiting, and checksum verification"
 license = "MIT"
