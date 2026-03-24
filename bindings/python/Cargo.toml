@@ -1,6 +1,6 @@
 [package]
 name = "bytehaul-python"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Python extension module for the bytehaul async download library"
 publish = false
