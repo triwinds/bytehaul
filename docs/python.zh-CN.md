@@ -97,6 +97,24 @@ downloader = Downloader(
 )
 ```
 
+### 日志
+
+```python
+# 在便捷函数中启用调试日志
+bytehaul.download(
+    "https://example.com/file.bin",
+    "output.bin",
+    log_level="debug",
+)
+
+# 或在 Downloader 对象上设置
+from bytehaul import Downloader
+
+downloader = Downloader(log_level="info")
+```
+
+可选级别：`"off"`（默认）、`"error"`、`"warn"`、`"info"`、`"debug"`、`"trace"`（不区分大小写）。
+
 ### 使用对象 API 获取进度和取消下载
 
 ```python
@@ -192,6 +210,7 @@ except DownloadFailedError as exc:
 | `retry_max_delay` | `float` | `30.0` | 重试最大退避时间，单位秒 |
 | `max_download_speed` | `int` | `0` | 最大下载速度，`0` 表示不限速 |
 | `checksum_sha256` | `str \| None` | `None` | 下载完成后的 SHA-256 校验值 |
+| `log_level` | `str \| None` | `None`（`"off"`） | 日志级别 |
 
 ## 网络层参数
 

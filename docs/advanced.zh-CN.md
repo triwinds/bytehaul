@@ -73,6 +73,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+## 日志
+
+bytehaul 内部使用 `tracing`。日志**默认关闭**，可通过 builder 设置日志级别开启：
+
+```rust
+use bytehaul::{Downloader, LogLevel};
+
+let downloader = Downloader::builder()
+    .log_level(LogLevel::Debug)
+    .build()?;
+```
+
+可选级别（由少到多）：`Off`（默认）、`Error`、`Warn`、`Info`、`Debug`、`Trace`。
+
+要在终端看到日志输出，还需要在应用中初始化 `tracing-subscriber`：
+
+```rust
+tracing_subscriber::fmt::init();
+
+let downloader = Downloader::builder()
+    .log_level(LogLevel::Info)
+    .build()?;
+```
+
 ## 取消下载
 
 ```rust

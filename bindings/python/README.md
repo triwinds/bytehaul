@@ -63,6 +63,24 @@ bytehaul.download(
 )
 ```
 
+### Logging
+
+```python
+# Enable debug logging on the convenience function
+bytehaul.download(
+    "https://example.com/file.bin",
+    "output.bin",
+    log_level="debug",
+)
+
+# Or on the Downloader object
+from bytehaul import Downloader
+
+downloader = Downloader(log_level="info")
+```
+
+Valid levels: `"off"` (default), `"error"`, `"warn"`, `"info"`, `"debug"`, `"trace"`.
+
 ### Object API with progress and cancellation
 
 ```python
@@ -151,6 +169,9 @@ Frozen snapshot of download progress.
 | `retry_max_delay`   | `float` (secs)   | `30.0`        |
 | `max_download_speed`| `int`            | `0` (unlimited)|
 | `checksum_sha256`   | `str \| None`    | `None`        |
+| `log_level`         | `str \| None`    | `None` (`"off"`) |
+
+Valid `log_level` values: `"off"`, `"error"`, `"warn"`, `"info"`, `"debug"`, `"trace"` (case-insensitive).
 
 ### Network options
 

@@ -73,6 +73,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+## Logging
+
+Bytehaul uses `tracing` internally. Logging is **off by default** — opt in by setting the log level on the builder:
+
+```rust
+use bytehaul::{Downloader, LogLevel};
+
+let downloader = Downloader::builder()
+    .log_level(LogLevel::Debug)
+    .build()?;
+```
+
+Available levels (from least to most verbose): `Off` (default), `Error`, `Warn`, `Info`, `Debug`, `Trace`.
+
+To see logs you also need a `tracing-subscriber` in your application:
+
+```rust
+tracing_subscriber::fmt::init();
+
+let downloader = Downloader::builder()
+    .log_level(LogLevel::Info)
+    .build()?;
+```
+
 ## Cancellation
 
 ```rust
