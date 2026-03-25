@@ -6,6 +6,7 @@ use bytes::{Bytes, BytesMut};
 ///
 /// Data is stored per piece, and within each piece by contiguous byte ranges.
 /// Adjacent or overlapping writes are merged to reduce the number of disk I/O operations.
+#[derive(Default)]
 pub struct WriteBackCache {
     /// Cached entries keyed by piece_id.
     pieces: BTreeMap<usize, PieceCacheEntry>,
@@ -27,10 +28,7 @@ pub struct FlushBlock {
 
 impl WriteBackCache {
     pub fn new() -> Self {
-        Self {
-            pieces: BTreeMap::new(),
-            total_bytes: 0,
-        }
+        Self::default()
     }
 
     /// Total bytes currently buffered in the cache.
