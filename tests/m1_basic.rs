@@ -74,6 +74,53 @@ async fn test_download_progress_reports() {
     assert_eq!(snap.state, DownloadState::Completed);
     assert_eq!(snap.downloaded, expected_len);
     assert_eq!(snap.total_size, Some(expected_len));
+    assert_eq!(snap.eta_secs, Some(0.0));
+}
+
+#[tokio::test]
+async fn test_single_connection_eta_reports() {
+    let route = warp::path("etafile").map(|| {
+        let stream = futures::stream::unfold(0u32, |count| async move {
+            if count >= 30 {
+                return None;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+            let chunk = vec![0xEEu8; 8_192];
+            Some((Ok::<_, std::convert::Infallible>(chunk), count + 1))
+        });
+        let body = warp::hyper::Body::wrap_stream(stream);
+        warp::http::Response::builder()
+            .header("content-length", (30 * 8_192).to_string())
+            .body(body)
+            .unwrap()
+    });
+    let (addr, server) = warp::serve(route).bind_ephemeral(([127, 0, 0, 1], 0));
+    tokio::spawn(server);
+
+    let dir = tempfile::tempdir().unwrap();
+    let output_path = dir.path().join("eta.bin");
+
+    let downloader = Downloader::builder().build().unwrap();
+    let mut spec = DownloadSpec::new(format!("http://{addr}/etafile"), &output_path);
+    spec.file_allocation = FileAllocation::None;
+
+    let handle = downloader.download(spec);
+    let mut rx = handle.subscribe_progress();
+    let mut saw_eta = false;
+
+    for _ in 0..40 {
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        let snap = rx.borrow_and_update().clone();
+        if matches!(snap.state, DownloadState::Downloading) && snap.eta_secs.is_some() {
+            saw_eta = true;
+            break;
+        }
+    }
+
+    handle.wait().await.unwrap();
+    let final_snap = rx.borrow_and_update().clone();
+    assert!(saw_eta, "eta should become available during download");
+    assert_eq!(final_snap.eta_secs, Some(0.0));
 }
 
 #[tokio::test]

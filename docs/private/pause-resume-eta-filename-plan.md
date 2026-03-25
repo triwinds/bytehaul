@@ -143,6 +143,8 @@
 
 ## 二、ETA（预计剩余时间）计算
 
+状态：已实现（2026-03-25）
+
 ### 2.1 现状
 
 - `ProgressSnapshot` 已有 `speed_bytes_per_sec`、`total_size`、`downloaded`、`start_time`。
@@ -221,6 +223,15 @@
    - 下载过程中 `eta_secs` 会从 `None` 变为合理数值
    - 下载接近完成时 `eta_secs` 逐步下降
    - **完成态语义（已固定）：** `eta_secs = Some(0.0)`，表示"剩余 0 秒"。`None` 保留给"无法估算"的情况（如 `total_size` 未知、尚无样本数据、速度过低）
+
+### 2.4 实现结果
+
+- 已新增 `src/eta.rs`，使用 EWMA 吞吐样本估算剩余时间
+- 已为 `ProgressSnapshot` 增加 `eta_secs: Option<f64>` 字段
+- 单连接路径已按 1 秒采样窗口估算 ETA，多连接路径已按现有 200ms progress tick 估算 ETA
+- 完成态的 `eta_secs` 固定为 `Some(0.0)`，未知或速度过低场景保持 `None`
+- Python 绑定的 `PyProgressSnapshot.eta_secs` 已同步可用
+- 已补充单元测试和单连接、多连接 ETA 集成测试
 
 ---
 

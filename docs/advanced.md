@@ -62,8 +62,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         while rx.changed().await.is_ok() {
             let snap = rx.borrow().clone();
             println!(
-                "state={:?} downloaded={} speed={:.0} B/s",
-                snap.state, snap.downloaded, snap.speed_bytes_per_sec
+                "state={:?} downloaded={} speed={:.0} B/s eta={:?}",
+                snap.state,
+                snap.downloaded,
+                snap.speed_bytes_per_sec,
+                snap.eta_secs
             );
         }
     });

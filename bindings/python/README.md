@@ -95,7 +95,10 @@ task = downloader.download("https://example.com/large.bin", "large.bin")
 
 # Poll progress
 snap = task.progress()
-print(f"State: {snap.state}, Downloaded: {snap.downloaded}, Speed: {snap.speed:.0f} B/s")
+print(
+    f"State: {snap.state}, Downloaded: {snap.downloaded}, "
+    f"Speed: {snap.speed:.0f} B/s, ETA: {snap.eta_secs}"
+)
 
 # Pause or cancel if needed
 # task.pause()
@@ -153,6 +156,7 @@ Frozen snapshot of download progress.
 | `downloaded`   | `int`          | Bytes downloaded so far         |
 | `state`        | `str`          | `"pending"`, `"downloading"`, `"completed"`, `"failed"`, `"cancelled"`, `"paused"` |
 | `speed`        | `float`        | Current speed in bytes/second   |
+| `eta_secs`     | `float \| None`| Estimated remaining seconds     |
 | `elapsed_secs` | `float \| None`| Elapsed time in seconds         |
 
 ### Download options

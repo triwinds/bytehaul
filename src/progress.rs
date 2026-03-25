@@ -16,6 +16,7 @@ pub struct ProgressSnapshot {
     pub downloaded: u64,
     pub state: DownloadState,
     pub speed_bytes_per_sec: f64,
+    pub eta_secs: Option<f64>,
     pub start_time: Option<Instant>,
 }
 
@@ -26,6 +27,7 @@ impl Default for ProgressSnapshot {
             downloaded: 0,
             state: DownloadState::Pending,
             speed_bytes_per_sec: 0.0,
+            eta_secs: None,
             start_time: None,
         }
     }
@@ -42,6 +44,7 @@ mod tests {
         assert_eq!(snap.downloaded, 0);
         assert_eq!(snap.state, DownloadState::Pending);
         assert_eq!(snap.speed_bytes_per_sec, 0.0);
+        assert_eq!(snap.eta_secs, None);
         assert!(snap.start_time.is_none());
     }
 
@@ -60,11 +63,13 @@ mod tests {
             downloaded: 500,
             state: DownloadState::Downloading,
             speed_bytes_per_sec: 100.0,
+            eta_secs: Some(5.0),
             start_time: Some(Instant::now()),
         };
         let cloned = snap.clone();
         assert_eq!(cloned.total_size, Some(1000));
         assert_eq!(cloned.downloaded, 500);
         assert_eq!(cloned.state, DownloadState::Downloading);
+        assert_eq!(cloned.eta_secs, Some(5.0));
     }
 }

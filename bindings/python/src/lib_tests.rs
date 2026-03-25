@@ -260,6 +260,7 @@ fn test_error_mapping_snapshot_conversion_and_repr() {
             downloaded: 32,
             state,
             speed_bytes_per_sec: 12.5,
+            eta_secs: Some(2.5),
             start_time: Some(Instant::now()),
         };
         let py_snapshot = snapshot_to_py(&snapshot);
@@ -267,6 +268,7 @@ fn test_error_mapping_snapshot_conversion_and_repr() {
         assert_eq!(py_snapshot.total_size, Some(64));
         assert_eq!(py_snapshot.downloaded, 32);
         assert_eq!(py_snapshot.speed, 12.5);
+        assert_eq!(py_snapshot.eta_secs, Some(2.5));
         assert!(py_snapshot.elapsed_secs.is_some());
     }
 
@@ -275,6 +277,7 @@ fn test_error_mapping_snapshot_conversion_and_repr() {
         downloaded: 5,
         state: "completed".into(),
         speed: 1.5,
+        eta_secs: Some(1.25),
         elapsed_secs: Some(2.25),
     };
     assert!(with_values.__repr__().contains("completed"));
@@ -284,6 +287,7 @@ fn test_error_mapping_snapshot_conversion_and_repr() {
         downloaded: 0,
         state: "pending".into(),
         speed: 0.0,
+        eta_secs: None,
         elapsed_secs: None,
     };
     let rendered = without_values.__repr__();

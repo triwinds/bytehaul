@@ -18,7 +18,7 @@ A Rust async HTTP download library with resume, multi-connection, write-back cac
 - **Rate limiting** — shared token-bucket across all workers
 - **SHA-256 checksum verification** — post-download integrity check
 - **Cancellation** — cooperative cancel via stop signal
-- **Progress reporting** — real-time speed, downloaded bytes, state
+- **Progress reporting** — real-time speed, ETA, downloaded bytes, and state
 - **Shared network configuration** — proxy, custom DNS servers, and IPv6 toggle on the downloader client
 
 ## Installation

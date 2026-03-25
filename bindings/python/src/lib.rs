@@ -260,6 +260,8 @@ struct PyProgressSnapshot {
     #[pyo3(get)]
     speed: f64,
     #[pyo3(get)]
+    eta_secs: Option<f64>,
+    #[pyo3(get)]
     elapsed_secs: Option<f64>,
 }
 
@@ -267,7 +269,7 @@ struct PyProgressSnapshot {
 impl PyProgressSnapshot {
     fn __repr__(&self) -> String {
         format!(
-            "ProgressSnapshot(state='{}', downloaded={}, total_size={}, speed={:.1}, elapsed_secs={})",
+            "ProgressSnapshot(state='{}', downloaded={}, total_size={}, speed={:.1}, eta_secs={}, elapsed_secs={})",
             self.state,
             self.downloaded,
             match self.total_size {
@@ -275,6 +277,10 @@ impl PyProgressSnapshot {
                 None => "None".to_string(),
             },
             self.speed,
+            match self.eta_secs {
+                Some(eta) => format!("{eta:.2}"),
+                None => "None".to_string(),
+            },
             match self.elapsed_secs {
                 Some(e) => format!("{e:.2}"),
                 None => "None".to_string(),
@@ -298,6 +304,7 @@ fn snapshot_to_py(snap: &bytehaul::ProgressSnapshot) -> PyProgressSnapshot {
         downloaded: snap.downloaded,
         state: state.to_string(),
         speed: snap.speed_bytes_per_sec,
+        eta_secs: snap.eta_secs,
         elapsed_secs: snap.start_time.map(|t| t.elapsed().as_secs_f64()),
     }
 }

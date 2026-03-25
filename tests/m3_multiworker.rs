@@ -138,6 +138,100 @@ async fn test_multi_worker_progress() {
     assert_eq!(snap.state, DownloadState::Completed);
     assert_eq!(snap.downloaded, expected_len);
     assert_eq!(snap.total_size, Some(expected_len));
+    assert_eq!(snap.eta_secs, Some(0.0));
+}
+
+#[tokio::test]
+async fn test_multi_worker_eta_reports() {
+    use futures::StreamExt;
+
+    let size = 15 * 1024 * 1024;
+    let content: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+    let data = Arc::new(content);
+
+    let d = data.clone();
+    let route = warp::path("eta-multi")
+        .and(warp::header::optional::<String>("range"))
+        .map(move |range_header: Option<String>| {
+            let data = d.clone();
+            let total = data.len();
+
+            let (start, end) = match range_header {
+                Some(range) => {
+                    let range = range.trim_start_matches("bytes=");
+                    let parts: Vec<&str> = range.split('-').collect();
+                    let s: u64 = parts[0].parse().unwrap_or(0);
+                    let e: u64 = if parts.len() > 1 && !parts[1].is_empty() {
+                        parts[1]
+                            .parse::<u64>()
+                            .unwrap_or(total as u64 - 1)
+                            .min(total as u64 - 1)
+                    } else {
+                        total as u64 - 1
+                    };
+                    (s, e)
+                }
+                None => (0, total as u64 - 1),
+            };
+
+            let slice = data[start as usize..=end as usize].to_vec();
+            let chunks: Vec<Result<Vec<u8>, std::convert::Infallible>> =
+                slice.chunks(32 * 1024).map(|chunk| Ok(chunk.to_vec())).collect();
+            let stream = futures::stream::iter(chunks).then(
+                |chunk: Result<Vec<u8>, std::convert::Infallible>| async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    chunk
+                },
+            );
+            let body = warp::hyper::Body::wrap_stream(stream);
+
+            let is_range = start > 0 || end < total as u64 - 1;
+            let status = if is_range { 206 } else { 200 };
+            let mut builder = warp::http::Response::builder()
+                .status(status)
+                .header("content-length", (end - start + 1).to_string())
+                .header("accept-ranges", "bytes")
+                .header("etag", "\"eta-multi\"")
+                .header("last-modified", "Sat, 01 Jan 2026 00:00:00 GMT");
+            if is_range {
+                builder = builder.header(
+                    "content-range",
+                    format!("bytes {}-{}/{}", start, end, total),
+                );
+            }
+            builder.body(body).unwrap()
+        });
+
+    let (addr, server) = warp::serve(route).bind_ephemeral(([127, 0, 0, 1], 0));
+    tokio::spawn(server);
+
+    let dir = tempfile::tempdir().unwrap();
+    let output_path = dir.path().join("eta-multi.bin");
+
+    let downloader = Downloader::builder().build().unwrap();
+    let mut spec = DownloadSpec::new(format!("http://{addr}/eta-multi"), &output_path);
+    spec.file_allocation = FileAllocation::None;
+    spec.max_connections = 4;
+    spec.piece_size = 1024 * 1024;
+    spec.min_split_size = 10 * 1024 * 1024;
+
+    let handle = downloader.download(spec);
+    let mut rx = handle.subscribe_progress();
+    let mut saw_eta = false;
+
+    for _ in 0..30 {
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        let snap = rx.borrow_and_update().clone();
+        if matches!(snap.state, DownloadState::Downloading) && snap.eta_secs.is_some() {
+            saw_eta = true;
+            break;
+        }
+    }
+
+    handle.wait().await.unwrap();
+    let final_snap = rx.borrow_and_update().clone();
+    assert!(saw_eta, "eta should become available during multi-worker download");
+    assert_eq!(final_snap.eta_secs, Some(0.0));
 }
 
 #[tokio::test]

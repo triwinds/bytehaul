@@ -210,6 +210,7 @@ class TestDownloaderAPI:
         assert snap.state in ("pending", "downloading", "completed")
         assert snap.downloaded >= 0
         assert snap.speed >= 0.0
+        assert snap.eta_secs is None or snap.eta_secs >= 0.0
         task.wait()
         assert out.read_bytes() == SAMPLE_BODY
 

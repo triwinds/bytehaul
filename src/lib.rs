@@ -1,6 +1,7 @@
 mod checksum;
 mod config;
 mod error;
+mod eta;
 mod http;
 #[macro_use]
 mod logging;

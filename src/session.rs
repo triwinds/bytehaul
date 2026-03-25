@@ -11,6 +11,7 @@ use tokio::sync::{mpsc, oneshot, watch, Semaphore};
 use crate::checksum::verify_checksum;
 use crate::config::{DownloadSpec, LogLevel};
 use crate::error::DownloadError;
+use crate::eta::EtaEstimator;
 use crate::http::request::build_range_request;
 use crate::http::response::ResponseMeta;
 use crate::http::worker::HttpWorker;
@@ -24,6 +25,8 @@ use crate::storage::segment::Segment;
 use crate::storage::writer::{WriterCommand, WriterTask};
 
 const CONTROL_SAVE_INTERVAL: Duration = Duration::from_secs(5);
+const ETA_ALPHA: f64 = 0.3;
+const SINGLE_ETA_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StopSignal {
@@ -492,7 +495,10 @@ async fn run_single_connection(
         let _ = ControlSnapshot::delete(control_path).await;
     }
     log_debug!(log_level, download_id = download_id, "single-connection download completed");
-    progress_tx.send_modify(|p| p.state = DownloadState::Completed);
+    progress_tx.send_modify(|p| {
+        p.state = DownloadState::Completed;
+        p.eta_secs = Some(0.0);
+    });
     Ok(())
 }
 
@@ -511,6 +517,9 @@ async fn stream_single(
     let mut stream = response.bytes_stream();
     let mut downloaded: u64 = start_offset;
     let start_time = Instant::now();
+    let mut eta_estimator = EtaEstimator::new(ETA_ALPHA);
+    let mut last_sample_time = start_time;
+    let mut bytes_since_last_sample = 0u64;
     let mut cancel_rx = cancel_rx;
     let mut save_ticker = tokio::time::interval(CONTROL_SAVE_INTERVAL);
     save_ticker.tick().await;
@@ -520,6 +529,7 @@ async fn stream_single(
         p.downloaded = start_offset;
         p.state = DownloadState::Downloading;
         p.start_time = Some(start_time);
+        p.eta_secs = None;
     });
 
     loop {
@@ -569,15 +579,36 @@ async fn stream_single(
 
                         let offset = downloaded;
                         downloaded += len as u64;
+                        bytes_since_last_sample += len as u64;
                         if write_tx.send(WriterCommand::Data { offset, data, piece_id: None }).await.is_err() {
                             return Err(DownloadError::ChannelClosed);
                         }
                         permit.forget(); // permits returned by writer after flush
                         let elapsed = start_time.elapsed().as_secs_f64();
-                        let speed = if elapsed > 0.0 { downloaded as f64 / elapsed } else { 0.0 };
+                        let speed = if elapsed > 0.0 {
+                            downloaded.saturating_sub(start_offset) as f64 / elapsed
+                        } else {
+                            0.0
+                        };
+                        let now = Instant::now();
+                        if now.duration_since(last_sample_time) >= SINGLE_ETA_SAMPLE_INTERVAL {
+                            let delta_secs = now.duration_since(last_sample_time).as_secs_f64();
+                            eta_estimator.update_sample(bytes_since_last_sample, delta_secs);
+                            last_sample_time = now;
+                            bytes_since_last_sample = 0;
+                        }
+                        let eta_secs = total_size.and_then(|total| {
+                            let remaining = total.saturating_sub(downloaded);
+                            if remaining == 0 {
+                                Some(0.0)
+                            } else {
+                                eta_estimator.estimate(remaining)
+                            }
+                        });
                         progress_tx.send_modify(|p| {
                             p.downloaded = downloaded;
                             p.speed_bytes_per_sec = speed;
+                            p.eta_secs = eta_secs;
                         });
                     }
                     Some(Err(e)) => {
@@ -642,12 +673,15 @@ async fn run_multi_worker(
     // Shared progress counter
     let downloaded = Arc::new(AtomicU64::new(initial_downloaded));
     let start_time = Instant::now();
+    let mut eta_estimator = EtaEstimator::new(ETA_ALPHA);
+    let mut last_progress_bytes = initial_downloaded;
 
     progress_tx.send_modify(|p| {
         p.total_size = Some(total_size);
         p.downloaded = initial_downloaded;
         p.state = DownloadState::Downloading;
         p.start_time = Some(start_time);
+        p.eta_secs = None;
     });
 
     // Spawn workers
@@ -738,10 +772,24 @@ async fn run_multi_worker(
             _ = progress_interval.tick() => {
                 let d = downloaded.load(Ordering::Relaxed);
                 let elapsed = start_time.elapsed().as_secs_f64();
-                let speed = if elapsed > 0.0 { d as f64 / elapsed } else { 0.0 };
+                let speed = if elapsed > 0.0 {
+                    d.saturating_sub(initial_downloaded) as f64 / elapsed
+                } else {
+                    0.0
+                };
+                let delta_bytes = d.saturating_sub(last_progress_bytes);
+                eta_estimator.update_sample(delta_bytes, 0.2);
+                last_progress_bytes = d;
+                let remaining = total_size.saturating_sub(d);
+                let eta_secs = if remaining == 0 {
+                    Some(0.0)
+                } else {
+                    eta_estimator.estimate(remaining)
+                };
                 progress_tx.send_modify(|p| {
                     p.downloaded = d;
                     p.speed_bytes_per_sec = speed;
+                    p.eta_secs = eta_secs;
                 });
             }
 
@@ -822,6 +870,7 @@ async fn run_multi_worker(
     progress_tx.send_modify(|p| {
         p.downloaded = d;
         p.speed_bytes_per_sec = speed;
+        p.eta_secs = Some(0.0);
         p.state = DownloadState::Completed;
     });
     Ok(())
