@@ -42,6 +42,7 @@ parking_lot = "0.12"
 tracing = "0.1"
 crc32fast = "1"
 sha2 = "0.10"
+fastrand = "2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

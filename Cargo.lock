@@ -103,6 +103,7 @@ dependencies = [
  "bitvec",
  "bytes",
  "crc32fast",
+ "fastrand",
  "futures",
  "hickory-resolver",
  "http 1.4.0",

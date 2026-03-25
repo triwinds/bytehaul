@@ -39,9 +39,16 @@ where
                 let backoff = if let Some(retry_secs) = e.retry_after_secs() {
                     Duration::from_secs(retry_secs)
                 } else {
-                    base_delay
+                    let raw = base_delay
                         .saturating_mul(1u32 << attempt.min(10))
-                        .min(max_delay)
+                        .min(max_delay);
+                    // Equal jitter: half deterministic + half random to avoid
+                    // thundering herd while keeping a minimum delay floor.
+                    let half = raw / 2;
+                    let jitter = Duration::from_nanos(
+                        fastrand::u64(0..=half.as_nanos().min(u64::MAX as u128) as u64),
+                    );
+                    half + jitter
                 };
 
                 if let Some(limit) = max_retry_elapsed {
