@@ -1,6 +1,7 @@
+use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::watch;
+use tokio::sync::{watch, Semaphore};
 use tokio::task::JoinHandle;
 
 use crate::config::{DownloadSpec, LogLevel};
@@ -15,12 +16,14 @@ pub struct Downloader {
     client: reqwest::Client,
     client_config: ClientNetworkConfig,
     log_level: LogLevel,
+    concurrency_limit: Option<Arc<Semaphore>>,
 }
 
 /// Builder for [`Downloader`].
 pub struct DownloaderBuilder {
     client_config: ClientNetworkConfig,
     log_level: LogLevel,
+    max_concurrent_downloads: Option<usize>,
 }
 
 impl DownloaderBuilder {
@@ -67,6 +70,11 @@ impl DownloaderBuilder {
         self
     }
 
+    pub fn max_concurrent_downloads(mut self, limit: usize) -> Self {
+        self.max_concurrent_downloads = Some(limit);
+        self
+    }
+
     pub fn build(self) -> Result<Downloader, DownloadError> {
         let log_level = self.log_level;
         let client = self.client_config.build_client()?;
@@ -85,6 +93,9 @@ impl DownloaderBuilder {
             client,
             client_config: self.client_config,
             log_level,
+            concurrency_limit: self
+                .max_concurrent_downloads
+                .map(|n| Arc::new(Semaphore::new(n))),
         })
     }
 }
@@ -94,6 +105,7 @@ impl Downloader {
         DownloaderBuilder {
             client_config: ClientNetworkConfig::default(),
             log_level: LogLevel::default(),
+            max_concurrent_downloads: None,
         }
     }
 
@@ -138,7 +150,16 @@ impl Downloader {
             "download task created"
         );
 
+        let concurrency_limit = self.concurrency_limit.clone();
         let task = tokio::spawn(async move {
+            // Acquire a concurrency permit if a limit is configured.
+            // The permit is held for the lifetime of this download task.
+            let _permit = match &concurrency_limit {
+                Some(sem) => Some(sem.acquire().await.map_err(|_| {
+                    DownloadError::Internal("concurrency semaphore closed".into())
+                })?),
+                None => None,
+            };
             let client = if spec.connect_timeout == client_config.connect_timeout {
                 shared_client
             } else {
@@ -279,6 +300,22 @@ mod tests {
         let handle = downloader.download(spec);
         let err = handle.wait().await.unwrap_err();
         assert!(matches!(err, crate::error::DownloadError::InvalidConfig(message) if message.contains("max_connections")));
+    }
+
+    #[test]
+    fn test_downloader_builder_max_concurrent_downloads() {
+        let d = Downloader::builder()
+            .max_concurrent_downloads(3)
+            .build()
+            .unwrap();
+        let sem = d.concurrency_limit.as_ref().expect("semaphore should exist");
+        assert_eq!(sem.available_permits(), 3);
+    }
+
+    #[test]
+    fn test_downloader_builder_no_concurrency_limit_by_default() {
+        let d = Downloader::builder().build().unwrap();
+        assert!(d.concurrency_limit.is_none());
     }
 
     #[test]
