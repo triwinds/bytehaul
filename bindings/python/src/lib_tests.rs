@@ -188,6 +188,7 @@ fn test_apply_client_options_and_build_download_spec() {
         Some(4.0),
         Some(12345),
         Some(" abc123 ".into()),
+        None,
     )
     .unwrap();
 
@@ -232,6 +233,7 @@ fn test_apply_client_options_and_build_download_spec() {
         None,
         None,
         Some("   ".into()),
+        None,
     )
     .unwrap_err()
     .to_string()
@@ -334,6 +336,7 @@ fn test_download_task_methods_and_consumption_errors() {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -387,6 +390,7 @@ fn test_download_task_pause_maps_to_paused_error() {
             None,
             None,
             Some(true),
+            None,
             None,
             None,
             None,
@@ -458,6 +462,7 @@ fn test_py_downloader_download_success_and_module_registration() {
             Some(0.5),
             Some(2.0),
             Some(0),
+            None,
             None,
         )
         .unwrap();
@@ -534,6 +539,7 @@ fn test_top_level_download_success_and_failure() {
             Some(2.0),
             Some(0),
             None,
+            None,
             Some("debug".into()),
         )
         .unwrap();
@@ -547,6 +553,7 @@ fn test_top_level_download_success_and_failure() {
             py,
             "http://127.0.0.1:1/fail".into(),
             Some(unique_path("top-level-error")),
+            None,
             None,
             None,
             None,

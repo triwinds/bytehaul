@@ -131,6 +131,8 @@ pub struct DownloadSpec {
     pub(crate) max_download_speed: u64,
     /// Optional checksum for post-download verification.
     pub(crate) checksum: Option<Checksum>,
+    /// Interval for periodic control-file saves (default 5 s).
+    pub(crate) control_save_interval: Duration,
 }
 
 impl DownloadSpec {
@@ -155,6 +157,7 @@ impl DownloadSpec {
             max_retry_elapsed: None,
             max_download_speed: 0,
             checksum: None,
+            control_save_interval: Duration::from_secs(5),
         }
     }
 
@@ -232,6 +235,10 @@ impl DownloadSpec {
 
     pub fn get_checksum(&self) -> Option<&Checksum> {
         self.checksum.as_ref()
+    }
+
+    pub fn get_control_save_interval(&self) -> Duration {
+        self.control_save_interval
     }
 
     pub fn output_path(mut self, output_path: impl Into<PathBuf>) -> Self {
@@ -333,6 +340,11 @@ impl DownloadSpec {
 
     pub fn checksum(mut self, checksum: Checksum) -> Self {
         self.checksum = Some(checksum);
+        self
+    }
+
+    pub fn control_save_interval(mut self, interval: Duration) -> Self {
+        self.control_save_interval = interval;
         self
     }
 

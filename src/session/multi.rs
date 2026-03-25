@@ -10,7 +10,7 @@ use tokio::sync::{mpsc, watch, Semaphore};
 use super::{
     flush_all_and_wait, flush_piece_and_wait, range_response_allowed,
     stop_signal_error, stop_signal_label, stop_signal_state,
-    CONTROL_SAVE_INTERVAL, ETA_ALPHA, StopSignal,
+    ETA_ALPHA, StopSignal,
 };
 use crate::config::{DownloadSpec, LogLevel};
 use crate::error::DownloadError;
@@ -132,7 +132,7 @@ pub(super) async fn run_multi_worker(
 
     // ── Monitor loop ──
     let mut cancel_rx = cancel_rx;
-    let mut save_ticker = tokio::time::interval(CONTROL_SAVE_INTERVAL);
+    let mut save_ticker = tokio::time::interval(spec.control_save_interval);
     save_ticker.tick().await;
     let mut progress_interval = tokio::time::interval(Duration::from_millis(200));
     progress_interval.tick().await;

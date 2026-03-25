@@ -24,7 +24,6 @@ use self::resume::try_resume_download;
 use self::retry::retry_with_backoff;
 use self::single::run_single_connection;
 
-const CONTROL_SAVE_INTERVAL: Duration = Duration::from_secs(5);
 const ETA_ALPHA: f64 = 0.3;
 const SINGLE_ETA_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 

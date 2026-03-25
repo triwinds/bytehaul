@@ -40,8 +40,47 @@ pub(crate) async fn create_output_file(
     Ok(tokio::fs::File::from_std(std_file))
 }
 
-/// Write zeros to fill the file to the requested size, then seek back to start.
+/// Platform-optimized pre-allocation.
+///
+/// On Linux, uses `fallocate(2)` to allocate disk space without writing zeros.
+/// On macOS, uses `ftruncate` to extend the file (F_PREALLOCATE requires unsafe
+/// ioctl and provides marginal benefit over ftruncate for our use-case).
+/// On other platforms (Windows, etc.), falls back to writing zeros.
 fn preallocate_sync(file: &std::fs::File, size: u64) -> Result<(), std::io::Error> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        let ret = unsafe { libc::fallocate(file.as_raw_fd(), 0, 0, size as libc::off_t) };
+        if ret == 0 {
+            return Ok(());
+        }
+        // fallocate may fail on certain filesystems (e.g. NFS, tmpfs).
+        // Fall through to the portable path.
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        file.set_len(size)?;
+        file.sync_all()?;
+        let mut f = file.try_clone()?;
+        f.seek(SeekFrom::Start(0))?;
+        return Ok(());
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        preallocate_zeros(file, size)
+    }
+
+    // Linux fallback when fallocate fails
+    #[cfg(target_os = "linux")]
+    {
+        preallocate_zeros(file, size)
+    }
+}
+
+/// Portable zero-fill pre-allocation.
+fn preallocate_zeros(file: &std::fs::File, size: u64) -> Result<(), std::io::Error> {
     let mut writer = std::io::BufWriter::new(file.try_clone()?);
     let chunk = vec![0u8; 256 * 1024]; // 256 KiB
     let mut remaining = size;

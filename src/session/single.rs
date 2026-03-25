@@ -1,14 +1,14 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use tokio::sync::{mpsc, watch, Semaphore};
 
 use super::{
     flush_all_and_wait, stop_signal_error, stop_signal_state,
-    CONTROL_SAVE_INTERVAL, ETA_ALPHA, SINGLE_ETA_SAMPLE_INTERVAL, StopSignal,
+    ETA_ALPHA, SINGLE_ETA_SAMPLE_INTERVAL, StopSignal,
 };
 use crate::config::{DownloadSpec, LogLevel};
 use crate::error::DownloadError;
@@ -88,6 +88,7 @@ pub(super) async fn run_single_connection(
         },
         budget.clone(),
         &speed_limit,
+        spec.control_save_interval,
     )
     .await;
 
@@ -135,6 +136,7 @@ async fn stream_single(
     control: Option<(&Path, &ControlSnapshot)>,
     budget: Arc<Semaphore>,
     speed_limit: &SpeedLimit,
+    control_save_interval: Duration,
 ) -> Result<(), DownloadError> {
     let mut stream = response.bytes_stream();
     let mut downloaded: u64 = start_offset;
@@ -143,7 +145,7 @@ async fn stream_single(
     let mut last_sample_time = start_time;
     let mut bytes_since_last_sample = 0u64;
     let mut cancel_rx = cancel_rx;
-    let mut save_ticker = tokio::time::interval(CONTROL_SAVE_INTERVAL);
+    let mut save_ticker = tokio::time::interval(control_save_interval);
     save_ticker.tick().await;
 
     progress_tx.send_modify(|p| {

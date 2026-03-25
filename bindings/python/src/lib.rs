@@ -188,6 +188,7 @@ fn build_download_spec(
     max_retry_elapsed: Option<f64>,
     max_download_speed: Option<u64>,
     checksum_sha256: Option<String>,
+    control_save_interval: Option<f64>,
 ) -> PyResult<DownloadSpec> {
     let mut spec = DownloadSpec::new(url);
 
@@ -249,6 +250,12 @@ fn build_download_spec(
             return Err(config_error("checksum_sha256 cannot be empty"));
         }
         spec = spec.checksum(Checksum::Sha256(checksum_sha256));
+    }
+    if let Some(interval) = control_save_interval {
+        spec = spec.control_save_interval(duration_from_secs(
+            "control_save_interval",
+            interval,
+        )?);
     }
 
     spec.validate().map_err(|err| config_error(err.to_string()))?;
@@ -455,7 +462,8 @@ impl PyDownloader {
             retry_max_delay = None,
             max_retry_elapsed = None,
             max_download_speed = None,
-            checksum_sha256 = None
+            checksum_sha256 = None,
+            control_save_interval = None
         )
     )]
     #[allow(clippy::too_many_arguments)]
@@ -479,6 +487,7 @@ impl PyDownloader {
         max_retry_elapsed: Option<f64>,
         max_download_speed: Option<u64>,
         checksum_sha256: Option<String>,
+        control_save_interval: Option<f64>,
     ) -> PyResult<PyDownloadTask> {
         let spec = build_download_spec(
             url,
@@ -499,6 +508,7 @@ impl PyDownloader {
             max_retry_elapsed,
             max_download_speed,
             checksum_sha256,
+            control_save_interval,
         )?;
         let runtime = shared_runtime()?;
         let _guard = runtime.enter();
@@ -538,6 +548,7 @@ impl PyDownloader {
         max_retry_elapsed = None,
         max_download_speed = None,
         checksum_sha256 = None,
+        control_save_interval = None,
         log_level = None
     )
 )]
@@ -567,6 +578,7 @@ fn download(
     max_retry_elapsed: Option<f64>,
     max_download_speed: Option<u64>,
     checksum_sha256: Option<String>,
+    control_save_interval: Option<f64>,
     log_level: Option<String>,
 ) -> PyResult<()> {
     let level = match &log_level {
@@ -593,6 +605,7 @@ fn download(
         max_retry_elapsed,
         max_download_speed,
         checksum_sha256,
+        control_save_interval,
     )?;
     let runtime = shared_runtime()?;
 
