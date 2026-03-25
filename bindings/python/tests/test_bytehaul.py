@@ -321,3 +321,103 @@ class TestDownloaderAPI:
         task = d.download(f"{server}/attachment", output_dir=tmp_path)
         task.wait()
         assert (tmp_path / "server.bin").read_bytes() == SAMPLE_BODY
+
+
+# ---------------------------------------------------------------------------
+# Phase 4.2: Multi-threaded, GIL-release, and exception instance tests
+# ---------------------------------------------------------------------------
+
+
+class TestMultithreadedDownloads:
+    def test_concurrent_downloads_from_threads(self, server, tmp_path):
+        """Multiple threads calling download() concurrently should not crash."""
+        results = {}
+
+        def worker(idx):
+            out = tmp_path / f"thread_{idx}.bin"
+            try:
+                download(f"{server}/ok", str(out))
+                results[idx] = out.read_bytes()
+            except Exception as exc:
+                results[idx] = exc
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+
+        for idx in range(4):
+            assert isinstance(results[idx], bytes), f"thread {idx} failed: {results[idx]}"
+            assert results[idx] == SAMPLE_BODY
+
+    def test_concurrent_task_api_from_threads(self, server, tmp_path):
+        """Downloader.download() + task.wait() across threads."""
+        d = Downloader()
+        errors = []
+
+        def worker(idx):
+            try:
+                out = tmp_path / f"task_thread_{idx}.bin"
+                task = d.download(f"{server}/ok", str(out))
+                task.wait()
+                assert out.read_bytes() == SAMPLE_BODY
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+
+        assert not errors, f"thread errors: {errors}"
+
+
+class TestGILRelease:
+    def test_download_does_not_block_other_threads(self, server, tmp_path):
+        """While a download is in progress, other Python threads can still run."""
+        counter = {"value": 0}
+        done = threading.Event()
+
+        def counting_thread():
+            while not done.is_set():
+                counter["value"] += 1
+                time.sleep(0.01)
+
+        t = threading.Thread(target=counting_thread, daemon=True)
+        t.start()
+
+        out = tmp_path / "gil_test.bin"
+        download(f"{server}/slow", str(out))
+        done.set()
+        t.join(timeout=5)
+
+        # The counting thread should have made progress while download ran
+        assert counter["value"] > 0, "GIL was not released during download"
+        assert out.read_bytes() == SAMPLE_BODY
+
+
+class TestExceptionInstances:
+    def test_cancelled_error_is_instance(self, server, tmp_path):
+        d = Downloader()
+        task = d.download(f"{server}/slow", str(tmp_path / "cancel_inst.bin"))
+        task.cancel()
+        with pytest.raises(CancelledError) as exc_info:
+            task.wait()
+        assert isinstance(exc_info.value, BytehaulError)
+        assert isinstance(exc_info.value, CancelledError)
+
+    def test_config_error_is_instance(self, server, tmp_path):
+        with pytest.raises(ConfigError) as exc_info:
+            download(f"{server}/ok", str(tmp_path / "cfg_inst.bin"), max_connections=0)
+        assert isinstance(exc_info.value, BytehaulError)
+        assert isinstance(exc_info.value, ConfigError)
+
+    def test_download_failed_error_is_instance(self, server, tmp_path):
+        d = Downloader()
+        task = d.download(f"{server}/404", str(tmp_path / "fail_inst.bin"))
+        with pytest.raises(DownloadFailedError) as exc_info:
+            task.wait()
+        assert isinstance(exc_info.value, BytehaulError)
+        assert isinstance(exc_info.value, DownloadFailedError)
