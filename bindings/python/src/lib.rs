@@ -14,6 +14,8 @@ create_exception!(_bytehaul, BytehaulError, PyException);
 create_exception!(_bytehaul, CancelledError, BytehaulError);
 create_exception!(_bytehaul, PausedError, BytehaulError);
 create_exception!(_bytehaul, ConfigError, BytehaulError);
+create_exception!(_bytehaul, ResumeError, BytehaulError);
+create_exception!(_bytehaul, InternalError, BytehaulError);
 create_exception!(_bytehaul, DownloadFailedError, BytehaulError);
 
 static RUNTIME: OnceLock<Result<Runtime, String>> = OnceLock::new();
@@ -183,6 +185,7 @@ fn build_download_spec(
     max_retries: Option<u32>,
     retry_base_delay: Option<f64>,
     retry_max_delay: Option<f64>,
+    max_retry_elapsed: Option<f64>,
     max_download_speed: Option<u64>,
     checksum_sha256: Option<String>,
 ) -> PyResult<DownloadSpec> {
@@ -196,51 +199,59 @@ fn build_download_spec(
     }
 
     if let Some(headers) = headers {
-        spec.headers = headers;
+        spec = spec.headers(headers);
     }
     if let Some(max_connections) = max_connections {
-        spec.max_connections = non_zero_u32("max_connections", max_connections)?;
+        spec = spec.max_connections(non_zero_u32("max_connections", max_connections)?);
     }
     if let Some(connect_timeout) = connect_timeout {
-        spec.connect_timeout = duration_from_secs("connect_timeout", connect_timeout)?;
+        spec = spec.connect_timeout(duration_from_secs("connect_timeout", connect_timeout)?);
     }
     if let Some(read_timeout) = read_timeout {
-        spec.read_timeout = duration_from_secs("read_timeout", read_timeout)?;
+        spec = spec.read_timeout(duration_from_secs("read_timeout", read_timeout)?);
     }
     if let Some(memory_budget) = memory_budget {
-        spec.memory_budget = non_zero_usize("memory_budget", memory_budget)?;
+        spec = spec.memory_budget(non_zero_usize("memory_budget", memory_budget)?);
     }
     if let Some(file_allocation) = file_allocation {
-        spec.file_allocation = parse_file_allocation(&file_allocation)?;
+        spec = spec.file_allocation(parse_file_allocation(&file_allocation)?);
     }
     if let Some(resume) = resume {
-        spec.resume = resume;
+        spec = spec.resume(resume);
     }
     if let Some(piece_size) = piece_size {
-        spec.piece_size = non_zero_u64("piece_size", piece_size)?;
+        spec = spec.piece_size(non_zero_u64("piece_size", piece_size)?);
     }
     if let Some(min_split_size) = min_split_size {
-        spec.min_split_size = non_zero_u64("min_split_size", min_split_size)?;
+        spec = spec.min_split_size(non_zero_u64("min_split_size", min_split_size)?);
     }
     if let Some(max_retries) = max_retries {
-        spec.max_retries = max_retries;
+        spec = spec.max_retries(max_retries);
     }
     if let Some(retry_base_delay) = retry_base_delay {
-        spec.retry_base_delay = duration_from_secs("retry_base_delay", retry_base_delay)?;
+        spec = spec.retry_base_delay(duration_from_secs("retry_base_delay", retry_base_delay)?);
     }
     if let Some(retry_max_delay) = retry_max_delay {
-        spec.retry_max_delay = duration_from_secs("retry_max_delay", retry_max_delay)?;
+        spec = spec.retry_max_delay(duration_from_secs("retry_max_delay", retry_max_delay)?);
+    }
+    if let Some(max_retry_elapsed) = max_retry_elapsed {
+        spec = spec.max_retry_elapsed(duration_from_secs(
+            "max_retry_elapsed",
+            max_retry_elapsed,
+        )?);
     }
     if let Some(max_download_speed) = max_download_speed {
-        spec.max_download_speed = max_download_speed;
+        spec = spec.max_download_speed(max_download_speed);
     }
     if let Some(checksum_sha256) = checksum_sha256 {
         let checksum_sha256 = checksum_sha256.trim().to_string();
         if checksum_sha256.is_empty() {
             return Err(config_error("checksum_sha256 cannot be empty"));
         }
-        spec.checksum = Some(Checksum::Sha256(checksum_sha256));
+        spec = spec.checksum(Checksum::Sha256(checksum_sha256));
     }
+
+    spec.validate().map_err(|err| config_error(err.to_string()))?;
 
     Ok(spec)
 }
@@ -249,6 +260,12 @@ fn map_download_error(error: DownloadError) -> PyErr {
     match error {
         DownloadError::Cancelled => CancelledError::new_err("download cancelled"),
         DownloadError::Paused => PausedError::new_err("download paused"),
+        DownloadError::InvalidConfig(message) => ConfigError::new_err(message),
+        DownloadError::ResumeMismatch(message)
+        | DownloadError::ControlFileCorrupted(message) => ResumeError::new_err(message),
+        DownloadError::TaskFailed(message) | DownloadError::Internal(message) => {
+            InternalError::new_err(message)
+        }
         other => DownloadFailedError::new_err(other.to_string()),
     }
 }
@@ -436,6 +453,7 @@ impl PyDownloader {
             max_retries = None,
             retry_base_delay = None,
             retry_max_delay = None,
+            max_retry_elapsed = None,
             max_download_speed = None,
             checksum_sha256 = None
         )
@@ -458,6 +476,7 @@ impl PyDownloader {
         max_retries: Option<u32>,
         retry_base_delay: Option<f64>,
         retry_max_delay: Option<f64>,
+        max_retry_elapsed: Option<f64>,
         max_download_speed: Option<u64>,
         checksum_sha256: Option<String>,
     ) -> PyResult<PyDownloadTask> {
@@ -477,6 +496,7 @@ impl PyDownloader {
             max_retries,
             retry_base_delay,
             retry_max_delay,
+            max_retry_elapsed,
             max_download_speed,
             checksum_sha256,
         )?;
@@ -515,6 +535,7 @@ impl PyDownloader {
         max_retries = None,
         retry_base_delay = None,
         retry_max_delay = None,
+        max_retry_elapsed = None,
         max_download_speed = None,
         checksum_sha256 = None,
         log_level = None
@@ -543,6 +564,7 @@ fn download(
     max_retries: Option<u32>,
     retry_base_delay: Option<f64>,
     retry_max_delay: Option<f64>,
+    max_retry_elapsed: Option<f64>,
     max_download_speed: Option<u64>,
     checksum_sha256: Option<String>,
     log_level: Option<String>,
@@ -568,6 +590,7 @@ fn download(
         max_retries,
         retry_base_delay,
         retry_max_delay,
+        max_retry_elapsed,
         max_download_speed,
         checksum_sha256,
     )?;
@@ -576,7 +599,7 @@ fn download(
     py.allow_threads(move || {
         let mut builder = apply_client_options(
             bytehaul::Downloader::builder(),
-            Some(spec.connect_timeout.as_secs_f64()),
+            Some(spec.get_connect_timeout().as_secs_f64()),
             proxy,
             http_proxy,
             https_proxy,
@@ -603,6 +626,8 @@ fn register_exceptions(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult
     module.add("CancelledError", py.get_type::<CancelledError>())?;
     module.add("PausedError", py.get_type::<PausedError>())?;
     module.add("ConfigError", py.get_type::<ConfigError>())?;
+    module.add("ResumeError", py.get_type::<ResumeError>())?;
+    module.add("InternalError", py.get_type::<InternalError>())?;
     module.add("DownloadFailedError", py.get_type::<DownloadFailedError>())?;
     Ok(())
 }

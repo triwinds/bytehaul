@@ -87,7 +87,7 @@ impl BytehaulDnsResolver {
     fn new(dns_servers: &[SocketAddr], enable_ipv6: bool) -> Result<Self, DownloadError> {
         let mut builder = if dns_servers.is_empty() {
             TokioResolver::builder_tokio().map_err(|err| {
-                DownloadError::Other(format!("failed to read system DNS configuration: {err}"))
+                DownloadError::Internal(format!("failed to read system DNS configuration: {err}"))
             })?
         } else {
             TokioResolver::builder_with_config(

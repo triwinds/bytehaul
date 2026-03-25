@@ -20,17 +20,29 @@ pub enum DownloadError {
     #[error("internal channel closed unexpectedly")]
     ChannelClosed,
 
-    #[error("resume metadata mismatch: {0}")]
+    #[error("invalid download config: {0}")]
+    InvalidConfig(String),
+
+    #[error("resume state mismatch: {0}")]
     ResumeMismatch(String),
 
     #[error("control file corrupted: {0}")]
     ControlFileCorrupted(String),
 
+    #[error("retry budget exhausted after {elapsed:?} (limit {limit:?})")]
+    RetryBudgetExceeded {
+        elapsed: std::time::Duration,
+        limit: std::time::Duration,
+    },
+
+    #[error("task failure: {0}")]
+    TaskFailed(String),
+
+    #[error("internal error: {0}")]
+    Internal(String),
+
     #[error("checksum mismatch: expected {expected}, got {actual}")]
     ChecksumMismatch { expected: String, actual: String },
-
-    #[error("{0}")]
-    Other(String),
 }
 
 impl DownloadError {
@@ -120,9 +132,16 @@ mod tests {
         assert!(!DownloadError::Cancelled.is_retryable());
         assert!(!DownloadError::Paused.is_retryable());
         assert!(!DownloadError::ChannelClosed.is_retryable());
-        assert!(!DownloadError::Other("test".into()).is_retryable());
+        assert!(!DownloadError::InvalidConfig("test".into()).is_retryable());
         assert!(!DownloadError::ResumeMismatch("test".into()).is_retryable());
         assert!(!DownloadError::ControlFileCorrupted("test".into()).is_retryable());
+        assert!(!DownloadError::RetryBudgetExceeded {
+            elapsed: std::time::Duration::from_secs(2),
+            limit: std::time::Duration::from_secs(1),
+        }
+        .is_retryable());
+        assert!(!DownloadError::TaskFailed("test".into()).is_retryable());
+        assert!(!DownloadError::Internal("test".into()).is_retryable());
         assert!(!DownloadError::ChecksumMismatch {
             expected: "a".into(),
             actual: "b".into(),
@@ -181,6 +200,9 @@ mod tests {
         };
         assert!(format!("{e}").contains("aaa"));
         assert!(format!("{e}").contains("bbb"));
+
+        let e = DownloadError::InvalidConfig("max_connections must be >= 1".into());
+        assert!(format!("{e}").contains("invalid download config"));
 
         let e = DownloadError::HttpStatus {
             status: 404,

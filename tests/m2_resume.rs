@@ -132,8 +132,9 @@ async fn test_resume_after_cancel() {
     let downloader = Downloader::builder().build().unwrap();
 
     // First download: let it run a bit, then cancel
-    let mut spec = DownloadSpec::new(format!("http://{addr}/resumefile")).output_path(output_path.clone());
-    spec.file_allocation = FileAllocation::None;
+    let spec = DownloadSpec::new(format!("http://{addr}/resumefile"))
+        .output_path(output_path.clone())
+        .file_allocation(FileAllocation::None);
     let handle = downloader.download(spec.clone());
 
     // Wait for some data to arrive, then cancel
@@ -204,8 +205,9 @@ async fn test_resume_etag_mismatch_restarts() {
 
     // Download should detect mismatch, discard old state, and start fresh
     let downloader = Downloader::builder().build().unwrap();
-    let mut spec = DownloadSpec::new(format!("http://{addr}/etagfile")).output_path(output_path.clone());
-    spec.file_allocation = FileAllocation::None;
+    let spec = DownloadSpec::new(format!("http://{addr}/etagfile"))
+        .output_path(output_path.clone())
+        .file_allocation(FileAllocation::None);
 
     let handle = downloader.download(spec);
     handle.wait().await.unwrap();
@@ -226,9 +228,10 @@ async fn test_no_resume_when_disabled() {
     let output_path = dir.path().join("noresume.bin");
 
     let downloader = Downloader::builder().build().unwrap();
-    let mut spec = DownloadSpec::new(format!("http://{addr}/noresume")).output_path(output_path.clone());
-    spec.file_allocation = FileAllocation::None;
-    spec.resume = false;
+    let spec = DownloadSpec::new(format!("http://{addr}/noresume"))
+        .output_path(output_path.clone())
+        .file_allocation(FileAllocation::None)
+        .resume(false);
 
     let handle = downloader.download(spec);
     handle.wait().await.unwrap();
@@ -239,6 +242,44 @@ async fn test_no_resume_when_disabled() {
     // No control file should exist
     let ctrl_path = output_path.with_file_name("noresume.bin.bytehaul");
     assert!(!ctrl_path.exists());
+}
+
+#[tokio::test]
+async fn test_resume_truncated_local_file_restarts_cleanly() {
+    let content: Vec<u8> = (0..120_000u32).map(|i| (i % 251) as u8).collect();
+    let expected = content.clone();
+
+    let (addr, server) = range_server("truncated-local", content);
+    tokio::spawn(server);
+
+    let dir = tempfile::tempdir().unwrap();
+    let output_path = dir.path().join("truncated-local.bin");
+    let ctrl_path = output_path.with_file_name("truncated-local.bin.bytehaul");
+
+    std::fs::write(&output_path, vec![0xAA; 8_000]).unwrap();
+    let fake_ctrl = bytehaul_test_support::make_control_snapshot(
+        &format!("http://{addr}/truncated-local"),
+        120_000,
+        40_000,
+        Some("\"test-etag-123\""),
+        Some("Sat, 01 Jan 2026 00:00:00 GMT"),
+    );
+    fake_ctrl.save(&ctrl_path).await;
+
+    let downloader = Downloader::builder().build().unwrap();
+    let spec = DownloadSpec::new(format!("http://{addr}/truncated-local"))
+        .output_path(output_path.clone())
+        .file_allocation(FileAllocation::None);
+
+    let handle = downloader.download(spec);
+    handle.wait().await.unwrap();
+
+    let downloaded = std::fs::read(&output_path).unwrap();
+    assert_eq!(downloaded, expected);
+    assert!(
+        !ctrl_path.exists(),
+        "control file should be deleted after clean restart"
+    );
 }
 
 /// Helper module to access internal types for testing.
@@ -261,10 +302,12 @@ mod bytehaul_test_support {
             let payload = ControlPayload {
                 url: self.url.clone(),
                 total_size: self.total_size,
+                piece_size: self.total_size,
+                piece_count: 1,
+                completed_bitset: vec![0],
                 downloaded_bytes: self.downloaded_bytes,
                 etag: self.etag.clone(),
                 last_modified: self.last_modified.clone(),
-                piece_size: self.total_size,
             };
             let encoded = bincode::serialize(&payload).unwrap();
             let checksum = crc32fast::hash(&encoded);
@@ -284,10 +327,12 @@ mod bytehaul_test_support {
     struct ControlPayload {
         url: String,
         total_size: u64,
+        piece_size: u64,
+        piece_count: usize,
+        completed_bitset: Vec<u8>,
         downloaded_bytes: u64,
         etag: Option<String>,
         last_modified: Option<String>,
-        piece_size: u64,
     }
 
     pub fn make_control_snapshot(

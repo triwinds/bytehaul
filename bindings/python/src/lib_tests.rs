@@ -185,35 +185,38 @@ fn test_apply_client_options_and_build_download_spec() {
         Some(7),
         Some(0.5),
         Some(2.0),
+        Some(4.0),
         Some(12345),
         Some(" abc123 ".into()),
     )
     .unwrap();
 
-    assert_eq!(spec.url, "https://example.com/file.bin");
-    assert_eq!(spec.output_path, Some(output_path));
-    assert_eq!(spec.output_dir, Some(std::env::temp_dir()));
-    assert_eq!(spec.headers, headers);
-    assert_eq!(spec.max_connections, 3);
-    assert_eq!(spec.connect_timeout, Duration::from_secs_f64(1.25));
-    assert_eq!(spec.read_timeout, Duration::from_secs_f64(3.5));
-    assert_eq!(spec.memory_budget, 8192);
-    assert_eq!(spec.file_allocation, FileAllocation::None);
-    assert!(!spec.resume);
-    assert_eq!(spec.piece_size, 4096);
-    assert_eq!(spec.min_split_size, 2048);
-    assert_eq!(spec.max_retries, 7);
-    assert_eq!(spec.retry_base_delay, Duration::from_secs_f64(0.5));
-    assert_eq!(spec.retry_max_delay, Duration::from_secs_f64(2.0));
-    assert_eq!(spec.max_download_speed, 12345);
+    assert_eq!(spec.get_url(), "https://example.com/file.bin");
+    assert_eq!(spec.get_output_path(), Some(output_path.as_path()));
+    assert_eq!(spec.get_output_dir(), Some(std::env::temp_dir().as_path()));
+    assert_eq!(spec.get_headers(), &headers);
+    assert_eq!(spec.get_max_connections(), 3);
+    assert_eq!(spec.get_connect_timeout(), Duration::from_secs_f64(1.25));
+    assert_eq!(spec.get_read_timeout(), Duration::from_secs_f64(3.5));
+    assert_eq!(spec.get_memory_budget(), 8192);
+    assert_eq!(spec.get_file_allocation(), FileAllocation::None);
+    assert!(!spec.get_resume());
+    assert_eq!(spec.get_piece_size(), 4096);
+    assert_eq!(spec.get_min_split_size(), 2048);
+    assert_eq!(spec.get_max_retries(), 7);
+    assert_eq!(spec.get_retry_base_delay(), Duration::from_secs_f64(0.5));
+    assert_eq!(spec.get_retry_max_delay(), Duration::from_secs_f64(2.0));
+    assert_eq!(spec.get_max_retry_elapsed(), Some(Duration::from_secs_f64(4.0)));
+    assert_eq!(spec.get_max_download_speed(), 12345);
     assert!(matches!(
-        spec.checksum,
+        spec.get_checksum(),
         Some(Checksum::Sha256(ref checksum)) if checksum == "abc123"
     ));
 
     assert!(build_download_spec(
         "https://example.com/file.bin".into(),
         Some(unique_path("empty-checksum")),
+        None,
         None,
         None,
         None,
@@ -244,7 +247,16 @@ fn test_error_mapping_snapshot_conversion_and_repr() {
     assert!(map_download_error(DownloadError::Paused)
         .to_string()
         .contains("PausedError"));
-    assert!(map_download_error(DownloadError::Other("boom".into()))
+    assert!(map_download_error(DownloadError::Internal("boom".into()))
+        .to_string()
+        .contains("InternalError"));
+    assert!(map_download_error(DownloadError::ResumeMismatch("resume mismatch".into()))
+        .to_string()
+        .contains("ResumeError"));
+    assert!(map_download_error(DownloadError::RetryBudgetExceeded {
+        elapsed: Duration::from_secs(3),
+        limit: Duration::from_secs(2),
+    })
         .to_string()
         .contains("DownloadFailedError"));
 
@@ -321,6 +333,7 @@ fn test_download_task_methods_and_consumption_errors() {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -374,6 +387,7 @@ fn test_download_task_pause_maps_to_paused_error() {
             None,
             None,
             Some(true),
+            None,
             None,
             None,
             None,
@@ -442,6 +456,7 @@ fn test_py_downloader_download_success_and_module_registration() {
             Some(1),
             Some(0.25),
             Some(0.5),
+            Some(2.0),
             Some(0),
             None,
         )
@@ -469,6 +484,8 @@ fn test_py_downloader_download_success_and_module_registration() {
             "CancelledError",
             "PausedError",
             "ConfigError",
+            "ResumeError",
+            "InternalError",
             "DownloadFailedError",
             "download",
             "Downloader",
@@ -514,6 +531,7 @@ fn test_top_level_download_success_and_failure() {
             Some(1),
             Some(0.25),
             Some(0.5),
+            Some(2.0),
             Some(0),
             None,
             Some("debug".into()),
@@ -529,6 +547,7 @@ fn test_top_level_download_success_and_failure() {
             py,
             "http://127.0.0.1:1/fail".into(),
             Some(unique_path("top-level-error")),
+            None,
             None,
             None,
             None,

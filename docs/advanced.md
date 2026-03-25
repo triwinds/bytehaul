@@ -11,21 +11,25 @@ For basic usage, see the [main README](../README.md).
 use std::time::Duration;
 use bytehaul::{Checksum, DownloadSpec, FileAllocation};
 
-let mut spec = DownloadSpec::new("https://example.com/file.bin")
+let spec = DownloadSpec::new("https://example.com/file.bin")
     .output_dir("downloads")
-    .output_path("file.bin");
-spec.max_connections = 8;               // parallel workers
-spec.piece_size = 2 * 1024 * 1024;      // 2 MiB pieces
-spec.min_split_size = 10 * 1024 * 1024;  // split only if > 10 MiB
-spec.file_allocation = FileAllocation::Prealloc;
-spec.resume = true;                      // enable breakpoint resume
-spec.max_retries = 5;
-spec.retry_base_delay = Duration::from_secs(1);
-spec.max_download_speed = 1024 * 1024;   // 1 MB/s limit
-spec.checksum = Some(Checksum::Sha256(
-    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".into(),
-));
+    .output_path("file.bin")
+    .max_connections(8) // parallel workers
+    .piece_size(2 * 1024 * 1024) // 2 MiB pieces
+    .min_split_size(10 * 1024 * 1024) // split only if > 10 MiB
+    .file_allocation(FileAllocation::Prealloc)
+    .resume(true)
+    .retry_policy(5, Duration::from_secs(1), Duration::from_secs(30))
+    .max_retry_elapsed(Duration::from_secs(120)) // stop retrying after 2 minutes total
+    .max_download_speed(1024 * 1024) // 1 MB/s limit
+    .checksum(Checksum::Sha256(
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".into(),
+    ));
 ```
+
+bytehaul now validates these task-level settings through `DownloadSpec::validate()` before network work starts, so invalid combinations fail consistently instead of relying on scattered runtime checks.
+
+`max_retries` still controls how many retry attempts are allowed. `max_retry_elapsed` adds a separate time budget. If the retry loop would exceed that budget, the request stops with `DownloadError::RetryBudgetExceeded` instead of continuing until the retry count is exhausted.
 
 If you omit `.output_path(...)`, bytehaul will detect the filename from `Content-Disposition`, then the URL path, then `download`. Absolute output paths are still accepted when `.output_dir(...)` is not set.
 
@@ -80,6 +84,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+`eta_secs` is intentionally conservative:
+
+- `None` means bytehaul does not have enough stable samples yet, or the total size is still unknown.
+- `Some(0.0)` means the task has reached the end of the stream and the progress state is transitioning to `Completed`.
+
+## Pause And Resume
+
+```rust
+let handle = downloader.download(spec.clone());
+handle.pause();
+
+match handle.wait().await {
+    Err(bytehaul::DownloadError::Paused) => {
+        let resumed = downloader.download(spec);
+        resumed.wait().await?;
+    }
+    other => other?,
+}
+```
+
+Pause is not an in-place suspension of the same handle. It ends the current task after flushing writer state and saving a control file. Resuming means starting a new `download(spec)` call against the same resolved output path.
+
+Resume safety has two checks before bytehaul trusts the saved state:
+
+- Remote metadata still has to match the saved snapshot.
+- The local output file must still be consistent with the saved progress snapshot.
+
+If either check fails, bytehaul discards the stale control file and restarts the download from scratch.
+
 ## Logging
 
 Bytehaul uses `tracing` internally. Logging is **off by default** — opt in by setting the log level on the builder:
@@ -112,3 +145,5 @@ let handle = downloader.download(spec);
 handle.cancel();
 let result = handle.wait().await; // returns Err(DownloadError::Cancelled)
 ```
+
+`Cancelled`, `Paused`, and `Completed` are distinct end states. `cancel()` abandons the task. `pause()` preserves resumable state. A normally completed download removes its control file and returns `Ok(())`.

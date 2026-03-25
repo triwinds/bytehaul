@@ -99,14 +99,17 @@ async fn test_retry_on_503_multi_worker() {
     let output_path = dir.path().join("retry503.bin");
 
     let downloader = Downloader::builder().build().unwrap();
-    let mut spec = DownloadSpec::new(format!("http://{addr}/retry503")).output_path(output_path.clone());
-    spec.file_allocation = FileAllocation::None;
-    spec.max_connections = 4;
-    spec.piece_size = 1024 * 1024;
-    spec.min_split_size = 10 * 1024 * 1024;
-    spec.max_retries = 5;
-    spec.retry_base_delay = std::time::Duration::from_millis(10);
-    spec.retry_max_delay = std::time::Duration::from_millis(100);
+    let spec = DownloadSpec::new(format!("http://{addr}/retry503"))
+        .output_path(output_path.clone())
+        .file_allocation(FileAllocation::None)
+        .max_connections(4)
+        .piece_size(1024 * 1024)
+        .min_split_size(10 * 1024 * 1024)
+        .retry_policy(
+            5,
+            std::time::Duration::from_millis(10),
+            std::time::Duration::from_millis(100),
+        );
 
     let handle = downloader.download(spec);
     handle.wait().await.unwrap();
@@ -130,12 +133,15 @@ async fn test_retry_on_503_single_connection() {
     let output_path = dir.path().join("retrysmall.bin");
 
     let downloader = Downloader::builder().build().unwrap();
-    let mut spec = DownloadSpec::new(format!("http://{addr}/retrysmall")).output_path(output_path.clone());
-    spec.file_allocation = FileAllocation::None;
-    spec.max_connections = 1;
-    spec.max_retries = 5;
-    spec.retry_base_delay = std::time::Duration::from_millis(10);
-    spec.retry_max_delay = std::time::Duration::from_millis(100);
+    let spec = DownloadSpec::new(format!("http://{addr}/retrysmall"))
+        .output_path(output_path.clone())
+        .file_allocation(FileAllocation::None)
+        .max_connections(1)
+        .retry_policy(
+            5,
+            std::time::Duration::from_millis(10),
+            std::time::Duration::from_millis(100),
+        );
 
     let handle = downloader.download(spec);
     handle.wait().await.unwrap();
@@ -154,9 +160,10 @@ async fn test_no_retry_on_403() {
     let output_path = dir.path().join("forbidden.bin");
 
     let downloader = Downloader::builder().build().unwrap();
-    let mut spec = DownloadSpec::new(format!("http://{addr}/forbidden")).output_path(output_path.clone());
-    spec.file_allocation = FileAllocation::None;
-    spec.max_retries = 5;
+    let spec = DownloadSpec::new(format!("http://{addr}/forbidden"))
+        .output_path(output_path.clone())
+        .file_allocation(FileAllocation::None)
+        .max_retries(5);
 
     let handle = downloader.download(spec);
     let err = handle.wait().await.unwrap_err();
@@ -183,12 +190,15 @@ async fn test_exhausted_retries_fails() {
     let output_path = dir.path().join("alwaysfail.bin");
 
     let downloader = Downloader::builder().build().unwrap();
-    let mut spec = DownloadSpec::new(format!("http://{addr}/alwaysfail")).output_path(output_path.clone());
-    spec.file_allocation = FileAllocation::None;
-    spec.max_connections = 1;
-    spec.max_retries = 2;
-    spec.retry_base_delay = std::time::Duration::from_millis(10);
-    spec.retry_max_delay = std::time::Duration::from_millis(50);
+    let spec = DownloadSpec::new(format!("http://{addr}/alwaysfail"))
+        .output_path(output_path.clone())
+        .file_allocation(FileAllocation::None)
+        .max_connections(1)
+        .retry_policy(
+            2,
+            std::time::Duration::from_millis(10),
+            std::time::Duration::from_millis(50),
+        );
 
     let handle = downloader.download(spec);
     let result = handle.wait().await;
@@ -348,14 +358,17 @@ async fn test_retry_429_with_retry_after_multi_worker() {
     let output_path = dir.path().join("rate_limit.bin");
 
     let downloader = Downloader::builder().build().unwrap();
-    let mut spec = DownloadSpec::new(format!("http://{addr}/rate_limit")).output_path(output_path.clone());
-    spec.file_allocation = FileAllocation::None;
-    spec.max_connections = 4;
-    spec.piece_size = 1024 * 1024;
-    spec.min_split_size = 10 * 1024 * 1024;
-    spec.max_retries = 5;
-    spec.retry_base_delay = std::time::Duration::from_millis(10);
-    spec.retry_max_delay = std::time::Duration::from_millis(100);
+    let spec = DownloadSpec::new(format!("http://{addr}/rate_limit"))
+        .output_path(output_path.clone())
+        .file_allocation(FileAllocation::None)
+        .max_connections(4)
+        .piece_size(1024 * 1024)
+        .min_split_size(10 * 1024 * 1024)
+        .retry_policy(
+            5,
+            std::time::Duration::from_millis(10),
+            std::time::Duration::from_millis(100),
+        );
 
     let handle = downloader.download(spec);
     handle.wait().await.unwrap();
@@ -379,11 +392,12 @@ async fn test_gzip_content_encoding_fallback() {
     let output_path = dir.path().join("gzip_enc.bin");
 
     let downloader = Downloader::builder().build().unwrap();
-    let mut spec = DownloadSpec::new(format!("http://{addr}/gzip_enc")).output_path(output_path.clone());
-    spec.file_allocation = FileAllocation::None;
-    spec.max_connections = 4;
-    spec.piece_size = 1024 * 1024;
-    spec.min_split_size = 10 * 1024 * 1024;
+    let spec = DownloadSpec::new(format!("http://{addr}/gzip_enc"))
+        .output_path(output_path.clone())
+        .file_allocation(FileAllocation::None)
+        .max_connections(4)
+        .piece_size(1024 * 1024)
+        .min_split_size(10 * 1024 * 1024);
 
     let handle = downloader.download(spec);
     handle.wait().await.unwrap();
@@ -481,14 +495,17 @@ async fn test_multi_worker_segment_retry_on_503() {
     let output_path = dir.path().join("segretry.bin");
 
     let downloader = Downloader::builder().build().unwrap();
-    let mut spec = DownloadSpec::new(format!("http://{addr}/segretry")).output_path(output_path.clone());
-    spec.file_allocation = FileAllocation::None;
-    spec.max_connections = 4;
-    spec.piece_size = 1024 * 1024;
-    spec.min_split_size = 1024 * 1024;
-    spec.max_retries = 8;
-    spec.retry_base_delay = std::time::Duration::from_millis(10);
-    spec.retry_max_delay = std::time::Duration::from_millis(100);
+    let spec = DownloadSpec::new(format!("http://{addr}/segretry"))
+        .output_path(output_path.clone())
+        .file_allocation(FileAllocation::None)
+        .max_connections(4)
+        .piece_size(1024 * 1024)
+        .min_split_size(1024 * 1024)
+        .retry_policy(
+            8,
+            std::time::Duration::from_millis(10),
+            std::time::Duration::from_millis(100),
+        );
 
     let handle = downloader.download(spec);
     handle.wait().await.unwrap();

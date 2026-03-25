@@ -1,6 +1,8 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+use crate::error::DownloadError;
 
 /// Log verbosity level for download tasks.
 ///
@@ -112,29 +114,31 @@ pub enum Checksum {
 /// Specification for a download task.
 #[derive(Debug, Clone)]
 pub struct DownloadSpec {
-    pub url: String,
-    pub output_path: Option<PathBuf>,
-    pub output_dir: Option<PathBuf>,
-    pub headers: HashMap<String, String>,
-    pub max_connections: u32,
-    pub connect_timeout: Duration,
-    pub read_timeout: Duration,
-    pub memory_budget: usize,
-    pub file_allocation: FileAllocation,
-    pub channel_buffer: usize,
-    pub resume: bool,
-    pub piece_size: u64,
-    pub min_split_size: u64,
+    pub(crate) url: String,
+    pub(crate) output_path: Option<PathBuf>,
+    pub(crate) output_dir: Option<PathBuf>,
+    pub(crate) headers: HashMap<String, String>,
+    pub(crate) max_connections: u32,
+    pub(crate) connect_timeout: Duration,
+    pub(crate) read_timeout: Duration,
+    pub(crate) memory_budget: usize,
+    pub(crate) file_allocation: FileAllocation,
+    pub(crate) channel_buffer: usize,
+    pub(crate) resume: bool,
+    pub(crate) piece_size: u64,
+    pub(crate) min_split_size: u64,
     /// Maximum retry attempts per segment (0 = no retries).
-    pub max_retries: u32,
+    pub(crate) max_retries: u32,
     /// Base delay for exponential backoff between retries.
-    pub retry_base_delay: Duration,
+    pub(crate) retry_base_delay: Duration,
     /// Maximum delay cap for exponential backoff.
-    pub retry_max_delay: Duration,
+    pub(crate) retry_max_delay: Duration,
+    /// Optional total elapsed retry budget across retries for a single request.
+    pub(crate) max_retry_elapsed: Option<Duration>,
     /// Maximum download speed in bytes/sec. 0 = unlimited.
-    pub max_download_speed: u64,
+    pub(crate) max_download_speed: u64,
     /// Optional checksum for post-download verification.
-    pub checksum: Option<Checksum>,
+    pub(crate) checksum: Option<Checksum>,
 }
 
 impl DownloadSpec {
@@ -156,9 +160,86 @@ impl DownloadSpec {
             max_retries: 5,
             retry_base_delay: Duration::from_secs(1),
             retry_max_delay: Duration::from_secs(30),
+            max_retry_elapsed: None,
             max_download_speed: 0,
             checksum: None,
         }
+    }
+
+    pub fn get_url(&self) -> &str {
+        &self.url
+    }
+
+    pub fn get_output_path(&self) -> Option<&Path> {
+        self.output_path.as_deref()
+    }
+
+    pub fn get_output_dir(&self) -> Option<&Path> {
+        self.output_dir.as_deref()
+    }
+
+    pub fn get_headers(&self) -> &HashMap<String, String> {
+        &self.headers
+    }
+
+    pub fn get_max_connections(&self) -> u32 {
+        self.max_connections
+    }
+
+    pub fn get_connect_timeout(&self) -> Duration {
+        self.connect_timeout
+    }
+
+    pub fn get_read_timeout(&self) -> Duration {
+        self.read_timeout
+    }
+
+    pub fn get_memory_budget(&self) -> usize {
+        self.memory_budget
+    }
+
+    pub fn get_file_allocation(&self) -> FileAllocation {
+        self.file_allocation
+    }
+
+    pub fn get_channel_buffer(&self) -> usize {
+        self.channel_buffer
+    }
+
+    pub fn get_resume(&self) -> bool {
+        self.resume
+    }
+
+    pub fn get_piece_size(&self) -> u64 {
+        self.piece_size
+    }
+
+    pub fn get_min_split_size(&self) -> u64 {
+        self.min_split_size
+    }
+
+    pub fn get_max_retries(&self) -> u32 {
+        self.max_retries
+    }
+
+    pub fn get_retry_base_delay(&self) -> Duration {
+        self.retry_base_delay
+    }
+
+    pub fn get_retry_max_delay(&self) -> Duration {
+        self.retry_max_delay
+    }
+
+    pub fn get_max_retry_elapsed(&self) -> Option<Duration> {
+        self.max_retry_elapsed
+    }
+
+    pub fn get_max_download_speed(&self) -> u64 {
+        self.max_download_speed
+    }
+
+    pub fn get_checksum(&self) -> Option<&Checksum> {
+        self.checksum.as_ref()
     }
 
     pub fn output_path(mut self, output_path: impl Into<PathBuf>) -> Self {
@@ -169,6 +250,140 @@ impl DownloadSpec {
     pub fn output_dir(mut self, output_dir: impl Into<PathBuf>) -> Self {
         self.output_dir = Some(output_dir.into());
         self
+    }
+
+    pub fn headers(mut self, headers: HashMap<String, String>) -> Self {
+        self.headers = headers;
+        self
+    }
+
+    pub fn max_connections(mut self, max_connections: u32) -> Self {
+        self.max_connections = max_connections;
+        self
+    }
+
+    pub fn connect_timeout(mut self, connect_timeout: Duration) -> Self {
+        self.connect_timeout = connect_timeout;
+        self
+    }
+
+    pub fn read_timeout(mut self, read_timeout: Duration) -> Self {
+        self.read_timeout = read_timeout;
+        self
+    }
+
+    pub fn memory_budget(mut self, memory_budget: usize) -> Self {
+        self.memory_budget = memory_budget;
+        self
+    }
+
+    pub fn file_allocation(mut self, file_allocation: FileAllocation) -> Self {
+        self.file_allocation = file_allocation;
+        self
+    }
+
+    pub fn channel_buffer(mut self, channel_buffer: usize) -> Self {
+        self.channel_buffer = channel_buffer;
+        self
+    }
+
+    pub fn resume(mut self, resume: bool) -> Self {
+        self.resume = resume;
+        self
+    }
+
+    pub fn piece_size(mut self, piece_size: u64) -> Self {
+        self.piece_size = piece_size;
+        self
+    }
+
+    pub fn min_split_size(mut self, min_split_size: u64) -> Self {
+        self.min_split_size = min_split_size;
+        self
+    }
+
+    pub fn max_retries(mut self, max_retries: u32) -> Self {
+        self.max_retries = max_retries;
+        self
+    }
+
+    pub fn retry_base_delay(mut self, retry_base_delay: Duration) -> Self {
+        self.retry_base_delay = retry_base_delay;
+        self
+    }
+
+    pub fn retry_max_delay(mut self, retry_max_delay: Duration) -> Self {
+        self.retry_max_delay = retry_max_delay;
+        self
+    }
+
+    pub fn max_retry_elapsed(mut self, max_retry_elapsed: Duration) -> Self {
+        self.max_retry_elapsed = Some(max_retry_elapsed);
+        self
+    }
+
+    pub fn retry_policy(
+        mut self,
+        max_retries: u32,
+        retry_base_delay: Duration,
+        retry_max_delay: Duration,
+    ) -> Self {
+        self.max_retries = max_retries;
+        self.retry_base_delay = retry_base_delay;
+        self.retry_max_delay = retry_max_delay;
+        self
+    }
+
+    pub fn max_download_speed(mut self, max_download_speed: u64) -> Self {
+        self.max_download_speed = max_download_speed;
+        self
+    }
+
+    pub fn checksum(mut self, checksum: Checksum) -> Self {
+        self.checksum = Some(checksum);
+        self
+    }
+
+    pub fn validate(&self) -> Result<(), DownloadError> {
+        if self.url.trim().is_empty() {
+            return Err(DownloadError::InvalidConfig("url cannot be empty".into()));
+        }
+        if self.max_connections == 0 {
+            return Err(DownloadError::InvalidConfig(
+                "max_connections must be >= 1".into(),
+            ));
+        }
+        if self.memory_budget == 0 {
+            return Err(DownloadError::InvalidConfig(
+                "memory_budget must be >= 1".into(),
+            ));
+        }
+        if self.channel_buffer == 0 {
+            return Err(DownloadError::InvalidConfig(
+                "channel_buffer must be >= 1".into(),
+            ));
+        }
+        if self.piece_size == 0 {
+            return Err(DownloadError::InvalidConfig("piece_size must be >= 1".into()));
+        }
+        if self.min_split_size == 0 {
+            return Err(DownloadError::InvalidConfig(
+                "min_split_size must be >= 1".into(),
+            ));
+        }
+        if self.retry_base_delay > self.retry_max_delay {
+            return Err(DownloadError::InvalidConfig(
+                "retry_base_delay cannot exceed retry_max_delay".into(),
+            ));
+        }
+        if let Some(Checksum::Sha256(value)) = &self.checksum {
+            if value.trim().is_empty() {
+                return Err(DownloadError::InvalidConfig(
+                    "checksum value cannot be empty".into(),
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -192,6 +407,7 @@ mod tests {
         assert_eq!(spec.piece_size, 1024 * 1024);
         assert_eq!(spec.min_split_size, 10 * 1024 * 1024);
         assert_eq!(spec.max_retries, 5);
+        assert_eq!(spec.max_retry_elapsed, None);
         assert_eq!(spec.max_download_speed, 0);
         assert!(spec.checksum.is_none());
         assert!(spec.headers.is_empty());
@@ -204,6 +420,73 @@ mod tests {
             .output_path("nested/file.bin");
         assert_eq!(spec.output_dir, Some(PathBuf::from("/tmp")));
         assert_eq!(spec.output_path, Some(PathBuf::from("nested/file.bin")));
+    }
+
+    #[test]
+    fn test_download_spec_configuration_builders() {
+        let mut headers = HashMap::new();
+        headers.insert("Authorization".into(), "Bearer token".into());
+
+        let spec = DownloadSpec::new("https://example.com/file")
+            .headers(headers.clone())
+            .max_connections(8)
+            .connect_timeout(Duration::from_secs(10))
+            .read_timeout(Duration::from_secs(20))
+            .memory_budget(1024)
+            .file_allocation(FileAllocation::None)
+            .channel_buffer(8)
+            .resume(false)
+            .piece_size(2048)
+            .min_split_size(4096)
+            .retry_policy(7, Duration::from_millis(10), Duration::from_millis(50))
+            .max_retry_elapsed(Duration::from_secs(3))
+            .max_download_speed(12345)
+            .checksum(Checksum::Sha256("abc123".into()));
+
+        assert_eq!(spec.headers, headers);
+        assert_eq!(spec.max_connections, 8);
+        assert_eq!(spec.connect_timeout, Duration::from_secs(10));
+        assert_eq!(spec.read_timeout, Duration::from_secs(20));
+        assert_eq!(spec.memory_budget, 1024);
+        assert_eq!(spec.file_allocation, FileAllocation::None);
+        assert_eq!(spec.channel_buffer, 8);
+        assert!(!spec.resume);
+        assert_eq!(spec.piece_size, 2048);
+        assert_eq!(spec.min_split_size, 4096);
+        assert_eq!(spec.max_retries, 7);
+        assert_eq!(spec.retry_base_delay, Duration::from_millis(10));
+        assert_eq!(spec.retry_max_delay, Duration::from_millis(50));
+        assert_eq!(spec.max_retry_elapsed, Some(Duration::from_secs(3)));
+        assert_eq!(spec.max_download_speed, 12345);
+        assert!(matches!(spec.checksum, Some(Checksum::Sha256(ref value)) if value == "abc123"));
+    }
+
+    #[test]
+    fn test_download_spec_validate_rejects_invalid_values() {
+        let err = DownloadSpec::new("https://example.com/file")
+            .max_connections(0)
+            .validate()
+            .unwrap_err();
+        assert!(err.to_string().contains("max_connections"));
+
+        let err = DownloadSpec::new("https://example.com/file")
+            .retry_policy(1, Duration::from_secs(5), Duration::from_secs(1))
+            .validate()
+            .unwrap_err();
+        assert!(err.to_string().contains("retry_base_delay"));
+
+        let err = DownloadSpec::new("https://example.com/file")
+            .checksum(Checksum::Sha256("   ".into()))
+            .validate()
+            .unwrap_err();
+        assert!(err.to_string().contains("checksum"));
+    }
+
+    #[test]
+    fn test_download_spec_validate_accepts_defaults() {
+        DownloadSpec::new("https://example.com/file")
+            .validate()
+            .unwrap();
     }
 
     #[test]

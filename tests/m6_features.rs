@@ -23,11 +23,12 @@ async fn test_rate_limiting() {
     let out = dir.path().join("rate_limited.bin");
 
     // Limit to ~5 KB/s — should take at least 1.5s for 10 KB
-    let mut spec = DownloadSpec::new(format!("http://{addr}/file")).output_path(out.clone());
-    spec.max_connections = 1;
-    spec.file_allocation = FileAllocation::None;
-    spec.resume = false;
-    spec.max_download_speed = 5 * 1024; // 5 KB/s
+    let spec = DownloadSpec::new(format!("http://{addr}/file"))
+        .output_path(out.clone())
+        .max_connections(1)
+        .file_allocation(FileAllocation::None)
+        .resume(false)
+        .max_download_speed(5 * 1024);
 
     let dl = Downloader::builder().build().unwrap();
     let start = Instant::now();
@@ -57,11 +58,12 @@ async fn test_no_rate_limit_is_fast() {
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path().join("no_limit.bin");
 
-    let mut spec = DownloadSpec::new(format!("http://{addr}/file")).output_path(out.clone());
-    spec.max_connections = 1;
-    spec.file_allocation = FileAllocation::None;
-    spec.resume = false;
-    spec.max_download_speed = 0; // unlimited
+    let spec = DownloadSpec::new(format!("http://{addr}/file"))
+        .output_path(out.clone())
+        .max_connections(1)
+        .file_allocation(FileAllocation::None)
+        .resume(false)
+        .max_download_speed(0);
 
     let dl = Downloader::builder().build().unwrap();
     let start = Instant::now();
@@ -92,11 +94,12 @@ async fn test_checksum_sha256_pass() {
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path().join("checksum_ok.bin");
 
-    let mut spec = DownloadSpec::new(format!("http://{addr}/file")).output_path(out.clone());
-    spec.max_connections = 1;
-    spec.file_allocation = FileAllocation::None;
-    spec.resume = false;
-    spec.checksum = Some(Checksum::Sha256(hex));
+    let spec = DownloadSpec::new(format!("http://{addr}/file"))
+        .output_path(out.clone())
+        .max_connections(1)
+        .file_allocation(FileAllocation::None)
+        .resume(false)
+        .checksum(Checksum::Sha256(hex));
 
     let dl = Downloader::builder().build().unwrap();
     let handle = dl.download(spec);
@@ -118,13 +121,14 @@ async fn test_checksum_sha256_fail() {
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path().join("checksum_bad.bin");
 
-    let mut spec = DownloadSpec::new(format!("http://{addr}/file")).output_path(out.clone());
-    spec.max_connections = 1;
-    spec.file_allocation = FileAllocation::None;
-    spec.resume = false;
-    spec.checksum = Some(Checksum::Sha256(
-        "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
-    ));
+    let spec = DownloadSpec::new(format!("http://{addr}/file"))
+        .output_path(out.clone())
+        .max_connections(1)
+        .file_allocation(FileAllocation::None)
+        .resume(false)
+        .checksum(Checksum::Sha256(
+            "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+        ));
 
     let dl = Downloader::builder().build().unwrap();
     let handle = dl.download(spec);

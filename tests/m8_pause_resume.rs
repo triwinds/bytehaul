@@ -121,8 +121,9 @@ async fn test_pause_resume_single_connection() {
     let ctrl_path = output_path.with_file_name("pause-single.bin.bytehaul");
 
     let downloader = Downloader::builder().build().unwrap();
-    let mut spec = DownloadSpec::new(format!("http://{addr}/pause-single")).output_path(output_path.clone());
-    spec.file_allocation = FileAllocation::None;
+    let spec = DownloadSpec::new(format!("http://{addr}/pause-single"))
+        .output_path(output_path.clone())
+        .file_allocation(FileAllocation::None);
 
     let handle = downloader.download(spec.clone());
     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
@@ -160,11 +161,12 @@ async fn test_pause_resume_multi_connection() {
     let ctrl_path = output_path.with_file_name("pause-multi.bin.bytehaul");
 
     let downloader = Downloader::builder().build().unwrap();
-    let mut spec = DownloadSpec::new(format!("http://{addr}/pause-multi")).output_path(output_path.clone());
-    spec.file_allocation = FileAllocation::Prealloc;
-    spec.max_connections = 4;
-    spec.piece_size = 1024 * 1024;
-    spec.min_split_size = 10 * 1024 * 1024;
+    let spec = DownloadSpec::new(format!("http://{addr}/pause-multi"))
+        .output_path(output_path.clone())
+        .file_allocation(FileAllocation::Prealloc)
+        .max_connections(4)
+        .piece_size(1024 * 1024)
+        .min_split_size(10 * 1024 * 1024);
 
     let handle = downloader.download(spec.clone());
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;

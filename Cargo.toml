@@ -1,6 +1,6 @@
 [package]
 name = "bytehaul"
-version = "0.1.2"
+version.workspace = true
 edition = "2021"
 description = "Async HTTP download library with resume, multi-connection, rate limiting, and checksum verification"
 license = "MIT"
@@ -21,6 +21,9 @@ exclude = [
 [workspace]
 members = ["bindings/python"]
 resolver = "2"
+
+[workspace.package]
+version = "0.1.2"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tarpaulin)'] }

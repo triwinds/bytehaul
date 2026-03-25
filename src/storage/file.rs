@@ -35,7 +35,7 @@ pub(crate) async fn create_output_file(
         Ok(file)
     })
     .await
-    .map_err(|e| DownloadError::Other(format!("spawn_blocking join error: {e}")))??;
+    .map_err(|e| DownloadError::TaskFailed(format!("spawn_blocking join error: {e}")))??;
 
     Ok(tokio::fs::File::from_std(std_file))
 }

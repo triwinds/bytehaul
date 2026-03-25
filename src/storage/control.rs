@@ -37,7 +37,7 @@ impl ControlSnapshot {
         let path = control_path.to_path_buf();
         tokio::task::spawn_blocking(move || save_sync(&snapshot, &path))
             .await
-            .map_err(|e| DownloadError::Other(format!("spawn_blocking: {e}")))?
+            .map_err(|e| DownloadError::TaskFailed(format!("spawn_blocking: {e}")))?
     }
 
     /// Load and validate a control snapshot from disk.
@@ -46,7 +46,7 @@ impl ControlSnapshot {
         let path = control_path.to_path_buf();
         tokio::task::spawn_blocking(move || load_sync(&path))
             .await
-            .map_err(|e| DownloadError::Other(format!("spawn_blocking: {e}")))?
+            .map_err(|e| DownloadError::TaskFailed(format!("spawn_blocking: {e}")))?
     }
 
     /// Delete the control file if it exists.
@@ -64,7 +64,7 @@ fn save_sync(snapshot: &ControlSnapshot, path: &Path) -> Result<(), DownloadErro
     use std::io::Write;
 
     let payload = bincode::serialize(snapshot)
-        .map_err(|e| DownloadError::Other(format!("serialize: {e}")))?;
+        .map_err(|e| DownloadError::Internal(format!("control file serialize failed: {e}")))?;
     let checksum = crc32fast::hash(&payload);
 
     let tmp_path = path.with_extension("bytehaul.tmp");

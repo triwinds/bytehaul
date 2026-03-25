@@ -101,10 +101,27 @@ impl Downloader {
     pub fn download(&self, spec: DownloadSpec) -> DownloadHandle {
         let (progress_tx, progress_rx) = watch::channel(ProgressSnapshot::default());
         let (cancel_tx, cancel_rx) = watch::channel(session::StopSignal::Running);
-        let shared_client = self.client.clone();
-        let client_config = self.client_config.clone();
         let log_level = self.log_level;
         let download_id = next_download_id();
+
+        if let Err(error) = spec.validate() {
+            log_error!(
+                log_level,
+                download_id,
+                url = %spec.url,
+                error = %error,
+                "download task rejected due to invalid configuration"
+            );
+            let task = tokio::spawn(async move { Err(error) });
+            return DownloadHandle {
+                progress_rx,
+                cancel_tx,
+                task,
+            };
+        }
+
+        let shared_client = self.client.clone();
+        let client_config = self.client_config.clone();
         let output = spec
             .output_path
             .as_ref()
@@ -173,7 +190,7 @@ impl DownloadHandle {
     pub async fn wait(self) -> Result<(), DownloadError> {
         match self.task.await {
             Ok(result) => result,
-            Err(e) => Err(DownloadError::Other(format!("task panicked: {e}"))),
+            Err(e) => Err(DownloadError::TaskFailed(format!("task panicked: {e}"))),
         }
     }
 }
@@ -250,6 +267,18 @@ mod tests {
         handle.cancel();
         let result = handle.wait().await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_download_rejects_invalid_spec_before_network_work() {
+        let downloader = Downloader::builder().build().unwrap();
+        let spec = crate::config::DownloadSpec::new("http://127.0.0.1:1/nonexistent")
+            .output_path(std::env::temp_dir().join("bytehaul_test_invalid_spec"))
+            .max_connections(0);
+
+        let handle = downloader.download(spec);
+        let err = handle.wait().await.unwrap_err();
+        assert!(matches!(err, crate::error::DownloadError::InvalidConfig(message) if message.contains("max_connections")));
     }
 
     #[test]

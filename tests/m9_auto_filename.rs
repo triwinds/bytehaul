@@ -21,8 +21,9 @@ async fn test_auto_filename_uses_content_disposition() {
 
     let dir = tempfile::tempdir().unwrap();
     let downloader = Downloader::builder().build().unwrap();
-    let mut spec = DownloadSpec::new(format!("http://{addr}/attachment")).output_dir(dir.path());
-    spec.file_allocation = FileAllocation::None;
+    let spec = DownloadSpec::new(format!("http://{addr}/attachment"))
+        .output_dir(dir.path())
+        .file_allocation(FileAllocation::None);
 
     let handle = downloader.download(spec);
     handle.wait().await.unwrap();
@@ -46,8 +47,9 @@ async fn test_auto_filename_falls_back_to_url_path() {
 
     let dir = tempfile::tempdir().unwrap();
     let downloader = Downloader::builder().build().unwrap();
-    let mut spec = DownloadSpec::new(format!("http://{addr}/files/report.bin")).output_dir(dir.path());
-    spec.file_allocation = FileAllocation::None;
+    let spec = DownloadSpec::new(format!("http://{addr}/files/report.bin"))
+        .output_dir(dir.path())
+        .file_allocation(FileAllocation::None);
 
     let handle = downloader.download(spec);
     handle.wait().await.unwrap();
@@ -72,10 +74,10 @@ async fn test_output_dir_and_relative_output_path_are_combined() {
     let dir = tempfile::tempdir().unwrap();
     let output_path = dir.path().join("nested").join("custom.bin");
     let downloader = Downloader::builder().build().unwrap();
-    let mut spec = DownloadSpec::new(format!("http://{addr}/nested-output"))
+    let spec = DownloadSpec::new(format!("http://{addr}/nested-output"))
         .output_dir(dir.path())
-        .output_path("nested/custom.bin");
-    spec.file_allocation = FileAllocation::None;
+        .output_path("nested/custom.bin")
+        .file_allocation(FileAllocation::None);
 
     let handle = downloader.download(spec);
     handle.wait().await.unwrap();
@@ -153,9 +155,10 @@ async fn test_auto_filename_resume_after_pause() {
     let output_path = dir.path().join("resume-auto.bin");
     let control_path = output_path.with_file_name("resume-auto.bin.bytehaul");
     let downloader = Downloader::builder().build().unwrap();
-    let mut spec = DownloadSpec::new(format!("http://{addr}/resume-auto")).output_dir(dir.path());
-    spec.file_allocation = FileAllocation::None;
-    spec.max_connections = 1;
+    let spec = DownloadSpec::new(format!("http://{addr}/resume-auto"))
+        .output_dir(dir.path())
+        .file_allocation(FileAllocation::None)
+        .max_connections(1);
 
     let handle = downloader.download(spec.clone());
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
@@ -187,8 +190,9 @@ async fn test_auto_filename_defaults_to_download() {
 
     let dir = tempfile::tempdir().unwrap();
     let downloader = Downloader::builder().build().unwrap();
-    let mut spec = DownloadSpec::new(format!("http://{addr}/")).output_dir(dir.path());
-    spec.file_allocation = FileAllocation::None;
+    let spec = DownloadSpec::new(format!("http://{addr}/"))
+        .output_dir(dir.path())
+        .file_allocation(FileAllocation::None);
 
     let handle = downloader.download(spec);
     handle.wait().await.unwrap();

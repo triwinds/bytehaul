@@ -71,6 +71,7 @@ async fn retry_with_backoff<F, Fut, T>(
     max_retries: u32,
     base_delay: Duration,
     max_delay: Duration,
+    max_retry_elapsed: Option<Duration>,
     cancel_rx: &mut watch::Receiver<StopSignal>,
     mut op: F,
 ) -> Result<T, DownloadError>
@@ -79,6 +80,7 @@ where
     Fut: std::future::Future<Output = Result<T, DownloadError>>,
 {
     let mut attempt = 0u32;
+    let started_at = Instant::now();
     loop {
         match op().await {
             Ok(val) => return Ok(val),
@@ -86,6 +88,14 @@ where
                 if !e.is_retryable() || attempt >= max_retries {
                     return Err(e);
                 }
+
+                if let Some(limit) = max_retry_elapsed {
+                    let elapsed = started_at.elapsed();
+                    if elapsed >= limit {
+                        return Err(DownloadError::RetryBudgetExceeded { elapsed, limit });
+                    }
+                }
+
                 attempt += 1;
                 let backoff = if let Some(retry_secs) = e.retry_after_secs() {
                     Duration::from_secs(retry_secs)
@@ -94,6 +104,14 @@ where
                         .saturating_mul(1u32 << attempt.min(10))
                         .min(max_delay)
                 };
+
+                if let Some(limit) = max_retry_elapsed {
+                    let elapsed = started_at.elapsed();
+                    if elapsed.saturating_add(backoff) > limit {
+                        return Err(DownloadError::RetryBudgetExceeded { elapsed, limit });
+                    }
+                }
+
                 tokio::select! {
                     biased;
                     result = cancel_rx.changed() => {
@@ -136,19 +154,110 @@ fn resolve_static_output_path(spec: &DownloadSpec) -> Result<Option<PathBuf>, Do
     };
     if output_path.is_absolute() {
         if spec.output_dir.is_some() {
-            return Err(DownloadError::Other(
+            return Err(DownloadError::InvalidConfig(
                 "output_path must be relative when output_dir is set".into(),
             ));
         }
         return Ok(Some(output_path.clone()));
     }
     let relative = sanitize_relative_path(output_path).ok_or_else(|| {
-        DownloadError::Other(
+        DownloadError::InvalidConfig(
             "output_path must be a relative path without root prefixes or parent traversal"
                 .into(),
         )
     })?;
     Ok(Some(resolve_output_dir(spec)?.join(relative)))
+}
+
+async fn validate_local_resume_state(
+    output_path: &Path,
+    ctrl: &ControlSnapshot,
+    spec: &DownloadSpec,
+) -> Result<(), DownloadError> {
+    let metadata = tokio::fs::metadata(output_path).await.map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            DownloadError::ResumeMismatch("local download file is missing".into())
+        } else {
+            DownloadError::Io(error)
+        }
+    })?;
+
+    if ctrl.downloaded_bytes > ctrl.total_size {
+        return Err(DownloadError::ResumeMismatch(
+            "control file records more bytes than total_size".into(),
+        ));
+    }
+
+    let actual_len = metadata.len();
+    let is_multi = ctrl.piece_count > 1 && spec.max_connections > 1;
+    let preallocated = matches!(spec.file_allocation, crate::config::FileAllocation::Prealloc);
+
+    if is_multi {
+        let piece_map = PieceMap::from_bitset(
+            ctrl.total_size,
+            ctrl.piece_size,
+            &ctrl.completed_bitset,
+            ctrl.piece_count,
+        );
+        let completed_bytes = piece_map.completed_bytes();
+        if completed_bytes > ctrl.downloaded_bytes {
+            return Err(DownloadError::ResumeMismatch(
+                "control file marks more completed bytes than downloaded_bytes".into(),
+            ));
+        }
+
+        if preallocated {
+            if actual_len != ctrl.total_size {
+                return Err(DownloadError::ResumeMismatch(format!(
+                    "preallocated resume file size mismatch: expected {} bytes, found {}",
+                    ctrl.total_size, actual_len
+                )));
+            }
+            return Ok(());
+        }
+
+        let mut min_len = 0u64;
+        for piece_id in (0..piece_map.piece_count()).rev() {
+            if piece_map.is_complete(piece_id) {
+                min_len = piece_map.piece_range(piece_id).1;
+                break;
+            }
+        }
+
+        if actual_len < min_len {
+            return Err(DownloadError::ResumeMismatch(format!(
+                "resume file is truncated: expected at least {} bytes from completed pieces, found {}",
+                min_len, actual_len
+            )));
+        }
+        if actual_len > ctrl.total_size {
+            return Err(DownloadError::ResumeMismatch(format!(
+                "resume file is larger than expected total size: expected at most {} bytes, found {}",
+                ctrl.total_size, actual_len
+            )));
+        }
+        if ctrl.downloaded_bytes > actual_len {
+            return Err(DownloadError::ResumeMismatch(format!(
+                "control file records {} downloaded bytes but local file only has {} bytes",
+                ctrl.downloaded_bytes, actual_len
+            )));
+        }
+        return Ok(());
+    }
+
+    let expected_len = if preallocated {
+        ctrl.total_size
+    } else {
+        ctrl.downloaded_bytes
+    };
+    if actual_len != expected_len {
+        return Err(DownloadError::ResumeMismatch(format!(
+            "resume file size mismatch: expected {} bytes, found {}",
+            expected_len, actual_len
+        )));
+    }
+
+    Ok(())
 }
 
 fn resolve_auto_output_path(
@@ -195,6 +304,17 @@ async fn try_resume_download(
     if let Some(ctrl) = resume_ctrl {
         let is_multi = ctrl.piece_count > 1 && spec.max_connections > 1;
 
+        if let Err(error) = validate_local_resume_state(output_path, &ctrl, spec).await {
+            log_warn!(
+                log_level,
+                download_id,
+                error = %error,
+                "local resume state rejected, restarting download"
+            );
+            let _ = ControlSnapshot::delete(&control_path).await;
+            return Ok(None);
+        }
+
         if is_multi {
             let piece_map = PieceMap::from_bitset(
                 ctrl.total_size,
@@ -208,6 +328,7 @@ async fn try_resume_download(
                     spec.max_retries,
                     spec.retry_base_delay,
                     spec.retry_max_delay,
+                    spec.max_retry_elapsed,
                     cancel_rx,
                     || worker.send_range(start, end - 1),
                 )
@@ -250,6 +371,7 @@ async fn try_resume_download(
                 spec.max_retries,
                 spec.retry_base_delay,
                 spec.retry_max_delay,
+                spec.max_retry_elapsed,
                 cancel_rx,
                 || worker.send_range(ctrl.downloaded_bytes, ctrl.total_size - 1),
             )
@@ -499,6 +621,7 @@ async fn run_download_inner(
                     spec.max_retries,
                     spec.retry_base_delay,
                     spec.retry_max_delay,
+                    spec.max_retry_elapsed,
                     &mut cancel_rx,
                     || worker.send_get(),
                 )
@@ -523,6 +646,7 @@ async fn run_download_inner(
                 spec.max_retries,
                 spec.retry_base_delay,
                 spec.retry_max_delay,
+                spec.max_retry_elapsed,
                 &mut cancel_rx,
                 || worker.send_get(),
             )
@@ -553,6 +677,7 @@ async fn run_download_inner(
                     spec.max_retries,
                     spec.retry_base_delay,
                     spec.retry_max_delay,
+                    spec.max_retry_elapsed,
                     &mut cancel_rx,
                     || worker.send_get(),
                 )
@@ -565,6 +690,7 @@ async fn run_download_inner(
             spec.max_retries,
             spec.retry_base_delay,
             spec.retry_max_delay,
+            spec.max_retry_elapsed,
             &mut cancel_rx,
             || worker.send_get(),
         )
@@ -682,7 +808,7 @@ async fn run_single_connection(
     drop(write_tx);
     let writer_result = writer_handle
         .await
-        .map_err(|e| DownloadError::Other(format!("writer panicked: {e}")))?;
+        .map_err(|e| DownloadError::TaskFailed(format!("writer panicked: {e}")))?;
 
     if let Err(ref e) = stream_result {
         if use_control {
@@ -784,7 +910,7 @@ async fn stream_single(
                         let permit = budget
                             .acquire_many(len as u32)
                             .await
-                            .map_err(|_| DownloadError::Other("budget semaphore closed".into()))?;
+                            .map_err(|_| DownloadError::Internal("budget semaphore closed".into()))?;
 
                         let offset = downloaded;
                         downloaded += len as u64;
@@ -922,6 +1048,7 @@ async fn run_multi_worker(
             spec.max_retries,
             spec.retry_base_delay,
             spec.retry_max_delay,
+            spec.max_retry_elapsed,
             scheduler.clone(),
             write_tx.clone(),
             downloaded.clone(),
@@ -1020,7 +1147,7 @@ async fn run_multi_worker(
                         if !join_err.is_cancelled() {
                             log_error!(log_level, download_id = download_id,
                                 error = %join_err, "worker panicked");
-                            download_error = Some(DownloadError::Other(
+                            download_error = Some(DownloadError::TaskFailed(
                                 format!("worker panicked: {join_err}"),
                             ));
                         }
@@ -1045,7 +1172,7 @@ async fn run_multi_worker(
     // Wait for writer
     let writer_result = writer_handle
         .await
-        .map_err(|e| DownloadError::Other(format!("writer panicked: {e}")))?;
+        .map_err(|e| DownloadError::TaskFailed(format!("writer panicked: {e}")))?;
 
     if let Some(e) = download_error {
         if spec.resume {
@@ -1062,7 +1189,7 @@ async fn run_multi_worker(
             save_multi_control(spec, meta, &scheduler, total_size, control_path, None).await;
         }
         log_error!(log_level, download_id = download_id, "multi-worker download incomplete");
-        return Err(DownloadError::Other("download incomplete".into()));
+        return Err(DownloadError::Internal("download incomplete".into()));
     }
 
     let _ = ControlSnapshot::delete(control_path).await;
@@ -1130,6 +1257,7 @@ async fn worker_loop(
     max_retries: u32,
     retry_base_delay: Duration,
     retry_max_delay: Duration,
+    max_retry_elapsed: Option<Duration>,
     scheduler: Scheduler,
     write_tx: mpsc::Sender<WriterCommand>,
     downloaded: Arc<AtomicU64>,
@@ -1169,6 +1297,7 @@ async fn worker_loop(
             piece_id = segment.piece_id, "assigned piece");
 
         let mut attempt = 0u32;
+    let retry_started_at = Instant::now();
 
         loop {
             let result = if let Some((resp, pid)) = first_response.take() {
@@ -1231,6 +1360,14 @@ async fn worker_loop(
                         return Err(e);
                     }
 
+                    if let Some(limit) = max_retry_elapsed {
+                        let elapsed = retry_started_at.elapsed();
+                        if elapsed >= limit {
+                            scheduler.lock().reclaim(segment.piece_id);
+                            return Err(DownloadError::RetryBudgetExceeded { elapsed, limit });
+                        }
+                    }
+
                     attempt += 1;
 
                     // Compute backoff delay
@@ -1240,6 +1377,14 @@ async fn worker_loop(
                         let exp = retry_base_delay.saturating_mul(1u32 << attempt.min(10));
                         exp.min(retry_max_delay)
                     };
+
+                    if let Some(limit) = max_retry_elapsed {
+                        let elapsed = retry_started_at.elapsed();
+                        if elapsed.saturating_add(backoff) > limit {
+                            scheduler.lock().reclaim(segment.piece_id);
+                            return Err(DownloadError::RetryBudgetExceeded { elapsed, limit });
+                        }
+                    }
 
                     log_warn!(log_level, download_id = download_id, worker_id = worker_id,
                         piece_id = segment.piece_id, attempt = attempt, error = %e,
@@ -1396,7 +1541,7 @@ async fn stream_segment(
                         let permit = budget
                             .acquire_many(len as u32)
                             .await
-                            .map_err(|_| DownloadError::Other("budget semaphore closed".into()))?;
+                            .map_err(|_| DownloadError::Internal("budget semaphore closed".into()))?;
 
                         if write_tx.send(WriterCommand::Data {
                             offset,
@@ -1667,6 +1812,7 @@ mod tests {
             3,
             Duration::from_millis(10),
             Duration::from_millis(100),
+            None,
             &mut cancel_rx,
             || async { Ok(42) },
         )
@@ -1681,6 +1827,7 @@ mod tests {
             3,
             Duration::from_millis(10),
             Duration::from_millis(100),
+            None,
             &mut cancel_rx,
             || async { Err(DownloadError::Cancelled) },
         )
@@ -1699,6 +1846,7 @@ mod tests {
             3,
             Duration::from_millis(1),
             Duration::from_millis(10),
+            None,
             &mut cancel_rx,
             move || {
                 let attempts = attempts_clone.clone();
@@ -1727,6 +1875,7 @@ mod tests {
             2,
             Duration::from_millis(1),
             Duration::from_millis(10),
+            None,
             &mut cancel_rx,
             || async {
                 Err(DownloadError::HttpStatus {
@@ -1753,6 +1902,7 @@ mod tests {
             3,
             Duration::from_millis(1),
             Duration::from_millis(10),
+            None,
             &mut cancel_rx,
             move || {
                 let attempts = attempts_clone.clone();
@@ -1785,6 +1935,7 @@ mod tests {
             10,
             Duration::from_secs(10),
             Duration::from_secs(60),
+            None,
             &mut cancel_rx,
             || async {
                 Err(DownloadError::HttpStatus {
@@ -1809,6 +1960,7 @@ mod tests {
             10,
             Duration::from_secs(10),
             Duration::from_secs(60),
+            None,
             &mut cancel_rx,
             || async {
                 Err(DownloadError::HttpStatus {
@@ -1819,6 +1971,29 @@ mod tests {
         )
         .await;
         assert!(matches!(result, Err(DownloadError::Paused)));
+    }
+
+    #[tokio::test]
+    async fn test_retry_with_backoff_retry_budget_exhausted() {
+        let (_, mut cancel_rx) = watch::channel(StopSignal::Running);
+        let result: Result<i32, DownloadError> = retry_with_backoff(
+            10,
+            Duration::from_millis(25),
+            Duration::from_millis(25),
+            Some(Duration::from_millis(10)),
+            &mut cancel_rx,
+            || async {
+                Err(DownloadError::HttpStatus {
+                    status: 503,
+                    message: "Service Unavailable".into(),
+                })
+            },
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(DownloadError::RetryBudgetExceeded { .. })
+        ));
     }
 
     #[tokio::test]
