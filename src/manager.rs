@@ -197,6 +197,33 @@ impl DownloadHandle {
         self.progress_rx.clone()
     }
 
+    /// Register a progress callback that is invoked whenever the progress snapshot changes.
+    ///
+    /// The callback runs on a spawned tokio task and receives each new [`ProgressSnapshot`].
+    /// It continues until the download finishes (state becomes terminal) or the handle is dropped.
+    pub fn on_progress<F>(&self, callback: F)
+    where
+        F: Fn(ProgressSnapshot) + Send + 'static,
+    {
+        let mut rx = self.progress_rx.clone();
+        tokio::spawn(async move {
+            while rx.changed().await.is_ok() {
+                let snap = rx.borrow().clone();
+                let terminal = matches!(
+                    snap.state,
+                    crate::progress::DownloadState::Completed
+                        | crate::progress::DownloadState::Failed
+                        | crate::progress::DownloadState::Cancelled
+                        | crate::progress::DownloadState::Paused
+                );
+                callback(snap);
+                if terminal {
+                    break;
+                }
+            }
+        });
+    }
+
     /// Request cancellation of the download.
     pub fn cancel(&self) {
         let _ = self.cancel_tx.send(session::StopSignal::Cancel);
@@ -371,5 +398,39 @@ mod tests {
 
         let err = handle.wait().await.unwrap_err().to_string();
         assert!(err.contains("task panicked"));
+    }
+
+    #[tokio::test]
+    async fn test_on_progress_receives_updates() {
+        let (progress_tx, progress_rx) = watch::channel(ProgressSnapshot::default());
+        let (cancel_tx, _) = watch::channel(session::StopSignal::Running);
+
+        let task = tokio::spawn(async { Ok(()) });
+        let handle = DownloadHandle {
+            progress_rx,
+            cancel_tx,
+            task,
+        };
+
+        let received = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let received_clone = received.clone();
+        handle.on_progress(move |_snap| {
+            received_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+
+        // Send a progress update
+        let mut snap = ProgressSnapshot::default();
+        snap.state = crate::progress::DownloadState::Downloading;
+        snap.downloaded = 100;
+        progress_tx.send(snap).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Send a terminal update
+        let mut snap = ProgressSnapshot::default();
+        snap.state = crate::progress::DownloadState::Completed;
+        progress_tx.send(snap).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert!(received.load(std::sync::atomic::Ordering::Relaxed) >= 2);
     }
 }

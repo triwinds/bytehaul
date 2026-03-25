@@ -382,6 +382,22 @@ impl PyDownloadTask {
         }
     }
 
+    fn on_progress(&self, callback: PyObject) -> PyResult<()> {
+        let guard = self.handle.lock().unwrap();
+        let handle = guard
+            .as_ref()
+            .ok_or_else(|| BytehaulError::new_err("task already consumed by wait()"))?;
+        handle.on_progress(move |snap| {
+            Python::with_gil(|py| {
+                let py_snap = snapshot_to_py(&snap);
+                if let Err(err) = callback.call1(py, (py_snap,)) {
+                    err.write_unraisable(py, None);
+                }
+            });
+        });
+        Ok(())
+    }
+
     fn wait(&self, py: Python<'_>) -> PyResult<()> {
         let handle = {
             let mut guard = self.handle.lock().unwrap();
