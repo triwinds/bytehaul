@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use bitvec::prelude::*;
 
 /// Tracks piece-level completion state for a download.
-pub(crate) struct PieceMap {
+pub struct PieceMap {
     piece_size: u64,
     total_size: u64,
     piece_count: usize,

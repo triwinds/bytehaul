@@ -10,7 +10,7 @@ const HEADER_SIZE: usize = 16; // magic(4) + version(4) + payload_len(4) + check
 
 /// Control file snapshot for resume support.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct ControlSnapshot {
+pub struct ControlSnapshot {
     pub url: String,
     pub total_size: u64,
     pub piece_size: u64,

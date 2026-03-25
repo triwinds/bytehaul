@@ -6,7 +6,7 @@ use bytes::{Bytes, BytesMut};
 ///
 /// Data is stored per piece, and within each piece by contiguous byte ranges.
 /// Adjacent or overlapping writes are merged to reduce the number of disk I/O operations.
-pub(crate) struct WriteBackCache {
+pub struct WriteBackCache {
     /// Cached entries keyed by piece_id.
     pieces: BTreeMap<usize, PieceCacheEntry>,
     /// Total bytes currently held in the cache.
@@ -20,7 +20,7 @@ struct PieceCacheEntry {
 }
 
 /// A contiguous block of data ready to be flushed to disk.
-pub(crate) struct FlushBlock {
+pub struct FlushBlock {
     pub offset: u64,
     pub data: Bytes,
 }
