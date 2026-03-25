@@ -14,8 +14,9 @@ async fn test_basic_download() {
     let output_path = dir.path().join("downloaded.bin");
 
     let downloader = Downloader::builder().build().unwrap();
-    let mut spec = DownloadSpec::new(format!("http://{addr}/testfile")).output_path(output_path.clone());
-    spec.file_allocation = FileAllocation::None;
+    let spec = DownloadSpec::new(format!("http://{addr}/testfile"))
+        .output_path(output_path.clone())
+        .file_allocation(FileAllocation::None);
 
     let handle = downloader.download(spec);
     handle.wait().await.unwrap();
@@ -37,8 +38,9 @@ async fn test_download_with_prealloc() {
     let output_path = dir.path().join("prealloc.bin");
 
     let downloader = Downloader::builder().build().unwrap();
-    let mut spec = DownloadSpec::new(format!("http://{addr}/preallocfile")).output_path(output_path.clone());
-    spec.file_allocation = FileAllocation::Prealloc;
+    let spec = DownloadSpec::new(format!("http://{addr}/preallocfile"))
+        .output_path(output_path.clone())
+        .file_allocation(FileAllocation::Prealloc);
 
     let handle = downloader.download(spec);
     handle.wait().await.unwrap();
@@ -60,8 +62,9 @@ async fn test_download_progress_reports() {
     let output_path = dir.path().join("progress.bin");
 
     let downloader = Downloader::builder().build().unwrap();
-    let mut spec = DownloadSpec::new(format!("http://{addr}/progressfile")).output_path(output_path.clone());
-    spec.file_allocation = FileAllocation::None;
+    let spec = DownloadSpec::new(format!("http://{addr}/progressfile"))
+        .output_path(output_path.clone())
+        .file_allocation(FileAllocation::None);
 
     let handle = downloader.download(spec);
     let mut rx = handle.subscribe_progress();
@@ -101,8 +104,9 @@ async fn test_single_connection_eta_reports() {
     let output_path = dir.path().join("eta.bin");
 
     let downloader = Downloader::builder().build().unwrap();
-    let mut spec = DownloadSpec::new(format!("http://{addr}/etafile")).output_path(output_path.clone());
-    spec.file_allocation = FileAllocation::None;
+    let spec = DownloadSpec::new(format!("http://{addr}/etafile"))
+        .output_path(output_path.clone())
+        .file_allocation(FileAllocation::None);
 
     let handle = downloader.download(spec);
     let mut rx = handle.subscribe_progress();
@@ -148,8 +152,9 @@ async fn test_download_cancel() {
     let output_path = dir.path().join("cancelled.bin");
 
     let downloader = Downloader::builder().build().unwrap();
-    let mut spec = DownloadSpec::new(format!("http://{addr}/slowfile")).output_path(output_path.clone());
-    spec.file_allocation = FileAllocation::None;
+    let spec = DownloadSpec::new(format!("http://{addr}/slowfile"))
+        .output_path(output_path.clone())
+        .file_allocation(FileAllocation::None);
 
     let handle = downloader.download(spec);
 
@@ -176,8 +181,9 @@ async fn test_download_404() {
     let output_path = dir.path().join("missing.bin");
 
     let downloader = Downloader::builder().build().unwrap();
-    let mut spec = DownloadSpec::new(format!("http://{addr}/missing")).output_path(output_path.clone());
-    spec.file_allocation = FileAllocation::None;
+    let spec = DownloadSpec::new(format!("http://{addr}/missing"))
+        .output_path(output_path.clone())
+        .file_allocation(FileAllocation::None);
 
     let handle = downloader.download(spec);
     let result = handle.wait().await;
@@ -200,8 +206,9 @@ async fn test_basic_download_with_logging() {
         .log_level(LogLevel::Debug)
         .build()
         .unwrap();
-    let mut spec = DownloadSpec::new(format!("http://{addr}/logtest")).output_path(output_path.clone());
-    spec.file_allocation = FileAllocation::None;
+    let spec = DownloadSpec::new(format!("http://{addr}/logtest"))
+        .output_path(output_path.clone())
+        .file_allocation(FileAllocation::None);
 
     let handle = downloader.download(spec);
     handle.wait().await.unwrap();

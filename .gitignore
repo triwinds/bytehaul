@@ -44,3 +44,4 @@ dist/
 /.py-install/
 /.tmp/
 /.wheelhouse/
+.ace-tool/

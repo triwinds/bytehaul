@@ -1,0 +1,4 @@
+interface:
+  display_name: "Plan-Driven Implementation"
+  short_description: "Implement work from a tracked markdown plan"
+  default_prompt: "Use $plan-driven-implementation with `plan=docs/private/your-plan.md` and finish all remaining phases in the plan, updating the plan after each completed phase. Use `phase=...` only when you intentionally want to limit scope."
