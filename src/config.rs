@@ -10,9 +10,10 @@ use crate::error::DownloadError;
 /// When set to a non-`Off` value, log events up to and including that level
 /// will be produced via the `tracing` crate. A subscriber must be installed
 /// by the application (or the Python binding) to actually see the output.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub enum LogLevel {
     /// No logging.
+    #[default]
     Off = 0,
     /// Errors only.
     Error = 1,
@@ -26,11 +27,7 @@ pub enum LogLevel {
     Trace = 5,
 }
 
-impl Default for LogLevel {
-    fn default() -> Self {
-        LogLevel::Off
-    }
-}
+
 
 impl std::fmt::Display for LogLevel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -90,18 +87,13 @@ impl LogLevel {
 }
 
 /// File allocation strategy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FileAllocation {
     /// No pre-allocation; file grows as data is written.
     None,
     /// Pre-allocate the full file size by writing zeros before downloading.
+    #[default]
     Prealloc,
-}
-
-impl Default for FileAllocation {
-    fn default() -> Self {
-        FileAllocation::Prealloc
-    }
 }
 
 /// Checksum algorithm for post-download verification.

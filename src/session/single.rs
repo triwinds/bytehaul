@@ -124,6 +124,7 @@ pub(super) async fn run_single_connection(
 }
 
 /// Stream a single HTTP response body to the writer channel.
+#[allow(clippy::too_many_arguments)]
 async fn stream_single(
     response: reqwest::Response,
     write_tx: &mpsc::Sender<WriterCommand>,

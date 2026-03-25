@@ -58,7 +58,7 @@ pub(crate) fn filename_from_url(url: &str) -> Option<String> {
     let parsed = reqwest::Url::parse(url).ok()?;
     let segment = parsed
         .path_segments()
-        .and_then(|segments| segments.filter(|segment| !segment.is_empty()).next_back())?;
+        .and_then(|mut segments| segments.rfind(|segment: &&str| !segment.is_empty()))?;
     let decoded = percent_decode(segment)?;
     let sanitized = sanitize_filename_component(&decoded);
     if sanitized.is_empty() {

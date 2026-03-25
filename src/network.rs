@@ -185,8 +185,10 @@ mod tests {
 
     #[test]
     fn test_invalid_proxy_fails_client_build() {
-        let mut config = ClientNetworkConfig::default();
-        config.all_proxy = Some("not a proxy url".into());
+        let config = ClientNetworkConfig {
+            all_proxy: Some("not a proxy url".into()),
+            ..ClientNetworkConfig::default()
+        };
 
         let err = config.build_client().unwrap_err().to_string();
         assert!(err.contains("builder") || err.contains("URL"));
@@ -200,18 +202,22 @@ mod tests {
 
     #[test]
     fn test_build_client_accepts_http_and_https_proxies() {
-        let mut config = ClientNetworkConfig::default();
-        config.http_proxy = Some("http://127.0.0.1:8080".into());
-        config.https_proxy = Some("http://127.0.0.1:8443".into());
-        config.enable_ipv6 = false;
+        let config = ClientNetworkConfig {
+            http_proxy: Some("http://127.0.0.1:8080".into()),
+            https_proxy: Some("http://127.0.0.1:8443".into()),
+            enable_ipv6: false,
+            ..ClientNetworkConfig::default()
+        };
 
         config.build_client().unwrap();
     }
 
     #[test]
     fn test_build_dns_resolver_supports_system_and_custom_servers() {
-        let mut ipv4_only = ClientNetworkConfig::default();
-        ipv4_only.enable_ipv6 = false;
+        let ipv4_only = ClientNetworkConfig {
+            enable_ipv6: false,
+            ..ClientNetworkConfig::default()
+        };
         assert!(ipv4_only.build_dns_resolver().unwrap().is_some());
 
         let custom =

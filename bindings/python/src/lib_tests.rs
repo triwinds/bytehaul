@@ -12,7 +12,7 @@ use pyo3::types::PyModule;
 
 fn init_python() {
     static INIT: Once = Once::new();
-    INIT.call_once(|| pyo3::prepare_freethreaded_python());
+    INIT.call_once(pyo3::prepare_freethreaded_python);
 }
 
 fn with_python<T>(f: impl for<'py> FnOnce(Python<'py>) -> T) -> T {
