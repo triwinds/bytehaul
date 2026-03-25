@@ -99,8 +99,14 @@ pub enum FileAllocation {
 /// Checksum algorithm for post-download verification.
 #[derive(Debug, Clone)]
 pub enum Checksum {
-    /// SHA-256 digest (hex-encoded, lowercase).
+    /// SHA-256 digest (hex-encoded).
     Sha256(String),
+    /// SHA-1 digest (hex-encoded).
+    Sha1(String),
+    /// MD5 digest (hex-encoded).
+    Md5(String),
+    /// SHA-512 digest (hex-encoded).
+    Sha512(String),
 }
 
 /// Specification for a download task.
@@ -380,7 +386,10 @@ impl DownloadSpec {
                 "retry_base_delay cannot exceed retry_max_delay".into(),
             ));
         }
-        if let Some(Checksum::Sha256(value)) = &self.checksum {
+        if let Some(ref checksum) = self.checksum {
+            let value = match checksum {
+                Checksum::Sha256(v) | Checksum::Sha1(v) | Checksum::Md5(v) | Checksum::Sha512(v) => v,
+            };
             if value.trim().is_empty() {
                 return Err(DownloadError::InvalidConfig(
                     "checksum value cannot be empty".into(),

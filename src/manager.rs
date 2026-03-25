@@ -419,15 +419,19 @@ mod tests {
         });
 
         // Send a progress update
-        let mut snap = ProgressSnapshot::default();
-        snap.state = crate::progress::DownloadState::Downloading;
-        snap.downloaded = 100;
+        let snap = ProgressSnapshot {
+            state: crate::progress::DownloadState::Downloading,
+            downloaded: 100,
+            ..Default::default()
+        };
         progress_tx.send(snap).unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         // Send a terminal update
-        let mut snap = ProgressSnapshot::default();
-        snap.state = crate::progress::DownloadState::Completed;
+        let snap = ProgressSnapshot {
+            state: crate::progress::DownloadState::Completed,
+            ..Default::default()
+        };
         progress_tx.send(snap).unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
 

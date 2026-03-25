@@ -1,5 +1,4 @@
-use sha2::{Digest, Sha256};
-use tokio::io::AsyncReadExt;
+use sha2::{Digest, Sha256, Sha512};
 
 use crate::config::Checksum;
 use crate::error::DownloadError;
@@ -9,33 +8,56 @@ pub(crate) async fn verify_checksum(
     path: &std::path::Path,
     expected: &Checksum,
 ) -> Result<(), DownloadError> {
-    tracing::debug!(path = %path.display(), algorithm = "sha256", "starting checksum verification");
+    let algorithm = match expected {
+        Checksum::Sha256(_) => "sha256",
+        Checksum::Sha1(_) => "sha1",
+        Checksum::Md5(_) => "md5",
+        Checksum::Sha512(_) => "sha512",
+    };
+    tracing::debug!(path = %path.display(), algorithm, "starting checksum verification");
     let mut file = tokio::fs::File::open(path)
         .await
         .map_err(DownloadError::Io)?;
 
     match expected {
         Checksum::Sha256(expected_hex) => {
-            let mut hasher = Sha256::new();
-            let mut buf = vec![0u8; 64 * 1024];
-            loop {
-                let n = file.read(&mut buf).await.map_err(DownloadError::Io)?;
-                if n == 0 {
-                    break;
-                }
-                hasher.update(&buf[..n]);
-            }
-            let result = hasher.finalize();
-            let actual_hex = hex_encode(&result);
-            if actual_hex != expected_hex.to_ascii_lowercase() {
-                return Err(DownloadError::ChecksumMismatch {
-                    expected: expected_hex.clone(),
-                    actual: actual_hex,
-                });
-            }
-            Ok(())
+            hash_and_compare::<Sha256>(&mut file, expected_hex).await
+        }
+        Checksum::Sha512(expected_hex) => {
+            hash_and_compare::<Sha512>(&mut file, expected_hex).await
+        }
+        Checksum::Sha1(expected_hex) => {
+            hash_and_compare::<sha1::Sha1>(&mut file, expected_hex).await
+        }
+        Checksum::Md5(expected_hex) => {
+            hash_and_compare::<md5::Md5>(&mut file, expected_hex).await
         }
     }
+}
+
+async fn hash_and_compare<D: Digest + Default>(
+    file: &mut tokio::fs::File,
+    expected_hex: &str,
+) -> Result<(), DownloadError> {
+    use tokio::io::AsyncReadExt;
+    let mut hasher = D::default();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf).await.map_err(DownloadError::Io)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let result = hasher.finalize();
+    let actual_hex = hex_encode(&result);
+    if actual_hex != expected_hex.to_ascii_lowercase() {
+        return Err(DownloadError::ChecksumMismatch {
+            expected: expected_hex.to_string(),
+            actual: actual_hex,
+        });
+    }
+    Ok(())
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -107,5 +129,41 @@ mod tests {
         )
         .await;
         assert!(matches!(result, Err(DownloadError::Io(_))));
+    }
+
+    #[tokio::test]
+    async fn test_verify_checksum_sha1() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test_sha1.bin");
+        tokio::fs::write(&path, b"hello world").await.unwrap();
+        // SHA-1 of "hello world"
+        let expected = Checksum::Sha1(
+            "2aae6c35c94fcfb415dbe95f408b9ce91ee846ed".into(),
+        );
+        verify_checksum(&path, &expected).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_verify_checksum_md5() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test_md5.bin");
+        tokio::fs::write(&path, b"hello world").await.unwrap();
+        // MD5 of "hello world"
+        let expected = Checksum::Md5(
+            "5eb63bbbe01eeed093cb22bb8f5acdc3".into(),
+        );
+        verify_checksum(&path, &expected).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_verify_checksum_sha512() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test_sha512.bin");
+        tokio::fs::write(&path, b"hello world").await.unwrap();
+        // SHA-512 of "hello world"
+        let expected = Checksum::Sha512(
+            "309ecc489c12d6eb4cc40f50c902f2b4d0ed77ee511a7c7a9bcd3ca86d4cd86f989dd35bc5ff499670da34255b45b0cfd830e81f605dcf7dc5542e93ae9cd76f".into(),
+        );
+        verify_checksum(&path, &expected).await.unwrap();
     }
 }

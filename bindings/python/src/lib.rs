@@ -152,6 +152,25 @@ fn parse_log_level(value: &str) -> PyResult<LogLevel> {
     })
 }
 
+fn parse_checksum_string(value: &str) -> PyResult<Checksum> {
+    let (algo, hex) = value.split_once(':').ok_or_else(|| {
+        config_error("checksum must be in 'algorithm:hex_digest' format (e.g. 'sha256:abcdef...')")
+    })?;
+    let hex = hex.trim().to_string();
+    if hex.is_empty() {
+        return Err(config_error("checksum digest cannot be empty"));
+    }
+    match algo.to_ascii_lowercase().as_str() {
+        "sha256" => Ok(Checksum::Sha256(hex)),
+        "sha1" => Ok(Checksum::Sha1(hex)),
+        "md5" => Ok(Checksum::Md5(hex)),
+        "sha512" => Ok(Checksum::Sha512(hex)),
+        _ => Err(config_error(
+            "unsupported checksum algorithm; supported: sha256, sha1, md5, sha512",
+        )),
+    }
+}
+
 static TRACING_INIT: Once = Once::new();
 
 fn init_tracing(level: LogLevel) {
@@ -188,6 +207,7 @@ fn build_download_spec(
     max_retry_elapsed: Option<f64>,
     max_download_speed: Option<u64>,
     checksum_sha256: Option<String>,
+    checksum: Option<String>,
     control_save_interval: Option<f64>,
 ) -> PyResult<DownloadSpec> {
     let mut spec = DownloadSpec::new(url);
@@ -250,6 +270,10 @@ fn build_download_spec(
             return Err(config_error("checksum_sha256 cannot be empty"));
         }
         spec = spec.checksum(Checksum::Sha256(checksum_sha256));
+    }
+    if let Some(checksum) = checksum {
+        let checksum = checksum.trim().to_string();
+        spec = spec.checksum(parse_checksum_string(&checksum)?);
     }
     if let Some(interval) = control_save_interval {
         spec = spec.control_save_interval(duration_from_secs(
@@ -479,6 +503,7 @@ impl PyDownloader {
             max_retry_elapsed = None,
             max_download_speed = None,
             checksum_sha256 = None,
+            checksum = None,
             control_save_interval = None
         )
     )]
@@ -503,6 +528,7 @@ impl PyDownloader {
         max_retry_elapsed: Option<f64>,
         max_download_speed: Option<u64>,
         checksum_sha256: Option<String>,
+        checksum: Option<String>,
         control_save_interval: Option<f64>,
     ) -> PyResult<PyDownloadTask> {
         let spec = build_download_spec(
@@ -524,6 +550,7 @@ impl PyDownloader {
             max_retry_elapsed,
             max_download_speed,
             checksum_sha256,
+            checksum,
             control_save_interval,
         )?;
         let runtime = shared_runtime()?;
@@ -564,6 +591,7 @@ impl PyDownloader {
         max_retry_elapsed = None,
         max_download_speed = None,
         checksum_sha256 = None,
+        checksum = None,
         control_save_interval = None,
         log_level = None
     )
@@ -594,6 +622,7 @@ fn download(
     max_retry_elapsed: Option<f64>,
     max_download_speed: Option<u64>,
     checksum_sha256: Option<String>,
+    checksum: Option<String>,
     control_save_interval: Option<f64>,
     log_level: Option<String>,
 ) -> PyResult<()> {
@@ -621,6 +650,7 @@ fn download(
         max_retry_elapsed,
         max_download_speed,
         checksum_sha256,
+        checksum,
         control_save_interval,
     )?;
     let runtime = shared_runtime()?;
