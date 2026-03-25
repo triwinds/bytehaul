@@ -11,7 +11,9 @@
 use std::time::Duration;
 use bytehaul::{Checksum, DownloadSpec, FileAllocation};
 
-let mut spec = DownloadSpec::new("https://example.com/file.bin", "file.bin");
+let mut spec = DownloadSpec::new("https://example.com/file.bin")
+    .output_dir("downloads")
+    .output_path("file.bin");
 spec.max_connections = 8;                // 并发连接数
 spec.piece_size = 2 * 1024 * 1024;       // 分片大小：2 MiB
 spec.min_split_size = 10 * 1024 * 1024;  // 文件大于 10 MiB 时才拆分
@@ -24,6 +26,8 @@ spec.checksum = Some(Checksum::Sha256(
     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".into(),
 ));
 ```
+
+如果省略 `.output_path(...)`，bytehaul 会依次按 `Content-Disposition`、URL 路径最后一段、默认名 `download` 自动选择文件名。若未设置 `.output_dir(...)`，仍可继续直接传绝对输出路径。
 
 ## 网络层配置
 
@@ -53,17 +57,17 @@ use bytehaul::{DownloadSpec, DownloadState, Downloader};
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dl = Downloader::builder().build()?;
-    let handle = dl.download(DownloadSpec::new(
-        "https://example.com/file.bin", "file.bin"
-    ));
+    let handle = dl.download(
+        DownloadSpec::new("https://example.com/file.bin").output_path("file.bin")
+    );
 
     let mut rx = handle.subscribe_progress();
     tokio::spawn(async move {
         while rx.changed().await.is_ok() {
             let snap = rx.borrow().clone();
             println!(
-                "state={:?} downloaded={} speed={:.0} B/s",
-                snap.state, snap.downloaded, snap.speed_bytes_per_sec
+                "state={:?} downloaded={} speed={:.0} B/s eta={:?}",
+                snap.state, snap.downloaded, snap.speed_bytes_per_sec, snap.eta_secs
             );
         }
     });

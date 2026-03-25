@@ -237,6 +237,8 @@
 
 ## 三、文件名自动检测
 
+状态：已实现（2026-03-25）
+
 ### 3.1 现状
 
 - 当前 Rust API 要求显式提供 `output_path`：`DownloadSpec::new(url, output_path)`。
@@ -301,7 +303,7 @@
    - `output_dir = Some(dir)`：最终路径始终落在该目录下
    - `output_dir = None`：等价于使用当前工作目录
    - `output_path = Some(path)` 且 `output_dir = Some(dir)`：最终路径为 `dir.join(normalized_relative_output_path)`
-   - `output_path = Some(path)` 且 `output_dir = None`：最终路径为 `cwd.join(normalized_relative_output_path)`
+   - `output_path = Some(path)` 且 `output_dir = None`：最终路径默认为 `cwd.join(normalized_relative_output_path)`；为了兼容既有调用方，实现上也接受绝对 `output_path`
    - `output_path = None` 且 `output_dir = Some(dir)`：最终路径为 `dir.join(detected_filename)`
    - `output_path = None` 且 `output_dir = None`：最终路径为 `cwd.join(detected_filename)`
    - 若 `output_path` 含有根路径、盘符或目录穿越片段，需要在解析阶段拒绝或归一化为安全的相对路径；文档与实现需固定一致策略
@@ -526,5 +528,17 @@ P2       文件名自动检测            中-高       需梳理启动顺序与
 | 自动文件名与当前 resume 流程存在先后依赖冲突 | 明确区分显式输出名和自动文件名两条启动路径，引入统一的 `resolved_output_path` 解析阶段，必要时重排 `run_download_inner(...)` |
 | 自动文件名模式下服务器返回不同 `Content-Disposition` 导致控制文件遗弃 | 在 `ControlSnapshot` 中新增 `resolved_filename` 字段，resume 时校验文件名一致性，不匹配则丢弃控制文件重新开始 |
 | `output_path: Option<PathBuf>` + `output_dir` 是公开 API 变更，且 `output_path` 名称容易让人误解成完整路径 | 在 Rust/Python 文档中固定语义：`output_dir` 对齐 aria2 `--dir`，`output_path` 对齐 aria2 `--out`，始终按相对输出名处理并做安全归一化 |
-| `output_path` 从 `PathBuf` 改为 `Option<PathBuf>` 会破坏现有调用方 | 直接改 `DownloadSpec::new` 签名，不做向后兼容；同步更新所有集成测试和 Python 绑定中的调用点 |
+| `output_path` 从 `PathBuf` 改为 `Option<PathBuf>` 会影响既有调用方 | `DownloadSpec::new` 已切换为新签名；同时保留“未设置 `output_dir` 时允许绝对 `output_path`”的兼容路径，降低迁移成本 |
+
+### 3.4 实现结果
+
+- 已新增 `src/filename.rs`，实现 `Content-Disposition` / URL 文件名解析、Windows 保留名与路径安全清理、超长文件名截断
+- 已将 `ResponseMeta` 扩展为包含 `content_disposition`
+- 已将 `DownloadSpec::new(...)` 调整为仅接收 `url`，并提供 `.output_path(...)` / `.output_dir(...)`
+- `src/session.rs` 已引入统一的 `resolved_output_path` 解析阶段，分别处理显式输出路径与自动文件名流程
+- 自动文件名模式现已支持 resume，控制文件路径基于最终解析出的输出文件名定位
+- Rust 集成测试已覆盖 `Content-Disposition`、URL 回退、默认名 `download`、`output_dir` 组合、自动文件名 + pause/resume 共存
+- Python 绑定已支持 `download(url, output_path=None, output_dir=None, ...)` 与 `Downloader.download(...)` 的同等语义
+- 实现上保留了未设置 `output_dir` 时直接传绝对 `output_path` 的兼容路径，避免无谓破坏既有调用方式
+- 验证结果：`cargo test --workspace --all-targets`、Python `pytest` 全部通过，`cargo tarpaulin --engine llvm --workspace --all-targets --out Stdout --fail-under 95` 达到 `95.09%`
 | 目标文件名冲突时行为不明确 | 在设计阶段先固定策略，推荐默认报错，后续再考虑自动编号 |

@@ -23,7 +23,7 @@ async fn test_rate_limiting() {
     let out = dir.path().join("rate_limited.bin");
 
     // Limit to ~5 KB/s — should take at least 1.5s for 10 KB
-    let mut spec = DownloadSpec::new(format!("http://{addr}/file"), &out);
+    let mut spec = DownloadSpec::new(format!("http://{addr}/file")).output_path(out.clone());
     spec.max_connections = 1;
     spec.file_allocation = FileAllocation::None;
     spec.resume = false;
@@ -57,7 +57,7 @@ async fn test_no_rate_limit_is_fast() {
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path().join("no_limit.bin");
 
-    let mut spec = DownloadSpec::new(format!("http://{addr}/file"), &out);
+    let mut spec = DownloadSpec::new(format!("http://{addr}/file")).output_path(out.clone());
     spec.max_connections = 1;
     spec.file_allocation = FileAllocation::None;
     spec.resume = false;
@@ -92,7 +92,7 @@ async fn test_checksum_sha256_pass() {
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path().join("checksum_ok.bin");
 
-    let mut spec = DownloadSpec::new(format!("http://{addr}/file"), &out);
+    let mut spec = DownloadSpec::new(format!("http://{addr}/file")).output_path(out.clone());
     spec.max_connections = 1;
     spec.file_allocation = FileAllocation::None;
     spec.resume = false;
@@ -118,7 +118,7 @@ async fn test_checksum_sha256_fail() {
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path().join("checksum_bad.bin");
 
-    let mut spec = DownloadSpec::new(format!("http://{addr}/file"), &out);
+    let mut spec = DownloadSpec::new(format!("http://{addr}/file")).output_path(out.clone());
     spec.max_connections = 1;
     spec.file_allocation = FileAllocation::None;
     spec.resume = false;

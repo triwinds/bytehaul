@@ -113,7 +113,8 @@ pub enum Checksum {
 #[derive(Debug, Clone)]
 pub struct DownloadSpec {
     pub url: String,
-    pub output_path: PathBuf,
+    pub output_path: Option<PathBuf>,
+    pub output_dir: Option<PathBuf>,
     pub headers: HashMap<String, String>,
     pub max_connections: u32,
     pub connect_timeout: Duration,
@@ -137,10 +138,11 @@ pub struct DownloadSpec {
 }
 
 impl DownloadSpec {
-    pub fn new(url: impl Into<String>, output_path: impl Into<PathBuf>) -> Self {
+    pub fn new(url: impl Into<String>) -> Self {
         Self {
             url: url.into(),
-            output_path: output_path.into(),
+            output_path: None,
+            output_dir: None,
             headers: HashMap::new(),
             max_connections: 4,
             connect_timeout: Duration::from_secs(30),
@@ -158,6 +160,16 @@ impl DownloadSpec {
             checksum: None,
         }
     }
+
+    pub fn output_path(mut self, output_path: impl Into<PathBuf>) -> Self {
+        self.output_path = Some(output_path.into());
+        self
+    }
+
+    pub fn output_dir(mut self, output_dir: impl Into<PathBuf>) -> Self {
+        self.output_dir = Some(output_dir.into());
+        self
+    }
 }
 
 #[cfg(test)]
@@ -166,9 +178,10 @@ mod tests {
 
     #[test]
     fn test_download_spec_defaults() {
-        let spec = DownloadSpec::new("https://example.com/file", "/tmp/file");
+        let spec = DownloadSpec::new("https://example.com/file");
         assert_eq!(spec.url, "https://example.com/file");
-        assert_eq!(spec.output_path, PathBuf::from("/tmp/file"));
+        assert_eq!(spec.output_path, None);
+        assert_eq!(spec.output_dir, None);
         assert_eq!(spec.max_connections, 4);
         assert_eq!(spec.connect_timeout, Duration::from_secs(30));
         assert_eq!(spec.read_timeout, Duration::from_secs(60));
@@ -182,6 +195,15 @@ mod tests {
         assert_eq!(spec.max_download_speed, 0);
         assert!(spec.checksum.is_none());
         assert!(spec.headers.is_empty());
+    }
+
+    #[test]
+    fn test_download_spec_output_builders() {
+        let spec = DownloadSpec::new("https://example.com/file")
+            .output_dir("/tmp")
+            .output_path("nested/file.bin");
+        assert_eq!(spec.output_dir, Some(PathBuf::from("/tmp")));
+        assert_eq!(spec.output_path, Some(PathBuf::from("nested/file.bin")));
     }
 
     #[test]

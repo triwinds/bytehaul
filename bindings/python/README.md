@@ -36,7 +36,10 @@ uv run --project . maturin build --release -m Cargo.toml
 ```python
 import bytehaul
 
-bytehaul.download("https://example.com/file.bin", "output.bin")
+bytehaul.download("https://example.com/file.bin", output_path="output.bin")
+
+# Let bytehaul decide the filename and place it in downloads/
+bytehaul.download("https://example.com/file.bin", output_dir="downloads")
 ```
 
 ### With options
@@ -44,7 +47,7 @@ bytehaul.download("https://example.com/file.bin", "output.bin")
 ```python
 bytehaul.download(
     "https://example.com/file.bin",
-    "output.bin",
+    output_path="output.bin",
     max_connections=8,
     max_download_speed=1_000_000,  # 1 MB/s
     headers={"Authorization": "Bearer token"},
@@ -56,7 +59,7 @@ bytehaul.download(
 ```python
 bytehaul.download(
     "https://example.com/file.bin",
-    "output.bin",
+    output_path="output.bin",
     proxy="http://127.0.0.1:7890",
     dns_servers=["1.1.1.1", "8.8.8.8:53"],
     enable_ipv6=False,
@@ -69,7 +72,7 @@ bytehaul.download(
 # Enable debug logging on the convenience function
 bytehaul.download(
     "https://example.com/file.bin",
-    "output.bin",
+    output_path="output.bin",
     log_level="debug",
 )
 
@@ -91,7 +94,10 @@ downloader = Downloader(
     dns_servers=["1.1.1.1"],
     enable_ipv6=False,
 )
-task = downloader.download("https://example.com/large.bin", "large.bin")
+task = downloader.download(
+    "https://example.com/large.bin",
+    output_dir="downloads",
+)
 
 # Poll progress
 snap = task.progress()
@@ -114,7 +120,7 @@ task.wait()
 from bytehaul import download, DownloadFailedError, CancelledError, PausedError, ConfigError
 
 try:
-    download("https://example.com/file.bin", "output.bin")
+    download("https://example.com/file.bin", output_path="output.bin")
 except ConfigError as e:
     print(f"Invalid parameter: {e}")
 except PausedError:
@@ -127,15 +133,20 @@ except DownloadFailedError as e:
 
 ## API Reference
 
-### `download(url, output_path, **options)`
+### `download(url, output_path=None, output_dir=None, **options)`
 
 Blocking convenience function. Downloads a file and returns when complete.
+
+- `output_path`: explicit filename or relative output path
+- `output_dir`: destination directory for explicit or auto-detected filenames
+- If `output_path` is omitted, bytehaul chooses `Content-Disposition` → URL path → `download`
+- Absolute `output_path` values are still accepted when `output_dir` is omitted
 
 ### `Downloader(connect_timeout=None, proxy=None, http_proxy=None, https_proxy=None, dns_servers=None, enable_ipv6=None)`
 
 Reusable downloader instance.
 
-- `downloader.download(url, output_path, **options) -> DownloadTask`
+- `downloader.download(url, output_path=None, output_dir=None, **options) -> DownloadTask`
 
 ### `DownloadTask`
 
@@ -163,6 +174,8 @@ Frozen snapshot of download progress.
 
 | Parameter           | Type             | Default       |
 |---------------------|------------------|---------------|
+| `output_path`       | `str \| Path \| None` | `None` |
+| `output_dir`        | `str \| Path \| None` | `None` |
 | `headers`           | `dict[str, str]` | `{}`          |
 | `max_connections`   | `int`            | `4`           |
 | `connect_timeout`   | `float` (secs)   | `30.0`        |

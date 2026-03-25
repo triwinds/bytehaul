@@ -10,6 +10,7 @@ pub(crate) struct ResponseMeta {
     pub accept_ranges: bool,
     pub etag: Option<String>,
     pub last_modified: Option<String>,
+    pub content_disposition: Option<String>,
     pub content_encoding: Option<String>,
 }
 
@@ -30,6 +31,11 @@ impl ResponseMeta {
 
         let last_modified = headers
             .get("last-modified")
+            .and_then(|v| v.to_str().ok())
+            .map(String::from);
+
+        let content_disposition = headers
+            .get("content-disposition")
             .and_then(|v| v.to_str().ok())
             .map(String::from);
 
@@ -67,6 +73,7 @@ impl ResponseMeta {
             accept_ranges,
             etag,
             last_modified,
+            content_disposition,
             content_encoding,
         }
     }
@@ -93,6 +100,7 @@ mod tests {
         assert_eq!(meta.content_range_end, Some(199));
         assert_eq!(meta.content_range_total, Some(1000));
         assert_eq!(meta.content_encoding.as_deref(), Some("identity"));
+        assert_eq!(meta.content_disposition, None);
     }
 
     #[test]
@@ -168,5 +176,21 @@ mod tests {
         assert_eq!(meta.content_range_start, Some(0));
         assert_eq!(meta.content_range_end, Some(99));
         assert_eq!(meta.content_range_total, None);
+    }
+
+    #[test]
+    fn test_content_disposition() {
+        let response = reqwest::Response::from(
+            http::Response::builder()
+                .status(200)
+                .header("content-disposition", "attachment; filename=test.bin")
+                .body("test")
+                .unwrap(),
+        );
+        let meta = ResponseMeta::from_response(&response);
+        assert_eq!(
+            meta.content_disposition.as_deref(),
+            Some("attachment; filename=test.bin")
+        );
     }
 }

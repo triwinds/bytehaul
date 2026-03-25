@@ -11,7 +11,9 @@ For basic usage, see the [main README](../README.md).
 use std::time::Duration;
 use bytehaul::{Checksum, DownloadSpec, FileAllocation};
 
-let mut spec = DownloadSpec::new("https://example.com/file.bin", "file.bin");
+let mut spec = DownloadSpec::new("https://example.com/file.bin")
+    .output_dir("downloads")
+    .output_path("file.bin");
 spec.max_connections = 8;               // parallel workers
 spec.piece_size = 2 * 1024 * 1024;      // 2 MiB pieces
 spec.min_split_size = 10 * 1024 * 1024;  // split only if > 10 MiB
@@ -24,6 +26,8 @@ spec.checksum = Some(Checksum::Sha256(
     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".into(),
 ));
 ```
+
+If you omit `.output_path(...)`, bytehaul will detect the filename from `Content-Disposition`, then the URL path, then `download`. Absolute output paths are still accepted when `.output_dir(...)` is not set.
 
 ## Network Settings
 
@@ -53,9 +57,9 @@ use bytehaul::{DownloadSpec, DownloadState, Downloader};
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dl = Downloader::builder().build()?;
-    let handle = dl.download(DownloadSpec::new(
-        "https://example.com/file.bin", "file.bin"
-    ));
+    let handle = dl.download(
+        DownloadSpec::new("https://example.com/file.bin").output_path("file.bin")
+    );
 
     let mut rx = handle.subscribe_progress();
     tokio::spawn(async move {

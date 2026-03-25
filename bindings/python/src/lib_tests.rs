@@ -171,7 +171,8 @@ fn test_apply_client_options_and_build_download_spec() {
     let output_path = unique_path("spec");
     let spec = build_download_spec(
         "https://example.com/file.bin".into(),
-        output_path.clone(),
+        Some(output_path.clone()),
+        Some(std::env::temp_dir()),
         Some(headers.clone()),
         Some(3),
         Some(1.25),
@@ -190,7 +191,8 @@ fn test_apply_client_options_and_build_download_spec() {
     .unwrap();
 
     assert_eq!(spec.url, "https://example.com/file.bin");
-    assert_eq!(spec.output_path, output_path);
+    assert_eq!(spec.output_path, Some(output_path));
+    assert_eq!(spec.output_dir, Some(std::env::temp_dir()));
     assert_eq!(spec.headers, headers);
     assert_eq!(spec.max_connections, 3);
     assert_eq!(spec.connect_timeout, Duration::from_secs_f64(1.25));
@@ -211,7 +213,8 @@ fn test_apply_client_options_and_build_download_spec() {
 
     assert!(build_download_spec(
         "https://example.com/file.bin".into(),
-        unique_path("empty-checksum"),
+        Some(unique_path("empty-checksum")),
+        None,
         None,
         None,
         None,
@@ -302,7 +305,8 @@ fn test_download_task_methods_and_consumption_errors() {
     let task = downloader
         .download(
             "http://127.0.0.1:1/unreachable".into(),
-            unique_path("task-error"),
+            Some(unique_path("task-error")),
+            None,
             None,
             None,
             None,
@@ -361,7 +365,8 @@ fn test_download_task_pause_maps_to_paused_error() {
     let task = downloader
         .download(
             "http://127.0.0.1:1/unreachable".into(),
-            unique_path("task-paused"),
+            Some(unique_path("task-paused")),
+            None,
             None,
             None,
             None,
@@ -423,7 +428,8 @@ fn test_py_downloader_download_success_and_module_registration() {
     let task = downloader
         .download(
             format!("{base_url}/file.bin"),
-            output_path.clone(),
+            Some(output_path.clone()),
+            None,
             Some(headers),
             Some(2),
             Some(1.0),
@@ -489,7 +495,8 @@ fn test_top_level_download_success_and_failure() {
         download(
             py,
             format!("{base_url}/ok"),
-            output_path.clone(),
+            Some(output_path.clone()),
+            None,
             None,
             Some(2),
             Some(1.0),
@@ -521,7 +528,8 @@ fn test_top_level_download_success_and_failure() {
         download(
             py,
             "http://127.0.0.1:1/fail".into(),
-            unique_path("top-level-error"),
+            Some(unique_path("top-level-error")),
+            None,
             None,
             None,
             None,

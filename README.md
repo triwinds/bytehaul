@@ -55,10 +55,8 @@ use bytehaul::{DownloadSpec, Downloader};
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let downloader = Downloader::builder().build()?;
 
-    let spec = DownloadSpec::new(
-        "https://example.com/largefile.zip",
-        "largefile.zip",
-    );
+    let spec = DownloadSpec::new("https://example.com/largefile.zip")
+        .output_path("largefile.zip");
 
     let handle = downloader.download(spec);
     handle.wait().await?;
@@ -69,18 +67,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 For configuration, progress monitoring, cancellation, and more, see the [Advanced Usage Guide](docs/advanced.md).
 
+If you omit `output_path`, bytehaul will automatically choose a filename from `Content-Disposition`, then the URL path, and finally `download`. You can combine that with `.output_dir("downloads")` to control the destination directory. Absolute `output_path` values are still accepted when `output_dir` is not set.
+
 ## Quick Start (Python)
 
 ```python
 import bytehaul
 
 # Simple one-line download
-bytehaul.download("https://example.com/file.bin", "output.bin")
+bytehaul.download("https://example.com/file.bin", output_path="output.bin")
+
+# Automatic filename detection into a directory
+bytehaul.download("https://example.com/file.bin", output_dir="downloads")
 
 # With options
 bytehaul.download(
     "https://example.com/file.bin",
-    "output.bin",
+    output_path="output.bin",
     max_connections=8,
     max_download_speed=1_000_000,  # 1 MB/s
 )

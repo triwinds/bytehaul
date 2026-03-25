@@ -35,7 +35,7 @@ async fn test_early_eof_single_connection() {
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path().join("eof.bin");
 
-    let mut spec = DownloadSpec::new(format!("http://{addr}/file"), &out);
+    let mut spec = DownloadSpec::new(format!("http://{addr}/file")).output_path(out.clone());
     spec.max_connections = 1;
     spec.file_allocation = FileAllocation::None;
     spec.resume = false;
@@ -89,7 +89,7 @@ async fn test_transient_503_recovery() {
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path().join("recovered.bin");
 
-    let mut spec = DownloadSpec::new(format!("http://{addr}/file"), &out);
+    let mut spec = DownloadSpec::new(format!("http://{addr}/file")).output_path(out.clone());
     spec.max_connections = 1;
     spec.file_allocation = FileAllocation::None;
     spec.resume = false;
@@ -125,7 +125,7 @@ async fn test_permanent_failure_404() {
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path().join("notfound.bin");
 
-    let mut spec = DownloadSpec::new(format!("http://{addr}/file"), &out);
+    let mut spec = DownloadSpec::new(format!("http://{addr}/file")).output_path(out.clone());
     spec.max_connections = 1;
     spec.file_allocation = FileAllocation::None;
     spec.resume = false;
@@ -160,7 +160,7 @@ async fn test_corrupted_control_file_recovery() {
     // Write garbage as control file
     std::fs::write(&ctrl_path, b"this is not a valid control file").unwrap();
 
-    let mut spec = DownloadSpec::new(format!("http://{addr}/file"), &out);
+    let mut spec = DownloadSpec::new(format!("http://{addr}/file")).output_path(out.clone());
     spec.max_connections = 1;
     spec.file_allocation = FileAllocation::None;
     spec.resume = true; // will try to load corrupted control file
@@ -228,7 +228,7 @@ async fn test_stress_large_file_multi_worker() {
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path().join("stress_large.bin");
 
-    let mut spec = DownloadSpec::new(format!("http://{addr}/file"), &out);
+    let mut spec = DownloadSpec::new(format!("http://{addr}/file")).output_path(out.clone());
     spec.max_connections = 4;
     spec.file_allocation = FileAllocation::Prealloc;
     spec.resume = false;
@@ -256,7 +256,7 @@ async fn test_stress_many_small_pieces() {
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path().join("stress_small_pieces.bin");
 
-    let mut spec = DownloadSpec::new(format!("http://{addr}/file"), &out);
+    let mut spec = DownloadSpec::new(format!("http://{addr}/file")).output_path(out.clone());
     spec.max_connections = 4;
     spec.file_allocation = FileAllocation::Prealloc;
     spec.resume = false;
@@ -293,7 +293,7 @@ async fn test_stress_concurrent_downloads() {
     let mut handles = Vec::new();
     for i in 0..5 {
         let out = dir.path().join(format!("concurrent_{i}.bin"));
-        let mut spec = DownloadSpec::new(format!("http://{addr}/file"), &out);
+        let mut spec = DownloadSpec::new(format!("http://{addr}/file")).output_path(out.clone());
         spec.max_connections = 1;
         spec.file_allocation = FileAllocation::None;
         spec.resume = false;
@@ -332,7 +332,7 @@ async fn test_cancel_mid_download_progress() {
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path().join("cancel_mid.bin");
 
-    let mut spec = DownloadSpec::new(format!("http://{addr}/file"), &out);
+    let mut spec = DownloadSpec::new(format!("http://{addr}/file")).output_path(out.clone());
     spec.max_connections = 1;
     spec.file_allocation = FileAllocation::None;
     spec.resume = false;

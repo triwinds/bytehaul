@@ -105,12 +105,17 @@ impl Downloader {
         let client_config = self.client_config.clone();
         let log_level = self.log_level;
         let download_id = next_download_id();
+        let output = spec
+            .output_path
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "<auto>".to_string());
 
         log_info!(
             log_level,
             download_id,
             url = %spec.url,
-            output = %spec.output_path.display(),
+            output = %output,
             max_connections = spec.max_connections,
             resume = spec.resume,
             "download task created"
@@ -216,10 +221,8 @@ mod tests {
     #[tokio::test]
     async fn test_download_handle_progress_default() {
         let downloader = Downloader::builder().build().unwrap();
-        let spec = crate::config::DownloadSpec::new(
-            "http://127.0.0.1:1/nonexistent",
-            std::env::temp_dir().join("bytehaul_test_never_created"),
-        );
+        let spec = crate::config::DownloadSpec::new("http://127.0.0.1:1/nonexistent")
+            .output_path(std::env::temp_dir().join("bytehaul_test_never_created"));
         let handle = downloader.download(spec);
 
         // Initial progress should be pending
@@ -241,10 +244,8 @@ mod tests {
             .log_level(crate::config::LogLevel::Debug)
             .build()
             .unwrap();
-        let spec = crate::config::DownloadSpec::new(
-            "http://127.0.0.1:1/nonexistent",
-            std::env::temp_dir().join("bytehaul_test_log_enabled"),
-        );
+        let spec = crate::config::DownloadSpec::new("http://127.0.0.1:1/nonexistent")
+            .output_path(std::env::temp_dir().join("bytehaul_test_log_enabled"));
         let handle = downloader.download(spec);
         handle.cancel();
         let result = handle.wait().await;
@@ -277,10 +278,8 @@ mod tests {
     #[tokio::test]
     async fn test_download_rebuilds_client_for_spec_timeout_override() {
         let downloader = Downloader::builder().build().unwrap();
-        let mut spec = crate::config::DownloadSpec::new(
-            "http://127.0.0.1:1/nonexistent",
-            std::env::temp_dir().join("bytehaul_test_timeout_override"),
-        );
+        let mut spec = crate::config::DownloadSpec::new("http://127.0.0.1:1/nonexistent")
+            .output_path(std::env::temp_dir().join("bytehaul_test_timeout_override"));
         spec.connect_timeout = Duration::from_secs(1);
 
         let handle = downloader.download(spec);

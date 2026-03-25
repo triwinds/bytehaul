@@ -99,7 +99,7 @@ async fn test_retry_on_503_multi_worker() {
     let output_path = dir.path().join("retry503.bin");
 
     let downloader = Downloader::builder().build().unwrap();
-    let mut spec = DownloadSpec::new(format!("http://{addr}/retry503"), &output_path);
+    let mut spec = DownloadSpec::new(format!("http://{addr}/retry503")).output_path(output_path.clone());
     spec.file_allocation = FileAllocation::None;
     spec.max_connections = 4;
     spec.piece_size = 1024 * 1024;
@@ -130,7 +130,7 @@ async fn test_retry_on_503_single_connection() {
     let output_path = dir.path().join("retrysmall.bin");
 
     let downloader = Downloader::builder().build().unwrap();
-    let mut spec = DownloadSpec::new(format!("http://{addr}/retrysmall"), &output_path);
+    let mut spec = DownloadSpec::new(format!("http://{addr}/retrysmall")).output_path(output_path.clone());
     spec.file_allocation = FileAllocation::None;
     spec.max_connections = 1;
     spec.max_retries = 5;
@@ -154,7 +154,7 @@ async fn test_no_retry_on_403() {
     let output_path = dir.path().join("forbidden.bin");
 
     let downloader = Downloader::builder().build().unwrap();
-    let mut spec = DownloadSpec::new(format!("http://{addr}/forbidden"), &output_path);
+    let mut spec = DownloadSpec::new(format!("http://{addr}/forbidden")).output_path(output_path.clone());
     spec.file_allocation = FileAllocation::None;
     spec.max_retries = 5;
 
@@ -183,7 +183,7 @@ async fn test_exhausted_retries_fails() {
     let output_path = dir.path().join("alwaysfail.bin");
 
     let downloader = Downloader::builder().build().unwrap();
-    let mut spec = DownloadSpec::new(format!("http://{addr}/alwaysfail"), &output_path);
+    let mut spec = DownloadSpec::new(format!("http://{addr}/alwaysfail")).output_path(output_path.clone());
     spec.file_allocation = FileAllocation::None;
     spec.max_connections = 1;
     spec.max_retries = 2;
@@ -348,7 +348,7 @@ async fn test_retry_429_with_retry_after_multi_worker() {
     let output_path = dir.path().join("rate_limit.bin");
 
     let downloader = Downloader::builder().build().unwrap();
-    let mut spec = DownloadSpec::new(format!("http://{addr}/rate_limit"), &output_path);
+    let mut spec = DownloadSpec::new(format!("http://{addr}/rate_limit")).output_path(output_path.clone());
     spec.file_allocation = FileAllocation::None;
     spec.max_connections = 4;
     spec.piece_size = 1024 * 1024;
@@ -379,7 +379,7 @@ async fn test_gzip_content_encoding_fallback() {
     let output_path = dir.path().join("gzip_enc.bin");
 
     let downloader = Downloader::builder().build().unwrap();
-    let mut spec = DownloadSpec::new(format!("http://{addr}/gzip_enc"), &output_path);
+    let mut spec = DownloadSpec::new(format!("http://{addr}/gzip_enc")).output_path(output_path.clone());
     spec.file_allocation = FileAllocation::None;
     spec.max_connections = 4;
     spec.piece_size = 1024 * 1024;
@@ -481,7 +481,7 @@ async fn test_multi_worker_segment_retry_on_503() {
     let output_path = dir.path().join("segretry.bin");
 
     let downloader = Downloader::builder().build().unwrap();
-    let mut spec = DownloadSpec::new(format!("http://{addr}/segretry"), &output_path);
+    let mut spec = DownloadSpec::new(format!("http://{addr}/segretry")).output_path(output_path.clone());
     spec.file_allocation = FileAllocation::None;
     spec.max_connections = 4;
     spec.piece_size = 1024 * 1024;

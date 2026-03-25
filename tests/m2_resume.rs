@@ -132,7 +132,7 @@ async fn test_resume_after_cancel() {
     let downloader = Downloader::builder().build().unwrap();
 
     // First download: let it run a bit, then cancel
-    let mut spec = DownloadSpec::new(format!("http://{addr}/resumefile"), &output_path);
+    let mut spec = DownloadSpec::new(format!("http://{addr}/resumefile")).output_path(output_path.clone());
     spec.file_allocation = FileAllocation::None;
     let handle = downloader.download(spec.clone());
 
@@ -204,7 +204,7 @@ async fn test_resume_etag_mismatch_restarts() {
 
     // Download should detect mismatch, discard old state, and start fresh
     let downloader = Downloader::builder().build().unwrap();
-    let mut spec = DownloadSpec::new(format!("http://{addr}/etagfile"), &output_path);
+    let mut spec = DownloadSpec::new(format!("http://{addr}/etagfile")).output_path(output_path.clone());
     spec.file_allocation = FileAllocation::None;
 
     let handle = downloader.download(spec);
@@ -226,7 +226,7 @@ async fn test_no_resume_when_disabled() {
     let output_path = dir.path().join("noresume.bin");
 
     let downloader = Downloader::builder().build().unwrap();
-    let mut spec = DownloadSpec::new(format!("http://{addr}/noresume"), &output_path);
+    let mut spec = DownloadSpec::new(format!("http://{addr}/noresume")).output_path(output_path.clone());
     spec.file_allocation = FileAllocation::None;
     spec.resume = false;
 

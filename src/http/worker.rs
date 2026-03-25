@@ -97,7 +97,7 @@ mod tests {
     use warp::Filter;
 
     fn worker_for(url: String) -> HttpWorker {
-        let mut spec = DownloadSpec::new(url, "unused.bin");
+        let mut spec = DownloadSpec::new(url).output_path("unused.bin");
         spec.read_timeout = Duration::from_secs(5);
         HttpWorker::new(reqwest::Client::new(), &spec)
     }

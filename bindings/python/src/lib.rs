@@ -169,7 +169,8 @@ fn init_tracing(level: LogLevel) {
 #[allow(clippy::too_many_arguments)]
 fn build_download_spec(
     url: String,
-    output_path: PathBuf,
+    output_path: Option<PathBuf>,
+    output_dir: Option<PathBuf>,
     headers: Option<HashMap<String, String>>,
     max_connections: Option<u32>,
     connect_timeout: Option<f64>,
@@ -185,7 +186,14 @@ fn build_download_spec(
     max_download_speed: Option<u64>,
     checksum_sha256: Option<String>,
 ) -> PyResult<DownloadSpec> {
-    let mut spec = DownloadSpec::new(url, output_path);
+    let mut spec = DownloadSpec::new(url);
+
+    if let Some(output_path) = output_path {
+        spec = spec.output_path(output_path);
+    }
+    if let Some(output_dir) = output_dir {
+        spec = spec.output_dir(output_dir);
+    }
 
     if let Some(headers) = headers {
         spec.headers = headers;
@@ -414,7 +422,8 @@ impl PyDownloader {
     #[pyo3(
         signature = (
             url,
-            output_path,
+            output_path = None,
+            output_dir = None,
             headers = None,
             max_connections = None,
             connect_timeout = None,
@@ -435,7 +444,8 @@ impl PyDownloader {
     fn download(
         &self,
         url: String,
-        output_path: PathBuf,
+        output_path: Option<PathBuf>,
+        output_dir: Option<PathBuf>,
         headers: Option<HashMap<String, String>>,
         max_connections: Option<u32>,
         connect_timeout: Option<f64>,
@@ -454,6 +464,7 @@ impl PyDownloader {
         let spec = build_download_spec(
             url,
             output_path,
+            output_dir,
             headers,
             max_connections,
             connect_timeout,
@@ -485,7 +496,8 @@ impl PyDownloader {
 #[pyfunction(
     signature = (
         url,
-        output_path,
+        output_path = None,
+        output_dir = None,
         headers = None,
         max_connections = None,
         connect_timeout = None,
@@ -512,7 +524,8 @@ impl PyDownloader {
 fn download(
     py: Python<'_>,
     url: String,
-    output_path: PathBuf,
+    output_path: Option<PathBuf>,
+    output_dir: Option<PathBuf>,
     headers: Option<HashMap<String, String>>,
     max_connections: Option<u32>,
     connect_timeout: Option<f64>,
@@ -542,6 +555,7 @@ fn download(
     let spec = build_download_spec(
         url,
         output_path,
+        output_dir,
         headers,
         max_connections,
         connect_timeout,

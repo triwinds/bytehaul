@@ -49,7 +49,10 @@ uv run --project . maturin build --release -m Cargo.toml
 ```python
 import bytehaul
 
-bytehaul.download("https://example.com/file.bin", "output.bin")
+bytehaul.download("https://example.com/file.bin", output_path="output.bin")
+
+# 自动根据响应头或 URL 推断文件名，并落到目标目录
+bytehaul.download("https://example.com/file.bin", output_dir="downloads")
 ```
 
 ### 传入下载参数
@@ -61,7 +64,7 @@ import bytehaul
 
 bytehaul.download(
     "https://example.com/file.bin",
-    Path("output.bin"),
+    output_path=Path("output.bin"),
     max_connections=8,
     max_download_speed=1_000_000,
     headers={"Authorization": "Bearer token"},
@@ -78,7 +81,7 @@ import bytehaul
 
 bytehaul.download(
     "https://example.com/file.bin",
-    "output.bin",
+    output_path="output.bin",
     proxy="http://127.0.0.1:7890",
     dns_servers=["1.1.1.1", "8.8.8.8:53"],
     enable_ipv6=False,
@@ -103,7 +106,7 @@ downloader = Downloader(
 # 在便捷函数中启用调试日志
 bytehaul.download(
     "https://example.com/file.bin",
-    "output.bin",
+    output_path="output.bin",
     log_level="debug",
 )
 
@@ -123,7 +126,7 @@ from bytehaul import Downloader
 downloader = Downloader(connect_timeout=15.0)
 task = downloader.download(
     "https://example.com/large.bin",
-    "large.bin",
+    output_path="large.bin",
     max_connections=8,
     resume=True,
 )
@@ -131,10 +134,11 @@ task = downloader.download(
 snap = task.progress()
 print(
     f"state={snap.state} downloaded={snap.downloaded} "
-    f"speed={snap.speed:.0f} B/s"
+    f"speed={snap.speed:.0f} B/s eta={snap.eta_secs}"
 )
 
-# 如有需要可取消
+# 如有需要可暂停或取消
+# task.pause()
 # task.cancel()
 
 task.wait()
@@ -148,12 +152,14 @@ task.wait()
 ### 错误处理
 
 ```python
-from bytehaul import ConfigError, CancelledError, DownloadFailedError, download
+from bytehaul import ConfigError, CancelledError, PausedError, DownloadFailedError, download
 
 try:
-    download("https://example.com/file.bin", "output.bin")
+    download("https://example.com/file.bin", output_path="output.bin")
 except ConfigError as exc:
     print(f"参数无效: {exc}")
+except PausedError:
+    print("下载已暂停")
 except CancelledError:
     print("下载已取消")
 except DownloadFailedError as exc:
@@ -162,21 +168,27 @@ except DownloadFailedError as exc:
 
 ## API 概览
 
-### `download(url, output_path, **options)`
+### `download(url, output_path=None, output_dir=None, **options)`
 
 阻塞式便捷函数。调用后会一直等待，直到下载完成或失败。
+
+- `output_path`：显式文件名或相对输出路径
+- `output_dir`：输出目录
+- 省略 `output_path` 时，会按 `Content-Disposition` → URL 路径 → `download` 自动选择文件名
+- 若未设置 `output_dir`，仍可直接传绝对 `output_path`
 
 ### `Downloader(connect_timeout=None, proxy=None, http_proxy=None, https_proxy=None, dns_servers=None, enable_ipv6=None)`
 
 可复用的下载器实例。
 
-- `downloader.download(url, output_path, **options) -> DownloadTask`
+- `downloader.download(url, output_path=None, output_dir=None, **options) -> DownloadTask`
 
 ### `DownloadTask`
 
 运行中下载任务的句柄。
 
 - `task.progress()`：获取当前进度快照
+- `task.pause()`：暂停下载并尽量落盘控制文件
 - `task.cancel()`：取消下载
 - `task.wait()`：阻塞等待下载结束
 
@@ -188,14 +200,17 @@ except DownloadFailedError as exc:
 | --- | --- | --- |
 | `total_size` | `int \| None` | 文件总大小，未知时为 `None` |
 | `downloaded` | `int` | 已下载字节数 |
-| `state` | `str` | 当前状态，如 `pending`、`downloading`、`completed` |
+| `state` | `str` | 当前状态，如 `pending`、`downloading`、`completed`、`cancelled`、`paused` |
 | `speed` | `float` | 当前下载速度，单位为字节/秒 |
+| `eta_secs` | `float \| None` | 预计剩余秒数 |
 | `elapsed_secs` | `float \| None` | 已耗时秒数 |
 
 ## 常用参数
 
 | 参数 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
+| `output_path` | `str \| Path \| None` | `None` | 显式文件名或相对输出路径 |
+| `output_dir` | `str \| Path \| None` | `None` | 输出目录 |
 | `headers` | `dict[str, str]` | `{}` | 自定义请求头 |
 | `max_connections` | `int` | `4` | 最大并发连接数 |
 | `connect_timeout` | `float` | `30.0` | 连接超时，单位秒 |

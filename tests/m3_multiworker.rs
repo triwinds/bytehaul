@@ -92,7 +92,7 @@ async fn test_multi_worker_download() {
     let output_path = dir.path().join("bigfile.bin");
 
     let downloader = Downloader::builder().build().unwrap();
-    let mut spec = DownloadSpec::new(format!("http://{addr}/bigfile"), &output_path);
+    let mut spec = DownloadSpec::new(format!("http://{addr}/bigfile")).output_path(output_path.clone());
     spec.file_allocation = FileAllocation::Prealloc;
     spec.max_connections = 4;
     spec.piece_size = 1024 * 1024; // 1 MiB
@@ -123,7 +123,7 @@ async fn test_multi_worker_progress() {
     let output_path = dir.path().join("progressmulti.bin");
 
     let downloader = Downloader::builder().build().unwrap();
-    let mut spec = DownloadSpec::new(format!("http://{addr}/progressmulti"), &output_path);
+    let mut spec = DownloadSpec::new(format!("http://{addr}/progressmulti")).output_path(output_path.clone());
     spec.file_allocation = FileAllocation::None;
     spec.max_connections = 4;
     spec.piece_size = 1024 * 1024;
@@ -209,7 +209,7 @@ async fn test_multi_worker_eta_reports() {
     let output_path = dir.path().join("eta-multi.bin");
 
     let downloader = Downloader::builder().build().unwrap();
-    let mut spec = DownloadSpec::new(format!("http://{addr}/eta-multi"), &output_path);
+    let mut spec = DownloadSpec::new(format!("http://{addr}/eta-multi")).output_path(output_path.clone());
     spec.file_allocation = FileAllocation::None;
     spec.max_connections = 4;
     spec.piece_size = 1024 * 1024;
@@ -247,7 +247,7 @@ async fn test_fallback_to_single_connection_no_range() {
     let output_path = dir.path().join("norange.bin");
 
     let downloader = Downloader::builder().build().unwrap();
-    let mut spec = DownloadSpec::new(format!("http://{addr}/norange"), &output_path);
+    let mut spec = DownloadSpec::new(format!("http://{addr}/norange")).output_path(output_path.clone());
     spec.file_allocation = FileAllocation::None;
     spec.max_connections = 4;
 
@@ -271,7 +271,7 @@ async fn test_small_file_uses_single_connection() {
     let output_path = dir.path().join("smallfile.bin");
 
     let downloader = Downloader::builder().build().unwrap();
-    let mut spec = DownloadSpec::new(format!("http://{addr}/smallfile"), &output_path);
+    let mut spec = DownloadSpec::new(format!("http://{addr}/smallfile")).output_path(output_path.clone());
     spec.file_allocation = FileAllocation::None;
     spec.max_connections = 4;
     spec.min_split_size = 10 * 1024 * 1024; // 10 MiB, much larger than file
@@ -357,7 +357,7 @@ async fn test_multi_worker_resume_after_cancel() {
     let downloader = Downloader::builder().build().unwrap();
 
     // First download: cancel after some data arrives
-    let mut spec = DownloadSpec::new(format!("http://{addr}/slowmulti"), &output_path);
+    let mut spec = DownloadSpec::new(format!("http://{addr}/slowmulti")).output_path(output_path.clone());
     spec.file_allocation = FileAllocation::Prealloc;
     spec.max_connections = 4;
     spec.piece_size = 1024 * 1024;
@@ -400,7 +400,7 @@ async fn test_multi_connection_with_logging() {
         .log_level(LogLevel::Debug)
         .build()
         .unwrap();
-    let mut spec = DownloadSpec::new(format!("http://{addr}/logmulti"), &output_path);
+    let mut spec = DownloadSpec::new(format!("http://{addr}/logmulti")).output_path(output_path.clone());
     spec.max_connections = 4;
     spec.piece_size = 50_000;
     spec.min_split_size = 1;

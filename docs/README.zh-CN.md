@@ -54,10 +54,8 @@ use bytehaul::{DownloadSpec, Downloader};
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let downloader = Downloader::builder().build()?;
 
-    let spec = DownloadSpec::new(
-        "https://example.com/largefile.zip",
-        "largefile.zip",
-    );
+    let spec = DownloadSpec::new("https://example.com/largefile.zip")
+        .output_path("largefile.zip");
 
     let handle = downloader.download(spec);
     handle.wait().await?;
@@ -68,18 +66,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 更多配置、进度监控、取消下载等进阶用法，请参阅[进阶用法指南](advanced.zh-CN.md)。
 
+如果省略 `output_path`，bytehaul 会按 `Content-Disposition`、URL 路径最后一段、默认名 `download` 自动选择文件名。可结合 `.output_dir("downloads")` 指定目标目录；在未设置 `output_dir` 时，也仍然支持直接传绝对输出路径。
+
 ## 快速开始（Python）
 
 ```python
 import bytehaul
 
 # 一行代码完成下载
-bytehaul.download("https://example.com/file.bin", "output.bin")
+bytehaul.download("https://example.com/file.bin", output_path="output.bin")
+
+# 自动文件名下载到指定目录
+bytehaul.download("https://example.com/file.bin", output_dir="downloads")
 
 # 传入下载参数
 bytehaul.download(
     "https://example.com/file.bin",
-    "output.bin",
+    output_path="output.bin",
     max_connections=8,
     max_download_speed=1_000_000,  # 限速 1 MB/s
 )

@@ -35,6 +35,22 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(SAMPLE_BODY)))
             self.end_headers()
             self.wfile.write(SAMPLE_BODY)
+        elif self.path == "/attachment":
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(SAMPLE_BODY)))
+            self.send_header("Content-Disposition", 'attachment; filename="server.bin"')
+            self.end_headers()
+            self.wfile.write(SAMPLE_BODY)
+        elif self.path == "/files/report.bin":
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(SAMPLE_BODY)))
+            self.end_headers()
+            self.wfile.write(SAMPLE_BODY)
+        elif self.path == "/":
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(SAMPLE_BODY)))
+            self.end_headers()
+            self.wfile.write(SAMPLE_BODY)
         elif self.path == "/slow":
             self.send_response(200)
             self.send_header("Content-Length", str(len(SAMPLE_BODY)))
@@ -166,6 +182,20 @@ class TestDownloadFunction:
         )
         assert out.read_bytes() == SAMPLE_BODY
 
+    def test_auto_filename_with_content_disposition(self, server, tmp_path):
+        download(f"{server}/attachment", output_dir=tmp_path)
+        assert (tmp_path / "server.bin").read_bytes() == SAMPLE_BODY
+
+    def test_auto_filename_falls_back_to_url_and_default(self, server, tmp_path):
+        url_out_dir = tmp_path / "url"
+        default_out_dir = tmp_path / "default"
+
+        download(f"{server}/files/report.bin", output_dir=url_out_dir)
+        download(f"{server}/", output_dir=default_out_dir)
+
+        assert (url_out_dir / "report.bin").read_bytes() == SAMPLE_BODY
+        assert (default_out_dir / "download").read_bytes() == SAMPLE_BODY
+
 
 # ---------------------------------------------------------------------------
 # Downloader / DownloadTask object API tests
@@ -285,3 +315,9 @@ class TestDownloaderAPI:
         task = d.download(f"{server}/404", str(tmp_path / "e404"))
         with pytest.raises(DownloadFailedError):
             task.wait()
+
+    def test_download_auto_filename_with_output_dir(self, server, tmp_path):
+        d = Downloader()
+        task = d.download(f"{server}/attachment", output_dir=tmp_path)
+        task.wait()
+        assert (tmp_path / "server.bin").read_bytes() == SAMPLE_BODY

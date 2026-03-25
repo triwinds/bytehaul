@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -12,6 +12,7 @@ use crate::checksum::verify_checksum;
 use crate::config::{DownloadSpec, LogLevel};
 use crate::error::DownloadError;
 use crate::eta::EtaEstimator;
+use crate::filename::{detect_filename, sanitize_relative_path};
 use crate::http::request::build_range_request;
 use crate::http::response::ResponseMeta;
 use crate::http::worker::HttpWorker;
@@ -113,57 +114,65 @@ where
 //  Entry point
 // ──────────────────────────────────────────────────────────────
 
-pub(crate) async fn run_download(
-    client: reqwest::Client,
-    spec: DownloadSpec,
-    log_level: LogLevel,
-    download_id: u64,
-    progress_tx: watch::Sender<ProgressSnapshot>,
-    cancel_rx: watch::Receiver<StopSignal>,
-) -> Result<(), DownloadError> {
-    let checksum = spec.checksum.clone();
-    let output_path = spec.output_path.clone();
-
-    let result =
-        run_download_inner(client, spec, log_level, download_id, &progress_tx, cancel_rx).await;
-
-    if let Err(ref e) = result {
-        log_error!(log_level, download_id, error = %e, "download failed");
-        return result;
-    }
-
-    // Post-download checksum verification
-    if let Some(ref expected) = checksum {
-        log_info!(log_level, download_id, algorithm = "sha256", "checksum verification started");
-        match verify_checksum(&output_path, expected).await {
-            Ok(()) => {
-                log_info!(log_level, download_id, "checksum verification passed");
-            }
-            Err(e) => {
-                log_error!(log_level, download_id, error = %e, "checksum verification failed");
-                return Err(e);
-            }
-        }
-    }
-
-    log_info!(log_level, download_id, "download completed successfully");
-    Ok(())
+#[derive(Debug, Clone, Copy)]
+enum FreshResponseSource {
+    RangeProbe,
+    FallbackGet,
 }
 
-async fn run_download_inner(
+fn resolve_output_dir(spec: &DownloadSpec) -> Result<PathBuf, DownloadError> {
+    let cwd = std::env::current_dir()?;
+    let dir = spec.output_dir.clone().unwrap_or_else(|| cwd.clone());
+    if dir.is_absolute() {
+        Ok(dir)
+    } else {
+        Ok(cwd.join(dir))
+    }
+}
+
+fn resolve_static_output_path(spec: &DownloadSpec) -> Result<Option<PathBuf>, DownloadError> {
+    let Some(output_path) = &spec.output_path else {
+        return Ok(None);
+    };
+    if output_path.is_absolute() {
+        if spec.output_dir.is_some() {
+            return Err(DownloadError::Other(
+                "output_path must be relative when output_dir is set".into(),
+            ));
+        }
+        return Ok(Some(output_path.clone()));
+    }
+    let relative = sanitize_relative_path(output_path).ok_or_else(|| {
+        DownloadError::Other(
+            "output_path must be a relative path without root prefixes or parent traversal"
+                .into(),
+        )
+    })?;
+    Ok(Some(resolve_output_dir(spec)?.join(relative)))
+}
+
+fn resolve_auto_output_path(
+    spec: &DownloadSpec,
+    meta: &ResponseMeta,
+) -> Result<PathBuf, DownloadError> {
+    Ok(resolve_output_dir(spec)?.join(detect_filename(
+        meta.content_disposition.as_deref(),
+        &spec.url,
+    )))
+}
+
+async fn try_resume_download(
     client: reqwest::Client,
-    spec: DownloadSpec,
+    worker: &HttpWorker,
+    spec: &DownloadSpec,
+    output_path: &Path,
+    progress_tx: &watch::Sender<ProgressSnapshot>,
+    cancel_rx: &mut watch::Receiver<StopSignal>,
+    speed_limit: SpeedLimit,
     log_level: LogLevel,
     download_id: u64,
-    progress_tx: &watch::Sender<ProgressSnapshot>,
-    cancel_rx: watch::Receiver<StopSignal>,
-) -> Result<(), DownloadError> {
-    let control_path = ControlSnapshot::control_path(&spec.output_path);
-    let worker = HttpWorker::new(client.clone(), &spec);
-    let mut cancel_rx = cancel_rx;
-    let speed_limit = SpeedLimit::new(spec.max_download_speed);
-
-    // ── Phase 1: attempt resume ──────────────────────────────
+) -> Result<Option<PathBuf>, DownloadError> {
+    let control_path = ControlSnapshot::control_path(output_path);
     let resume_ctrl = if spec.resume {
         match ControlSnapshot::load(&control_path).await {
             Ok(ctrl) => {
@@ -199,7 +208,7 @@ async fn run_download_inner(
                     spec.max_retries,
                     spec.retry_base_delay,
                     spec.retry_max_delay,
-                    &mut cancel_rx,
+                    cancel_rx,
                     || worker.send_range(start, end - 1),
                 )
                 .await;
@@ -216,21 +225,23 @@ async fn run_download_inner(
                             completed_pieces = piece_map.completed_count(),
                             "download strategy selected"
                         );
-                        return run_multi_worker(
+                        run_multi_worker(
                             client,
-                            &spec,
+                            spec,
+                            output_path,
                             &meta,
                             ctrl.total_size,
                             piece_map,
                             Some((resp, probe_piece)),
-                            &progress_tx,
-                            cancel_rx,
+                            progress_tx,
+                            cancel_rx.clone(),
                             &control_path,
                             speed_limit,
                             log_level,
                             download_id,
                         )
-                        .await;
+                        .await?;
+                        return Ok(Some(output_path.to_path_buf()));
                     }
                 }
             }
@@ -239,7 +250,7 @@ async fn run_download_inner(
                 spec.max_retries,
                 spec.retry_base_delay,
                 spec.retry_max_delay,
-                &mut cancel_rx,
+                cancel_rx,
                 || worker.send_range(ctrl.downloaded_bytes, ctrl.total_size - 1),
             )
             .await;
@@ -256,139 +267,337 @@ async fn run_download_inner(
                         total_size = ctrl.total_size,
                         "download strategy selected"
                     );
-                    return run_single_connection(
+                    run_single_connection(
                         resp,
                         &meta,
-                        &spec,
+                        spec,
+                        output_path,
                         ctrl.downloaded_bytes,
-                        &progress_tx,
-                        cancel_rx,
+                        progress_tx,
+                        cancel_rx.clone(),
                         &control_path,
                         Some(ctrl.total_size),
                         speed_limit,
                         log_level,
                         download_id,
                     )
-                    .await;
+                    .await?;
+                    return Ok(Some(output_path.to_path_buf()));
                 }
             }
         }
-        // Resume failed — discard
+
         log_warn!(log_level, download_id, "control file discarded, restarting download");
         let _ = ControlSnapshot::delete(&control_path).await;
     }
 
-    // ── Phase 2: fresh download ──────────────────────────────
-    if spec.max_connections > 1 {
-        let piece_end = spec.piece_size.saturating_sub(1);
-        // Probe for Range support — no retry since this is exploratory
-        if let Ok((resp, meta)) = worker.send_range(0, piece_end).await {
-            if resp.status().as_u16() == 206 && range_response_allowed(&meta) {
-                if let Some(total_size) = meta.content_range_total {
-                    if total_size > spec.min_split_size {
-                        log_info!(
-                            log_level,
-                            download_id,
-                            strategy = "fresh multi",
-                            total_size,
-                            max_connections = spec.max_connections,
-                            piece_size = spec.piece_size,
-                            "download strategy selected"
-                        );
-                        let piece_map = PieceMap::new(total_size, spec.piece_size);
-                        return run_multi_worker(
-                            client,
-                            &spec,
-                            &meta,
-                            total_size,
-                            piece_map,
-                            Some((resp, 0)),
-                            &progress_tx,
-                            cancel_rx,
-                            &control_path,
-                            speed_limit,
-                            log_level,
-                            download_id,
-                        )
-                        .await;
-                    }
-                }
-                // File too small for splitting — use this response as single connection
-                let total = meta.content_range_total;
+    Ok(None)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_fresh_from_response(
+    client: reqwest::Client,
+    spec: &DownloadSpec,
+    output_path: &Path,
+    response: reqwest::Response,
+    meta: ResponseMeta,
+    source: FreshResponseSource,
+    progress_tx: &watch::Sender<ProgressSnapshot>,
+    cancel_rx: watch::Receiver<StopSignal>,
+    speed_limit: SpeedLimit,
+    log_level: LogLevel,
+    download_id: u64,
+) -> Result<PathBuf, DownloadError> {
+    let control_path = ControlSnapshot::control_path(output_path);
+
+    if spec.max_connections > 1
+        && matches!(source, FreshResponseSource::RangeProbe)
+        && response.status().as_u16() == 206
+        && range_response_allowed(&meta)
+    {
+        if let Some(total_size) = meta.content_range_total {
+            if total_size > spec.min_split_size {
                 log_info!(
                     log_level,
                     download_id,
-                    strategy = "fresh single",
-                    total_size = total,
-                    reason = "file below min_split_size",
+                    strategy = "fresh multi",
+                    total_size,
+                    max_connections = spec.max_connections,
+                    piece_size = spec.piece_size,
                     "download strategy selected"
                 );
-                return run_single_connection(
-                    resp,
+                let piece_map = PieceMap::new(total_size, spec.piece_size);
+                run_multi_worker(
+                    client,
+                    spec,
+                    output_path,
                     &meta,
-                    &spec,
-                    0,
-                    &progress_tx,
+                    total_size,
+                    piece_map,
+                    Some((response, 0)),
+                    progress_tx,
                     cancel_rx,
                     &control_path,
-                    total,
                     speed_limit,
                     log_level,
                     download_id,
                 )
-                .await;
-            } else if resp.status().as_u16() != 206 {
-                // Got 200 — Range not supported; stream this response
-                log_info!(
-                    log_level,
-                    download_id,
-                    strategy = "fresh single",
-                    reason = "range not supported (200 response)",
-                    "download strategy selected"
-                );
-                return run_single_connection(
-                    resp,
-                    &meta,
-                    &spec,
-                    0,
-                    &progress_tx,
-                    cancel_rx,
-                    &control_path,
-                    meta.content_length,
-                    speed_limit,
-                    log_level,
-                    download_id,
-                )
-                .await;
+                .await?;
+                return Ok(output_path.to_path_buf());
             }
         }
+
+        let total = meta.content_range_total;
+        log_info!(
+            log_level,
+            download_id,
+            strategy = "fresh single",
+            total_size = total,
+            reason = "file below min_split_size",
+            "download strategy selected"
+        );
+        run_single_connection(
+            response,
+            &meta,
+            spec,
+            output_path,
+            0,
+            progress_tx,
+            cancel_rx,
+            &control_path,
+            total,
+            speed_limit,
+            log_level,
+            download_id,
+        )
+        .await?;
+        return Ok(output_path.to_path_buf());
     }
 
-    // ── Fallback: plain GET ──────────────────────────────────
+    let reason = match source {
+        FreshResponseSource::RangeProbe if response.status().as_u16() != 206 => {
+            "range not supported (200 response)"
+        }
+        FreshResponseSource::RangeProbe => "file below min_split_size",
+        FreshResponseSource::FallbackGet => "fallback GET (single connection or range probe failed)",
+    };
     log_info!(
         log_level,
         download_id,
         strategy = "fresh single",
-        reason = "fallback GET (single connection or range probe failed)",
+        reason,
         "download strategy selected"
     );
-    let (resp, meta) = retry_with_backoff(
-        spec.max_retries,
-        spec.retry_base_delay,
-        spec.retry_max_delay,
-        &mut cancel_rx,
-        || worker.send_get(),
-    )
-    .await?;
+    let total = if response.status().as_u16() == 206 {
+        meta.content_range_total
+    } else {
+        meta.content_length
+    };
     run_single_connection(
-        resp,
+        response,
         &meta,
-        &spec,
+        spec,
+        output_path,
         0,
-        &progress_tx,
+        progress_tx,
         cancel_rx,
         &control_path,
-        meta.content_length,
+        total,
+        speed_limit,
+        log_level,
+        download_id,
+    )
+    .await?;
+    Ok(output_path.to_path_buf())
+}
+
+pub(crate) async fn run_download(
+    client: reqwest::Client,
+    spec: DownloadSpec,
+    log_level: LogLevel,
+    download_id: u64,
+    progress_tx: watch::Sender<ProgressSnapshot>,
+    cancel_rx: watch::Receiver<StopSignal>,
+) -> Result<(), DownloadError> {
+    let checksum = spec.checksum.clone();
+    let result = run_download_inner(client, spec, log_level, download_id, &progress_tx, cancel_rx).await;
+
+    let output_path = match result {
+        Ok(output_path) => output_path,
+        Err(e) => {
+            log_error!(log_level, download_id, error = %e, "download failed");
+            return Err(e);
+        }
+    };
+
+    // Post-download checksum verification
+    if let Some(ref expected) = checksum {
+        log_info!(log_level, download_id, algorithm = "sha256", "checksum verification started");
+        match verify_checksum(&output_path, expected).await {
+            Ok(()) => {
+                log_info!(log_level, download_id, "checksum verification passed");
+            }
+            Err(e) => {
+                log_error!(log_level, download_id, error = %e, "checksum verification failed");
+                return Err(e);
+            }
+        }
+    }
+
+    log_info!(log_level, download_id, output = %output_path.display(), "download completed successfully");
+    Ok(())
+}
+
+async fn run_download_inner(
+    client: reqwest::Client,
+    spec: DownloadSpec,
+    log_level: LogLevel,
+    download_id: u64,
+    progress_tx: &watch::Sender<ProgressSnapshot>,
+    cancel_rx: watch::Receiver<StopSignal>,
+) -> Result<PathBuf, DownloadError> {
+    let worker = HttpWorker::new(client.clone(), &spec);
+    let mut cancel_rx = cancel_rx;
+    let speed_limit = SpeedLimit::new(spec.max_download_speed);
+
+    if let Some(output_path) = resolve_static_output_path(&spec)? {
+        if let Some(resumed_path) = try_resume_download(
+            client.clone(),
+            &worker,
+            &spec,
+            &output_path,
+            progress_tx,
+            &mut cancel_rx,
+            speed_limit.clone(),
+            log_level,
+            download_id,
+        )
+        .await?
+        {
+            return Ok(resumed_path);
+        }
+
+        return if spec.max_connections > 1 {
+            let piece_end = spec.piece_size.saturating_sub(1);
+            if let Ok((resp, meta)) = worker.send_range(0, piece_end).await {
+                run_fresh_from_response(
+                    client,
+                    &spec,
+                    &output_path,
+                    resp,
+                    meta,
+                    FreshResponseSource::RangeProbe,
+                    progress_tx,
+                    cancel_rx,
+                    speed_limit,
+                    log_level,
+                    download_id,
+                )
+                .await
+            } else {
+                let (resp, meta) = retry_with_backoff(
+                    spec.max_retries,
+                    spec.retry_base_delay,
+                    spec.retry_max_delay,
+                    &mut cancel_rx,
+                    || worker.send_get(),
+                )
+                .await?;
+                run_fresh_from_response(
+                    client,
+                    &spec,
+                    &output_path,
+                    resp,
+                    meta,
+                    FreshResponseSource::FallbackGet,
+                    progress_tx,
+                    cancel_rx,
+                    speed_limit,
+                    log_level,
+                    download_id,
+                )
+                .await
+            }
+        } else {
+            let (resp, meta) = retry_with_backoff(
+                spec.max_retries,
+                spec.retry_base_delay,
+                spec.retry_max_delay,
+                &mut cancel_rx,
+                || worker.send_get(),
+            )
+            .await?;
+            run_fresh_from_response(
+                client,
+                &spec,
+                &output_path,
+                resp,
+                meta,
+                FreshResponseSource::FallbackGet,
+                progress_tx,
+                cancel_rx,
+                speed_limit,
+                log_level,
+                download_id,
+            )
+            .await
+        };
+    }
+
+    let (initial_response, initial_meta, source) = if spec.max_connections > 1 {
+        let piece_end = spec.piece_size.saturating_sub(1);
+        match worker.send_range(0, piece_end).await {
+            Ok((resp, meta)) => (resp, meta, FreshResponseSource::RangeProbe),
+            Err(_) => {
+                let (resp, meta) = retry_with_backoff(
+                    spec.max_retries,
+                    spec.retry_base_delay,
+                    spec.retry_max_delay,
+                    &mut cancel_rx,
+                    || worker.send_get(),
+                )
+                .await?;
+                (resp, meta, FreshResponseSource::FallbackGet)
+            }
+        }
+    } else {
+        let (resp, meta) = retry_with_backoff(
+            spec.max_retries,
+            spec.retry_base_delay,
+            spec.retry_max_delay,
+            &mut cancel_rx,
+            || worker.send_get(),
+        )
+        .await?;
+        (resp, meta, FreshResponseSource::FallbackGet)
+    };
+
+    let output_path = resolve_auto_output_path(&spec, &initial_meta)?;
+    if let Some(resumed_path) = try_resume_download(
+        client.clone(),
+        &worker,
+        &spec,
+        &output_path,
+        progress_tx,
+        &mut cancel_rx,
+        speed_limit.clone(),
+        log_level,
+        download_id,
+    )
+    .await?
+    {
+        return Ok(resumed_path);
+    }
+
+    run_fresh_from_response(
+        client,
+        &spec,
+        &output_path,
+        initial_response,
+        initial_meta,
+        source,
+        progress_tx,
+        cancel_rx,
         speed_limit,
         log_level,
         download_id,
@@ -404,6 +613,7 @@ async fn run_single_connection(
     response: reqwest::Response,
     meta: &ResponseMeta,
     spec: &DownloadSpec,
+    output_path: &Path,
     start_offset: u64,
     progress_tx: &watch::Sender<ProgressSnapshot>,
     cancel_rx: watch::Receiver<StopSignal>,
@@ -421,12 +631,11 @@ async fn run_single_connection(
         "single-connection download started");
 
     let file = if start_offset > 0 {
-        open_existing_file(&spec.output_path).await?
+        open_existing_file(output_path).await?
     } else {
-        create_output_file(&spec.output_path, total_size, spec.file_allocation).await?
+        create_output_file(output_path, total_size, spec.file_allocation).await?
     };
 
-    // Memory budget semaphore: permits = memory_budget bytes
     let budget = Arc::new(Semaphore::new(spec.memory_budget));
     let (write_tx, write_rx) = mpsc::channel::<WriterCommand>(spec.channel_buffer);
     let written_bytes = Arc::new(AtomicU64::new(start_offset));
@@ -631,6 +840,7 @@ async fn stream_single(
 async fn run_multi_worker(
     client: reqwest::Client,
     spec: &DownloadSpec,
+    output_path: &Path,
     meta: &ResponseMeta,
     total_size: u64,
     piece_map: PieceMap,
@@ -644,9 +854,9 @@ async fn run_multi_worker(
 ) -> Result<(), DownloadError> {
     // File
     let file = if piece_map.completed_count() > 0 {
-        open_existing_file(&spec.output_path).await?
+        open_existing_file(output_path).await?
     } else {
-        create_output_file(&spec.output_path, Some(total_size), spec.file_allocation).await?
+        create_output_file(output_path, Some(total_size), spec.file_allocation).await?
     };
 
     // Memory budget semaphore
@@ -1282,6 +1492,7 @@ mod tests {
             accept_ranges: false,
             etag: None,
             last_modified: None,
+            content_disposition: None,
             content_encoding: None,
         };
         assert!(range_response_allowed(&meta));
@@ -1297,6 +1508,7 @@ mod tests {
             accept_ranges: false,
             etag: None,
             last_modified: None,
+            content_disposition: None,
             content_encoding: Some("identity".into()),
         };
         assert!(range_response_allowed(&meta));
@@ -1312,6 +1524,7 @@ mod tests {
             accept_ranges: false,
             etag: None,
             last_modified: None,
+            content_disposition: None,
             content_encoding: Some("gzip".into()),
         };
         assert!(!range_response_allowed(&meta));
@@ -1327,6 +1540,7 @@ mod tests {
             accept_ranges: true,
             etag: Some("\"abc\"".into()),
             last_modified: Some("Thu, 01 Jan 2026 00:00:00 GMT".into()),
+            content_disposition: None,
             content_encoding: None,
         };
         let ctrl = ControlSnapshot {
@@ -1352,6 +1566,7 @@ mod tests {
             accept_ranges: true,
             etag: None,
             last_modified: None,
+            content_disposition: None,
             content_encoding: None,
         };
         let ctrl = ControlSnapshot {
@@ -1377,6 +1592,7 @@ mod tests {
             accept_ranges: true,
             etag: Some("\"new\"".into()),
             last_modified: None,
+            content_disposition: None,
             content_encoding: None,
         };
         let ctrl = ControlSnapshot {
@@ -1402,6 +1618,7 @@ mod tests {
             accept_ranges: true,
             etag: None,
             last_modified: Some("Fri, 02 Jan 2026".into()),
+            content_disposition: None,
             content_encoding: None,
         };
         let ctrl = ControlSnapshot {
@@ -1427,6 +1644,7 @@ mod tests {
             accept_ranges: true,
             etag: None,
             last_modified: None,
+            content_disposition: None,
             content_encoding: None,
         };
         let ctrl = ControlSnapshot {
@@ -1698,6 +1916,7 @@ mod tests {
             accept_ranges: true,
             etag: None,
             last_modified: None,
+            content_disposition: None,
             content_encoding: None,
         };
         let segment = Segment {
@@ -1718,6 +1937,7 @@ mod tests {
             accept_ranges: true,
             etag: None,
             last_modified: None,
+            content_disposition: None,
             content_encoding: Some("gzip".into()),
         };
         let segment = Segment {
@@ -1741,6 +1961,7 @@ mod tests {
             accept_ranges: true,
             etag: None,
             last_modified: None,
+            content_disposition: None,
             content_encoding: None,
         };
         let segment = Segment {
@@ -1764,6 +1985,7 @@ mod tests {
             accept_ranges: true,
             etag: None,
             last_modified: None,
+            content_disposition: None,
             content_encoding: None,
         };
         let segment = Segment {
@@ -1787,6 +2009,7 @@ mod tests {
             accept_ranges: true,
             etag: None,
             last_modified: None,
+            content_disposition: None,
             content_encoding: None,
         };
         let segment = Segment {
