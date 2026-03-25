@@ -97,6 +97,16 @@ pub(super) async fn run_multi_worker(
     let mut probe_response = probe_response;
     let save_write_tx = write_tx.clone();
 
+    let worker_cfg = Arc::new(WorkerConfig {
+        url: spec.url.clone(),
+        headers: spec.headers.clone(),
+        read_timeout: spec.read_timeout,
+        max_retries: spec.max_retries,
+        retry_base_delay: spec.retry_base_delay,
+        retry_max_delay: spec.retry_max_delay,
+        max_retry_elapsed: spec.max_retry_elapsed,
+    });
+
     for worker_id in 0..num_workers {
         let first = if worker_id == 0 {
             probe_response.take()
@@ -106,13 +116,7 @@ pub(super) async fn run_multi_worker(
         let handle = tokio::spawn(worker_loop(
             worker_id,
             client.clone(),
-            spec.url.clone(),
-            spec.headers.clone(),
-            spec.read_timeout,
-            spec.max_retries,
-            spec.retry_base_delay,
-            spec.retry_max_delay,
-            spec.max_retry_elapsed,
+            worker_cfg.clone(),
             scheduler.clone(),
             write_tx.clone(),
             downloaded.clone(),
@@ -311,17 +315,22 @@ async fn save_multi_control(
 //  Worker loop
 // ──────────────────────────────────────────────────────────────
 
-#[allow(clippy::too_many_arguments)]
-async fn worker_loop(
-    worker_id: usize,
-    client: reqwest::Client,
+/// Immutable per-download configuration shared by all workers via `Arc`.
+struct WorkerConfig {
     url: String,
     headers: std::collections::HashMap<String, String>,
-    timeout: Duration,
+    read_timeout: Duration,
     max_retries: u32,
     retry_base_delay: Duration,
     retry_max_delay: Duration,
     max_retry_elapsed: Option<Duration>,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn worker_loop(
+    worker_id: usize,
+    client: reqwest::Client,
+    cfg: Arc<WorkerConfig>,
     scheduler: Scheduler,
     write_tx: mpsc::Sender<WriterCommand>,
     downloaded: Arc<AtomicU64>,
@@ -379,9 +388,9 @@ async fn worker_loop(
                 } else {
                     download_segment(
                         &client,
-                        &url,
-                        &headers,
-                        timeout,
+                        &cfg.url,
+                        &cfg.headers,
+                        cfg.read_timeout,
                         &segment,
                         &write_tx,
                         &downloaded,
@@ -394,9 +403,9 @@ async fn worker_loop(
             } else {
                 download_segment(
                     &client,
-                    &url,
-                    &headers,
-                    timeout,
+                    &cfg.url,
+                    &cfg.headers,
+                    cfg.read_timeout,
                     &segment,
                     &write_tx,
                     &downloaded,
@@ -416,7 +425,7 @@ async fn worker_loop(
                     break;
                 }
                 Err(e) => {
-                    if !e.is_retryable() || attempt >= max_retries {
+                    if !e.is_retryable() || attempt >= cfg.max_retries {
                         log_warn!(log_level, download_id = download_id, worker_id = worker_id,
                             piece_id = segment.piece_id, error = %e,
                             "segment failed, reclaiming (non-retryable or max retries exceeded)");
@@ -424,7 +433,7 @@ async fn worker_loop(
                         return Err(e);
                     }
 
-                    if let Some(limit) = max_retry_elapsed {
+                    if let Some(limit) = cfg.max_retry_elapsed {
                         let elapsed = retry_started_at.elapsed();
                         if elapsed >= limit {
                             scheduler.lock().reclaim(segment.piece_id);
@@ -438,11 +447,11 @@ async fn worker_loop(
                     let backoff = if let Some(retry_secs) = e.retry_after_secs() {
                         Duration::from_secs(retry_secs)
                     } else {
-                        let exp = retry_base_delay.saturating_mul(1u32 << attempt.min(10));
-                        exp.min(retry_max_delay)
+                        let exp = cfg.retry_base_delay.saturating_mul(1u32 << attempt.min(10));
+                        exp.min(cfg.retry_max_delay)
                     };
 
-                    if let Some(limit) = max_retry_elapsed {
+                    if let Some(limit) = cfg.max_retry_elapsed {
                         let elapsed = retry_started_at.elapsed();
                         if elapsed.saturating_add(backoff) > limit {
                             scheduler.lock().reclaim(segment.piece_id);
