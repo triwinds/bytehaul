@@ -11,6 +11,7 @@ import bytehaul
 from bytehaul import (
     BytehaulError,
     CancelledError,
+    PausedError,
     ConfigError,
     DownloadFailedError,
     Downloader,
@@ -80,6 +81,7 @@ class TestImports:
 
     def test_exception_hierarchy(self):
         assert issubclass(CancelledError, BytehaulError)
+        assert issubclass(PausedError, BytehaulError)
         assert issubclass(ConfigError, BytehaulError)
         assert issubclass(DownloadFailedError, BytehaulError)
 
@@ -230,6 +232,15 @@ class TestDownloaderAPI:
         task = d.download(f"{server}/slow", str(out))
         task.cancel()
         with pytest.raises(CancelledError):
+            task.wait()
+
+    def test_pause(self, server, tmp_path):
+        out = tmp_path / "pause.bin"
+        d = Downloader()
+        task = d.download(f"{server}/slow", str(out), resume=True)
+        time.sleep(0.05)
+        task.pause()
+        with pytest.raises(PausedError):
             task.wait()
 
     def test_wait_twice_raises(self, server, tmp_path):

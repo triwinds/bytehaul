@@ -100,7 +100,7 @@ impl Downloader {
     /// Start a download and return a handle for monitoring / cancellation.
     pub fn download(&self, spec: DownloadSpec) -> DownloadHandle {
         let (progress_tx, progress_rx) = watch::channel(ProgressSnapshot::default());
-        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let (cancel_tx, cancel_rx) = watch::channel(session::StopSignal::Running);
         let shared_client = self.client.clone();
         let client_config = self.client_config.clone();
         let log_level = self.log_level;
@@ -139,7 +139,7 @@ impl Downloader {
 /// Handle to a running download task.
 pub struct DownloadHandle {
     progress_rx: watch::Receiver<ProgressSnapshot>,
-    cancel_tx: watch::Sender<bool>,
+    cancel_tx: watch::Sender<session::StopSignal>,
     task: JoinHandle<Result<(), DownloadError>>,
 }
 
@@ -156,7 +156,12 @@ impl DownloadHandle {
 
     /// Request cancellation of the download.
     pub fn cancel(&self) {
-        let _ = self.cancel_tx.send(true);
+        let _ = self.cancel_tx.send(session::StopSignal::Cancel);
+    }
+
+    /// Request the download to pause and persist resume state.
+    pub fn pause(&self) {
+        let _ = self.cancel_tx.send(session::StopSignal::Pause);
     }
 
     /// Wait for the download to finish and return the result.
@@ -286,7 +291,7 @@ mod tests {
     #[tokio::test]
     async fn test_download_handle_wait_maps_panics() {
         let (progress_tx, progress_rx) = watch::channel(ProgressSnapshot::default());
-        let (cancel_tx, _) = watch::channel(false);
+        let (cancel_tx, _) = watch::channel(session::StopSignal::Running);
         drop(progress_tx);
 
         let handle = DownloadHandle {

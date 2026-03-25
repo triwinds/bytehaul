@@ -11,6 +11,9 @@ pub enum DownloadError {
     #[error("download cancelled")]
     Cancelled,
 
+    #[error("download paused")]
+    Paused,
+
     #[error("HTTP {status}: {message}")]
     HttpStatus { status: u16, message: String },
 
@@ -115,6 +118,7 @@ mod tests {
     #[test]
     fn test_is_retryable_other_variants() {
         assert!(!DownloadError::Cancelled.is_retryable());
+        assert!(!DownloadError::Paused.is_retryable());
         assert!(!DownloadError::ChannelClosed.is_retryable());
         assert!(!DownloadError::Other("test".into()).is_retryable());
         assert!(!DownloadError::ResumeMismatch("test".into()).is_retryable());
@@ -159,6 +163,7 @@ mod tests {
     #[test]
     fn test_retry_after_secs_non_http_status() {
         assert_eq!(DownloadError::Cancelled.retry_after_secs(), None);
+        assert_eq!(DownloadError::Paused.retry_after_secs(), None);
         assert_eq!(DownloadError::ChannelClosed.retry_after_secs(), None);
     }
 
@@ -166,6 +171,9 @@ mod tests {
     fn test_error_display() {
         let e = DownloadError::Cancelled;
         assert_eq!(format!("{e}"), "download cancelled");
+
+        let e = DownloadError::Paused;
+        assert_eq!(format!("{e}"), "download paused");
 
         let e = DownloadError::ChecksumMismatch {
             expected: "aaa".into(),

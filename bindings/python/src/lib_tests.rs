@@ -238,6 +238,9 @@ fn test_error_mapping_snapshot_conversion_and_repr() {
     assert!(map_download_error(DownloadError::Cancelled)
         .to_string()
         .contains("CancelledError"));
+    assert!(map_download_error(DownloadError::Paused)
+        .to_string()
+        .contains("PausedError"));
     assert!(map_download_error(DownloadError::Other("boom".into()))
         .to_string()
         .contains("DownloadFailedError"));
@@ -320,6 +323,7 @@ fn test_download_task_methods_and_consumption_errors() {
     ));
 
     task.cancel().unwrap();
+    task.pause().unwrap();
 
     let wait_err = with_python(|py| task.wait(py).unwrap_err());
     assert!(wait_err.to_string().contains("Error"));
@@ -340,9 +344,41 @@ fn test_download_task_methods_and_consumption_errors() {
         Err(err) => assert!(err.to_string().contains("already consumed")),
     }
     none_task.cancel().unwrap();
+    none_task.pause().unwrap();
     assert!(with_python(|py| none_task.wait(py).unwrap_err())
         .to_string()
         .contains("already consumed"));
+}
+
+#[test]
+fn test_download_task_pause_maps_to_paused_error() {
+    init_python();
+    let downloader = PyDownloader::new(None, None, None, None, None, None, None).unwrap();
+    let task = downloader
+        .download(
+            "http://127.0.0.1:1/unreachable".into(),
+            unique_path("task-paused"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(true),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+    task.pause().unwrap();
+
+    let wait_err = with_python(|py| task.wait(py).unwrap_err());
+    assert!(wait_err.to_string().contains("PausedError"));
 }
 
 #[test]
@@ -421,6 +457,7 @@ fn test_py_downloader_download_success_and_module_registration() {
         for name in [
             "BytehaulError",
             "CancelledError",
+            "PausedError",
             "ConfigError",
             "DownloadFailedError",
             "download",

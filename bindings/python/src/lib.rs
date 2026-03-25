@@ -12,6 +12,7 @@ use tokio::runtime::{Builder, Runtime};
 
 create_exception!(_bytehaul, BytehaulError, PyException);
 create_exception!(_bytehaul, CancelledError, BytehaulError);
+create_exception!(_bytehaul, PausedError, BytehaulError);
 create_exception!(_bytehaul, ConfigError, BytehaulError);
 create_exception!(_bytehaul, DownloadFailedError, BytehaulError);
 
@@ -239,6 +240,7 @@ fn build_download_spec(
 fn map_download_error(error: DownloadError) -> PyErr {
     match error {
         DownloadError::Cancelled => CancelledError::new_err("download cancelled"),
+        DownloadError::Paused => PausedError::new_err("download paused"),
         other => DownloadFailedError::new_err(other.to_string()),
     }
 }
@@ -324,6 +326,17 @@ impl PyDownloadTask {
         match guard.as_ref() {
             Some(h) => {
                 h.cancel();
+                Ok(())
+            }
+            None => Ok(()),
+        }
+    }
+
+    fn pause(&self) -> PyResult<()> {
+        let guard = self.handle.lock().unwrap();
+        match guard.as_ref() {
+            Some(h) => {
+                h.pause();
                 Ok(())
             }
             None => Ok(()),
@@ -567,6 +580,7 @@ fn download(
 fn register_exceptions(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("BytehaulError", py.get_type::<BytehaulError>())?;
     module.add("CancelledError", py.get_type::<CancelledError>())?;
+    module.add("PausedError", py.get_type::<PausedError>())?;
     module.add("ConfigError", py.get_type::<ConfigError>())?;
     module.add("DownloadFailedError", py.get_type::<DownloadFailedError>())?;
     Ok(())

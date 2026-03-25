@@ -25,12 +25,49 @@ use crate::storage::writer::{WriterCommand, WriterTask};
 
 const CONTROL_SAVE_INTERVAL: Duration = Duration::from_secs(5);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StopSignal {
+    Running,
+    Cancel,
+    Pause,
+}
+
+impl StopSignal {
+    fn is_stop_requested(self) -> bool {
+        !matches!(self, Self::Running)
+    }
+}
+
+fn stop_signal_error(signal: StopSignal) -> Option<DownloadError> {
+    match signal {
+        StopSignal::Running => None,
+        StopSignal::Cancel => Some(DownloadError::Cancelled),
+        StopSignal::Pause => Some(DownloadError::Paused),
+    }
+}
+
+fn stop_signal_state(signal: StopSignal) -> Option<DownloadState> {
+    match signal {
+        StopSignal::Running => None,
+        StopSignal::Cancel => Some(DownloadState::Cancelled),
+        StopSignal::Pause => Some(DownloadState::Paused),
+    }
+}
+
+fn stop_signal_label(signal: StopSignal) -> &'static str {
+    match signal {
+        StopSignal::Running => "running",
+        StopSignal::Cancel => "cancelled",
+        StopSignal::Pause => "paused",
+    }
+}
+
 /// Retry an async operation with exponential backoff.
 async fn retry_with_backoff<F, Fut, T>(
     max_retries: u32,
     base_delay: Duration,
     max_delay: Duration,
-    cancel_rx: &mut watch::Receiver<bool>,
+    cancel_rx: &mut watch::Receiver<StopSignal>,
     mut op: F,
 ) -> Result<T, DownloadError>
 where
@@ -56,8 +93,10 @@ where
                 tokio::select! {
                     biased;
                     result = cancel_rx.changed() => {
-                        if result.is_ok() && *cancel_rx.borrow_and_update() {
-                            return Err(DownloadError::Cancelled);
+                        if result.is_ok() {
+                            if let Some(error) = stop_signal_error(*cancel_rx.borrow_and_update()) {
+                                return Err(error);
+                            }
                         }
                     }
                     _ = tokio::time::sleep(backoff) => {}
@@ -77,7 +116,7 @@ pub(crate) async fn run_download(
     log_level: LogLevel,
     download_id: u64,
     progress_tx: watch::Sender<ProgressSnapshot>,
-    cancel_rx: watch::Receiver<bool>,
+    cancel_rx: watch::Receiver<StopSignal>,
 ) -> Result<(), DownloadError> {
     let checksum = spec.checksum.clone();
     let output_path = spec.output_path.clone();
@@ -114,7 +153,7 @@ async fn run_download_inner(
     log_level: LogLevel,
     download_id: u64,
     progress_tx: &watch::Sender<ProgressSnapshot>,
-    cancel_rx: watch::Receiver<bool>,
+    cancel_rx: watch::Receiver<StopSignal>,
 ) -> Result<(), DownloadError> {
     let control_path = ControlSnapshot::control_path(&spec.output_path);
     let worker = HttpWorker::new(client.clone(), &spec);
@@ -364,7 +403,7 @@ async fn run_single_connection(
     spec: &DownloadSpec,
     start_offset: u64,
     progress_tx: &watch::Sender<ProgressSnapshot>,
-    cancel_rx: watch::Receiver<bool>,
+    cancel_rx: watch::Receiver<StopSignal>,
     control_path: &Path,
     total_size: Option<u64>,
     speed_limit: SpeedLimit,
@@ -440,7 +479,7 @@ async fn run_single_connection(
             s.downloaded_bytes = w;
             let _ = s.save(control_path).await;
         }
-        if !matches!(e, DownloadError::Cancelled) {
+        if !matches!(e, DownloadError::Cancelled | DownloadError::Paused) {
             log_error!(log_level, download_id = download_id, error = %e,
                 "single-connection download failed");
             progress_tx.send_modify(|p| p.state = DownloadState::Failed);
@@ -462,7 +501,7 @@ async fn stream_single(
     response: reqwest::Response,
     write_tx: &mpsc::Sender<WriterCommand>,
     progress_tx: &watch::Sender<ProgressSnapshot>,
-    cancel_rx: watch::Receiver<bool>,
+    cancel_rx: watch::Receiver<StopSignal>,
     total_size: Option<u64>,
     start_offset: u64,
     control: Option<(&Path, &ControlSnapshot)>,
@@ -488,9 +527,21 @@ async fn stream_single(
             biased;
 
             result = cancel_rx.changed() => {
-                if result.is_ok() && *cancel_rx.borrow_and_update() {
-                    progress_tx.send_modify(|p| p.state = DownloadState::Cancelled);
-                    return Err(DownloadError::Cancelled);
+                if result.is_ok() {
+                    let signal = *cancel_rx.borrow_and_update();
+                    if let Some(error) = stop_signal_error(signal) {
+                        if let Some(state) = stop_signal_state(signal) {
+                            progress_tx.send_modify(|p| p.state = state);
+                        }
+                        if let Some((cp, tmpl)) = &control {
+                            if let Ok(w) = flush_all_and_wait(write_tx, true).await {
+                                let mut s = (*tmpl).clone();
+                                s.downloaded_bytes = w;
+                                let _ = s.save(cp).await;
+                            }
+                        }
+                        return Err(error);
+                    }
                 }
             }
 
@@ -554,7 +605,7 @@ async fn run_multi_worker(
     piece_map: PieceMap,
     probe_response: Option<(reqwest::Response, usize)>,
     progress_tx: &watch::Sender<ProgressSnapshot>,
-    cancel_rx: watch::Receiver<bool>,
+    cancel_rx: watch::Receiver<StopSignal>,
     control_path: &Path,
     speed_limit: SpeedLimit,
     log_level: LogLevel,
@@ -658,12 +709,25 @@ async fn run_multi_worker(
             biased;
 
             result = cancel_rx.changed() => {
-                if result.is_ok() && *cancel_rx.borrow_and_update() {
-                    log_info!(log_level, download_id = download_id, "multi-worker download cancelled");
-                    for ah in &abort_handles { ah.abort(); }
-                    progress_tx.send_modify(|p| p.state = DownloadState::Cancelled);
-                    download_error = Some(DownloadError::Cancelled);
-                    break;
+                if result.is_ok() {
+                    let signal = *cancel_rx.borrow_and_update();
+                    if let Some(error) = stop_signal_error(signal) {
+                        log_info!(
+                            log_level,
+                            download_id = download_id,
+                            stop = stop_signal_label(signal),
+                            "multi-worker download stopped"
+                        );
+                        for ah in &abort_handles { ah.abort(); }
+                        if let Some(state) = stop_signal_state(signal) {
+                            progress_tx.send_modify(|p| p.state = state);
+                        }
+                        if spec.resume {
+                            save_multi_control(spec, meta, &scheduler, total_size, control_path, Some(&save_write_tx)).await;
+                        }
+                        download_error = Some(error);
+                        break;
+                    }
                 }
             }
 
@@ -810,7 +874,7 @@ async fn worker_loop(
     scheduler: Scheduler,
     write_tx: mpsc::Sender<WriterCommand>,
     downloaded: Arc<AtomicU64>,
-    cancel_rx: watch::Receiver<bool>,
+    cancel_rx: watch::Receiver<StopSignal>,
     budget: Arc<Semaphore>,
     speed_limit: SpeedLimit,
     first_response: Option<(reqwest::Response, usize)>,
@@ -822,9 +886,16 @@ async fn worker_loop(
     log_debug!(log_level, download_id = download_id, worker_id = worker_id, "worker started");
 
     loop {
-        if *cancel_rx.borrow() {
-            log_debug!(log_level, download_id = download_id, worker_id = worker_id, "worker cancelled");
-            return Err(DownloadError::Cancelled);
+        let signal = *cancel_rx.borrow();
+        if signal.is_stop_requested() {
+            log_debug!(
+                log_level,
+                download_id = download_id,
+                worker_id = worker_id,
+                stop = stop_signal_label(signal),
+                "worker stopped"
+            );
+            return Err(stop_signal_error(signal).expect("stop signal must map to an error"));
         }
 
         let segment = match scheduler.lock().assign() {
@@ -920,9 +991,12 @@ async fn worker_loop(
                     tokio::select! {
                         biased;
                         result = cancel_rx.changed() => {
-                            if result.is_ok() && *cancel_rx.borrow_and_update() {
+                            if result.is_ok() {
+                                let signal = *cancel_rx.borrow_and_update();
                                 scheduler.lock().reclaim(segment.piece_id);
-                                return Err(DownloadError::Cancelled);
+                                if let Some(error) = stop_signal_error(signal) {
+                                    return Err(error);
+                                }
                             }
                         }
                         _ = tokio::time::sleep(backoff) => {}
@@ -992,7 +1066,7 @@ async fn download_segment(
     segment: &Segment,
     write_tx: &mpsc::Sender<WriterCommand>,
     downloaded: &Arc<AtomicU64>,
-    cancel_rx: &mut watch::Receiver<bool>,
+    cancel_rx: &mut watch::Receiver<StopSignal>,
     budget: &Arc<Semaphore>,
     speed_limit: &SpeedLimit,
 ) -> Result<(), DownloadError> {
@@ -1034,7 +1108,7 @@ async fn stream_segment(
     segment: &Segment,
     write_tx: &mpsc::Sender<WriterCommand>,
     downloaded: &Arc<AtomicU64>,
-    cancel_rx: &mut watch::Receiver<bool>,
+    cancel_rx: &mut watch::Receiver<StopSignal>,
     budget: &Arc<Semaphore>,
     speed_limit: &SpeedLimit,
 ) -> Result<(), DownloadError> {
@@ -1046,8 +1120,10 @@ async fn stream_segment(
             biased;
 
             result = cancel_rx.changed() => {
-                if result.is_ok() && *cancel_rx.borrow_and_update() {
-                    return Err(DownloadError::Cancelled);
+                if result.is_ok() {
+                    if let Some(error) = stop_signal_error(*cancel_rx.borrow_and_update()) {
+                        return Err(error);
+                    }
                 }
             }
 
@@ -1319,7 +1395,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_retry_with_backoff_immediate_success() {
-        let (_, mut cancel_rx) = watch::channel(false);
+        let (_, mut cancel_rx) = watch::channel(StopSignal::Running);
         let result: Result<i32, DownloadError> = retry_with_backoff(
             3,
             Duration::from_millis(10),
@@ -1333,7 +1409,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_retry_with_backoff_non_retryable() {
-        let (_, mut cancel_rx) = watch::channel(false);
+        let (_, mut cancel_rx) = watch::channel(StopSignal::Running);
         let result: Result<i32, DownloadError> = retry_with_backoff(
             3,
             Duration::from_millis(10),
@@ -1348,7 +1424,7 @@ mod tests {
     #[tokio::test]
     async fn test_retry_with_backoff_retries_then_succeeds() {
         use std::sync::atomic::{AtomicU32, Ordering};
-        let (_, mut cancel_rx) = watch::channel(false);
+        let (_, mut cancel_rx) = watch::channel(StopSignal::Running);
         let attempts = Arc::new(AtomicU32::new(0));
         let attempts_clone = attempts.clone();
 
@@ -1379,7 +1455,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_retry_with_backoff_exhausts_retries() {
-        let (_, mut cancel_rx) = watch::channel(false);
+        let (_, mut cancel_rx) = watch::channel(StopSignal::Running);
         let result: Result<i32, DownloadError> = retry_with_backoff(
             2,
             Duration::from_millis(1),
@@ -1402,7 +1478,7 @@ mod tests {
     #[tokio::test]
     async fn test_retry_with_backoff_with_retry_after_hint() {
         use std::sync::atomic::{AtomicU32, Ordering};
-        let (_, mut cancel_rx) = watch::channel(false);
+        let (_, mut cancel_rx) = watch::channel(StopSignal::Running);
         let attempts = Arc::new(AtomicU32::new(0));
         let attempts_clone = attempts.clone();
 
@@ -1432,10 +1508,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_retry_with_backoff_cancelled() {
-        let (cancel_tx, mut cancel_rx) = watch::channel(false);
+        let (cancel_tx, mut cancel_rx) = watch::channel(StopSignal::Running);
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(5)).await;
-            let _ = cancel_tx.send(true);
+            let _ = cancel_tx.send(StopSignal::Cancel);
         });
 
         let result: Result<i32, DownloadError> = retry_with_backoff(
@@ -1452,6 +1528,30 @@ mod tests {
         )
         .await;
         assert!(matches!(result, Err(DownloadError::Cancelled)));
+    }
+
+    #[tokio::test]
+    async fn test_retry_with_backoff_paused() {
+        let (cancel_tx, mut cancel_rx) = watch::channel(StopSignal::Running);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            let _ = cancel_tx.send(StopSignal::Pause);
+        });
+
+        let result: Result<i32, DownloadError> = retry_with_backoff(
+            10,
+            Duration::from_secs(10),
+            Duration::from_secs(60),
+            &mut cancel_rx,
+            || async {
+                Err(DownloadError::HttpStatus {
+                    status: 503,
+                    message: "retry-after:60".into(),
+                })
+            },
+        )
+        .await;
+        assert!(matches!(result, Err(DownloadError::Paused)));
     }
 
     #[tokio::test]

@@ -11,13 +11,13 @@ A Rust async HTTP download library with resume, multi-connection, write-back cac
 ## Features
 
 - **Single & multi-connection downloads** — automatic Range probing and fallback
-- **Resume / breakpoint continuation** — control file persistence with atomic save
+- **Pause / resume** — cooperative pause with persisted control files for later continuation
 - **Write-back cache** — piece-based aggregation to reduce random I/O
 - **Memory budget & backpressure** — semaphore-based flow control
 - **Retry with exponential backoff** — configurable max retries, respects `Retry-After`
 - **Rate limiting** — shared token-bucket across all workers
 - **SHA-256 checksum verification** — post-download integrity check
-- **Cancellation** — cooperative cancel via watch channel
+- **Cancellation** — cooperative cancel via stop signal
 - **Progress reporting** — real-time speed, downloaded bytes, state
 - **Shared network configuration** — proxy, custom DNS servers, and IPv6 toggle on the downloader client
 

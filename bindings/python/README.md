@@ -97,7 +97,8 @@ task = downloader.download("https://example.com/large.bin", "large.bin")
 snap = task.progress()
 print(f"State: {snap.state}, Downloaded: {snap.downloaded}, Speed: {snap.speed:.0f} B/s")
 
-# Cancel if needed
+# Pause or cancel if needed
+# task.pause()
 # task.cancel()
 
 # Wait for completion
@@ -107,12 +108,14 @@ task.wait()
 ### Error handling
 
 ```python
-from bytehaul import download, DownloadFailedError, CancelledError, ConfigError
+from bytehaul import download, DownloadFailedError, CancelledError, PausedError, ConfigError
 
 try:
     download("https://example.com/file.bin", "output.bin")
 except ConfigError as e:
     print(f"Invalid parameter: {e}")
+except PausedError:
+    print("Download was paused")
 except CancelledError:
     print("Download was cancelled")
 except DownloadFailedError as e:
@@ -136,6 +139,7 @@ Reusable downloader instance.
 Handle to a running download.
 
 - `task.progress() -> ProgressSnapshot` — current download progress
+- `task.pause()` — pause the download and persist resume metadata when available
 - `task.cancel()` — cancel the download
 - `task.wait()` — block until download completes (releases GIL)
 
