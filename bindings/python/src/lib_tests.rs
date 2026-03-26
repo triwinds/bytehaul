@@ -243,6 +243,83 @@ fn test_apply_client_options_and_build_download_spec() {
 }
 
 #[test]
+fn test_checksum_parsing_and_invalid_config_mapping() {
+    init_python();
+
+    assert!(matches!(
+        parse_checksum_string("sha256:abc123").unwrap(),
+        Checksum::Sha256(ref checksum) if checksum == "abc123"
+    ));
+    assert!(matches!(
+        parse_checksum_string("SHA1:def456").unwrap(),
+        Checksum::Sha1(ref checksum) if checksum == "def456"
+    ));
+    assert!(matches!(
+        parse_checksum_string("md5:7890").unwrap(),
+        Checksum::Md5(ref checksum) if checksum == "7890"
+    ));
+    assert!(matches!(
+        parse_checksum_string("sha512:feedbeef").unwrap(),
+        Checksum::Sha512(ref checksum) if checksum == "feedbeef"
+    ));
+
+    assert!(parse_checksum_string("sha256")
+        .unwrap_err()
+        .to_string()
+        .contains("algorithm:hex_digest"));
+    assert!(parse_checksum_string("sha256:   ")
+        .unwrap_err()
+        .to_string()
+        .contains("cannot be empty"));
+    assert!(parse_checksum_string("crc32:abcd")
+        .unwrap_err()
+        .to_string()
+        .contains("unsupported checksum algorithm"));
+
+    assert!(map_download_error(DownloadError::InvalidConfig("bad config".into()))
+        .to_string()
+        .contains("ConfigError"));
+}
+
+#[test]
+fn test_build_download_spec_with_checksum_and_control_interval() {
+    init_python();
+
+    let spec = build_download_spec(
+        "https://example.com/file.bin".into(),
+        Some(unique_path("checksum-spec")),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some("sha512: deadbeef ".into()),
+        Some(3.0),
+    )
+    .unwrap();
+
+    assert!(matches!(
+        spec.get_checksum(),
+        Some(Checksum::Sha512(checksum)) if checksum == "deadbeef"
+    ));
+    assert_eq!(
+        spec.get_control_save_interval(),
+        Duration::from_secs_f64(3.0)
+    );
+}
+
+#[test]
 fn test_error_mapping_snapshot_conversion_and_repr() {
     init_python();
     assert!(map_download_error(DownloadError::Cancelled)
