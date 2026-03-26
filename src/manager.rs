@@ -381,6 +381,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_download_reports_closed_concurrency_semaphore() {
+        let downloader = Downloader::builder()
+            .max_concurrent_downloads(1)
+            .build()
+            .unwrap();
+        downloader
+            .concurrency_limit
+            .as_ref()
+            .expect("semaphore should exist")
+            .close();
+
+        let spec = crate::config::DownloadSpec::new("http://127.0.0.1:1/nonexistent")
+            .output_path(std::env::temp_dir().join("bytehaul_test_closed_semaphore"));
+
+        let err = downloader.download(spec).wait().await.unwrap_err();
+        assert!(matches!(err, crate::error::DownloadError::Internal(message) if message.contains("concurrency semaphore closed")));
+    }
+
+    #[tokio::test]
     async fn test_download_handle_wait_maps_panics() {
         let (progress_tx, progress_rx) = watch::channel(ProgressSnapshot::default());
         let (cancel_tx, _) = watch::channel(session::StopSignal::Running);
@@ -436,5 +455,53 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         assert!(received.load(std::sync::atomic::Ordering::Relaxed) >= 2);
+    }
+
+    #[tokio::test]
+    async fn test_on_progress_stops_for_all_terminal_states() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let terminal_states = [
+            crate::progress::DownloadState::Completed,
+            crate::progress::DownloadState::Failed,
+            crate::progress::DownloadState::Cancelled,
+            crate::progress::DownloadState::Paused,
+        ];
+
+        for state in terminal_states {
+            let (progress_tx, progress_rx) = watch::channel(ProgressSnapshot::default());
+            let (cancel_tx, _) = watch::channel(session::StopSignal::Running);
+            let received = Arc::new(AtomicU32::new(0));
+            let received_clone = received.clone();
+
+            let handle = DownloadHandle {
+                progress_rx,
+                cancel_tx,
+                task: tokio::spawn(async { Ok(()) }),
+            };
+
+            handle.on_progress(move |_snap| {
+                received_clone.fetch_add(1, Ordering::Relaxed);
+            });
+
+            progress_tx
+                .send(ProgressSnapshot {
+                    state,
+                    ..Default::default()
+                })
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            progress_tx
+                .send(ProgressSnapshot {
+                    state: crate::progress::DownloadState::Downloading,
+                    downloaded: 1,
+                    ..Default::default()
+                })
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            assert_eq!(received.load(Ordering::Relaxed), 1);
+        }
     }
 }

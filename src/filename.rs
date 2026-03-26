@@ -233,6 +233,11 @@ mod tests {
     }
 
     #[test]
+    fn test_filename_from_url_rejects_empty_sanitized_segment() {
+        assert_eq!(filename_from_url("https://example.com/files/%20"), None);
+    }
+
+    #[test]
     fn test_detect_filename_falls_back_to_url_when_header_is_invalid() {
         assert_eq!(
             detect_filename(
