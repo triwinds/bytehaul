@@ -1,6 +1,7 @@
 use std::sync::Arc;
+use std::time::Duration;
 
-use bytehaul::{DownloadError, DownloadSpec, DownloadState, Downloader, FileAllocation};
+use bytehaul::{DownloadError, DownloadHandle, DownloadSpec, DownloadState, Downloader, FileAllocation};
 use futures::StreamExt;
 use warp::Filter;
 
@@ -26,7 +27,7 @@ fn slow_single_server(
                 .collect();
             let stream = futures::stream::iter(chunks).then(
                 |chunk: Result<Vec<u8>, std::convert::Infallible>| async move {
-                    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                    tokio::time::sleep(Duration::from_millis(30)).await;
                     chunk
                 },
             );
@@ -83,7 +84,7 @@ fn slow_multi_server(
                 slice.chunks(32 * 1024).map(|chunk| Ok(chunk.to_vec())).collect();
             let stream = futures::stream::iter(chunks).then(
                 |chunk: Result<Vec<u8>, std::convert::Infallible>| async move {
-                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    tokio::time::sleep(Duration::from_millis(5)).await;
                     chunk
                 },
             );
@@ -108,6 +109,23 @@ fn slow_multi_server(
     warp::serve(route).bind_ephemeral(([127, 0, 0, 1], 0))
 }
 
+async fn wait_for_state(handle: &DownloadHandle, expected: DownloadState) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let state = handle.progress().state;
+        if state == expected {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "expected progress state {:?}, got {:?}",
+            expected,
+            state
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 #[tokio::test]
 async fn test_pause_resume_single_connection() {
     let content: Vec<u8> = (0..200_000u32).map(|index| (index % 251) as u8).collect();
@@ -126,11 +144,10 @@ async fn test_pause_resume_single_connection() {
         .file_allocation(FileAllocation::None);
 
     let handle = downloader.download(spec.clone());
-    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
     handle.pause();
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    wait_for_state(&handle, DownloadState::Paused).await;
 
-    assert_eq!(handle.progress().state, DownloadState::Paused);
     assert!(matches!(handle.wait().await, Err(DownloadError::Paused)));
     assert!(ctrl_path.exists(), "control file should exist after pause");
 
@@ -169,11 +186,10 @@ async fn test_pause_resume_multi_connection() {
         .min_split_size(10 * 1024 * 1024);
 
     let handle = downloader.download(spec.clone());
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
     handle.pause();
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    wait_for_state(&handle, DownloadState::Paused).await;
 
-    assert_eq!(handle.progress().state, DownloadState::Paused);
     assert!(matches!(handle.wait().await, Err(DownloadError::Paused)));
     assert!(ctrl_path.exists(), "control file should exist after pause");
 
