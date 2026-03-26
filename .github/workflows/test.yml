@@ -84,7 +84,7 @@ jobs:
         run: cargo install cargo-tarpaulin
 
       - name: Run coverage
-        run: cargo tarpaulin --engine llvm --workspace --all-targets --out Stdout --fail-under 95
+        run: cargo tarpaulin --engine llvm -p bytehaul --all-targets --out Stdout --fail-under 95
 
   python-tests:
     name: Python binding tests

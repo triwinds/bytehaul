@@ -64,7 +64,7 @@ fn preallocate_sync(file: &std::fs::File, size: u64) -> Result<(), std::io::Erro
         file.sync_all()?;
         let mut f = file.try_clone()?;
         f.seek(SeekFrom::Start(0))?;
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
