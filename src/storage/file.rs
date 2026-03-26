@@ -1,4 +1,4 @@
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{Seek, SeekFrom};
 use std::path::Path;
 
 use crate::config::FileAllocation;
@@ -80,7 +80,9 @@ fn preallocate_sync(file: &std::fs::File, size: u64) -> Result<(), std::io::Erro
 }
 
 /// Portable zero-fill pre-allocation.
+#[cfg(not(target_os = "macos"))]
 fn preallocate_zeros(file: &std::fs::File, size: u64) -> Result<(), std::io::Error> {
+    use std::io::Write;
     let mut writer = std::io::BufWriter::new(file.try_clone()?);
     let chunk = vec![0u8; 256 * 1024]; // 256 KiB
     let mut remaining = size;

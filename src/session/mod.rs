@@ -634,4 +634,96 @@ mod tests {
         let result = flush_all_and_wait(&tx, false).await;
         assert!(matches!(result, Err(DownloadError::ChannelClosed)));
     }
+
+    #[test]
+    fn test_stop_signal_is_stop_requested() {
+        assert!(!StopSignal::Running.is_stop_requested());
+        assert!(StopSignal::Cancel.is_stop_requested());
+        assert!(StopSignal::Pause.is_stop_requested());
+    }
+
+    #[test]
+    fn test_stop_signal_error() {
+        assert!(stop_signal_error(StopSignal::Running).is_none());
+        assert!(matches!(
+            stop_signal_error(StopSignal::Cancel),
+            Some(DownloadError::Cancelled)
+        ));
+        assert!(matches!(
+            stop_signal_error(StopSignal::Pause),
+            Some(DownloadError::Paused)
+        ));
+    }
+
+    #[test]
+    fn test_stop_signal_state() {
+        assert!(stop_signal_state(StopSignal::Running).is_none());
+        assert_eq!(
+            stop_signal_state(StopSignal::Cancel),
+            Some(DownloadState::Cancelled)
+        );
+        assert_eq!(
+            stop_signal_state(StopSignal::Pause),
+            Some(DownloadState::Paused)
+        );
+    }
+
+    #[test]
+    fn test_stop_signal_label() {
+        assert_eq!(stop_signal_label(StopSignal::Running), "running");
+        assert_eq!(stop_signal_label(StopSignal::Cancel), "cancelled");
+        assert_eq!(stop_signal_label(StopSignal::Pause), "paused");
+    }
+
+    #[test]
+    fn test_resolve_output_dir_uses_cwd_when_none() {
+        let spec = DownloadSpec::new("http://example.com/file")
+            .output_path(PathBuf::from("file.bin"));
+        let dir = resolve_output_dir(&spec).unwrap();
+        assert!(dir.is_absolute());
+    }
+
+    #[test]
+    fn test_resolve_output_dir_absolute() {
+        let abs_dir = std::env::temp_dir().join("bytehaul_test_resolve");
+        let mut spec = DownloadSpec::new("http://example.com/file");
+        spec.output_dir = Some(abs_dir.clone());
+        let dir = resolve_output_dir(&spec).unwrap();
+        assert_eq!(dir, abs_dir);
+    }
+
+    #[test]
+    fn test_resolve_static_output_path_none() {
+        let spec = DownloadSpec::new("http://example.com/file");
+        let result = resolve_static_output_path(&spec).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_resolve_static_output_path_absolute() {
+        let abs_path = std::env::temp_dir().join("bytehaul_test_abs.bin");
+        let spec = DownloadSpec::new("http://example.com/file")
+            .output_path(abs_path.clone());
+        let result = resolve_static_output_path(&spec).unwrap();
+        assert_eq!(result, Some(abs_path));
+    }
+
+    #[test]
+    fn test_resolve_static_output_path_absolute_with_output_dir_is_error() {
+        let abs_path = std::env::temp_dir().join("bytehaul_test_abs.bin");
+        let mut spec = DownloadSpec::new("http://example.com/file")
+            .output_path(abs_path);
+        spec.output_dir = Some(std::env::temp_dir());
+        let result = resolve_static_output_path(&spec);
+        assert!(matches!(result, Err(DownloadError::InvalidConfig(_))));
+    }
+
+    #[test]
+    fn test_resolve_static_output_path_relative() {
+        let spec = DownloadSpec::new("http://example.com/file")
+            .output_path(PathBuf::from("data.bin"));
+        let result = resolve_static_output_path(&spec).unwrap().unwrap();
+        assert!(result.is_absolute());
+        assert!(result.ends_with("data.bin"));
+    }
 }

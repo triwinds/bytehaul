@@ -252,3 +252,202 @@ pub(super) async fn try_resume_download(
 
     Ok(None)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::FileAllocation;
+
+    fn test_ctrl(
+        total_size: u64,
+        piece_size: u64,
+        piece_count: usize,
+        downloaded_bytes: u64,
+        completed_bitset: Vec<u8>,
+    ) -> ControlSnapshot {
+        ControlSnapshot {
+            url: "http://example.com/file".into(),
+            total_size,
+            piece_size,
+            piece_count,
+            completed_bitset,
+            downloaded_bytes,
+            etag: None,
+            last_modified: None,
+        }
+    }
+
+    fn test_spec(max_connections: u32, file_allocation: FileAllocation) -> DownloadSpec {
+        DownloadSpec::new("http://example.com/file")
+            .file_allocation(file_allocation)
+            .max_connections(max_connections)
+    }
+
+    #[tokio::test]
+    async fn test_validate_resume_file_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.bin");
+        let ctrl = test_ctrl(1000, 1000, 1, 500, vec![0]);
+        let spec = test_spec(1, FileAllocation::None);
+        let err = validate_local_resume_state(&missing, &ctrl, &spec)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DownloadError::ResumeMismatch(msg) if msg.contains("missing")));
+    }
+
+    #[tokio::test]
+    async fn test_validate_resume_downloaded_exceeds_total() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.bin");
+        std::fs::write(&path, vec![0u8; 500]).unwrap();
+        let ctrl = test_ctrl(1000, 1000, 1, 2000, vec![0]);
+        let spec = test_spec(1, FileAllocation::None);
+        let err = validate_local_resume_state(&path, &ctrl, &spec)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DownloadError::ResumeMismatch(msg) if msg.contains("more bytes")));
+    }
+
+    #[tokio::test]
+    async fn test_validate_resume_single_no_prealloc_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.bin");
+        std::fs::write(&path, vec![0u8; 500]).unwrap();
+        let ctrl = test_ctrl(1000, 1000, 1, 500, vec![0]);
+        let spec = test_spec(1, FileAllocation::None);
+        validate_local_resume_state(&path, &ctrl, &spec)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_validate_resume_single_no_prealloc_size_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.bin");
+        std::fs::write(&path, vec![0u8; 300]).unwrap();
+        let ctrl = test_ctrl(1000, 1000, 1, 500, vec![0]);
+        let spec = test_spec(1, FileAllocation::None);
+        let err = validate_local_resume_state(&path, &ctrl, &spec)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DownloadError::ResumeMismatch(msg) if msg.contains("resume file size mismatch")));
+    }
+
+    #[tokio::test]
+    async fn test_validate_resume_single_prealloc_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.bin");
+        std::fs::write(&path, vec![0u8; 1000]).unwrap();
+        let ctrl = test_ctrl(1000, 1000, 1, 500, vec![0]);
+        let spec = test_spec(1, FileAllocation::Prealloc);
+        validate_local_resume_state(&path, &ctrl, &spec)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_validate_resume_single_prealloc_size_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.bin");
+        std::fs::write(&path, vec![0u8; 800]).unwrap();
+        let ctrl = test_ctrl(1000, 1000, 1, 500, vec![0]);
+        let spec = test_spec(1, FileAllocation::Prealloc);
+        let err = validate_local_resume_state(&path, &ctrl, &spec)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DownloadError::ResumeMismatch(msg) if msg.contains("resume file size mismatch")));
+    }
+
+    #[tokio::test]
+    async fn test_validate_resume_multi_prealloc_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.bin");
+        // 2 pieces of 500 bytes each, first piece complete
+        std::fs::write(&path, vec![0u8; 1000]).unwrap();
+        let ctrl = test_ctrl(1000, 500, 2, 500, vec![0b01]);
+        let spec = test_spec(4, FileAllocation::Prealloc);
+        validate_local_resume_state(&path, &ctrl, &spec)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_validate_resume_multi_prealloc_size_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.bin");
+        std::fs::write(&path, vec![0u8; 800]).unwrap();
+        let ctrl = test_ctrl(1000, 500, 2, 500, vec![0b01]);
+        let spec = test_spec(4, FileAllocation::Prealloc);
+        let err = validate_local_resume_state(&path, &ctrl, &spec)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DownloadError::ResumeMismatch(msg) if msg.contains("preallocated")));
+    }
+
+    #[tokio::test]
+    async fn test_validate_resume_multi_no_prealloc_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.bin");
+        // 2 pieces of 500 bytes, first piece (0) complete → file needs at least 500 bytes
+        std::fs::write(&path, vec![0u8; 500]).unwrap();
+        let ctrl = test_ctrl(1000, 500, 2, 500, vec![0b01]);
+        let spec = test_spec(4, FileAllocation::None);
+        validate_local_resume_state(&path, &ctrl, &spec)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_validate_resume_multi_no_prealloc_truncated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.bin");
+        // Second piece (id=1) is complete (range 500..1000), but file is only 200 bytes
+        std::fs::write(&path, vec![0u8; 200]).unwrap();
+        let ctrl = test_ctrl(1000, 500, 2, 500, vec![0b10]);
+        let spec = test_spec(4, FileAllocation::None);
+        let err = validate_local_resume_state(&path, &ctrl, &spec)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DownloadError::ResumeMismatch(msg) if msg.contains("truncated")));
+    }
+
+    #[tokio::test]
+    async fn test_validate_resume_multi_no_prealloc_too_large() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.bin");
+        std::fs::write(&path, vec![0u8; 1500]).unwrap();
+        let ctrl = test_ctrl(1000, 500, 2, 500, vec![0b01]);
+        let spec = test_spec(4, FileAllocation::None);
+        let err = validate_local_resume_state(&path, &ctrl, &spec)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DownloadError::ResumeMismatch(msg) if msg.contains("larger")));
+    }
+
+    #[tokio::test]
+    async fn test_validate_resume_multi_no_prealloc_downloaded_exceeds_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.bin");
+        std::fs::write(&path, vec![0u8; 500]).unwrap();
+        let ctrl = test_ctrl(1000, 500, 2, 800, vec![0b01]);
+        let spec = test_spec(4, FileAllocation::None);
+        let err = validate_local_resume_state(&path, &ctrl, &spec)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DownloadError::ResumeMismatch(msg) if msg.contains("downloaded bytes")));
+    }
+
+    #[tokio::test]
+    async fn test_validate_resume_multi_completed_exceeds_downloaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.bin");
+        std::fs::write(&path, vec![0u8; 1000]).unwrap();
+        // Both pieces marked complete (1000 bytes) but downloaded_bytes only 100
+        let ctrl = test_ctrl(1000, 500, 2, 100, vec![0b11]);
+        let spec = test_spec(4, FileAllocation::None);
+        let err = validate_local_resume_state(&path, &ctrl, &spec)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DownloadError::ResumeMismatch(msg) if msg.contains("completed bytes")));
+    }
+}
