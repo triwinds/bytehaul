@@ -173,4 +173,43 @@ mod tests {
         let meta = std::fs::metadata(&path).unwrap();
         assert_eq!(meta.len(), 0);
     }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn test_preallocate_zeros_small() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("zeros.bin");
+        let file = std::fs::File::create(&path).unwrap();
+        preallocate_zeros(&file, 1024).unwrap();
+        drop(file);
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(meta.len(), 1024);
+        let data = std::fs::read(&path).unwrap();
+        assert!(data.iter().all(|&b| b == 0));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn test_preallocate_zeros_large() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("zeros_large.bin");
+        let file = std::fs::File::create(&path).unwrap();
+        // Larger than one 256 KiB chunk to exercise the loop
+        let size = 512 * 1024 + 100;
+        preallocate_zeros(&file, size as u64).unwrap();
+        drop(file);
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(meta.len(), size as u64);
+    }
+
+    #[test]
+    fn test_preallocate_sync_small_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prealloc_sync.bin");
+        let file = std::fs::File::create(&path).unwrap();
+        preallocate_sync(&file, 4096).unwrap();
+        drop(file);
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(meta.len(), 4096);
+    }
 }

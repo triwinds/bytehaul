@@ -282,4 +282,31 @@ mod tests {
             Some(PathBuf::from("nested/file.txt"))
         );
     }
+
+    #[test]
+    fn test_unsupported_charset_in_filename_star() {
+        // Triggers the `else { None }` branch in decode_rfc5987_value
+        let header = "attachment; filename*=WINDOWS-1252''caf%E9.txt; filename=fallback.txt";
+        assert_eq!(parse_content_disposition(header).as_deref(), Some("fallback.txt"));
+    }
+
+    #[test]
+    fn test_unsupported_charset_only_returns_none() {
+        let header = "attachment; filename*=WINDOWS-1252''caf%E9.txt";
+        assert_eq!(parse_content_disposition(header), None);
+    }
+
+    #[test]
+    fn test_filename_from_url_with_trailing_incomplete_percent() {
+        // Triggers None from percent_decode_bytes when index + 2 >= bytes.len()
+        assert_eq!(filename_from_url("https://example.com/file%2"), None);
+    }
+
+    #[test]
+    fn test_long_name_without_extension_is_trimmed() {
+        let long_name = "a".repeat(300);
+        let header = format!("attachment; filename=\"{long_name}\"");
+        let parsed = parse_content_disposition(&header).unwrap();
+        assert_eq!(parsed.len(), 255);
+    }
 }

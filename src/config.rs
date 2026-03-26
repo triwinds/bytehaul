@@ -592,4 +592,113 @@ mod tests {
             tracing::level_filters::LevelFilter::TRACE
         );
     }
+
+    #[test]
+    fn test_download_spec_getter_methods() {
+        let mut headers = HashMap::new();
+        headers.insert("X-Custom".into(), "value".into());
+
+        let spec = DownloadSpec::new("https://example.com/file")
+            .output_path("/tmp/out.bin")
+            .output_dir("/tmp")
+            .headers(headers)
+            .max_connections(8)
+            .connect_timeout(Duration::from_secs(10))
+            .read_timeout(Duration::from_secs(20))
+            .memory_budget(2048)
+            .file_allocation(FileAllocation::None)
+            .channel_buffer(16)
+            .resume(false)
+            .piece_size(4096)
+            .min_split_size(8192)
+            .max_retries(3)
+            .retry_base_delay(Duration::from_millis(100))
+            .retry_max_delay(Duration::from_secs(5))
+            .max_retry_elapsed(Duration::from_secs(60))
+            .max_download_speed(999)
+            .checksum(Checksum::Sha256("abc".into()))
+            .control_save_interval(Duration::from_secs(10));
+
+        assert_eq!(spec.get_url(), "https://example.com/file");
+        assert_eq!(spec.get_output_path().unwrap(), Path::new("/tmp/out.bin"));
+        assert_eq!(spec.get_output_dir().unwrap(), Path::new("/tmp"));
+        assert_eq!(spec.get_headers().len(), 1);
+        assert_eq!(spec.get_max_connections(), 8);
+        assert_eq!(spec.get_connect_timeout(), Duration::from_secs(10));
+        assert_eq!(spec.get_read_timeout(), Duration::from_secs(20));
+        assert_eq!(spec.get_memory_budget(), 2048);
+        assert_eq!(spec.get_file_allocation(), FileAllocation::None);
+        assert_eq!(spec.get_channel_buffer(), 16);
+        assert!(!spec.get_resume());
+        assert_eq!(spec.get_piece_size(), 4096);
+        assert_eq!(spec.get_min_split_size(), 8192);
+        assert_eq!(spec.get_max_retries(), 3);
+        assert_eq!(spec.get_retry_base_delay(), Duration::from_millis(100));
+        assert_eq!(spec.get_retry_max_delay(), Duration::from_secs(5));
+        assert_eq!(spec.get_max_retry_elapsed(), Some(Duration::from_secs(60)));
+        assert_eq!(spec.get_max_download_speed(), 999);
+        assert!(spec.get_checksum().is_some());
+        assert_eq!(spec.get_control_save_interval(), Duration::from_secs(10));
+    }
+
+    #[test]
+    fn test_download_spec_getter_defaults_none() {
+        let spec = DownloadSpec::new("https://example.com");
+        assert!(spec.get_output_path().is_none());
+        assert!(spec.get_output_dir().is_none());
+        assert!(spec.get_max_retry_elapsed().is_none());
+        assert!(spec.get_checksum().is_none());
+    }
+
+    #[test]
+    fn test_validate_empty_url() {
+        let err = DownloadSpec::new("   ").validate().unwrap_err();
+        assert!(err.to_string().contains("url"));
+    }
+
+    #[test]
+    fn test_validate_zero_memory_budget() {
+        let err = DownloadSpec::new("https://x.com")
+            .memory_budget(0)
+            .validate()
+            .unwrap_err();
+        assert!(err.to_string().contains("memory_budget"));
+    }
+
+    #[test]
+    fn test_validate_zero_channel_buffer() {
+        let err = DownloadSpec::new("https://x.com")
+            .channel_buffer(0)
+            .validate()
+            .unwrap_err();
+        assert!(err.to_string().contains("channel_buffer"));
+    }
+
+    #[test]
+    fn test_validate_zero_piece_size() {
+        let err = DownloadSpec::new("https://x.com")
+            .piece_size(0)
+            .validate()
+            .unwrap_err();
+        assert!(err.to_string().contains("piece_size"));
+    }
+
+    #[test]
+    fn test_validate_zero_min_split_size() {
+        let err = DownloadSpec::new("https://x.com")
+            .min_split_size(0)
+            .validate()
+            .unwrap_err();
+        assert!(err.to_string().contains("min_split_size"));
+    }
+
+    #[test]
+    fn test_checksum_variants_debug() {
+        let sha1 = Checksum::Sha1("aaa".into());
+        let md5 = Checksum::Md5("bbb".into());
+        let sha512 = Checksum::Sha512("ccc".into());
+        assert!(format!("{sha1:?}").contains("Sha1"));
+        assert!(format!("{md5:?}").contains("Md5"));
+        assert!(format!("{sha512:?}").contains("Sha512"));
+    }
 }
