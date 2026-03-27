@@ -42,7 +42,7 @@ jobs:
           import tomllib
 
 
-          def resolve_package_version(manifest, manifest_name):
+          def resolve_package_version(manifest, manifest_name, workspace_manifest=None):
             package = manifest.get("package", {})
             version = package.get("version")
             if isinstance(version, str):
@@ -50,10 +50,14 @@ jobs:
 
             if isinstance(version, dict) and version.get("workspace"):
               workspace_version = manifest.get("workspace", {}).get("package", {}).get("version")
+              if not isinstance(workspace_version, str) and workspace_manifest is not None:
+                workspace_version = (
+                  workspace_manifest.get("workspace", {}).get("package", {}).get("version")
+                )
               if isinstance(workspace_version, str):
                 return workspace_version
               raise SystemExit(
-                f"{manifest_name} uses version.workspace but has no workspace.package.version"
+                f"{manifest_name} uses version.workspace but no workspace.package.version could be resolved"
               )
 
             raise SystemExit(f"Could not determine version for {manifest_name}")
@@ -70,7 +74,9 @@ jobs:
           expected = {
               "workspace crate": resolve_package_version(root_manifest, "Cargo.toml"),
               "python binding crate": resolve_package_version(
-                python_manifest, "bindings/python/Cargo.toml"
+                python_manifest,
+                "bindings/python/Cargo.toml",
+                workspace_manifest=root_manifest,
               ),
           }
 
