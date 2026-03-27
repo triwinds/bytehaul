@@ -2,6 +2,8 @@
 
 This guide covers the key parameters that affect bytehaul's download performance and resource usage.
 
+[中文版](tuning.zh-CN.md)
+
 ## `piece_size`
 
 **Default:** 1 MiB  

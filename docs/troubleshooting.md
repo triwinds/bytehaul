@@ -2,6 +2,8 @@
 
 Common issues and how to resolve them.
 
+[中文版](troubleshooting.zh-CN.md)
+
 ## Control File Corrupted
 
 **Symptom:** Download fails on resume with `ControlFileCorrupted` error.

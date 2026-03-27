@@ -6,6 +6,9 @@ Rust 异步 HTTP 下载库，支持断点续传、多连接并发、回写缓存
 
 - [English README](../README.md)
 - [进阶用法（Rust）](advanced.zh-CN.md) | [Advanced Usage](advanced.md)
+- [架构说明](architecture.zh-CN.md) | [Architecture](architecture.md)
+- [故障排查指南](troubleshooting.zh-CN.md) | [Troubleshooting Guide](troubleshooting.md)
+- [性能调优指南](tuning.zh-CN.md) | [Performance Tuning Guide](tuning.md)
 - [Python 使用文档](python.zh-CN.md) | [Python Bindings Guide](../bindings/python/README.md)
 
 ## 功能特性

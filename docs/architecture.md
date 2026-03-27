@@ -2,6 +2,8 @@
 
 This document describes bytehaul's internal data-flow pipeline and the key abstractions involved.
 
+[中文版](architecture.zh-CN.md)
+
 ## Overview
 
 bytehaul is an async HTTP download library built on Tokio and reqwest. It supports multi-connection parallel downloading, resume via control files, write-back caching, and a configurable memory budget for back-pressure.
