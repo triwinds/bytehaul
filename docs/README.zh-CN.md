@@ -1,6 +1,13 @@
 # bytehaul
 
-Rust 异步 HTTP 下载库，支持断点续传、多连接并发、回写缓存、限速和校验。
+[![Tests](https://img.shields.io/github/actions/workflow/status/triwinds/bytehaul/test.yml?branch=main&logo=githubactions&label=tests)](https://github.com/triwinds/bytehaul/actions/workflows/test.yml)
+[![Crates.io](https://img.shields.io/crates/v/bytehaul?logo=rust)](https://crates.io/crates/bytehaul)
+[![Docs.rs](https://img.shields.io/docsrs/bytehaul?logo=docs.rs)](https://docs.rs/bytehaul)
+[![PyPI](https://img.shields.io/pypi/v/bytehaul?logo=pypi)](https://pypi.org/project/bytehaul/)
+[![Python](https://img.shields.io/pypi/pyversions/bytehaul?logo=python&logoColor=white)](https://pypi.org/project/bytehaul/)
+[![License](https://img.shields.io/github/license/triwinds/bytehaul)](LICENSE)
+
+Rust 异步 HTTP 下载库，带有 Python 绑定（同时在 PyPI 发布），支持断点续传、多连接并发、回写缓存、限速和校验。
 
 ## 文档
 
@@ -37,7 +44,7 @@ cargo add bytehaul
 
 ```toml
 [dependencies]
-bytehaul = "0.1.2"
+bytehaul = "0.1.3"
 ```
 
 ### Python

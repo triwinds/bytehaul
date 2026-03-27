@@ -1,6 +1,13 @@
 # bytehaul
 
-A Rust async HTTP download library with resume, multi-connection, write-back cache, rate limiting, and checksum verification.
+[![Tests](https://img.shields.io/github/actions/workflow/status/triwinds/bytehaul/test.yml?branch=main&logo=githubactions&label=tests)](https://github.com/triwinds/bytehaul/actions/workflows/test.yml)
+[![Crates.io](https://img.shields.io/crates/v/bytehaul?logo=rust)](https://crates.io/crates/bytehaul)
+[![Docs.rs](https://img.shields.io/docsrs/bytehaul?logo=docs.rs)](https://docs.rs/bytehaul)
+[![PyPI](https://img.shields.io/pypi/v/bytehaul?logo=pypi)](https://pypi.org/project/bytehaul/)
+[![Python](https://img.shields.io/pypi/pyversions/bytehaul?logo=python&logoColor=white)](https://pypi.org/project/bytehaul/)
+[![License](https://img.shields.io/github/license/triwinds/bytehaul)](LICENSE)
+
+A Rust async HTTP download library with Python bindings (also available on PyPI), supporting resume, multi-connection downloads, write-back cache, rate limiting, and checksum verification.
 
 ## Documentation
 
@@ -35,7 +42,7 @@ Or add it manually to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-bytehaul = "0.1.2"
+bytehaul = "0.1.3"
 ```
 
 ### Python
