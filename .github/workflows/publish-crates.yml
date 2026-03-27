@@ -43,13 +43,30 @@ jobs:
           import pathlib
           import tomllib
 
+
+          def resolve_package_version(manifest, manifest_name):
+            package = manifest.get("package", {})
+            version = package.get("version")
+            if isinstance(version, str):
+              return version
+
+            if isinstance(version, dict) and version.get("workspace"):
+              workspace_version = manifest.get("workspace", {}).get("package", {}).get("version")
+              if isinstance(workspace_version, str):
+                return workspace_version
+              raise SystemExit(
+                f"{manifest_name} uses version.workspace but has no workspace.package.version"
+              )
+
+            raise SystemExit(f"Could not determine version for {manifest_name}")
+
           tag = os.environ["GITHUB_REF_NAME"]
           if not tag.startswith("v"):
               raise SystemExit(f"Expected a v-prefixed tag, got {tag!r}")
 
           version = tag[1:]
           manifest = tomllib.loads(pathlib.Path("Cargo.toml").read_text("utf-8"))
-          actual = manifest["package"]["version"]
+          actual = resolve_package_version(manifest, "Cargo.toml")
           if actual != version:
               raise SystemExit(f"Tag version {version} does not match Cargo.toml version {actual}")
 

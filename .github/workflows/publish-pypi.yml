@@ -41,6 +41,23 @@ jobs:
           import pathlib
           import tomllib
 
+
+          def resolve_package_version(manifest, manifest_name):
+            package = manifest.get("package", {})
+            version = package.get("version")
+            if isinstance(version, str):
+              return version
+
+            if isinstance(version, dict) and version.get("workspace"):
+              workspace_version = manifest.get("workspace", {}).get("package", {}).get("version")
+              if isinstance(workspace_version, str):
+                return workspace_version
+              raise SystemExit(
+                f"{manifest_name} uses version.workspace but has no workspace.package.version"
+              )
+
+            raise SystemExit(f"Could not determine version for {manifest_name}")
+
           tag = os.environ["GITHUB_REF_NAME"]
           if not tag.startswith("v"):
               raise SystemExit(f"Expected a v-prefixed tag, got {tag!r}")
@@ -51,8 +68,10 @@ jobs:
           pyproject = tomllib.loads(pathlib.Path("bindings/python/pyproject.toml").read_text("utf-8"))
 
           expected = {
-              "workspace crate": root_manifest["package"]["version"],
-              "python binding crate": python_manifest["package"]["version"],
+              "workspace crate": resolve_package_version(root_manifest, "Cargo.toml"),
+              "python binding crate": resolve_package_version(
+                python_manifest, "bindings/python/Cargo.toml"
+              ),
           }
 
           mismatches = {
