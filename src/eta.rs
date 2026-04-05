@@ -90,13 +90,9 @@ impl EtaEstimator {
             return match previous {
                 Some(before) if before.at < cutoff => {
                     let total_span = sample.at.duration_since(before.at).as_secs_f64();
-                    if total_span <= 0.0 {
-                        Some((before.downloaded as f64, before.at))
-                    } else {
-                        let elapsed = cutoff.duration_since(before.at).as_secs_f64();
-                        let delta_bytes = sample.downloaded.saturating_sub(before.downloaded) as f64;
-                        Some((before.downloaded as f64 + delta_bytes * (elapsed / total_span), cutoff))
-                    }
+                    let elapsed = cutoff.duration_since(before.at).as_secs_f64();
+                    let delta_bytes = sample.downloaded.saturating_sub(before.downloaded) as f64;
+                    Some((before.downloaded as f64 + delta_bytes * (elapsed / total_span), cutoff))
                 }
                 Some(before) => Some((before.downloaded as f64, before.at)),
                 None => Some((sample.downloaded as f64, sample.at)),
@@ -181,5 +177,54 @@ mod tests {
 
         estimator.record(1, start + Duration::from_secs(4));
         assert_eq!(estimator.estimate(1_000), None);
+    }
+
+    #[test]
+    fn test_eta_estimator_updates_last_sample_when_time_does_not_advance() {
+        let mut estimator = EtaEstimator::new(Duration::from_secs(5), Duration::from_secs(1));
+        let start = Instant::now();
+
+        estimator.record(100, start);
+        estimator.record(150, start);
+        estimator.record(250, start + Duration::from_secs(2));
+
+        let speed = estimator.speed_bytes_per_sec().unwrap();
+        assert!((speed - 50.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_eta_estimator_resets_when_downloaded_regresses() {
+        let mut estimator = EtaEstimator::new(Duration::from_secs(5), Duration::from_secs(1));
+        let start = Instant::now();
+
+        estimator.record(100, start);
+        estimator.record(40, start + Duration::from_secs(1));
+        assert_eq!(estimator.speed_bytes_per_sec(), None);
+
+        estimator.record(140, start + Duration::from_secs(3));
+        let speed = estimator.speed_bytes_per_sec().unwrap();
+        assert!((speed - 50.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_eta_estimator_returns_none_for_zero_span_when_min_span_is_zero() {
+        let mut estimator = EtaEstimator::new(Duration::ZERO, Duration::ZERO);
+        let start = Instant::now();
+
+        estimator.record(100, start);
+
+        assert_eq!(estimator.speed_bytes_per_sec(), None);
+    }
+
+    #[test]
+    fn test_eta_estimator_interpolates_window_start() {
+        let mut estimator = EtaEstimator::new(Duration::from_secs(5), Duration::from_secs(1));
+        let start = Instant::now();
+
+        estimator.record(0, start);
+        estimator.record(10_000, start + Duration::from_secs(10));
+
+        let speed = estimator.speed_bytes_per_sec().unwrap();
+        assert!((speed - 1_000.0).abs() < 0.01);
     }
 }

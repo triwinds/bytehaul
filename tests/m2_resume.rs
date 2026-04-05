@@ -1,5 +1,6 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytehaul::{DownloadSpec, Downloader, FileAllocation};
 use futures::StreamExt;
@@ -168,6 +169,48 @@ async fn test_resume_after_cancel() {
         !ctrl_path.exists(),
         "control file should be deleted on success"
     );
+}
+
+#[tokio::test]
+async fn test_single_resume_control_file_saves_periodically() {
+    let content: Vec<u8> = (0..160_000u32).map(|index| (index % 251) as u8).collect();
+    let served = Arc::new(AtomicU64::new(0));
+
+    let (addr, server) = slow_range_server("periodic-save", content, served.clone());
+    tokio::spawn(server);
+
+    let dir = tempfile::tempdir().unwrap();
+    let output_path = dir.path().join("periodic-save.bin");
+    let ctrl_path = output_path.with_file_name("periodic-save.bin.bytehaul");
+
+    let downloader = Downloader::builder().build().unwrap();
+    let spec = DownloadSpec::new(format!("http://{addr}/periodic-save"))
+        .output_path(output_path.clone())
+        .file_allocation(FileAllocation::None)
+        .control_save_interval(Duration::from_millis(50));
+
+    let handle = downloader.download(spec);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let mut saw_periodic_save = false;
+
+    while tokio::time::Instant::now() < deadline {
+        if ctrl_path.exists()
+            && std::fs::metadata(&ctrl_path)
+                .map(|metadata| metadata.len() > 0)
+                .unwrap_or(false)
+        {
+            saw_periodic_save = true;
+            break;
+        }
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    handle.cancel();
+    let _ = handle.wait().await;
+
+    assert!(served.load(Ordering::Relaxed) > 0, "download should make progress before cancel");
+    assert!(saw_periodic_save, "control file should be saved before cancellation");
 }
 
 #[tokio::test]
