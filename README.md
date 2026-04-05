@@ -26,7 +26,7 @@ A Rust async HTTP download library with Python bindings (also available on PyPI)
 - **SHA-256 checksum verification** — post-download integrity check
 - **Cancellation** — cooperative cancel via stop signal
 - **Progress reporting** — real-time speed, ETA, downloaded bytes, and state
-- **Shared network configuration** — proxy, custom DNS servers, and IPv6 toggle on the downloader client
+- **Shared network configuration** — proxy, custom DNS servers, DNS-over-HTTPS endpoints, and IPv6 toggle on the downloader client
 
 ## Installation
 

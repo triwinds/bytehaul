@@ -60,6 +60,20 @@ impl DownloaderBuilder {
         self
     }
 
+    pub fn doh_server(mut self, server: impl Into<String>) -> Self {
+        self.client_config.doh_servers.push(server.into());
+        self
+    }
+
+    pub fn doh_servers<I, S>(mut self, servers: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.client_config.doh_servers = servers.into_iter().map(Into::into).collect();
+        self
+    }
+
     pub fn enable_ipv6(mut self, enabled: bool) -> Self {
         self.client_config.enable_ipv6 = enabled;
         self
@@ -86,6 +100,7 @@ impl DownloaderBuilder {
                 || self.client_config.http_proxy.is_some()
                 || self.client_config.https_proxy.is_some(),
             custom_dns_count = self.client_config.dns_servers.len(),
+            custom_doh_count = self.client_config.doh_servers.len(),
             ipv6 = self.client_config.enable_ipv6,
             "downloader built"
         );
@@ -277,6 +292,7 @@ mod tests {
         let downloader = Downloader::builder()
             .all_proxy("http://127.0.0.1:7890")
             .dns_server(std::net::SocketAddr::from(([1, 1, 1, 1], 53)))
+            .doh_server("https://127.0.0.1/dns-query")
             .enable_ipv6(false)
             .build()
             .unwrap();
@@ -351,11 +367,16 @@ mod tests {
             std::net::SocketAddr::from(([1, 1, 1, 1], 53)),
             std::net::SocketAddr::from(([8, 8, 8, 8], 53)),
         ];
+        let doh_servers = vec![
+            "https://127.0.0.1/dns-query".to_string(),
+            "https://localhost/custom-dns".to_string(),
+        ];
 
         let builder = Downloader::builder()
             .http_proxy("http://127.0.0.1:8080")
             .https_proxy("http://127.0.0.1:8443")
-            .dns_servers(servers.clone());
+            .dns_servers(servers.clone())
+            .doh_servers(doh_servers.clone());
 
         assert_eq!(
             builder.client_config.http_proxy.as_deref(),
@@ -366,6 +387,7 @@ mod tests {
             Some("http://127.0.0.1:8443")
         );
         assert_eq!(builder.client_config.dns_servers, servers);
+        assert_eq!(builder.client_config.doh_servers, doh_servers);
     }
 
     #[tokio::test]

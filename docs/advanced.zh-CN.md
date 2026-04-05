@@ -47,11 +47,14 @@ let downloader = Downloader::builder()
         SocketAddr::from(([1, 1, 1, 1], 53)),
         SocketAddr::from(([8, 8, 8, 8], 53)),
     ])
+    .doh_server("https://dns.google/dns-query")
     .enable_ipv6(false)
     .build()?;
 ```
 
 `DownloadSpec::connect_timeout` 仍然可用；如果单个任务覆盖了它，bytehaul 会为该任务临时构建一个等价 client。
+
+`doh_server(...)` 和 `doh_servers(...)` 接收 HTTPS URL。如果 DoH 主机是域名而不是字面 IP，bytehaul 会在构建 client 时先用一次系统解析器把它 bootstrap 成目标地址。
 
 ## 进度监控
 

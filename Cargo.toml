@@ -31,7 +31,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tarpaulin)'] }
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", default-features = false, features = ["stream", "charset", "http2", "macos-system-configuration", "rustls-tls-native-roots"] }
-hickory-resolver = { version = "0.25", default-features = false, features = ["tokio", "system-config"] }
+hickory-resolver = { version = "0.25", default-features = false, features = ["tokio", "system-config", "https-ring", "rustls-platform-verifier"] }
 bytes = "1"
 futures = "0.3"
 thiserror = "2"

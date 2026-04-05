@@ -81,6 +81,23 @@ fn parse_dns_servers(dns_servers: Option<Vec<String>>) -> PyResult<Vec<SocketAdd
     }
 }
 
+fn parse_doh_servers(doh_servers: Option<Vec<String>>) -> PyResult<Vec<String>> {
+    match doh_servers {
+        Some(doh_servers) => doh_servers
+            .into_iter()
+            .map(|server| {
+                let server = server.trim();
+                if server.is_empty() {
+                    Err(config_error("doh_servers entries cannot be empty"))
+                } else {
+                    Ok(server.to_string())
+                }
+            })
+            .collect(),
+        None => Ok(Vec::new()),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn apply_client_options(
     mut builder: bytehaul::DownloaderBuilder,
@@ -89,6 +106,7 @@ fn apply_client_options(
     http_proxy: Option<String>,
     https_proxy: Option<String>,
     dns_servers: Option<Vec<String>>,
+    doh_servers: Option<Vec<String>>,
     enable_ipv6: Option<bool>,
 ) -> PyResult<bytehaul::DownloaderBuilder> {
     if let Some(connect_timeout) = connect_timeout {
@@ -107,6 +125,10 @@ fn apply_client_options(
     let dns_servers = parse_dns_servers(dns_servers)?;
     if !dns_servers.is_empty() {
         builder = builder.dns_servers(dns_servers);
+    }
+    let doh_servers = parse_doh_servers(doh_servers)?;
+    if !doh_servers.is_empty() {
+        builder = builder.doh_servers(doh_servers);
     }
     if let Some(enable_ipv6) = enable_ipv6 {
         builder = builder.enable_ipv6(enable_ipv6);
@@ -452,6 +474,7 @@ impl PyDownloader {
         http_proxy = None,
         https_proxy = None,
         dns_servers = None,
+        doh_servers = None,
         enable_ipv6 = None,
         log_level = None
     ))]
@@ -461,6 +484,7 @@ impl PyDownloader {
         http_proxy: Option<String>,
         https_proxy: Option<String>,
         dns_servers: Option<Vec<String>>,
+        doh_servers: Option<Vec<String>>,
         enable_ipv6: Option<bool>,
         log_level: Option<String>,
     ) -> PyResult<Self> {
@@ -476,6 +500,7 @@ impl PyDownloader {
             http_proxy,
             https_proxy,
             dns_servers,
+            doh_servers,
             enable_ipv6,
         )?;
         builder = builder.log_level(level);
@@ -578,6 +603,7 @@ impl PyDownloader {
         http_proxy = None,
         https_proxy = None,
         dns_servers = None,
+        doh_servers = None,
         enable_ipv6 = None,
         read_timeout = None,
         memory_budget = None,
@@ -609,6 +635,7 @@ fn download(
     http_proxy: Option<String>,
     https_proxy: Option<String>,
     dns_servers: Option<Vec<String>>,
+    doh_servers: Option<Vec<String>>,
     enable_ipv6: Option<bool>,
     read_timeout: Option<f64>,
     memory_budget: Option<usize>,
@@ -663,6 +690,7 @@ fn download(
             http_proxy,
             https_proxy,
             dns_servers,
+            doh_servers,
             enable_ipv6,
         )?;
         builder = builder.log_level(level);

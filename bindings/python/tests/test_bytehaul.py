@@ -140,6 +140,14 @@ class TestConfigValidation:
         with pytest.raises(ConfigError, match="dns_servers"):
             download(f"{server}/ok", str(tmp_path / "out"), dns_servers=["not-an-ip"])
 
+    def test_doh_servers_invalid(self, server, tmp_path):
+        with pytest.raises(ConfigError, match="DoH server URL|doh_servers"):
+            download(
+                f"{server}/ok",
+                str(tmp_path / "out"),
+                doh_servers=["http://dns.google/dns-query"],
+            )
+
 
 # ---------------------------------------------------------------------------
 # download() convenience API tests
@@ -178,6 +186,7 @@ class TestDownloadFunction:
             f"{server}/ok",
             str(out),
             dns_servers=["1.1.1.1"],
+            doh_servers=["https://127.0.0.1/dns-query"],
             enable_ipv6=False,
         )
         assert out.read_bytes() == SAMPLE_BODY
@@ -216,12 +225,20 @@ class TestDownloaderAPI:
             Downloader(connect_timeout=-5.0)
 
     def test_create_with_network_options(self):
-        d = Downloader(dns_servers=["1.1.1.1"], enable_ipv6=False)
+        d = Downloader(
+            dns_servers=["1.1.1.1"],
+            doh_servers=["https://127.0.0.1/dns-query"],
+            enable_ipv6=False,
+        )
         assert d is not None
 
     def test_invalid_dns_servers(self):
         with pytest.raises(ConfigError, match="dns_servers"):
             Downloader(dns_servers=["bad dns"])
+
+    def test_invalid_doh_servers(self):
+        with pytest.raises(ConfigError, match="DoH server URL|doh_servers"):
+            Downloader(doh_servers=["http://dns.google/dns-query"])
 
     def test_download_and_wait(self, server, tmp_path):
         out = tmp_path / "dl.bin"

@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::time::Duration;
 
 use hickory_resolver::config::{
@@ -19,6 +19,7 @@ pub(crate) struct ClientNetworkConfig {
     pub http_proxy: Option<String>,
     pub https_proxy: Option<String>,
     pub dns_servers: Vec<SocketAddr>,
+    pub doh_servers: Vec<String>,
     pub enable_ipv6: bool,
 }
 
@@ -30,6 +31,7 @@ impl Default for ClientNetworkConfig {
             http_proxy: None,
             https_proxy: None,
             dns_servers: Vec::new(),
+            doh_servers: Vec::new(),
             enable_ipv6: true,
         }
     }
@@ -41,6 +43,7 @@ impl ClientNetworkConfig {
         tracing::debug!(connect_timeout_ms = self.connect_timeout.as_millis() as u64,
             has_proxy = self.all_proxy.is_some() || self.http_proxy.is_some() || self.https_proxy.is_some(),
             custom_dns = !self.dns_servers.is_empty(),
+            custom_doh = !self.doh_servers.is_empty(),
             enable_ipv6 = self.enable_ipv6,
             "building HTTP client");
         let mut builder = reqwest::Client::builder().connect_timeout(self.connect_timeout);
@@ -70,12 +73,20 @@ impl ClientNetworkConfig {
     }
 
     fn build_dns_resolver(&self) -> Result<Option<BytehaulDnsResolver>, DownloadError> {
-        if self.dns_servers.is_empty() && self.enable_ipv6 {
+        if self.dns_servers.is_empty() && self.doh_servers.is_empty() && self.enable_ipv6 {
             return Ok(None);
         }
 
-        BytehaulDnsResolver::new(&self.dns_servers, self.enable_ipv6).map(Some)
+        BytehaulDnsResolver::new(&self.dns_servers, &self.doh_servers, self.enable_ipv6)
+            .map(Some)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DohServerConfig {
+    socket_addrs: Vec<SocketAddr>,
+    tls_dns_name: String,
+    http_endpoint: Option<String>,
 }
 
 #[derive(Clone)]
@@ -84,14 +95,22 @@ struct BytehaulDnsResolver {
 }
 
 impl BytehaulDnsResolver {
-    fn new(dns_servers: &[SocketAddr], enable_ipv6: bool) -> Result<Self, DownloadError> {
-        let mut builder = if dns_servers.is_empty() {
+    fn new(
+        dns_servers: &[SocketAddr],
+        doh_servers: &[String],
+        enable_ipv6: bool,
+    ) -> Result<Self, DownloadError> {
+        let mut builder = if dns_servers.is_empty() && doh_servers.is_empty() {
             TokioResolver::builder_tokio().map_err(|err| {
                 DownloadError::Internal(format!("failed to read system DNS configuration: {err}"))
             })?
         } else {
             TokioResolver::builder_with_config(
-                ResolverConfig::from_parts(None, vec![], build_name_server_group(dns_servers)),
+                ResolverConfig::from_parts(
+                    None,
+                    vec![],
+                    build_name_server_group(dns_servers, doh_servers, enable_ipv6)?,
+                ),
                 TokioConnectionProvider::default(),
             )
         };
@@ -133,14 +152,115 @@ impl Resolve for BytehaulDnsResolver {
     }
 }
 
-fn build_name_server_group(dns_servers: &[SocketAddr]) -> NameServerConfigGroup {
+fn build_name_server_group(
+    dns_servers: &[SocketAddr],
+    doh_servers: &[String],
+    enable_ipv6: bool,
+) -> Result<NameServerConfigGroup, DownloadError> {
     let mut group = NameServerConfigGroup::new();
     for server in dns_servers {
         for protocol in [Protocol::Udp, Protocol::Tcp] {
             group.push(NameServerConfig::new(*server, protocol));
         }
     }
-    group
+
+    for server in doh_servers {
+        let config = parse_doh_server(server, enable_ipv6)?;
+        for socket_addr in config.socket_addrs {
+            let mut name_server = NameServerConfig::new(socket_addr, Protocol::Https);
+            name_server.tls_dns_name = Some(config.tls_dns_name.clone());
+            name_server.http_endpoint = config.http_endpoint.clone();
+            group.push(name_server);
+        }
+    }
+
+    Ok(group)
+}
+
+fn parse_doh_server(server: &str, enable_ipv6: bool) -> Result<DohServerConfig, DownloadError> {
+    let server = server.trim();
+    if server.is_empty() {
+        return Err(DownloadError::InvalidConfig(
+            "DoH server URLs cannot be empty".into(),
+        ));
+    }
+
+    let url = reqwest::Url::parse(server).map_err(|err| {
+        DownloadError::InvalidConfig(format!("invalid DoH server URL '{server}': {err}"))
+    })?;
+
+    if url.scheme() != "https" {
+        return Err(DownloadError::InvalidConfig(format!(
+            "DoH server URL '{server}' must use https"
+        )));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(DownloadError::InvalidConfig(format!(
+            "DoH server URL '{server}' cannot include credentials"
+        )));
+    }
+    if url.fragment().is_some() {
+        return Err(DownloadError::InvalidConfig(format!(
+            "DoH server URL '{server}' cannot include a fragment"
+        )));
+    }
+
+    let host = url.host_str().ok_or_else(|| {
+        DownloadError::InvalidConfig(format!("DoH server URL '{server}' is missing a host"))
+    })?;
+    let port = url.port_or_known_default().ok_or_else(|| {
+        DownloadError::InvalidConfig(format!(
+            "DoH server URL '{server}' is missing a valid port"
+        ))
+    })?;
+
+    let mut socket_addrs: Vec<SocketAddr> = if let Ok(ip) = host.parse::<IpAddr>() {
+        vec![SocketAddr::new(ip, port)]
+    } else {
+        (host, port)
+            .to_socket_addrs()
+            .map_err(|err| {
+                DownloadError::InvalidConfig(format!(
+                    "failed to resolve DoH host '{host}' from '{server}': {err}"
+                ))
+            })?
+            .collect()
+    };
+
+    if !enable_ipv6 {
+        socket_addrs.retain(SocketAddr::is_ipv4);
+    }
+    socket_addrs.sort_unstable();
+    socket_addrs.dedup();
+
+    if socket_addrs.is_empty() {
+        return Err(DownloadError::InvalidConfig(format!(
+            "DoH server URL '{server}' did not resolve to any {} address",
+            if enable_ipv6 { "IP" } else { "IPv4" }
+        )));
+    }
+
+    let mut http_endpoint = url.path().to_string();
+    if http_endpoint.is_empty() || http_endpoint == "/" {
+        http_endpoint.clear();
+    }
+    if let Some(query) = url.query() {
+        if http_endpoint.is_empty() {
+            http_endpoint.push('/');
+        }
+        http_endpoint.push('?');
+        http_endpoint.push_str(query);
+    }
+
+    Ok(DohServerConfig {
+        socket_addrs,
+        tls_dns_name: host.to_string(),
+        http_endpoint: if http_endpoint.is_empty() || http_endpoint == "/dns-query" {
+            None
+        } else {
+            Some(http_endpoint)
+        },
+    })
 }
 
 #[cfg(test)]
@@ -156,6 +276,7 @@ mod tests {
         assert!(config.http_proxy.is_none());
         assert!(config.https_proxy.is_none());
         assert!(config.dns_servers.is_empty());
+        assert!(config.doh_servers.is_empty());
         assert!(config.enable_ipv6);
     }
 
@@ -172,7 +293,7 @@ mod tests {
     #[test]
     fn test_build_name_server_group_adds_udp_and_tcp() {
         let server = SocketAddr::from(([1, 1, 1, 1], 53));
-        let group = build_name_server_group(&[server]);
+        let group = build_name_server_group(&[server], &[], true).unwrap();
 
         assert_eq!(group.len(), 2);
         assert!(group
@@ -181,6 +302,46 @@ mod tests {
         assert!(group
             .iter()
             .any(|cfg| cfg.socket_addr == server && cfg.protocol == Protocol::Tcp));
+    }
+
+    #[test]
+    fn test_build_name_server_group_adds_doh_servers() {
+        let group = build_name_server_group(&[], &["https://127.0.0.1/dns-query".into()], false)
+            .unwrap();
+
+        assert_eq!(group.len(), 1);
+        let cfg = group.iter().next().unwrap();
+        assert_eq!(cfg.socket_addr, SocketAddr::from(([127, 0, 0, 1], 443)));
+        assert_eq!(cfg.protocol, Protocol::Https);
+        assert_eq!(cfg.tls_dns_name.as_deref(), Some("127.0.0.1"));
+        assert!(cfg.http_endpoint.is_none());
+    }
+
+    #[test]
+    fn test_parse_doh_server_resolves_hostnames_and_custom_paths() {
+        let config = parse_doh_server("https://localhost/custom-dns?ct=application/dns-message", false)
+            .unwrap();
+
+        assert!(!config.socket_addrs.is_empty());
+        assert!(config.socket_addrs.iter().all(SocketAddr::is_ipv4));
+        assert_eq!(config.tls_dns_name, "localhost");
+        assert_eq!(
+            config.http_endpoint.as_deref(),
+            Some("/custom-dns?ct=application/dns-message")
+        );
+    }
+
+    #[test]
+    fn test_parse_doh_server_rejects_invalid_urls() {
+        let err = parse_doh_server("http://dns.google/dns-query", true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must use https"));
+
+        let err = parse_doh_server("https://user:pass@dns.google/dns-query", true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cannot include credentials"));
     }
 
     #[test]
@@ -221,17 +382,33 @@ mod tests {
         assert!(ipv4_only.build_dns_resolver().unwrap().is_some());
 
         let custom =
-            BytehaulDnsResolver::new(&[SocketAddr::from(([1, 1, 1, 1], 53))], true).unwrap();
+            BytehaulDnsResolver::new(&[SocketAddr::from(([1, 1, 1, 1], 53))], &[], true)
+                .unwrap();
         drop(custom);
+
+        let doh = BytehaulDnsResolver::new(&[], &["https://127.0.0.1/dns-query".into()], false)
+            .unwrap();
+        drop(doh);
     }
 
     #[tokio::test]
     async fn test_dns_resolver_resolves_localhost() {
-        let resolver = BytehaulDnsResolver::new(&[], false).unwrap();
+        let resolver = BytehaulDnsResolver::new(&[], &[], false).unwrap();
         let name = Name::from_str("localhost").unwrap();
         let addrs: Vec<_> = resolver.resolve(name).await.unwrap().collect();
 
         assert!(!addrs.is_empty());
         assert!(addrs.iter().all(|addr| addr.port() == 0));
+    }
+
+    #[test]
+    fn test_build_client_accepts_doh_servers() {
+        let config = ClientNetworkConfig {
+            doh_servers: vec!["https://127.0.0.1/dns-query".into()],
+            enable_ipv6: false,
+            ..ClientNetworkConfig::default()
+        };
+
+        config.build_client().unwrap();
     }
 }

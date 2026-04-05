@@ -62,9 +62,12 @@ bytehaul.download(
     output_path="output.bin",
     proxy="http://127.0.0.1:7890",
     dns_servers=["1.1.1.1", "8.8.8.8:53"],
+    doh_servers=["https://dns.google/dns-query"],
     enable_ipv6=False,
 )
 ```
+
+`doh_servers` expects HTTPS URLs. If you pass a hostname such as `dns.google`, bytehaul will use the system resolver once during client construction to bootstrap the DoH endpoint addresses.
 
 ### Logging
 
@@ -92,6 +95,7 @@ from bytehaul import Downloader
 downloader = Downloader(
     connect_timeout=15.0,
     dns_servers=["1.1.1.1"],
+    doh_servers=["https://dns.google/dns-query"],
     enable_ipv6=False,
 )
 task = downloader.download(
@@ -142,7 +146,7 @@ Blocking convenience function. Downloads a file and returns when complete.
 - If `output_path` is omitted, bytehaul chooses `Content-Disposition` → URL path → `download`
 - Absolute `output_path` values are still accepted when `output_dir` is omitted
 
-### `Downloader(connect_timeout=None, proxy=None, http_proxy=None, https_proxy=None, dns_servers=None, enable_ipv6=None)`
+### `Downloader(connect_timeout=None, proxy=None, http_proxy=None, https_proxy=None, dns_servers=None, doh_servers=None, enable_ipv6=None)`
 
 Reusable downloader instance.
 
@@ -206,6 +210,7 @@ Use these on `Downloader(...)` for the object API, or pass them directly to the 
 | `http_proxy`   | `str \| None`      | `None`  |
 | `https_proxy`  | `str \| None`      | `None`  |
 | `dns_servers`  | `list[str] \| None`| `None`  |
+| `doh_servers`  | `list[str] \| None`| `None`  |
 | `enable_ipv6`  | `bool \| None`     | `True`  |
 
 ## Running tests

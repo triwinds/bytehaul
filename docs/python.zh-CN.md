@@ -84,9 +84,12 @@ bytehaul.download(
     output_path="output.bin",
     proxy="http://127.0.0.1:7890",
     dns_servers=["1.1.1.1", "8.8.8.8:53"],
+    doh_servers=["https://dns.google/dns-query"],
     enable_ipv6=False,
 )
 ```
+
+`doh_servers` 需要传 HTTPS URL。如果使用像 `dns.google` 这样的域名，bytehaul 会在构建客户端时先用一次系统解析器来 bootstrap 这个 DoH 端点的 IP 地址。
 
 对象 API 下，这些网络层参数应放在 `Downloader(...)` 构造器上：
 
@@ -96,6 +99,7 @@ from bytehaul import Downloader
 downloader = Downloader(
     connect_timeout=15.0,
     dns_servers=["1.1.1.1"],
+    doh_servers=["https://dns.google/dns-query"],
     enable_ipv6=False,
 )
 ```
@@ -177,7 +181,7 @@ except DownloadFailedError as exc:
 - 省略 `output_path` 时，会按 `Content-Disposition` → URL 路径 → `download` 自动选择文件名
 - 若未设置 `output_dir`，仍可直接传绝对 `output_path`
 
-### `Downloader(connect_timeout=None, proxy=None, http_proxy=None, https_proxy=None, dns_servers=None, enable_ipv6=None)`
+### `Downloader(connect_timeout=None, proxy=None, http_proxy=None, https_proxy=None, dns_servers=None, doh_servers=None, enable_ipv6=None)`
 
 可复用的下载器实例。
 
@@ -237,6 +241,7 @@ except DownloadFailedError as exc:
 | `http_proxy` | `str \| None` | `None` | 仅为 HTTP 请求设置代理 |
 | `https_proxy` | `str \| None` | `None` | 仅为 HTTPS 请求设置代理 |
 | `dns_servers` | `list[str] \| None` | `None` | 自定义 DNS 服务器，支持 `IP` 或 `IP:PORT` |
+| `doh_servers` | `list[str] \| None` | `None` | 自定义 DNS-over-HTTPS 端点，传入 `https://...` URL |
 | `enable_ipv6` | `bool \| None` | `True` | 是否允许解析和连接 IPv6 地址 |
 
 ## 运行测试
