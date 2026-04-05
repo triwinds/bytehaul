@@ -42,7 +42,7 @@ Or add it manually to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-bytehaul = "0.1.3"
+bytehaul = "0.1.4"
 ```
 
 ### Python
