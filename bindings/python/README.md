@@ -166,9 +166,11 @@ Frozen snapshot of download progress.
 | `total_size`   | `int \| None`  | Total file size (if known)      |
 | `downloaded`   | `int`          | Bytes downloaded so far         |
 | `state`        | `str`          | `"pending"`, `"downloading"`, `"completed"`, `"failed"`, `"cancelled"`, `"paused"` |
-| `speed`        | `float`        | Current speed in bytes/second   |
+| `speed`        | `float`        | Recent-window speed in bytes/second |
 | `eta_secs`     | `float \| None`| Estimated remaining seconds     |
 | `elapsed_secs` | `float \| None`| Elapsed time in seconds         |
+
+`speed` and `eta_secs` are computed from the same recent throughput window. `speed` is not a whole-download lifetime average, and `eta_secs` stays `None` until bytehaul has enough recent samples or a known total size.
 
 ### Download options
 

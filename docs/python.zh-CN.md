@@ -201,9 +201,11 @@ except DownloadFailedError as exc:
 | `total_size` | `int \| None` | 文件总大小，未知时为 `None` |
 | `downloaded` | `int` | 已下载字节数 |
 | `state` | `str` | 当前状态，如 `pending`、`downloading`、`completed`、`cancelled`、`paused` |
-| `speed` | `float` | 当前下载速度，单位为字节/秒 |
+| `speed` | `float` | 最近窗口内的下载速度，单位为字节/秒 |
 | `eta_secs` | `float \| None` | 预计剩余秒数 |
 | `elapsed_secs` | `float \| None` | 已耗时秒数 |
+
+`speed` 和 `eta_secs` 使用同一条最近吞吐窗口。`speed` 不是全程平均速度；在最近样本不足或总大小未知时，`eta_secs` 会保持为 `None`。
 
 ## 常用参数
 

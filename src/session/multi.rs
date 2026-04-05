@@ -10,7 +10,7 @@ use tokio::sync::{mpsc, watch, Semaphore};
 use super::{
     flush_all_and_wait, flush_piece_and_wait, range_response_allowed,
     stop_signal_error, stop_signal_label, stop_signal_state,
-    ETA_ALPHA, StopSignal,
+    MIN_SPEED_SAMPLE_SPAN, MULTI_PROGRESS_INTERVAL, SPEED_ESTIMATE_WINDOW, StopSignal,
 };
 use crate::config::{DownloadSpec, LogLevel};
 use crate::error::DownloadError;
@@ -73,8 +73,8 @@ pub(super) async fn run_multi_worker(
     // Shared progress counter
     let downloaded = Arc::new(AtomicU64::new(initial_downloaded));
     let start_time = Instant::now();
-    let mut eta_estimator = EtaEstimator::new(ETA_ALPHA);
-    let mut last_progress_bytes = initial_downloaded;
+    let mut eta_estimator = EtaEstimator::new(SPEED_ESTIMATE_WINDOW, MIN_SPEED_SAMPLE_SPAN);
+    eta_estimator.record(initial_downloaded, start_time);
 
     progress_tx.send_modify(|p| {
         p.total_size = Some(total_size);
@@ -138,7 +138,7 @@ pub(super) async fn run_multi_worker(
     let mut cancel_rx = cancel_rx;
     let mut save_ticker = tokio::time::interval(spec.control_save_interval);
     save_ticker.tick().await;
-    let mut progress_interval = tokio::time::interval(Duration::from_millis(200));
+    let mut progress_interval = tokio::time::interval(MULTI_PROGRESS_INTERVAL);
     progress_interval.tick().await;
 
     let mut download_error: Option<DownloadError> = None;
@@ -176,15 +176,8 @@ pub(super) async fn run_multi_worker(
 
             _ = progress_interval.tick() => {
                 let d = downloaded.load(Ordering::Relaxed);
-                let elapsed = start_time.elapsed().as_secs_f64();
-                let speed = if elapsed > 0.0 {
-                    d.saturating_sub(initial_downloaded) as f64 / elapsed
-                } else {
-                    0.0
-                };
-                let delta_bytes = d.saturating_sub(last_progress_bytes);
-                eta_estimator.update_sample(delta_bytes, 0.2);
-                last_progress_bytes = d;
+                eta_estimator.record(d, Instant::now());
+                let speed = eta_estimator.speed_bytes_per_sec().unwrap_or(0.0);
                 let remaining = total_size.saturating_sub(d);
                 let eta_secs = if remaining == 0 {
                     Some(0.0)
@@ -263,14 +256,10 @@ pub(super) async fn run_multi_worker(
     let _ = ControlSnapshot::delete(control_path).await;
     // Final progress update
     let d = downloaded.load(Ordering::Relaxed);
-    let elapsed = start_time.elapsed().as_secs_f64();
-    let speed = if elapsed > 0.0 {
-        d as f64 / elapsed
-    } else {
-        0.0
-    };
+    eta_estimator.record(d, Instant::now());
+    let speed = eta_estimator.speed_bytes_per_sec().unwrap_or(0.0);
     log_info!(log_level, download_id = download_id,
-        total_bytes = d, elapsed_secs = format!("{elapsed:.2}"),
+        total_bytes = d, elapsed_secs = format!("{:.2}", start_time.elapsed().as_secs_f64()),
         "multi-worker download completed");
     progress_tx.send_modify(|p| {
         p.downloaded = d;

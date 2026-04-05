@@ -81,10 +81,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-`eta_secs` 的语义如下：
+`speed_bytes_per_sec` 和 `eta_secs` 现在共用同一条最近吞吐窗口：
 
-- `None`：当前样本还不足以给出稳定 ETA，或者总大小仍未知。
-- `Some(0.0)`：下载已经到达流末尾，状态即将或已经进入 `Completed`。
+- `speed_bytes_per_sec` 表示最近窗口内的速度，而不是从下载开始到当前时刻的全程平均值。
+- `eta_secs` 直接使用同一窗口速度估算剩余时间，因此它和显示出来的速度会一起变化，而不是各走一套平滑规则。
+- `eta_secs == None`：当前最近样本还不足以给出稳定 ETA，或者总大小仍未知。
+- `eta_secs == Some(0.0)`：下载已经到达流末尾，状态即将或已经进入 `Completed`。
 
 ## 暂停与续传
 

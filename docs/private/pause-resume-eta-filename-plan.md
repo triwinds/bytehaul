@@ -148,13 +148,12 @@
 ### 2.1 现状
 
 - `ProgressSnapshot` 已有 `speed_bytes_per_sec`、`total_size`、`downloaded`、`start_time`。
-- 当前 `speed_bytes_per_sec` 不是“瞬时速度”，而是从 `start_time` 到当前时刻的平均速度。
-- 库自身不计算 ETA，用户只能自行 `(total - downloaded) / speed`。
-- 直接使用当前平均速度计算 ETA 虽然简单，但在速度变化时会明显滞后；如果再对这个平均值做一层 EWMA，反而可能双重平滑、响应更慢。
+- 2026-04-05 更新：`speed_bytes_per_sec` 与 `eta_secs` 都已改为基于最近吞吐窗口，而不是全程平均速度。
+- 当前显示速度与 ETA 共享同一条估算曲线，避免“速度看起来稳定、ETA 却剧烈跳动”的口径不一致。
 
 ### 2.2 修订后的目标
 
-在 `ProgressSnapshot` 中增加 `eta_secs: Option<f64>`，由核心下载循环基于“最近一段时间的吞吐样本”计算，而不是直接对“全程平均速度”二次平滑。
+在 `ProgressSnapshot` 中让 `speed_bytes_per_sec` 与 `eta_secs` 共用同一条“最近一段时间的吞吐样本”曲线，避免 ETA 和显示速度采用不同时间尺度。
 
 ### 2.3 设计方案
 
@@ -226,9 +225,9 @@
 
 ### 2.4 实现结果
 
-- 已新增 `src/eta.rs`，使用 EWMA 吞吐样本估算剩余时间
+- 已新增 `src/eta.rs`，并在 2026-04-05 调整为最近窗口吞吐估算器，同时驱动 speed 与 ETA
 - 已为 `ProgressSnapshot` 增加 `eta_secs: Option<f64>` 字段
-- 单连接路径已按 1 秒采样窗口估算 ETA，多连接路径已按现有 200ms progress tick 估算 ETA
+- 单连接与多连接路径现在都使用同一套最近窗口速度来源；多连接仍按 200ms progress tick 更新采样
 - 完成态的 `eta_secs` 固定为 `Some(0.0)`，未知或速度过低场景保持 `None`
 - Python 绑定的 `PyProgressSnapshot.eta_secs` 已同步可用
 - 已补充单元测试和单连接、多连接 ETA 集成测试

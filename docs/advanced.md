@@ -84,10 +84,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-`eta_secs` is intentionally conservative:
+`speed_bytes_per_sec` and `eta_secs` are derived from the same recent throughput window:
 
-- `None` means bytehaul does not have enough stable samples yet, or the total size is still unknown.
-- `Some(0.0)` means the task has reached the end of the stream and the progress state is transitioning to `Completed`.
+- `speed_bytes_per_sec` is a recent-window rate, not a whole-download lifetime average.
+- `eta_secs` divides remaining bytes by that same recent-window rate, so it rises and falls with the displayed speed instead of using a different smoothing rule.
+- `eta_secs == None` means bytehaul does not have enough recent samples yet, or the total size is still unknown.
+- `eta_secs == Some(0.0)` means the task has reached the end of the stream and the progress state is transitioning to `Completed`.
 
 ## Pause And Resume
 

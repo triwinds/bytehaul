@@ -24,8 +24,9 @@ use self::resume::try_resume_download;
 use self::retry::retry_with_backoff;
 use self::single::run_single_connection;
 
-const ETA_ALPHA: f64 = 0.3;
-const SINGLE_ETA_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
+const SPEED_ESTIMATE_WINDOW: Duration = Duration::from_secs(5);
+const MIN_SPEED_SAMPLE_SPAN: Duration = Duration::from_secs(1);
+const MULTI_PROGRESS_INTERVAL: Duration = Duration::from_millis(200);
 
 /// Attempt a range probe first; on failure fall back to a plain GET with retry.
 async fn probe_or_fallback_get(

@@ -221,12 +221,14 @@ async fn test_multi_worker_eta_reports() {
     let handle = downloader.download(spec);
     let mut rx = handle.subscribe_progress();
     let mut saw_eta = false;
+    let mut saw_speed = false;
 
     for _ in 0..30 {
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         let snap = rx.borrow_and_update().clone();
         if matches!(snap.state, DownloadState::Downloading) && snap.eta_secs.is_some() {
             saw_eta = true;
+            saw_speed = snap.speed_bytes_per_sec > 0.0;
             break;
         }
     }
@@ -234,6 +236,7 @@ async fn test_multi_worker_eta_reports() {
     handle.wait().await.unwrap();
     let final_snap = rx.borrow_and_update().clone();
     assert!(saw_eta, "eta should become available during multi-worker download");
+    assert!(saw_speed, "speed should be driven by the same recent samples as eta");
     assert_eq!(final_snap.eta_secs, Some(0.0));
 }
 

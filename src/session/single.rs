@@ -8,7 +8,7 @@ use tokio::sync::{mpsc, watch, Semaphore};
 
 use super::{
     flush_all_and_wait, stop_signal_error, stop_signal_state,
-    ETA_ALPHA, SINGLE_ETA_SAMPLE_INTERVAL, StopSignal,
+    MIN_SPEED_SAMPLE_SPAN, SPEED_ESTIMATE_WINDOW, StopSignal,
 };
 use crate::config::{DownloadSpec, LogLevel};
 use crate::error::DownloadError;
@@ -141,12 +141,11 @@ async fn stream_single(
     let mut stream = response.bytes_stream();
     let mut downloaded: u64 = start_offset;
     let start_time = Instant::now();
-    let mut eta_estimator = EtaEstimator::new(ETA_ALPHA);
-    let mut last_sample_time = start_time;
-    let mut bytes_since_last_sample = 0u64;
+    let mut eta_estimator = EtaEstimator::new(SPEED_ESTIMATE_WINDOW, MIN_SPEED_SAMPLE_SPAN);
     let mut cancel_rx = cancel_rx;
     let mut save_ticker = tokio::time::interval(control_save_interval);
     save_ticker.tick().await;
+    eta_estimator.record(start_offset, start_time);
 
     progress_tx.send_modify(|p| {
         p.total_size = total_size;
@@ -203,24 +202,13 @@ async fn stream_single(
 
                         let offset = downloaded;
                         downloaded += len as u64;
-                        bytes_since_last_sample += len as u64;
                         if write_tx.send(WriterCommand::Data { offset, data, piece_id: None }).await.is_err() {
                             return Err(DownloadError::ChannelClosed);
                         }
                         permit.forget(); // permits returned by writer after flush
-                        let elapsed = start_time.elapsed().as_secs_f64();
-                        let speed = if elapsed > 0.0 {
-                            downloaded.saturating_sub(start_offset) as f64 / elapsed
-                        } else {
-                            0.0
-                        };
                         let now = Instant::now();
-                        if now.duration_since(last_sample_time) >= SINGLE_ETA_SAMPLE_INTERVAL {
-                            let delta_secs = now.duration_since(last_sample_time).as_secs_f64();
-                            eta_estimator.update_sample(bytes_since_last_sample, delta_secs);
-                            last_sample_time = now;
-                            bytes_since_last_sample = 0;
-                        }
+                        eta_estimator.record(downloaded, now);
+                        let speed = eta_estimator.speed_bytes_per_sec().unwrap_or(0.0);
                         let eta_secs = total_size.and_then(|total| {
                             let remaining = total.saturating_sub(downloaded);
                             if remaining == 0 {
