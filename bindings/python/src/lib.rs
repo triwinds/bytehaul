@@ -478,6 +478,7 @@ impl PyDownloader {
         enable_ipv6 = None,
         log_level = None
     ))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         connect_timeout: Option<f64>,
         proxy: Option<String>,
