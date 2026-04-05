@@ -100,6 +100,30 @@ bytehaul.download(
 
 完整的 Python API（对象 API、进度、取消、错误处理等），请参阅 [Python 使用文档](python.zh-CN.md)。
 
+## 覆盖率
+
+CI 中的覆盖率门禁仍然在 Ubuntu 上通过 Tarpaulin 执行：
+
+```bash
+cargo tarpaulin --engine llvm --workspace --all-targets --out Stdout --fail-under 95
+```
+
+在 Windows 上，如果直接跑 Tarpaulin，常见问题是中断后残留句柄、二进制被锁住，或者终端拿不到完整总结。仓库里提供了专门的 PowerShell 脚本来生成本地报告：
+
+```powershell
+rustup component add llvm-tools-preview
+cargo install cargo-llvm-cov
+powershell -ExecutionPolicy Bypass -File scripts/coverage-windows.ps1 -Scope tests -Format html
+```
+
+如果你需要机器可读的摘要，可以使用：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/coverage-windows.ps1 -Scope tests -Format json
+```
+
+该脚本会强制 `CARGO_BUILD_JOBS=1`，并使用隔离的 `CARGO_TARGET_DIR`，以减少 Windows 下 `os error 5`、`LNK1104` 以及残留 `cargo` / `rustc` 进程带来的冲突。
+
 ## 架构概览
 
 ```text

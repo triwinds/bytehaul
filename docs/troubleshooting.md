@@ -140,3 +140,29 @@ For production use, install the wheel:
 ```bash
 pip install bytehaul
 ```
+
+## Windows Coverage Reports
+
+**Symptom:** `cargo tarpaulin` on Windows fails with incomplete output, `os error 232`, `os error 5`, `LNK1104`, or leaves `cargo` / `rustc` processes behind that keep binaries and log files locked.
+
+**Cause:** Windows coverage runs are sensitive to process cleanup and target-directory reuse. If an earlier run is interrupted, or if two coverage commands share the same target directory, later runs can fail while cleaning old artifacts or linking instrumented test binaries.
+
+**Fix:**
+
+1. Stop any stale `cargo` / `rustc` processes before starting a new coverage run.
+2. Avoid running multiple coverage commands in parallel on Windows.
+3. Use the dedicated helper, which forces a single build job and an isolated target directory:
+
+```powershell
+rustup component add llvm-tools-preview
+cargo install cargo-llvm-cov
+powershell -ExecutionPolicy Bypass -File scripts/coverage-windows.ps1 -Scope tests -Format html
+```
+
+If you want a JSON summary instead of HTML:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/coverage-windows.ps1 -Scope tests -Format json
+```
+
+The Linux CI gate still uses Tarpaulin for the repository-wide threshold check.

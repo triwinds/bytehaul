@@ -98,6 +98,30 @@ bytehaul.download(
 
 For the full Python API (object API, progress, cancellation, error handling, etc.), see the [Python Bindings Guide](bindings/python/README.md).
 
+## Coverage
+
+The CI coverage gate is still enforced on Ubuntu with Tarpaulin:
+
+```bash
+cargo tarpaulin --engine llvm --workspace --all-targets --out Stdout --fail-under 95
+```
+
+On Windows, Tarpaulin can leave locked binaries or produce incomplete summaries after interrupted or parallel coverage runs. Use the PowerShell helper instead for a local report:
+
+```powershell
+rustup component add llvm-tools-preview
+cargo install cargo-llvm-cov
+powershell -ExecutionPolicy Bypass -File scripts/coverage-windows.ps1 -Scope tests -Format html
+```
+
+For a machine-readable summary on Windows:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/coverage-windows.ps1 -Scope tests -Format json
+```
+
+The helper forces `CARGO_BUILD_JOBS=1` and a dedicated `CARGO_TARGET_DIR`, which avoids the `os error 5`, `LNK1104`, and stale `cargo` / `rustc` handle conflicts that show up when multiple coverage builds overlap on Windows.
+
 ## Architecture
 
 ```

@@ -150,3 +150,29 @@ uv run maturin develop
 ```bash
 pip install bytehaul
 ```
+
+## Windows 下的覆盖率报告
+
+**现象：** 在 Windows 上执行 `cargo tarpaulin` 时，可能拿不到完整输出，或者出现 `os error 232`、`os error 5`、`LNK1104`，并残留 `cargo` / `rustc` 进程，导致二进制和日志文件持续被占用。
+
+**原因：** Windows 下的覆盖率构建对进程清理和 target 目录复用比较敏感。如果上一次覆盖率任务被中断，或者两个覆盖率命令共用了同一个 target 目录，后续任务就可能在清理旧产物或链接带插桩的测试二进制时失败。
+
+**处理方法：**
+
+1. 开始新的覆盖率任务前，先确认没有残留的 `cargo` / `rustc` 进程。
+2. 不要在 Windows 上并行执行多个覆盖率命令。
+3. 使用仓库内置的 PowerShell 脚本，它会强制单线程构建并隔离 target 目录：
+
+```powershell
+rustup component add llvm-tools-preview
+cargo install cargo-llvm-cov
+powershell -ExecutionPolicy Bypass -File scripts/coverage-windows.ps1 -Scope tests -Format html
+```
+
+如果你需要机器可读的摘要报告，可以改用：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/coverage-windows.ps1 -Scope tests -Format json
+```
+
+仓库的最终覆盖率门禁仍然在 Linux CI 上通过 Tarpaulin 校验。
