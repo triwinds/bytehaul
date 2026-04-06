@@ -281,13 +281,7 @@ impl DownloadHandle {
         tokio::spawn(async move {
             while rx.changed().await.is_ok() {
                 let snap = rx.borrow().clone();
-                let terminal = matches!(
-                    snap.state,
-                    DownloadState::Completed
-                        | DownloadState::Failed
-                        | DownloadState::Cancelled
-                        | DownloadState::Paused
-                );
+                let terminal = !matches!(snap.state, DownloadState::Pending | DownloadState::Downloading);
                 callback(snap);
                 if terminal {
                     break;
