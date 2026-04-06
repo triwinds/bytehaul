@@ -108,6 +108,35 @@ fn bench_control_roundtrip(c: &mut Criterion) {
     });
 }
 
+fn bench_control_save_only(c: &mut Criterion) {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    c.bench_function("control_save_only", |b| {
+        let dir = tempdir().unwrap();
+        let ctrl_path = dir.path().join("autosave.bytehaul");
+        let snapshot = ControlSnapshot {
+            url: "https://example.com/large-file.bin".to_string(),
+            total_size: 1_000_000_000,
+            piece_size: 1_000_000,
+            piece_count: 1000,
+            completed_bitset: vec![0xFF; 125],
+            downloaded_bytes: 500_000_000,
+            etag: Some("\"etag-bench\"".to_string()),
+            last_modified: Some("Thu, 01 Jan 2026 00:00:00 GMT".to_string()),
+        };
+
+        b.iter(|| {
+            rt.block_on(async {
+                snapshot.save(&ctrl_path).await.unwrap();
+                black_box(std::fs::metadata(&ctrl_path).unwrap().len());
+            });
+        });
+    });
+}
+
 fn bench_single_progress_reporting(c: &mut Criterion) {
     c.bench_function("single_progress_reporting_throttled", |b| {
         b.iter(|| {
@@ -121,6 +150,7 @@ criterion_group!(
     bench_cache_insert_coalesce,
     bench_piece_map_serde,
     bench_scheduler_snapshot,
+    bench_control_save_only,
     bench_control_roundtrip,
     bench_single_progress_reporting
 );

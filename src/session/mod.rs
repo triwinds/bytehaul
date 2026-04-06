@@ -17,7 +17,7 @@ use crate::http::worker::HttpWorker;
 use crate::progress::{DownloadState, ProgressSnapshot};
 use crate::rate_limiter::SpeedLimit;
 use crate::storage::control::ControlSnapshot;
-use crate::storage::writer::WriterCommand;
+use crate::storage::writer::{FlushAllStats, WriterCommand};
 
 use self::multi::run_multi_worker;
 use self::resume::try_resume_download;
@@ -86,6 +86,72 @@ fn stop_signal_label(signal: StopSignal) -> &'static str {
         StopSignal::Running => "running",
         StopSignal::Cancel => "cancelled",
         StopSignal::Pause => "paused",
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlSaveReason {
+    Autosave,
+    Terminal,
+}
+
+impl ControlSaveReason {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Autosave => "autosave",
+            Self::Terminal => "terminal",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ControlSaveTracker {
+    last_saved_downloaded_bytes: u64,
+    autosave_ticks_since_save: u32,
+}
+
+impl ControlSaveTracker {
+    fn new(initial_downloaded_bytes: u64) -> Self {
+        Self {
+            last_saved_downloaded_bytes: initial_downloaded_bytes,
+            autosave_ticks_since_save: 0,
+        }
+    }
+
+    fn should_save(
+        &mut self,
+        reason: ControlSaveReason,
+        current_downloaded_bytes: u64,
+        autosave_sync_every: u32,
+    ) -> bool {
+        if current_downloaded_bytes <= self.last_saved_downloaded_bytes {
+            if matches!(reason, ControlSaveReason::Autosave) {
+                self.autosave_ticks_since_save = 0;
+            }
+            return false;
+        }
+
+        match reason {
+            ControlSaveReason::Autosave => {
+                self.autosave_ticks_since_save =
+                    self.autosave_ticks_since_save.saturating_add(1);
+                self.autosave_ticks_since_save >= autosave_sync_every
+            }
+            ControlSaveReason::Terminal => true,
+        }
+    }
+
+    fn mark_saved(&mut self, downloaded_bytes: u64) {
+        self.last_saved_downloaded_bytes = downloaded_bytes;
+        self.autosave_ticks_since_save = 0;
+    }
+
+    fn last_saved_downloaded_bytes(&self) -> u64 {
+        self.last_saved_downloaded_bytes
+    }
+
+    fn pending_autosaves(&self) -> u32 {
+        self.autosave_ticks_since_save
     }
 }
 
@@ -432,7 +498,7 @@ async fn flush_piece_and_wait(
 async fn flush_all_and_wait(
     write_tx: &mpsc::Sender<WriterCommand>,
     sync_data: bool,
-) -> Result<u64, DownloadError> {
+) -> Result<FlushAllStats, DownloadError> {
     let (ack_tx, ack_rx) = oneshot::channel();
     write_tx
         .send(WriterCommand::FlushAll {
@@ -546,6 +612,27 @@ mod tests {
             last_modified: None,
         };
         assert!(!validate_metadata(&meta, &ctrl));
+    }
+
+    #[test]
+    fn test_control_save_tracker_defers_autosaves_until_threshold() {
+        let mut tracker = ControlSaveTracker::new(0);
+
+        assert!(!tracker.should_save(ControlSaveReason::Autosave, 128, 2));
+        assert_eq!(tracker.pending_autosaves(), 1);
+        assert!(tracker.should_save(ControlSaveReason::Autosave, 128, 2));
+
+        tracker.mark_saved(128);
+        assert!(!tracker.should_save(ControlSaveReason::Autosave, 128, 2));
+    }
+
+    #[test]
+    fn test_control_save_tracker_forces_terminal_save_on_new_progress() {
+        let mut tracker = ControlSaveTracker::new(64);
+
+        assert!(tracker.should_save(ControlSaveReason::Terminal, 96, 3));
+        tracker.mark_saved(96);
+        assert!(!tracker.should_save(ControlSaveReason::Terminal, 96, 3));
     }
 
     #[test]

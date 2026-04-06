@@ -75,7 +75,7 @@ Files smaller than this threshold are downloaded with a single connection regard
 
 **Default:** 5 seconds
 
-How often the control file (`.bytehaul`) is persisted to disk during a download. Lower values improve resume accuracy at the cost of more disk writes; higher values reduce I/O overhead but risk losing more progress on crash.
+How often the downloader evaluates whether it should persist a durable control file (`.bytehaul`) during a download. The actual durable save cadence is also gated by `autosave_sync_every`. Lower values improve resume accuracy at the cost of more disk writes; higher values reduce I/O overhead but risk losing more progress on crash.
 
 | Scenario | Recommended Value |
 |----------|-------------------|
@@ -83,6 +83,24 @@ How often the control file (`.bytehaul`) is persisted to disk during a download.
 | Slow or metered connection | 10 – 30 s |
 | SSD storage | 3 – 5 s (default) |
 | HDD or network storage | 10 – 15 s |
+
+## `autosave_sync_every`
+
+**Default:** 2  
+**Range:** Must be ≥ 1
+
+Coalesces multiple autosave ticks into one durable save. If unsaved progress exists, bytehaul will only call the heavy `sync_data + control save` path on every Nth autosave tick. User-triggered `pause`, cancellation, and failure paths still force an immediate durable save.
+
+| Scenario | Recommended Value |
+|----------|-------------------|
+| Fast SSD, tight crash window | 1 |
+| Default mixed workload | 2 (default) |
+| Slow HDD or network share | 3 – 4 |
+
+**Trade-offs:**
+- Lower values → less progress loss after a crash, but more `sync_data` and control-file churn
+- Higher values → fewer durable flushes and smoother throughput on slow disks, but a larger crash window
+- Approximate crash-loss window: `control_save_interval * autosave_sync_every`
 
 ## `max_download_speed`
 

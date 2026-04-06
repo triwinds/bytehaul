@@ -139,6 +139,8 @@ pub struct DownloadSpec {
     pub(crate) checksum: Option<Checksum>,
     /// Interval for periodic control-file saves (default 5 s).
     pub(crate) control_save_interval: Duration,
+    /// Persist a durable autosave every N autosave ticks with unsaved progress.
+    pub(crate) autosave_sync_every: u32,
 }
 
 impl DownloadSpec {
@@ -168,6 +170,7 @@ impl DownloadSpec {
             max_download_speed: 0,
             checksum: None,
             control_save_interval: Duration::from_secs(5),
+            autosave_sync_every: 2,
         }
     }
 
@@ -271,6 +274,11 @@ impl DownloadSpec {
     /// Returns the interval for periodic control-file saves.
     pub fn get_control_save_interval(&self) -> Duration {
         self.control_save_interval
+    }
+
+    /// Returns how many autosave ticks are coalesced into one durable save.
+    pub fn get_autosave_sync_every(&self) -> u32 {
+        self.autosave_sync_every
     }
 
     /// Set the explicit output file path.
@@ -401,6 +409,12 @@ impl DownloadSpec {
         self
     }
 
+    /// Save a durable autosave every N autosave ticks that have unsaved progress.
+    pub fn autosave_sync_every(mut self, autosave_sync_every: u32) -> Self {
+        self.autosave_sync_every = autosave_sync_every;
+        self
+    }
+
     /// Validate the configuration and return an error if any value is out of range.
     pub fn validate(&self) -> Result<(), DownloadError> {
         if self.url.trim().is_empty() {
@@ -427,6 +441,11 @@ impl DownloadSpec {
         if self.min_split_size == 0 {
             return Err(DownloadError::InvalidConfig(
                 "min_split_size must be >= 1".into(),
+            ));
+        }
+        if self.autosave_sync_every == 0 {
+            return Err(DownloadError::InvalidConfig(
+                "autosave_sync_every must be >= 1".into(),
             ));
         }
         if self.retry_base_delay > self.retry_max_delay {
@@ -472,6 +491,7 @@ mod tests {
         assert_eq!(spec.max_download_speed, 0);
         assert!(spec.checksum.is_none());
         assert!(spec.headers.is_empty());
+        assert_eq!(spec.autosave_sync_every, 2);
     }
 
     #[test]
@@ -502,7 +522,8 @@ mod tests {
             .retry_policy(7, Duration::from_millis(10), Duration::from_millis(50))
             .max_retry_elapsed(Duration::from_secs(3))
             .max_download_speed(12345)
-            .checksum(Checksum::Sha256("abc123".into()));
+            .checksum(Checksum::Sha256("abc123".into()))
+            .autosave_sync_every(4);
 
         assert_eq!(spec.headers, headers);
         assert_eq!(spec.max_connections, 8);
@@ -520,6 +541,7 @@ mod tests {
         assert_eq!(spec.max_retry_elapsed, Some(Duration::from_secs(3)));
         assert_eq!(spec.max_download_speed, 12345);
         assert!(matches!(spec.checksum, Some(Checksum::Sha256(ref value)) if value == "abc123"));
+        assert_eq!(spec.autosave_sync_every, 4);
     }
 
     #[test]
@@ -541,6 +563,12 @@ mod tests {
             .validate()
             .unwrap_err();
         assert!(err.to_string().contains("checksum"));
+
+        let err = DownloadSpec::new("https://example.com/file")
+            .autosave_sync_every(0)
+            .validate()
+            .unwrap_err();
+        assert!(err.to_string().contains("autosave_sync_every"));
     }
 
     #[test]
@@ -665,7 +693,8 @@ mod tests {
             .max_retry_elapsed(Duration::from_secs(60))
             .max_download_speed(999)
             .checksum(Checksum::Sha256("abc".into()))
-            .control_save_interval(Duration::from_secs(10));
+            .control_save_interval(Duration::from_secs(10))
+            .autosave_sync_every(6);
 
         assert_eq!(spec.get_url(), "https://example.com/file");
         assert_eq!(spec.get_output_path().unwrap(), Path::new("/tmp/out.bin"));
@@ -687,6 +716,7 @@ mod tests {
         assert_eq!(spec.get_max_download_speed(), 999);
         assert!(spec.get_checksum().is_some());
         assert_eq!(spec.get_control_save_interval(), Duration::from_secs(10));
+        assert_eq!(spec.get_autosave_sync_every(), 6);
     }
 
     #[test]

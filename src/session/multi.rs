@@ -9,6 +9,7 @@ use tokio::sync::{mpsc, watch, Semaphore};
 
 use super::{
     flush_all_and_wait, flush_piece_and_wait, range_response_allowed,
+    ControlSaveReason, ControlSaveTracker,
     stop_signal_error, stop_signal_label, stop_signal_state,
     MIN_SPEED_SAMPLE_SPAN, MULTI_PROGRESS_INTERVAL, SPEED_ESTIMATE_WINDOW, StopSignal,
 };
@@ -98,6 +99,7 @@ pub(super) async fn run_multi_worker(
     let mut workers = FuturesUnordered::new();
     let mut probe_response = probe_response;
     let save_write_tx = write_tx.clone();
+    let mut control_save_tracker = ControlSaveTracker::new(initial_downloaded);
 
     let worker_cfg = Arc::new(WorkerConfig {
         url: spec.url.clone(),
@@ -172,7 +174,18 @@ pub(super) async fn run_multi_worker(
                             progress_reporter.force_report(progress_tx, update, now);
                         }
                         if spec.resume {
-                            save_multi_control(spec, meta, &scheduler, total_size, control_path, Some(&save_write_tx)).await;
+                            persist_multi_control_snapshot(
+                                ControlSaveReason::Terminal,
+                                spec,
+                                meta,
+                                &scheduler,
+                                total_size,
+                                control_path,
+                                Some(&save_write_tx),
+                                &mut control_save_tracker,
+                                log_level,
+                                download_id,
+                            ).await;
                         }
                         download_error = Some(error);
                         break;
@@ -181,7 +194,18 @@ pub(super) async fn run_multi_worker(
             }
 
             _ = save_ticker.tick(), if spec.resume => {
-                save_multi_control(spec, meta, &scheduler, total_size, control_path, Some(&save_write_tx)).await;
+                persist_multi_control_snapshot(
+                    ControlSaveReason::Autosave,
+                    spec,
+                    meta,
+                    &scheduler,
+                    total_size,
+                    control_path,
+                    Some(&save_write_tx),
+                    &mut control_save_tracker,
+                    log_level,
+                    download_id,
+                ).await;
             }
 
             _ = progress_interval.tick() => {
@@ -241,7 +265,18 @@ pub(super) async fn run_multi_worker(
 
     if let Some(e) = download_error {
         if spec.resume {
-            save_multi_control(spec, meta, &scheduler, total_size, control_path, None).await;
+            persist_multi_control_snapshot(
+                ControlSaveReason::Terminal,
+                spec,
+                meta,
+                &scheduler,
+                total_size,
+                control_path,
+                None,
+                &mut control_save_tracker,
+                log_level,
+                download_id,
+            ).await;
         }
         if !matches!(e, DownloadError::Cancelled | DownloadError::Paused) {
             let now = Instant::now();
@@ -275,7 +310,18 @@ pub(super) async fn run_multi_worker(
 
     if !scheduler.lock().all_done() {
         if spec.resume {
-            save_multi_control(spec, meta, &scheduler, total_size, control_path, None).await;
+            persist_multi_control_snapshot(
+                ControlSaveReason::Terminal,
+                spec,
+                meta,
+                &scheduler,
+                total_size,
+                control_path,
+                None,
+                &mut control_save_tracker,
+                log_level,
+                download_id,
+            ).await;
         }
         let now = Instant::now();
         let update = sampled_progress_update(
@@ -320,19 +366,43 @@ fn sampled_progress_update(
     ProgressUpdate::new(downloaded, speed, eta_secs)
 }
 
-async fn save_multi_control(
+async fn persist_multi_control_snapshot(
+    reason: ControlSaveReason,
     spec: &DownloadSpec,
     meta: &ResponseMeta,
     scheduler: &Scheduler,
     total_size: u64,
     control_path: &Path,
     write_tx: Option<&mpsc::Sender<WriterCommand>>,
+    control_save_tracker: &mut ControlSaveTracker,
+    log_level: LogLevel,
+    download_id: u64,
 ) {
-    if let Some(write_tx) = write_tx {
-        if flush_all_and_wait(write_tx, true).await.is_err() {
-            return;
+    let current_downloaded = scheduler.lock().completed_bytes();
+    if !control_save_tracker.should_save(reason, current_downloaded, spec.autosave_sync_every) {
+        if matches!(reason, ControlSaveReason::Autosave)
+            && current_downloaded > control_save_tracker.last_saved_downloaded_bytes()
+        {
+            log_debug!(log_level, download_id = download_id,
+                checkpoint = reason.label(), downloaded_bytes = current_downloaded,
+                pending_autosaves = control_save_tracker.pending_autosaves(),
+                autosave_sync_every = spec.autosave_sync_every,
+                "control snapshot deferred");
         }
+        return;
     }
+
+    let flush_stats = match write_tx {
+        Some(write_tx) => match flush_all_and_wait(write_tx, true).await {
+            Ok(stats) => Some(stats),
+            Err(error) => {
+                log_warn!(log_level, download_id = download_id, checkpoint = reason.label(),
+                    error = %error, "control snapshot flush failed");
+                return;
+            }
+        },
+        None => None,
+    };
 
     let snap = {
         let sched = scheduler.lock();
@@ -347,7 +417,26 @@ async fn save_multi_control(
             last_modified: meta.last_modified.clone(),
         }
     };
-    let _ = snap.save(control_path).await;
+    if snap.downloaded_bytes <= control_save_tracker.last_saved_downloaded_bytes() {
+        return;
+    }
+
+    let save_started = Instant::now();
+    match snap.save(control_path).await {
+        Ok(()) => {
+            control_save_tracker.mark_saved(snap.downloaded_bytes);
+            log_debug!(log_level, download_id = download_id,
+                checkpoint = reason.label(), downloaded_bytes = snap.downloaded_bytes,
+                flush_all_ms = flush_stats.map(|stats| stats.flush_elapsed.as_millis() as u64).unwrap_or(0),
+                sync_data_ms = flush_stats.and_then(|stats| stats.sync_elapsed.map(|elapsed| elapsed.as_millis() as u64)).unwrap_or(0),
+                control_save_ms = save_started.elapsed().as_millis() as u64,
+                "control snapshot saved");
+        }
+        Err(error) => {
+            log_warn!(log_level, download_id = download_id, checkpoint = reason.label(),
+                error = %error, "control snapshot save failed");
+        }
+    }
 }
 
 // ──────────────────────────────────────────────────────────────

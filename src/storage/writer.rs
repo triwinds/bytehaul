@@ -1,5 +1,6 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
@@ -7,6 +8,13 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::error::DownloadError;
 use crate::storage::cache::WriteBackCache;
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FlushAllStats {
+    pub written_bytes: u64,
+    pub flush_elapsed: Duration,
+    pub sync_elapsed: Option<Duration>,
+}
 
 pub(crate) enum WriterCommand {
     Data {
@@ -23,7 +31,7 @@ pub(crate) enum WriterCommand {
     /// Flush all cached data and optionally sync it before acknowledging.
     FlushAll {
         sync_data: bool,
-        ack: oneshot::Sender<u64>,
+        ack: oneshot::Sender<FlushAllStats>,
     },
 }
 
@@ -87,11 +95,21 @@ impl WriterTask {
                     let _ = ack.send(());
                 }
                 WriterCommand::FlushAll { sync_data, ack } => {
+                    let flush_started = Instant::now();
                     self.flush_all().await?;
-                    if sync_data {
+                    let flush_elapsed = flush_started.elapsed();
+                    let sync_elapsed = if sync_data {
+                        let sync_started = Instant::now();
                         self.sync_file().await?;
-                    }
-                    let _ = ack.send(self.written_bytes.load(Ordering::Acquire));
+                        Some(sync_started.elapsed())
+                    } else {
+                        None
+                    };
+                    let _ = ack.send(FlushAllStats {
+                        written_bytes: self.written_bytes.load(Ordering::Acquire),
+                        flush_elapsed,
+                        sync_elapsed,
+                    });
                 }
             }
         }
@@ -269,7 +287,8 @@ mod tests {
         .await
         .unwrap();
         let written_val = ack_rx.await.unwrap();
-        assert!(written_val >= 50);
+        assert!(written_val.written_bytes >= 50);
+        assert!(written_val.sync_elapsed.is_some());
 
         drop(tx);
         handle.await.unwrap().unwrap();

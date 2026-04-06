@@ -225,6 +225,54 @@ async fn test_single_resume_control_file_saves_periodically() {
 }
 
 #[tokio::test]
+async fn test_single_resume_autosave_sync_every_defers_first_save() {
+    let content: Vec<u8> = (0..200_000u32).map(|index| (index % 251) as u8).collect();
+    let served = Arc::new(AtomicU64::new(0));
+
+    let (addr, server) = slow_range_server("autosave-sync-every", content, served.clone());
+    tokio::spawn(server);
+
+    let dir = tempfile::tempdir().unwrap();
+    let output_path = dir.path().join("autosave-sync-every.bin");
+    let ctrl_path = output_path.with_file_name("autosave-sync-every.bin.bytehaul");
+
+    let downloader = Downloader::builder().build().unwrap();
+    let spec = DownloadSpec::new(format!("http://{addr}/autosave-sync-every"))
+        .output_path(output_path)
+        .file_allocation(FileAllocation::None)
+        .control_save_interval(Duration::from_millis(50))
+        .autosave_sync_every(2);
+
+    let handle = downloader.download(spec);
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert!(
+        !ctrl_path.exists(),
+        "first autosave tick should not persist a durable control file"
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let mut saw_deferred_save = false;
+    while tokio::time::Instant::now() < deadline {
+        if ctrl_path.exists()
+            && std::fs::metadata(&ctrl_path)
+                .map(|metadata| metadata.len() > 0)
+                .unwrap_or(false)
+        {
+            saw_deferred_save = true;
+            break;
+        }
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    handle.cancel();
+    let _ = handle.wait().await;
+
+    assert!(served.load(Ordering::Relaxed) > 0, "download should make progress before cancel");
+    assert!(saw_deferred_save, "durable autosave should happen on the second autosave tick");
+}
+
+#[tokio::test]
 async fn test_resume_etag_mismatch_restarts() {
     // First server with etag "A"
     let content_v1: Vec<u8> = vec![0xAA; 50_000];

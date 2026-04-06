@@ -7,7 +7,8 @@ use futures::StreamExt;
 use tokio::sync::{mpsc, watch, Semaphore};
 
 use super::{
-    flush_all_and_wait, stop_signal_error, stop_signal_state,
+    flush_all_and_wait, stop_signal_error, stop_signal_state, ControlSaveReason,
+    ControlSaveTracker,
     MIN_SPEED_SAMPLE_SPAN, SPEED_ESTIMATE_WINDOW, StopSignal,
 };
 use crate::config::{DownloadSpec, LogLevel};
@@ -82,6 +83,7 @@ pub(super) async fn run_single_connection(
         etag: meta.etag.clone(),
         last_modified: meta.last_modified.clone(),
     };
+    let mut control_save_tracker = ControlSaveTracker::new(start_offset);
 
     let stream_result = stream_single(
         response,
@@ -98,6 +100,10 @@ pub(super) async fn run_single_connection(
         budget.clone(),
         &speed_limit,
         spec.control_save_interval,
+        &mut control_save_tracker,
+        spec.autosave_sync_every,
+        log_level,
+        download_id,
     )
     .await;
 
@@ -108,10 +114,18 @@ pub(super) async fn run_single_connection(
 
     if let Err(ref e) = stream_result {
         if use_control {
-            let w = written_bytes.load(Ordering::Acquire);
-            let mut s = snap_template.clone();
-            s.downloaded_bytes = w;
-            let _ = s.save(control_path).await;
+            persist_single_control_snapshot(
+                ControlSaveReason::Terminal,
+                written_bytes.load(Ordering::Acquire),
+                None,
+                control_path,
+                &snap_template,
+                &mut control_save_tracker,
+                spec.autosave_sync_every,
+                log_level,
+                download_id,
+            )
+            .await;
         }
         if !matches!(e, DownloadError::Cancelled | DownloadError::Paused) {
             log_error!(log_level, download_id = download_id, error = %e,
@@ -121,6 +135,20 @@ pub(super) async fn run_single_connection(
     }
     let summary = stream_result?;
     if let Err(error) = writer_result {
+        if use_control {
+            persist_single_control_snapshot(
+                ControlSaveReason::Terminal,
+                written_bytes.load(Ordering::Acquire),
+                None,
+                control_path,
+                &snap_template,
+                &mut control_save_tracker,
+                spec.autosave_sync_every,
+                log_level,
+                download_id,
+            )
+            .await;
+        }
         log_error!(log_level, download_id = download_id, error = %error,
             "single-connection writer failed");
         progress_tx.send_modify(|p| {
@@ -157,6 +185,10 @@ async fn stream_single(
     budget: Arc<Semaphore>,
     speed_limit: &SpeedLimit,
     control_save_interval: Duration,
+    control_save_tracker: &mut ControlSaveTracker,
+    autosave_sync_every: u32,
+    log_level: LogLevel,
+    download_id: u64,
 ) -> Result<SingleStreamSummary, DownloadError> {
     let mut stream = response.bytes_stream();
     let mut downloaded: u64 = start_offset;
@@ -200,11 +232,18 @@ async fn stream_single(
                             );
                         }
                         if let Some((cp, tmpl)) = &control {
-                            if let Ok(w) = flush_all_and_wait(write_tx, true).await {
-                                let mut s = (*tmpl).clone();
-                                s.downloaded_bytes = w;
-                                let _ = s.save(cp).await;
-                            }
+                            persist_single_control_snapshot(
+                                ControlSaveReason::Terminal,
+                                downloaded,
+                                Some(write_tx),
+                                cp,
+                                tmpl,
+                                control_save_tracker,
+                                autosave_sync_every,
+                                log_level,
+                                download_id,
+                            )
+                            .await;
                         }
                         return Err(error);
                     }
@@ -213,11 +252,18 @@ async fn stream_single(
 
             _ = save_ticker.tick(), if control.is_some() => {
                 if let Some((cp, tmpl)) = &control {
-                    if let Ok(w) = flush_all_and_wait(write_tx, true).await {
-                        let mut s = (*tmpl).clone();
-                        s.downloaded_bytes = w;
-                        let _ = s.save(cp).await;
-                    }
+                    persist_single_control_snapshot(
+                        ControlSaveReason::Autosave,
+                        downloaded,
+                        Some(write_tx),
+                        cp,
+                        tmpl,
+                        control_save_tracker,
+                        autosave_sync_every,
+                        log_level,
+                        download_id,
+                    )
+                    .await;
                 }
             }
 
@@ -276,4 +322,64 @@ async fn stream_single(
         downloaded,
         speed_bytes_per_sec: last_speed,
     })
+}
+
+async fn persist_single_control_snapshot(
+    reason: ControlSaveReason,
+    downloaded: u64,
+    write_tx: Option<&mpsc::Sender<WriterCommand>>,
+    control_path: &Path,
+    snap_template: &ControlSnapshot,
+    control_save_tracker: &mut ControlSaveTracker,
+    autosave_sync_every: u32,
+    log_level: LogLevel,
+    download_id: u64,
+) {
+    if !control_save_tracker.should_save(reason, downloaded, autosave_sync_every) {
+        if matches!(reason, ControlSaveReason::Autosave)
+            && downloaded > control_save_tracker.last_saved_downloaded_bytes()
+        {
+            log_debug!(log_level, download_id = download_id,
+                checkpoint = reason.label(), downloaded_bytes = downloaded,
+                pending_autosaves = control_save_tracker.pending_autosaves(),
+                autosave_sync_every = autosave_sync_every,
+                "control snapshot deferred");
+        }
+        return;
+    }
+
+    let flush_stats = match write_tx {
+        Some(write_tx) => match flush_all_and_wait(write_tx, true).await {
+            Ok(stats) => Some(stats),
+            Err(error) => {
+                log_warn!(log_level, download_id = download_id, checkpoint = reason.label(),
+                    error = %error, "control snapshot flush failed");
+                return;
+            }
+        },
+        None => None,
+    };
+    let persisted_downloaded = flush_stats.map_or(downloaded, |stats| stats.written_bytes);
+    if persisted_downloaded <= control_save_tracker.last_saved_downloaded_bytes() {
+        return;
+    }
+
+    let mut snapshot = snap_template.clone();
+    snapshot.downloaded_bytes = persisted_downloaded;
+    let save_started = Instant::now();
+    match snapshot.save(control_path).await {
+        Ok(()) => {
+            control_save_tracker.mark_saved(persisted_downloaded);
+            log_debug!(log_level, download_id = download_id,
+                checkpoint = reason.label(), downloaded_bytes = persisted_downloaded,
+                flush_all_ms = flush_stats.map(|stats| stats.flush_elapsed.as_millis() as u64).unwrap_or(0),
+                sync_data_ms = flush_stats.and_then(|stats| stats.sync_elapsed.map(|elapsed| elapsed.as_millis() as u64)).unwrap_or(0),
+                control_save_ms = save_started.elapsed().as_millis() as u64,
+                "control snapshot saved");
+        }
+        Err(error) => {
+            log_warn!(log_level, download_id = download_id, checkpoint = reason.label(),
+                error = %error, "control snapshot save failed");
+        }
+    }
 }

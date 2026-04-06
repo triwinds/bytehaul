@@ -231,6 +231,7 @@ fn build_download_spec(
     checksum_sha256: Option<String>,
     checksum: Option<String>,
     control_save_interval: Option<f64>,
+    autosave_sync_every: Option<u32>,
 ) -> PyResult<DownloadSpec> {
     let mut spec = DownloadSpec::new(url);
 
@@ -301,6 +302,12 @@ fn build_download_spec(
         spec = spec.control_save_interval(duration_from_secs(
             "control_save_interval",
             interval,
+        )?);
+    }
+    if let Some(autosave_sync_every) = autosave_sync_every {
+        spec = spec.autosave_sync_every(non_zero_u32(
+            "autosave_sync_every",
+            autosave_sync_every,
         )?);
     }
 
@@ -530,7 +537,8 @@ impl PyDownloader {
             max_download_speed = None,
             checksum_sha256 = None,
             checksum = None,
-            control_save_interval = None
+            control_save_interval = None,
+            autosave_sync_every = None
         )
     )]
     #[allow(clippy::too_many_arguments)]
@@ -556,6 +564,7 @@ impl PyDownloader {
         checksum_sha256: Option<String>,
         checksum: Option<String>,
         control_save_interval: Option<f64>,
+        autosave_sync_every: Option<u32>,
     ) -> PyResult<PyDownloadTask> {
         let spec = build_download_spec(
             url,
@@ -578,6 +587,7 @@ impl PyDownloader {
             checksum_sha256,
             checksum,
             control_save_interval,
+            autosave_sync_every,
         )?;
         let runtime = shared_runtime()?;
         let _guard = runtime.enter();
@@ -620,6 +630,7 @@ impl PyDownloader {
         checksum_sha256 = None,
         checksum = None,
         control_save_interval = None,
+        autosave_sync_every = None,
         log_level = None
     )
 )]
@@ -652,6 +663,7 @@ fn download(
     checksum_sha256: Option<String>,
     checksum: Option<String>,
     control_save_interval: Option<f64>,
+    autosave_sync_every: Option<u32>,
     log_level: Option<String>,
 ) -> PyResult<()> {
     let level = match &log_level {
@@ -680,6 +692,7 @@ fn download(
         checksum_sha256,
         checksum,
         control_save_interval,
+        autosave_sync_every,
     )?;
     let runtime = shared_runtime()?;
 

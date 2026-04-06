@@ -200,6 +200,7 @@ fn test_apply_client_options_and_build_download_spec() {
         Some(" abc123 ".into()),
         None,
         None,
+        None,
     )
     .unwrap();
 
@@ -244,6 +245,7 @@ fn test_apply_client_options_and_build_download_spec() {
         None,
         None,
         Some("   ".into()),
+        None,
         None,
         None,
     )
@@ -316,6 +318,7 @@ fn test_build_download_spec_with_checksum_and_control_interval() {
         None,
         Some("sha512: deadbeef ".into()),
         Some(3.0),
+        Some(4),
     )
     .unwrap();
 
@@ -327,6 +330,7 @@ fn test_build_download_spec_with_checksum_and_control_interval() {
         spec.get_control_save_interval(),
         Duration::from_secs_f64(3.0)
     );
+    assert_eq!(spec.get_autosave_sync_every(), 4);
 }
 
 #[test]
@@ -427,6 +431,7 @@ fn test_download_task_methods_and_consumption_errors() {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -480,6 +485,7 @@ fn test_download_task_pause_maps_to_paused_error() {
             None,
             None,
             Some(true),
+            None,
             None,
             None,
             None,
@@ -557,6 +563,7 @@ fn test_py_downloader_download_success_and_module_registration() {
             Some(0.5),
             Some(2.0),
             Some(0),
+            None,
             None,
             None,
             None,
@@ -638,6 +645,7 @@ fn test_top_level_download_success_and_failure() {
             None,
             None,
             None,
+            None,
             Some("debug".into()),
         )
         .unwrap();
@@ -651,6 +659,7 @@ fn test_top_level_download_success_and_failure() {
             py,
             "http://127.0.0.1:1/fail".into(),
             Some(unique_path("top-level-error")),
+            None,
             None,
             None,
             None,
