@@ -10,7 +10,7 @@ use crate::config::{DownloadSpec, LogLevel};
 use crate::error::DownloadError;
 use crate::logging::next_download_id;
 use crate::network::ClientNetworkConfig;
-use crate::progress::ProgressSnapshot;
+use crate::progress::{DownloadState, ProgressSnapshot};
 use crate::session;
 
 /// Top-level downloader that manages shared resources (e.g. HTTP client).
@@ -283,10 +283,10 @@ impl DownloadHandle {
                 let snap = rx.borrow().clone();
                 let terminal = matches!(
                     snap.state,
-                    crate::progress::DownloadState::Completed
-                        | crate::progress::DownloadState::Failed
-                        | crate::progress::DownloadState::Cancelled
-                        | crate::progress::DownloadState::Paused
+                    DownloadState::Completed
+                        | DownloadState::Failed
+                        | DownloadState::Cancelled
+                        | DownloadState::Paused
                 );
                 callback(snap);
                 if terminal {

@@ -18,9 +18,8 @@ where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T, DownloadError>>,
 {
-    let mut attempt = 0u32;
     let started_at = Instant::now();
-    loop {
+    for attempt in 0u32.. {
         match op().await {
             Ok(val) => return Ok(val),
             Err(e) => {
@@ -35,12 +34,12 @@ where
                     }
                 }
 
-                attempt += 1;
+                let retry_count = attempt.saturating_add(1);
                 let backoff = if let Some(retry_secs) = e.retry_after_secs() {
                     Duration::from_secs(retry_secs)
                 } else {
                     let raw = base_delay
-                        .saturating_mul(1u32 << attempt.min(10))
+                        .saturating_mul(1u32 << retry_count.min(10))
                         .min(max_delay);
                     // Equal jitter: half deterministic + half random to avoid
                     // thundering herd while keeping a minimum delay floor.
@@ -59,7 +58,6 @@ where
                 }
 
                 tokio::select! {
-                    biased;
                     result = cancel_rx.changed() => {
                         if result.is_ok() {
                             if let Some(error) = stop_signal_error(*cancel_rx.borrow_and_update()) {
@@ -72,6 +70,8 @@ where
             }
         }
     }
+
+    unreachable!("infinite retry loop should always return from success or error branches")
 }
 
 #[cfg(test)]
