@@ -25,6 +25,9 @@ pub(crate) fn build_range_request(
     end: u64,
 ) -> reqwest::RequestBuilder {
     let mut req = build_get_request(client, url, headers, timeout);
+    // Force HTTP/1.1 so concurrent range requests map to separate transport
+    // connections instead of collapsing onto a single multiplexed HTTP/2 session.
+    req = req.version(reqwest::Version::HTTP_11);
     req = req.header("Range", format!("bytes={start}-{end}"));
     req = req.header("Accept-Encoding", "identity");
     req
@@ -50,6 +53,7 @@ mod tests {
 
         assert_eq!(req.headers().get("range").unwrap(), "bytes=0-99");
         assert_eq!(req.headers().get("accept-encoding").unwrap(), "identity");
+        assert_eq!(req.version(), reqwest::Version::HTTP_11);
     }
 
     #[test]

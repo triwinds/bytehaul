@@ -1,0 +1,194 @@
+# bytehaul 多线程下载性能排查记录
+
+本文汇总截至 2026-04-07 已完成的下载性能排查实验，重点对比 bytehaul 与 aria2 在真实远端源和本地受控环境中的差异。
+
+## 测试前提
+
+- 操作系统：Windows
+- 对比工具：bytehaul、aria2c、curl
+- 主要测试目标：
+
+  - `https://nsa2.e6ex.com/gh/THZoria/NX_Firmware/releases/download/22.0.0/Firmware.22.0.0.zip`
+  - `https://rn.e6ex.com/gh/THZoria/NX_Firmware/releases/download/22.0.0/Firmware.22.0.0.zip`
+
+- 计量口径：
+
+  - 远端对比多数使用 `20s` 时间窗
+  - 局部初筛使用 `10s` 时间窗
+  - 吞吐统一记录为平均速度 `avg MiB/s`
+
+- 临时测量工具、mock server、header dump 工具均已在实验后删除，不保留在仓库中。
+
+## 已保留的代码修复
+
+在性能排查开始阶段，确认了一个真实问题并已修复：多分片 `Range` 请求现在强制使用 HTTP/1.1，避免多个 worker 在支持 HTTP/2 的服务端上被折叠到同一条 H2 会话中，导致“看起来有多线程，实际上不是真正多连接”。
+
+对应代码：
+
+- [src/http/request.rs](../src/http/request.rs)
+
+## 结果总览
+
+### 1. 真实源 `nsa2.e6ex.com` 初始探测（10 秒）
+
+先做了 bytehaul 自身的快速摸底：
+
+- bytehaul，4 连接：约 `0.17 MiB/s`
+- bytehaul，8 连接：约 `0.33 MiB/s`
+- `curl` 单流基线：约 `0.32 MiB/s`
+
+初步结论：
+
+- 8 连接明显优于 4 连接。
+- 在这一轮里，bytehaul 的 8 连接已接近 `curl` 单流结果，但还没有和 aria2 做直接对比。
+
+### 2. 真实源 `nsa2.e6ex.com`，aria2 对比基线（8 连接，20 秒）
+
+做了同源、同时间窗、同并发数的直接对比：
+
+- aria2，8 连接：约 `4.94 MiB/s`
+- bytehaul，8 连接：约 `0.71 MiB/s`
+
+初步结论：
+
+- 在该轮测试中，bytehaul 明显慢于 aria2，量级约为 `7x`。
+- 这说明“多线程下载明显慢于 aria2”并非体感问题，而是可复现的真实差异。
+
+### 3. 本地 mock server（每连接 100 KiB/s，8 连接，20 秒）
+
+为了排除远端 CDN、TLS、HTTP/2、链路抖动等变量，搭建了本地受控 HTTP Range mock server。服务端限制每条连接最大速度为 `100 KiB/s`。
+
+测试结果：
+
+- aria2，8 连接：约 `0.78 MiB/s`
+- bytehaul，8 连接，`resume=true`：约 `0.78 MiB/s`
+- bytehaul，8 连接，`resume=false`：约 `0.78 MiB/s`
+
+结论：
+
+- 在受控环境下，bytehaul 能把 8 路连接全部打满。
+- 核心多 worker 调度、写入路径、以及 resume/autosave 机制在低速受控场景中不是根本性瓶颈。
+- 因此，远端源上的大差距更可能来自“客户端栈与远端服务/CDN 的交互方式”，而不是“本地并发下载框架本身坏了”。
+
+### 4. `piece_size` 分片大小实验（真实源 `nsa2.e6ex.com`）
+
+怀疑点之一是默认 `piece_size = 1 MiB` 是否过小，于是对更大的分片做了实验。
+
+较可信的样本：
+
+- aria2，同期基线：约 `8.65 MiB/s`
+- bytehaul，`piece_size=1 MiB`，`resume=false`，`file_allocation=none`：约 `0.12 MiB/s`
+- bytehaul，`piece_size=8 MiB`，`resume=false`，`file_allocation=none`：约 `0.05 MiB/s`
+
+早期样本（受远端波动影响较大，仅作参考）：
+
+- `piece_size=8 MiB`，`resume=true`，`prealloc`：约 `0.14 MiB/s`
+- `piece_size=16 MiB`，`resume=true`，`prealloc`：约 `0.07 MiB/s`
+
+结论：
+
+- 没有看到“分片调大后，速度明显逼近 aria2”的证据。
+- 目前没有证据支持“默认 1 MiB 分片是导致差几倍的主因”。
+
+### 5. 请求头实验（真实源 `nsa2.e6ex.com`）
+
+通过本地抓包式 header dump server，确认了 aria2 与 bytehaul 的典型请求头差异。
+
+抓到的主要差异：
+
+- aria2 会带：
+
+  - `User-Agent: aria2/1.37.0`
+  - `Want-Digest: SHA-512;q=1, SHA-256;q=1, SHA;q=0.1`
+
+- bytehaul 默认请求主要包含：
+
+  - `Range`
+  - `Accept-Encoding: identity`
+  - `Accept: */*`
+
+远端 20 秒实验结果：
+
+- bytehaul 默认头：约 `1.12 MiB/s`
+- bytehaul 仅添加 `User-Agent=aria2/1.37.0`：约 `1.27 MiB/s`
+- bytehaul 再加 `Want-Digest`：约 `0.12 MiB/s`
+
+这一轮远端源波动很大，因此绝对值不宜与其他轮次直接横向比较，但可用于判断头部影响方向。
+
+结论：
+
+- `User-Agent` 可能有小幅帮助，但量级不足以解释“差几倍”。
+- 完整复刻已观察到的 aria2 头部，并没有稳定解决性能问题。
+- 因此，请求头差异不是当前最主要的嫌疑点。
+
+### 6. 换域名到 `rn.e6ex.com`（8 连接，20 秒）
+
+为了验证问题是否只绑定在 `nsa2.e6ex.com`，改用同路径的另一个域名：
+
+- aria2，8 连接：约 `0.39 MiB/s`
+- bytehaul，8 连接：约 `0.05 MiB/s`
+
+结论：
+
+- 换域名后，aria2 自身也变慢了，说明该域名链路本身比前一轮 `nsa2` 更慢。
+- 但 bytehaul 仍然明显慢于 aria2，差距依旧存在。
+
+### 7. `rn.e6ex.com` 再测 4 连接（20 秒）
+
+考虑到该域名在 8 连接下可能存在惩罚机制，又补测了 4 连接：
+
+- aria2，4 连接：约 `0.34 MiB/s`
+- bytehaul，4 连接：约 `0.10 MiB/s`
+
+结论：
+
+- 对 bytehaul 而言，该域名上 `4` 连接比 `8` 连接更快。
+- 对 aria2 而言，`4` 和 `8` 连接差距不大。
+- 这说明 bytehaul 在该远端上可能会在更高并发下触发额外惩罚或更差的连接行为。
+
+## 当前阶段结论
+
+根据上述所有实验，当前可以得到以下阶段性判断：
+
+1. bytehaul 的本地并发下载框架本身没有证明出“根本性故障”。
+
+   - 本地 mock server 下，8 路限速吞吐与 aria2 一致。
+
+2. `Range` 请求强制 HTTP/1.1 是必要修复，但不是全部答案。
+
+   - 它修掉了一个真实问题：HTTP/2 多路复用可能掩盖“多线程”等于“多连接”。
+   - 但修复后，真实远端仍存在显著性能差异。
+
+3. 目前没有证据支持以下因素是主因：
+
+   - 默认 `piece_size = 1 MiB`
+   - `resume/autosave`
+   - 本地写入路径本身
+   - 简单的请求头差异（例如 `User-Agent`）
+
+4. 当前最可疑的方向是：
+
+   - reqwest / rustls / hyper 这一套客户端栈，与目标 CDN / 镜像服务之间的交互方式
+   - 并发连接数升高后，服务端对 bytehaul 触发了不同于 aria2 的限流或调度策略
+   - TLS / ALPN / 连接建立 / 请求调度模式的差异，导致远端对两者给出完全不同的行为路径
+
+## 结果解读注意事项
+
+真实远端源存在明显波动，因此不同时间点的绝对吞吐数值不能简单横向对比。更可靠的做法是：
+
+- 优先看“同一轮、同一源、同一时间窗内”的相对比较。
+- 优先看本地 mock server 与真实远端结论是否一致，以区分“框架问题”和“远端兼容性问题”。
+
+因此，当前所有实验中最重要的结论并不是某一个具体 MiB/s 数字，而是下面两条：
+
+- 本地受控环境下，bytehaul 与 aria2 可以跑出同样的多连接吞吐。
+- 真实远端源上，bytehaul 与 aria2 的差距依然显著，而且该差距不会因为简单调大 `piece_size` 或复刻常见 header 而消失。
+
+## 建议的下一步
+
+后续建议优先做这几类实验：
+
+1. 在同一远端源上做 `1 / 2 / 4 / 8` 连接完整曲线，找到 bytehaul 的最佳并发点。
+2. 针对 reqwest / rustls / hyper 的连接与 TLS 行为做更细的对照实验。
+3. 对比不同 TLS 栈或客户端配置是否会显著影响目标源行为。
+4. 如果未来要把某些参数暴露给用户，优先考虑把并发数调优作为实际可用的 workaround，而不是盲目调大分片。
