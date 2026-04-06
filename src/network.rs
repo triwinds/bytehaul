@@ -502,6 +502,14 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_doh_server_rejects_empty_query_and_fragment_authorities() {
+        for server in ["https://", "https://?dns=1", "https://#fragment"] {
+            let err = parse_doh_server(server, true).unwrap_err().to_string();
+            assert!(err.contains("missing a host"), "unexpected error for {server}: {err}");
+        }
+    }
+
+    #[test]
     fn test_parse_doh_server_rejects_ipv6_only_result_when_ipv6_disabled() {
         let err = parse_doh_server("https://[::1]/dns-query", false)
             .unwrap_err()
@@ -517,6 +525,28 @@ mod tests {
         assert_eq!(config.socket_addrs, vec![SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 443))]);
         assert_eq!(config.tls_dns_name, "[::1]");
         assert!(config.http_endpoint.is_none());
+    }
+
+    #[test]
+    fn test_parse_doh_server_preserves_root_query_endpoint() {
+        let config = parse_doh_server("https://127.0.0.1?ct=application/dns-message", true)
+            .unwrap();
+
+        assert_eq!(config.socket_addrs, vec![SocketAddr::from(([127, 0, 0, 1], 443))]);
+        assert_eq!(config.tls_dns_name, "127.0.0.1");
+        assert_eq!(
+            config.http_endpoint.as_deref(),
+            Some("/?ct=application/dns-message")
+        );
+    }
+
+    #[test]
+    fn test_parse_doh_server_reports_resolution_failures() {
+        let err = parse_doh_server("https://resolver-test.invalid/dns-query", true)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("failed to resolve DoH host 'resolver-test.invalid'"));
     }
 
     #[test]
@@ -617,6 +647,44 @@ mod tests {
 
         assert!(!addrs.is_empty());
         assert!(addrs.iter().all(|addr| addr.port() == 0));
+    }
+
+    #[tokio::test]
+    async fn test_dns_resolver_returns_cached_lookup_without_querying_dns() {
+        let resolver = BytehaulDnsResolver::new(&[], &[], false).unwrap();
+        let cached_addrs = vec![
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            SocketAddr::from(([127, 0, 0, 2], 0)),
+        ];
+        store_cached_lookup(
+            &resolver.cache,
+            "cached.example.com".into(),
+            cached_addrs.clone(),
+            Instant::now() + Duration::from_secs(5),
+        );
+
+        let addrs: Vec<_> = resolver
+            .resolve(Name::from_str("cached.example.com").unwrap())
+            .await
+            .unwrap()
+            .collect();
+
+        assert_eq!(addrs, cached_addrs);
+    }
+
+    #[tokio::test]
+    async fn test_dns_resolver_returns_lookup_error_for_invalid_domain() {
+        let resolver = BytehaulDnsResolver::new(&[], &[], false).unwrap();
+        let result = resolver
+            .resolve(Name::from_str("coverage-check.invalid").unwrap())
+            .await;
+
+        let err = match result {
+            Ok(_) => panic!("expected DNS lookup to fail for coverage-check.invalid"),
+            Err(err) => err.to_string(),
+        };
+
+        assert!(!err.is_empty());
     }
 
     #[test]
