@@ -1,22 +1,39 @@
 use std::time::Instant;
 
+/// Current state of a download task.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DownloadState {
+    /// Waiting to start (initial state).
     Pending,
+    /// Actively transferring data.
     Downloading,
+    /// Download finished successfully.
     Completed,
+    /// Download failed with an error.
     Failed,
+    /// Download was cancelled by the user.
     Cancelled,
+    /// Download was paused and resume state saved.
     Paused,
 }
 
+/// A point-in-time snapshot of download progress.
+///
+/// Obtained via [`DownloadHandle::progress()`](crate::DownloadHandle::progress),
+/// the watch channel, or the progress callback.
 #[derive(Debug, Clone)]
 pub struct ProgressSnapshot {
+    /// Total file size in bytes, if known from the server response.
     pub total_size: Option<u64>,
+    /// Number of bytes downloaded so far.
     pub downloaded: u64,
+    /// Current download state.
     pub state: DownloadState,
+    /// Smoothed download speed in bytes per second.
     pub speed_bytes_per_sec: f64,
+    /// Estimated time remaining in seconds, if calculable.
     pub eta_secs: Option<f64>,
+    /// Timestamp when the download started transferring data.
     pub start_time: Option<Instant>,
 }
 

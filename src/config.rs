@@ -142,6 +142,10 @@ pub struct DownloadSpec {
 }
 
 impl DownloadSpec {
+    /// Create a new download specification for the given URL.
+    ///
+    /// All other fields are populated with sensible defaults:
+    /// 4 connections, 1 MiB pieces, 64 MiB memory budget, resume enabled, etc.
     pub fn new(url: impl Into<String>) -> Self {
         Self {
             url: url.into(),
@@ -167,166 +171,206 @@ impl DownloadSpec {
         }
     }
 
+    /// Returns the download URL.
     pub fn get_url(&self) -> &str {
         &self.url
     }
 
+    /// Returns the explicit output file path, if set.
     pub fn get_output_path(&self) -> Option<&Path> {
         self.output_path.as_deref()
     }
 
+    /// Returns the output directory (filename will be derived from the URL or
+    /// `Content-Disposition` header).
     pub fn get_output_dir(&self) -> Option<&Path> {
         self.output_dir.as_deref()
     }
 
+    /// Returns the custom HTTP headers that will be sent with every request.
     pub fn get_headers(&self) -> &HashMap<String, String> {
         &self.headers
     }
 
+    /// Returns the maximum number of parallel connections.
     pub fn get_max_connections(&self) -> u32 {
         self.max_connections
     }
 
+    /// Returns the TCP connect timeout.
     pub fn get_connect_timeout(&self) -> Duration {
         self.connect_timeout
     }
 
+    /// Returns the per-request read timeout.
     pub fn get_read_timeout(&self) -> Duration {
         self.read_timeout
     }
 
+    /// Returns the memory budget (in bytes) for the write-back cache.
     pub fn get_memory_budget(&self) -> usize {
         self.memory_budget
     }
 
+    /// Returns the file allocation strategy.
     pub fn get_file_allocation(&self) -> FileAllocation {
         self.file_allocation
     }
 
+    /// Returns the internal channel buffer size.
     pub fn get_channel_buffer(&self) -> usize {
         self.channel_buffer
     }
 
+    /// Returns whether resume is enabled.
     pub fn get_resume(&self) -> bool {
         self.resume
     }
 
+    /// Returns the piece size in bytes used for multi-connection splitting.
     pub fn get_piece_size(&self) -> u64 {
         self.piece_size
     }
 
+    /// Returns the minimum file size required before the download is split
+    /// across multiple connections.
     pub fn get_min_split_size(&self) -> u64 {
         self.min_split_size
     }
 
+    /// Returns the maximum number of retry attempts per segment.
     pub fn get_max_retries(&self) -> u32 {
         self.max_retries
     }
 
+    /// Returns the base delay for exponential backoff between retries.
     pub fn get_retry_base_delay(&self) -> Duration {
         self.retry_base_delay
     }
 
+    /// Returns the maximum delay cap for exponential backoff.
     pub fn get_retry_max_delay(&self) -> Duration {
         self.retry_max_delay
     }
 
+    /// Returns the optional total elapsed retry budget.
     pub fn get_max_retry_elapsed(&self) -> Option<Duration> {
         self.max_retry_elapsed
     }
 
+    /// Returns the maximum download speed in bytes/sec (0 = unlimited).
     pub fn get_max_download_speed(&self) -> u64 {
         self.max_download_speed
     }
 
+    /// Returns the checksum used for post-download verification, if set.
     pub fn get_checksum(&self) -> Option<&Checksum> {
         self.checksum.as_ref()
     }
 
+    /// Returns the interval for periodic control-file saves.
     pub fn get_control_save_interval(&self) -> Duration {
         self.control_save_interval
     }
 
+    /// Set the explicit output file path.
     pub fn output_path(mut self, output_path: impl Into<PathBuf>) -> Self {
         self.output_path = Some(output_path.into());
         self
     }
 
+    /// Set the output directory. The filename will be derived automatically
+    /// from the URL or `Content-Disposition` response header.
     pub fn output_dir(mut self, output_dir: impl Into<PathBuf>) -> Self {
         self.output_dir = Some(output_dir.into());
         self
     }
 
+    /// Set custom HTTP headers to include in every request.
     pub fn headers(mut self, headers: HashMap<String, String>) -> Self {
         self.headers = headers;
         self
     }
 
+    /// Set the maximum number of parallel connections (default: 4).
     pub fn max_connections(mut self, max_connections: u32) -> Self {
         self.max_connections = max_connections;
         self
     }
 
+    /// Set the TCP connect timeout (default: 30 s).
     pub fn connect_timeout(mut self, connect_timeout: Duration) -> Self {
         self.connect_timeout = connect_timeout;
         self
     }
 
+    /// Set the per-request read timeout (default: 60 s).
     pub fn read_timeout(mut self, read_timeout: Duration) -> Self {
         self.read_timeout = read_timeout;
         self
     }
 
+    /// Set the memory budget in bytes for the write-back cache (default: 64 MiB).
     pub fn memory_budget(mut self, memory_budget: usize) -> Self {
         self.memory_budget = memory_budget;
         self
     }
 
+    /// Set the file allocation strategy (default: [`FileAllocation::Prealloc`]).
     pub fn file_allocation(mut self, file_allocation: FileAllocation) -> Self {
         self.file_allocation = file_allocation;
         self
     }
 
+    /// Set the internal channel buffer size (default: 64).
     pub fn channel_buffer(mut self, channel_buffer: usize) -> Self {
         self.channel_buffer = channel_buffer;
         self
     }
 
+    /// Enable or disable resume support (default: `true`).
     pub fn resume(mut self, resume: bool) -> Self {
         self.resume = resume;
         self
     }
 
+    /// Set the piece size in bytes for multi-connection splitting (default: 1 MiB).
     pub fn piece_size(mut self, piece_size: u64) -> Self {
         self.piece_size = piece_size;
         self
     }
 
+    /// Set the minimum file size before splitting across connections (default: 10 MiB).
     pub fn min_split_size(mut self, min_split_size: u64) -> Self {
         self.min_split_size = min_split_size;
         self
     }
 
+    /// Set the maximum retry attempts per segment (default: 5).
     pub fn max_retries(mut self, max_retries: u32) -> Self {
         self.max_retries = max_retries;
         self
     }
 
+    /// Set the base delay for exponential backoff (default: 1 s).
     pub fn retry_base_delay(mut self, retry_base_delay: Duration) -> Self {
         self.retry_base_delay = retry_base_delay;
         self
     }
 
+    /// Set the maximum delay cap for exponential backoff (default: 30 s).
     pub fn retry_max_delay(mut self, retry_max_delay: Duration) -> Self {
         self.retry_max_delay = retry_max_delay;
         self
     }
 
+    /// Set the total elapsed retry budget for a single request.
     pub fn max_retry_elapsed(mut self, max_retry_elapsed: Duration) -> Self {
         self.max_retry_elapsed = Some(max_retry_elapsed);
         self
     }
 
+    /// Configure the full retry policy in one call.
     pub fn retry_policy(
         mut self,
         max_retries: u32,
@@ -339,21 +383,25 @@ impl DownloadSpec {
         self
     }
 
+    /// Set the maximum download speed in bytes/sec (default: 0 = unlimited).
     pub fn max_download_speed(mut self, max_download_speed: u64) -> Self {
         self.max_download_speed = max_download_speed;
         self
     }
 
+    /// Set the checksum for post-download integrity verification.
     pub fn checksum(mut self, checksum: Checksum) -> Self {
         self.checksum = Some(checksum);
         self
     }
 
+    /// Set the interval for periodic control-file saves (default: 5 s).
     pub fn control_save_interval(mut self, interval: Duration) -> Self {
         self.control_save_interval = interval;
         self
     }
 
+    /// Validate the configuration and return an error if any value is out of range.
     pub fn validate(&self) -> Result<(), DownloadError> {
         if self.url.trim().is_empty() {
             return Err(DownloadError::InvalidConfig("url cannot be empty".into()));

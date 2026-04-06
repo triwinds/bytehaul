@@ -27,31 +27,37 @@ pub struct DownloaderBuilder {
 }
 
 impl DownloaderBuilder {
+    /// Set the default TCP connect timeout for the HTTP client (default: 30 s).
     pub fn connect_timeout(mut self, timeout: Duration) -> Self {
         self.client_config.connect_timeout = timeout;
         self
     }
 
+    /// Set an HTTP/HTTPS/SOCKS proxy for all requests.
     pub fn all_proxy(mut self, proxy: impl Into<String>) -> Self {
         self.client_config.all_proxy = Some(proxy.into());
         self
     }
 
+    /// Set a proxy used only for plain HTTP requests.
     pub fn http_proxy(mut self, proxy: impl Into<String>) -> Self {
         self.client_config.http_proxy = Some(proxy.into());
         self
     }
 
+    /// Set a proxy used only for HTTPS requests.
     pub fn https_proxy(mut self, proxy: impl Into<String>) -> Self {
         self.client_config.https_proxy = Some(proxy.into());
         self
     }
 
+    /// Add a custom DNS server address.
     pub fn dns_server(mut self, server: std::net::SocketAddr) -> Self {
         self.client_config.dns_servers.push(server);
         self
     }
 
+    /// Replace the DNS server list with the given addresses.
     pub fn dns_servers<I>(mut self, servers: I) -> Self
     where
         I: IntoIterator<Item = std::net::SocketAddr>,
@@ -60,11 +66,13 @@ impl DownloaderBuilder {
         self
     }
 
+    /// Add a DNS-over-HTTPS (DoH) server URL.
     pub fn doh_server(mut self, server: impl Into<String>) -> Self {
         self.client_config.doh_servers.push(server.into());
         self
     }
 
+    /// Replace the DoH server list with the given URLs.
     pub fn doh_servers<I, S>(mut self, servers: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -74,21 +82,30 @@ impl DownloaderBuilder {
         self
     }
 
+    /// Enable or disable IPv6 support (default: `true`).
     pub fn enable_ipv6(mut self, enabled: bool) -> Self {
         self.client_config.enable_ipv6 = enabled;
         self
     }
 
+    /// Set the log verbosity level for download tasks (default: [`LogLevel::Off`]).
     pub fn log_level(mut self, level: LogLevel) -> Self {
         self.log_level = level;
         self
     }
 
+    /// Limit the number of downloads that can run concurrently.
+    ///
+    /// Additional downloads will wait for a semaphore permit.
     pub fn max_concurrent_downloads(mut self, limit: usize) -> Self {
         self.max_concurrent_downloads = Some(limit);
         self
     }
 
+    /// Build the [`Downloader`] instance.
+    ///
+    /// Returns an error if the HTTP client cannot be constructed
+    /// (e.g. an invalid proxy URL).
     pub fn build(self) -> Result<Downloader, DownloadError> {
         let log_level = self.log_level;
         let client = self.client_config.build_client()?;
@@ -116,6 +133,7 @@ impl DownloaderBuilder {
 }
 
 impl Downloader {
+    /// Create a new [`DownloaderBuilder`] with default settings.
     pub fn builder() -> DownloaderBuilder {
         DownloaderBuilder {
             client_config: ClientNetworkConfig::default(),

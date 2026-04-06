@@ -11,14 +11,21 @@ const HEADER_SIZE: usize = 16; // magic(4) + version(4) + payload_len(4) + check
 /// Control file snapshot for resume support.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ControlSnapshot {
+    /// The original download URL.
     pub url: String,
+    /// Total file size in bytes.
     pub total_size: u64,
+    /// Piece size used for splitting.
     pub piece_size: u64,
+    /// Total number of pieces.
     pub piece_count: usize,
+    /// Bitset encoding which pieces have been completed.
     pub completed_bitset: Vec<u8>,
     /// For single-connection resume: the byte offset written so far.
     pub downloaded_bytes: u64,
+    /// HTTP `ETag` header from the server, used to detect file changes.
     pub etag: Option<String>,
+    /// HTTP `Last-Modified` header from the server.
     pub last_modified: Option<String>,
 }
 

@@ -1,5 +1,6 @@
 use thiserror::Error;
 
+/// Errors that can occur during a download.
 #[derive(Debug, Error)]
 pub enum DownloadError {
     #[error("HTTP error: {0}")]
@@ -46,6 +47,10 @@ pub enum DownloadError {
 }
 
 impl DownloadError {
+    /// Returns `true` if this error is transient and the request should be retried.
+    ///
+    /// Retryable conditions include timeouts, connection resets, and
+    /// server errors (429, 500, 502, 503, 504).
     pub fn is_retryable(&self) -> bool {
         match self {
             DownloadError::Http(e) => {

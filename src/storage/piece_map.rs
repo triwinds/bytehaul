@@ -39,13 +39,16 @@ impl PieceMap {
         }
     }
 
+    /// Returns the configured piece size in bytes.
     pub fn piece_size(&self) -> u64 {
         self.piece_size
     }
+    /// Returns the total file size in bytes.
     #[allow(dead_code)]
     pub fn total_size(&self) -> u64 {
         self.total_size
     }
+    /// Returns the total number of pieces.
     pub fn piece_count(&self) -> usize {
         self.piece_count
     }
@@ -57,11 +60,13 @@ impl PieceMap {
         (start, end)
     }
 
+    /// Returns `true` if the given piece has been marked as complete.
     #[allow(dead_code)]
     pub fn is_complete(&self, piece_id: usize) -> bool {
         piece_id < self.piece_count && self.completed[piece_id]
     }
 
+    /// Mark the given piece as complete. Out-of-bounds IDs are silently ignored.
     pub fn mark_complete(&mut self, piece_id: usize) {
         if piece_id < self.piece_count {
             self.completed.set(piece_id, true);
@@ -73,14 +78,17 @@ impl PieceMap {
         (0..self.piece_count).find(|&i| !self.completed[i] && !exclude.contains(&i))
     }
 
+    /// Returns `true` if every piece has been completed.
     pub fn all_done(&self) -> bool {
         self.completed.all()
     }
 
+    /// Returns the number of completed pieces.
     pub fn completed_count(&self) -> usize {
         self.completed.count_ones()
     }
 
+    /// Returns the total number of bytes in completed pieces.
     pub fn completed_bytes(&self) -> u64 {
         let mut bytes = 0u64;
         for i in 0..self.piece_count {
@@ -92,6 +100,7 @@ impl PieceMap {
         bytes
     }
 
+    /// Returns the number of pieces that have not yet been completed.
     pub fn remaining_count(&self) -> usize {
         self.piece_count - self.completed_count()
     }

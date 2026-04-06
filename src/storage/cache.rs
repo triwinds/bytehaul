@@ -22,7 +22,9 @@ struct PieceCacheEntry {
 
 /// A contiguous block of data ready to be flushed to disk.
 pub struct FlushBlock {
+    /// File offset where this block should be written.
     pub offset: u64,
+    /// The data payload.
     pub data: Bytes,
 }
 
