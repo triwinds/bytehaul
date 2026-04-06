@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::sync::OnceLock;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -16,7 +17,7 @@ use crate::error::DownloadError;
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 type SharedDnsCache = Arc<Mutex<HashMap<String, CachedDnsLookup>>>;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct ClientNetworkConfig {
     pub connect_timeout: Duration,
     pub all_proxy: Option<String>,
@@ -84,6 +85,11 @@ impl ClientNetworkConfig {
         BytehaulDnsResolver::new(&self.dns_servers, &self.doh_servers, self.enable_ipv6)
             .map(Some)
     }
+}
+
+fn doh_config_cache() -> &'static Mutex<HashMap<(String, bool), DohServerConfig>> {
+    static CACHE: OnceLock<Mutex<HashMap<(String, bool), DohServerConfig>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -260,6 +266,14 @@ fn parse_doh_server(server: &str, enable_ipv6: bool) -> Result<DohServerConfig, 
         ));
     }
 
+    if let Some(cached) = doh_config_cache()
+        .lock()
+        .get(&(server.to_string(), enable_ipv6))
+        .cloned()
+    {
+        return Ok(cached);
+    }
+
     let url = reqwest::Url::parse(server).map_err(|err| {
         DownloadError::InvalidConfig(format!("invalid DoH server URL '{server}': {err}"))
     })?;
@@ -327,7 +341,7 @@ fn parse_doh_server(server: &str, enable_ipv6: bool) -> Result<DohServerConfig, 
         http_endpoint.push_str(query);
     }
 
-    Ok(DohServerConfig {
+    let config = DohServerConfig {
         socket_addrs,
         tls_dns_name: host.to_string(),
         http_endpoint: if http_endpoint.is_empty() || http_endpoint == "/dns-query" {
@@ -335,7 +349,11 @@ fn parse_doh_server(server: &str, enable_ipv6: bool) -> Result<DohServerConfig, 
         } else {
             Some(http_endpoint)
         },
-    })
+    };
+    doh_config_cache()
+        .lock()
+        .insert((server.to_string(), enable_ipv6), config.clone());
+    Ok(config)
 }
 
 #[cfg(test)]
@@ -353,6 +371,24 @@ mod tests {
         assert!(config.dns_servers.is_empty());
         assert!(config.doh_servers.is_empty());
         assert!(config.enable_ipv6);
+    }
+
+    #[test]
+    fn test_parse_doh_server_caches_results() {
+        let server = "https://localhost/dns-query?cache=network-test";
+        assert!(doh_config_cache()
+            .lock()
+            .get(&(server.to_string(), true))
+            .is_none());
+
+        let first = parse_doh_server(server, true).unwrap();
+        let second = parse_doh_server(server, true).unwrap();
+
+        assert_eq!(first, second);
+        assert!(doh_config_cache()
+            .lock()
+            .get(&(server.to_string(), true))
+            .is_some());
     }
 
     #[test]

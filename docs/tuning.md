@@ -119,3 +119,28 @@ Rate limiter for the download. Set to a non-zero value to cap bandwidth usage. U
 | `max_retry_elapsed` | None | Total retry time budget (None = unlimited) |
 
 Retries use exponential back-off with full jitter to avoid thundering-herd effects when multiple clients retry against the same server.
+
+## Benchmark Snapshot
+
+Local Windows baseline captured on 2026-04-06 with:
+
+```text
+cargo bench --bench storage_bench -- --sample-size 10 --measurement-time 0.05 --warm-up-time 0.05 --noplot
+```
+
+Treat these as directional local baselines, not portable capacity claims. The shortened Criterion run was chosen to keep iteration time low while validating that the new benchmark surfaces produce usable numbers.
+
+| Benchmark | Current local range |
+|-----------|---------------------|
+| `single_progress_reporting_throttled` | `12.883 µs – 14.010 µs` |
+| `control_save_only` | `2.1611 ms – 2.6577 ms` |
+| `scheduler_snapshot/10000` | `9.2247 ms – 11.477 ms` |
+| `scheduler_snapshot/100000` | `879.09 ms – 926.72 ms` |
+| `client_cache_default` | `7.5650 µs – 10.125 µs` |
+| `client_cache_custom_dns` | `2.7433 ms – 3.3432 ms` |
+| `client_cache_custom_doh_timeout` | `2.7134 ms – 3.8286 ms` |
+| `cache_seq_append_single_piece` | `1.2518 ms – 1.3304 ms` |
+| `cache_seq_append_multi_piece` | `3.2731 ms – 3.7718 ms` |
+| `cache_overlap_fallback` | `616.36 µs – 715.28 µs` |
+
+If you need stable comparisons across commits, rerun the same command on an idle machine and compare Criterion's generated history rather than treating a single short local run as definitive.

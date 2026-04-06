@@ -1,7 +1,10 @@
 use bytes::Bytes;
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use tempfile::tempdir;
+use std::net::SocketAddr;
+use std::time::Duration;
 
+use bytehaul::Downloader;
 use bytehaul::bench::{ControlSnapshot, PieceMap, WriteBackCache};
 
 fn bench_cache_insert_coalesce(c: &mut Criterion) {
@@ -175,6 +178,60 @@ fn bench_single_progress_reporting(c: &mut Criterion) {
     });
 }
 
+fn bench_client_cache_lookup(c: &mut Criterion) {
+    c.bench_function("client_cache_default", |b| {
+        b.iter_batched(
+            || Downloader::builder().build().unwrap(),
+            |downloader| {
+                black_box(bytehaul::bench::bench_cached_client_lookup(
+                    &downloader,
+                    Duration::from_secs(30),
+                    64,
+                ));
+            },
+            criterion::BatchSize::SmallInput,
+        );
+    });
+
+    c.bench_function("client_cache_custom_dns", |b| {
+        b.iter_batched(
+            || {
+                Downloader::builder()
+                    .dns_server(SocketAddr::from(([1, 1, 1, 1], 53)))
+                    .build()
+                    .unwrap()
+            },
+            |downloader| {
+                black_box(bytehaul::bench::bench_cached_client_lookup(
+                    &downloader,
+                    Duration::from_secs(10),
+                    64,
+                ));
+            },
+            criterion::BatchSize::SmallInput,
+        );
+    });
+
+    c.bench_function("client_cache_custom_doh_timeout", |b| {
+        b.iter_batched(
+            || {
+                Downloader::builder()
+                    .doh_server("https://localhost/dns-query")
+                    .build()
+                    .unwrap()
+            },
+            |downloader| {
+                black_box(bytehaul::bench::bench_cached_client_lookup(
+                    &downloader,
+                    Duration::from_secs(10),
+                    64,
+                ));
+            },
+            criterion::BatchSize::SmallInput,
+        );
+    });
+}
+
 criterion_group!(
     benches,
     bench_cache_insert_coalesce,
@@ -182,6 +239,7 @@ criterion_group!(
     bench_scheduler_snapshot,
     bench_control_save_only,
     bench_control_roundtrip,
-    bench_single_progress_reporting
+    bench_single_progress_reporting,
+    bench_client_cache_lookup
 );
 criterion_main!(benches);

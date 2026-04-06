@@ -1,6 +1,8 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use parking_lot::Mutex;
 use tokio::sync::{watch, Semaphore};
 use tokio::task::JoinHandle;
 
@@ -13,7 +15,7 @@ use crate::session;
 
 /// Top-level downloader that manages shared resources (e.g. HTTP client).
 pub struct Downloader {
-    client: reqwest::Client,
+    client_cache: Arc<Mutex<HashMap<ClientNetworkConfig, reqwest::Client>>>,
     client_config: ClientNetworkConfig,
     log_level: LogLevel,
     concurrency_limit: Option<Arc<Semaphore>>,
@@ -109,6 +111,10 @@ impl DownloaderBuilder {
     pub fn build(self) -> Result<Downloader, DownloadError> {
         let log_level = self.log_level;
         let client = self.client_config.build_client()?;
+        let client_cache = Arc::new(Mutex::new(HashMap::from([(
+            self.client_config.clone(),
+            client,
+        )])));
         log_debug!(
             log_level,
             log_level = %log_level,
@@ -122,7 +128,7 @@ impl DownloaderBuilder {
             "downloader built"
         );
         Ok(Downloader {
-            client,
+            client_cache,
             client_config: self.client_config,
             log_level,
             concurrency_limit: self
@@ -165,7 +171,7 @@ impl Downloader {
             };
         }
 
-        let shared_client = self.client.clone();
+        let client_cache = self.client_cache.clone();
         let client_config = self.client_config.clone();
         let output = spec
             .output_path
@@ -193,13 +199,12 @@ impl Downloader {
                 })?),
                 None => None,
             };
-            let client = if spec.connect_timeout == client_config.connect_timeout {
-                shared_client
+            let requested_config = if spec.connect_timeout == client_config.connect_timeout {
+                client_config.clone()
             } else {
-                client_config
-                    .with_connect_timeout(spec.connect_timeout)
-                    .build_client()?
+                client_config.with_connect_timeout(spec.connect_timeout)
             };
+            let client = cached_client_for_config(&client_cache, requested_config)?;
             session::run_download(client, spec, log_level, download_id, progress_tx, cancel_rx)
                 .await
         });
@@ -209,6 +214,40 @@ impl Downloader {
             cancel_tx,
             task,
         }
+    }
+}
+
+fn cached_client_for_config(
+    client_cache: &Arc<Mutex<HashMap<ClientNetworkConfig, reqwest::Client>>>,
+    requested_config: ClientNetworkConfig,
+) -> Result<reqwest::Client, DownloadError> {
+    if let Some(client) = client_cache.lock().get(&requested_config).cloned() {
+        return Ok(client);
+    }
+
+    let client = requested_config.build_client()?;
+    let mut cache = client_cache.lock();
+    Ok(cache
+        .entry(requested_config)
+        .or_insert_with(|| client.clone())
+        .clone())
+}
+
+impl Downloader {
+    pub(crate) fn bench_cached_client_lookup(
+        &self,
+        connect_timeout: Duration,
+    ) -> Result<(), DownloadError> {
+        let requested_config = if connect_timeout == self.client_config.connect_timeout {
+            self.client_config.clone()
+        } else {
+            self.client_config.with_connect_timeout(connect_timeout)
+        };
+        cached_client_for_config(&self.client_cache, requested_config).map(|_| ())
+    }
+
+    pub(crate) fn bench_cached_client_count(&self) -> usize {
+        self.client_cache.lock().len()
     }
 }
 
@@ -415,9 +454,45 @@ mod tests {
             .output_path(std::env::temp_dir().join("bytehaul_test_timeout_override"));
         spec.connect_timeout = Duration::from_secs(1);
 
+        assert_eq!(downloader.client_cache.lock().len(), 1);
         let handle = downloader.download(spec);
         let result = handle.wait().await;
         assert!(result.is_err());
+        assert_eq!(downloader.client_cache.lock().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_download_reuses_cached_timeout_override_client() {
+        let downloader = Downloader::builder().build().unwrap();
+        let mut spec = crate::config::DownloadSpec::new("http://127.0.0.1:1/nonexistent")
+            .output_path(std::env::temp_dir().join("bytehaul_test_timeout_override_reuse"));
+        spec.connect_timeout = Duration::from_secs(1);
+
+        let _ = downloader.download(spec.clone()).wait().await;
+        assert_eq!(downloader.client_cache.lock().len(), 2);
+
+        let _ = downloader.download(spec).wait().await;
+        assert_eq!(downloader.client_cache.lock().len(), 2);
+    }
+
+    #[test]
+    fn test_cached_client_lookup_reuses_existing_entry() {
+        let downloader = Downloader::builder().build().unwrap();
+
+        downloader
+            .bench_cached_client_lookup(Duration::from_secs(30))
+            .unwrap();
+        assert_eq!(downloader.bench_cached_client_count(), 1);
+
+        downloader
+            .bench_cached_client_lookup(Duration::from_secs(10))
+            .unwrap();
+        assert_eq!(downloader.bench_cached_client_count(), 2);
+
+        downloader
+            .bench_cached_client_lookup(Duration::from_secs(10))
+            .unwrap();
+        assert_eq!(downloader.bench_cached_client_count(), 2);
     }
 
     #[tokio::test]

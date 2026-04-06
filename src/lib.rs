@@ -59,6 +59,7 @@ pub use progress::{DownloadState, ProgressSnapshot};
 #[doc(hidden)]
 pub mod bench {
     use crate::scheduler::SchedulerState;
+    use std::time::Duration;
 
     pub use crate::progress::bench_progress_reporting;
     pub use crate::storage::cache::WriteBackCache;
@@ -83,5 +84,18 @@ pub mod bench {
         };
 
         (snapshot.completed_bitset.len(), snapshot.downloaded_bytes)
+    }
+
+    pub fn bench_cached_client_lookup(
+        downloader: &crate::manager::Downloader,
+        connect_timeout: Duration,
+        lookups: usize,
+    ) -> usize {
+        for _ in 0..lookups {
+            downloader
+                .bench_cached_client_lookup(connect_timeout)
+                .expect("client lookup should succeed during benchmark setup");
+        }
+        downloader.bench_cached_client_count()
     }
 }
