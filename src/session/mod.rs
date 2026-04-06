@@ -155,9 +155,9 @@ impl ControlSaveTracker {
     }
 }
 
-// ──────────────────────────────────────────────────────────────
+// 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 //  Entry point
-// ──────────────────────────────────────────────────────────────
+// 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 #[derive(Debug, Clone, Copy)]
 enum FreshResponseSource {
@@ -450,9 +450,9 @@ async fn run_download_inner(
     .await
 }
 
-// ──────────────────────────────────────────────────────────────
+// 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 //  Helpers
-// ──────────────────────────────────────────────────────────────
+// 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 fn validate_metadata(meta: &ResponseMeta, ctrl: &ControlSnapshot) -> bool {
     if let Some(total) = meta.content_range_total {
@@ -633,6 +633,12 @@ mod tests {
         assert!(tracker.should_save(ControlSaveReason::Terminal, 96, 3));
         tracker.mark_saved(96);
         assert!(!tracker.should_save(ControlSaveReason::Terminal, 96, 3));
+    }
+
+    #[test]
+    fn test_control_save_reason_labels() {
+        assert_eq!(ControlSaveReason::Autosave.label(), "autosave");
+        assert_eq!(ControlSaveReason::Terminal.label(), "terminal");
     }
 
     #[test]
@@ -819,5 +825,13 @@ mod tests {
         let result = resolve_static_output_path(&spec).unwrap().unwrap();
         assert!(result.is_absolute());
         assert!(result.ends_with("data.bin"));
+    }
+
+    #[test]
+    fn test_resolve_static_output_path_parent_traversal_is_error() {
+        let spec = DownloadSpec::new("http://example.com/file")
+            .output_path(PathBuf::from("../escape.bin"));
+        let result = resolve_static_output_path(&spec);
+        assert!(matches!(result, Err(DownloadError::InvalidConfig(_))));
     }
 }

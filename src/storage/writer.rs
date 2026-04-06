@@ -42,7 +42,7 @@ pub(crate) struct WriterTask {
     file: tokio::fs::File,
     written_bytes: Arc<AtomicU64>,
     cache: WriteBackCache,
-    /// Budget permit sender — returned when data is flushed to disk.
+    /// Budget permit sender 鈥?returned when data is flushed to disk.
     budget_return: Arc<tokio::sync::Semaphore>,
     /// Maximum bytes to buffer before forcing a flush.
     cache_high_watermark: usize,
@@ -292,6 +292,48 @@ mod tests {
 
         drop(tx);
         handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_writer_flush_all_without_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test_flush_all_no_sync.bin");
+        std::fs::write(&path, vec![0u8; 128]).unwrap();
+        let file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .await
+            .unwrap();
+
+        let budget = Arc::new(tokio::sync::Semaphore::new(1024 * 1024));
+        let written = Arc::new(AtomicU64::new(0));
+        let (tx, rx) = mpsc::channel(16);
+
+        let writer = WriterTask::new(rx, file, written.clone(), budget.clone(), 1024 * 1024);
+        let handle = tokio::spawn(writer.run());
+
+        tx.send(WriterCommand::Data {
+            offset: 0,
+            data: Bytes::from(vec![0x11; 64]),
+            piece_id: Some(0),
+        })
+        .await
+        .unwrap();
+
+        let (ack_tx, ack_rx) = oneshot::channel();
+        tx.send(WriterCommand::FlushAll {
+            sync_data: false,
+            ack: ack_tx,
+        })
+        .await
+        .unwrap();
+
+        let stats = ack_rx.await.unwrap();
+        drop(tx);
+        handle.await.unwrap().unwrap();
+
+        assert_eq!(stats.written_bytes, 64);
+        assert!(stats.sync_elapsed.is_none());
     }
 
     #[tokio::test]

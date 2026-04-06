@@ -270,4 +270,65 @@ mod tests {
             Err(DownloadError::RetryBudgetExceeded { .. })
         ));
     }
+
+    #[tokio::test]
+    async fn test_retry_with_backoff_retries_with_live_sender() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+
+        let (_cancel_tx, mut cancel_rx) = watch::channel(StopSignal::Running);
+        let attempts = Arc::new(AtomicU32::new(0));
+        let attempts_clone = attempts.clone();
+
+        let result: Result<i32, DownloadError> = retry_with_backoff(
+            2,
+            Duration::from_millis(1),
+            Duration::from_millis(5),
+            None,
+            &mut cancel_rx,
+            move || {
+                let attempts = attempts_clone.clone();
+                async move {
+                    let attempt = attempts.fetch_add(1, Ordering::Relaxed);
+                    if attempt == 0 {
+                        Err(DownloadError::HttpStatus {
+                            status: 503,
+                            message: "Service Unavailable".into(),
+                        })
+                    } else {
+                        Ok(7)
+                    }
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(result.unwrap(), 7);
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn test_retry_with_backoff_zero_retries_returns_retryable_error() {
+        let (_cancel_tx, mut cancel_rx) = watch::channel(StopSignal::Running);
+
+        let result: Result<i32, DownloadError> = retry_with_backoff(
+            0,
+            Duration::from_millis(1),
+            Duration::from_millis(5),
+            None,
+            &mut cancel_rx,
+            || async {
+                Err(DownloadError::HttpStatus {
+                    status: 503,
+                    message: "Service Unavailable".into(),
+                })
+            },
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(DownloadError::HttpStatus { status: 503, .. })
+        ));
+    }
 }
