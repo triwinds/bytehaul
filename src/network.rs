@@ -1,16 +1,20 @@
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use hickory_resolver::config::{
     LookupIpStrategy, NameServerConfig, NameServerConfigGroup, ResolverConfig,
 };
 use hickory_resolver::proto::xfer::Protocol;
 use hickory_resolver::{name_server::TokioConnectionProvider, TokioResolver};
+use parking_lot::Mutex;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 
 use crate::error::DownloadError;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
+type SharedDnsCache = Arc<Mutex<HashMap<String, CachedDnsLookup>>>;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ClientNetworkConfig {
@@ -89,9 +93,17 @@ struct DohServerConfig {
     http_endpoint: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct CachedDnsLookup {
+    valid_until: Instant,
+    addrs: Vec<SocketAddr>,
+}
+
 #[derive(Clone)]
 struct BytehaulDnsResolver {
     resolver: TokioResolver,
+    // Mirror successful lookups so cache hits are visible in bytehaul's debug logs.
+    cache: SharedDnsCache,
 }
 
 impl BytehaulDnsResolver {
@@ -123,6 +135,7 @@ impl BytehaulDnsResolver {
 
         Ok(Self {
             resolver: builder.build(),
+            cache: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 }
@@ -130,16 +143,41 @@ impl BytehaulDnsResolver {
 impl Resolve for BytehaulDnsResolver {
     fn resolve(&self, name: Name) -> Resolving {
         let resolver = self.resolver.clone();
+        let cache = self.cache.clone();
         let host = name.as_str().to_string();
 
         Box::pin(async move {
+            if let Some(cached) = load_cached_lookup(&cache, &host) {
+                #[cfg(not(tarpaulin))]
+                tracing::debug!(
+                    host = %host,
+                    addrs = ?cached.addrs,
+                    cache_hit = true,
+                    ttl_remaining_ms = duration_to_u64_millis(
+                        cached.valid_until.saturating_duration_since(Instant::now())
+                    ),
+                    "resolved host via DNS cache"
+                );
+
+                return Ok(Box::new(cached.addrs.into_iter()) as Addrs);
+            }
+
             let lookup = resolver
                 .lookup_ip(host.clone())
                 .await
-                .map_err(|err| -> BoxError { Box::new(err) })?;
+                .map_err(|err| {
+                    #[cfg(not(tarpaulin))]
+                    tracing::debug!(host = %host, cache_hit = false, error = %err, "DNS lookup failed");
+                    let boxed: BoxError = Box::new(err);
+                    boxed
+                })?;
+
+            let valid_until = lookup.valid_until();
 
             let addrs: Vec<SocketAddr> = lookup.iter().map(|ip| SocketAddr::new(ip, 0)).collect();
             if addrs.is_empty() {
+                #[cfg(not(tarpaulin))]
+                tracing::debug!(host = %host, cache_hit = false, "DNS lookup returned no IP addresses");
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::NotFound,
                     format!("no DNS records found for {host}"),
@@ -147,9 +185,46 @@ impl Resolve for BytehaulDnsResolver {
                 .into());
             }
 
+            store_cached_lookup(&cache, host.clone(), addrs.clone(), valid_until);
+
+            #[cfg(not(tarpaulin))]
+            tracing::debug!(
+                host = %host,
+                addrs = ?addrs,
+                cache_hit = false,
+                ttl_remaining_ms = duration_to_u64_millis(
+                    valid_until.saturating_duration_since(Instant::now())
+                ),
+                "resolved host via DNS lookup"
+            );
+
             Ok(Box::new(addrs.into_iter()) as Addrs)
         })
     }
+}
+
+fn load_cached_lookup(cache: &SharedDnsCache, host: &str) -> Option<CachedDnsLookup> {
+    let mut cache = cache.lock();
+    let cached = cache.get(host).cloned()?;
+    if cached.valid_until > Instant::now() {
+        Some(cached)
+    } else {
+        cache.remove(host);
+        None
+    }
+}
+
+fn store_cached_lookup(
+    cache: &SharedDnsCache,
+    host: String,
+    addrs: Vec<SocketAddr>,
+    valid_until: Instant,
+) {
+    cache.lock().insert(host, CachedDnsLookup { valid_until, addrs });
+}
+
+fn duration_to_u64_millis(duration: Duration) -> u64 {
+    duration.as_millis().min(u64::MAX as u128) as u64
 }
 
 fn build_name_server_group(
@@ -342,6 +417,37 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("cannot include credentials"));
+    }
+
+    #[test]
+    fn test_dns_lookup_cache_returns_fresh_entries() {
+        let cache = Arc::new(Mutex::new(HashMap::new()));
+        let addrs = vec![SocketAddr::from(([127, 0, 0, 1], 0))];
+
+        store_cached_lookup(
+            &cache,
+            "example.com".into(),
+            addrs.clone(),
+            Instant::now() + Duration::from_secs(5),
+        );
+
+        let cached = load_cached_lookup(&cache, "example.com").unwrap();
+        assert_eq!(cached.addrs, addrs);
+    }
+
+    #[test]
+    fn test_dns_lookup_cache_evicts_expired_entries() {
+        let cache = Arc::new(Mutex::new(HashMap::new()));
+
+        store_cached_lookup(
+            &cache,
+            "expired.example.com".into(),
+            vec![SocketAddr::from(([127, 0, 0, 1], 0))],
+            Instant::now() - Duration::from_secs(1),
+        );
+
+        assert!(load_cached_lookup(&cache, "expired.example.com").is_none());
+        assert!(!cache.lock().contains_key("expired.example.com"));
     }
 
     #[test]
