@@ -619,4 +619,45 @@ mod tests {
             assert_eq!(received.load(Ordering::Relaxed), 1);
         }
     }
+
+    #[tokio::test]
+    async fn test_on_progress_emits_terminal_states_deterministically() {
+        use tokio::sync::mpsc;
+
+        let terminal_states = [
+            crate::progress::DownloadState::Completed,
+            crate::progress::DownloadState::Failed,
+            crate::progress::DownloadState::Cancelled,
+            crate::progress::DownloadState::Paused,
+        ];
+
+        for state in terminal_states {
+            let (progress_tx, progress_rx) = watch::channel(ProgressSnapshot::default());
+            let (cancel_tx, _) = watch::channel(session::StopSignal::Running);
+            let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+
+            let handle = DownloadHandle {
+                progress_rx,
+                cancel_tx,
+                task: tokio::spawn(async { Ok(()) }),
+            };
+
+            handle.on_progress(move |snap| {
+                let _ = event_tx.send(snap.state);
+            });
+
+            progress_tx
+                .send(ProgressSnapshot {
+                    state,
+                    ..Default::default()
+                })
+                .unwrap();
+
+            let observed = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(observed, state);
+        }
+    }
 }

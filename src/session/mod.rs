@@ -793,6 +793,15 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_output_dir_relative() {
+        let mut spec = DownloadSpec::new("http://example.com/file");
+        spec.output_dir = Some(PathBuf::from("nested-output"));
+        let dir = resolve_output_dir(&spec).unwrap();
+        assert!(dir.is_absolute());
+        assert!(dir.ends_with("nested-output"));
+    }
+
+    #[test]
     fn test_resolve_static_output_path_none() {
         let spec = DownloadSpec::new("http://example.com/file");
         let result = resolve_static_output_path(&spec).unwrap();
