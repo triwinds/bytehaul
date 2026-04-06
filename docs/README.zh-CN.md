@@ -44,7 +44,7 @@ cargo add bytehaul
 
 ```toml
 [dependencies]
-bytehaul = "0.1.5"
+bytehaul = "0.1.6"
 ```
 
 ### Python
