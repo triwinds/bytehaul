@@ -36,13 +36,13 @@ bytes = "1"
 futures = "0.3"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
-bincode = "1"
+bincode = { version = "3", features = ["serde"] }
 bitvec = { version = "1", features = ["serde"] }
 parking_lot = "0.12"
 tracing = "0.1"
 crc32fast = "1"
-sha2 = "0.10"
-sha1 = "0.10"
+sha2 = "0.11"
+sha1 = "0.11"
 md-5 = "0.10"
 fastrand = "2"
 
@@ -52,11 +52,11 @@ libc = "0.2"
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 tracing-subscriber = "0.3"
-warp = "0.3"
+warp = { version = "0.4.2", features = ["server", "test"] }
 tempfile = "3"
 rand = "0.8"
 http = "1"
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8.2", features = ["html_reports"] }
 
 [[bench]]
 name = "storage_bench"
