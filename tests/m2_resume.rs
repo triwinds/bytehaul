@@ -141,7 +141,8 @@ async fn test_resume_after_cancel() {
     // Wait until some data is actually written, then cancel.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
     while tokio::time::Instant::now() < deadline {
-        if std::fs::metadata(&output_path)
+        if tokio::fs::metadata(&output_path)
+            .await
             .map(|metadata| metadata.len() > 0)
             .unwrap_or(false)
         {
