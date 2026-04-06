@@ -58,8 +58,30 @@ pub use progress::{DownloadState, ProgressSnapshot};
 /// Re-exports for benchmarking. Not part of the public API.
 #[doc(hidden)]
 pub mod bench {
+    use crate::scheduler::SchedulerState;
+
     pub use crate::progress::bench_progress_reporting;
     pub use crate::storage::cache::WriteBackCache;
     pub use crate::storage::control::ControlSnapshot;
     pub use crate::storage::piece_map::PieceMap;
+
+    pub fn bench_scheduler_snapshot(total_size: u64, piece_size: u64) -> (usize, u64) {
+        let mut scheduler = SchedulerState::new(PieceMap::new(total_size, piece_size));
+        while let Some(segment) = scheduler.assign() {
+            scheduler.complete(segment.piece_id);
+        }
+
+        let snapshot = ControlSnapshot {
+            url: "https://example.com/bench".into(),
+            total_size,
+            piece_size: scheduler.piece_size(),
+            piece_count: scheduler.piece_count(),
+            completed_bitset: scheduler.snapshot_bitset(),
+            downloaded_bytes: scheduler.completed_bytes(),
+            etag: None,
+            last_modified: None,
+        };
+
+        (snapshot.completed_bitset.len(), snapshot.downloaded_bytes)
+    }
 }

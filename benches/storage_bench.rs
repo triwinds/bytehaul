@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use tempfile::tempdir;
 
 use bytehaul::bench::{ControlSnapshot, PieceMap, WriteBackCache};
@@ -62,6 +62,22 @@ fn bench_piece_map_serde(c: &mut Criterion) {
     });
 }
 
+fn bench_scheduler_snapshot(c: &mut Criterion) {
+    let mut group = c.benchmark_group("scheduler_snapshot");
+    let piece_size = 1_000_000u64;
+
+    for piece_count in [10_000usize, 100_000usize] {
+        let total_size = piece_count as u64 * piece_size;
+        group.bench_with_input(BenchmarkId::from_parameter(piece_count), &total_size, |b, &size| {
+            b.iter(|| {
+                black_box(bytehaul::bench::bench_scheduler_snapshot(size, piece_size));
+            });
+        });
+    }
+
+    group.finish();
+}
+
 fn bench_control_roundtrip(c: &mut Criterion) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -104,6 +120,7 @@ criterion_group!(
     benches,
     bench_cache_insert_coalesce,
     bench_piece_map_serde,
+    bench_scheduler_snapshot,
     bench_control_roundtrip,
     bench_single_progress_reporting
 );

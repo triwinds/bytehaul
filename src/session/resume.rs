@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use tokio::sync::watch;
@@ -62,13 +61,10 @@ pub(crate) async fn validate_local_resume_state(
             return Ok(());
         }
 
-        let mut min_len = 0u64;
-        for piece_id in (0..piece_map.piece_count()).rev() {
-            if piece_map.is_complete(piece_id) {
-                min_len = piece_map.piece_range(piece_id).1;
-                break;
-            }
-        }
+        let min_len = piece_map
+            .highest_completed_piece()
+            .map(|piece_id| piece_map.piece_range(piece_id).1)
+            .unwrap_or(0);
 
         if actual_len < min_len {
             return Err(DownloadError::ResumeMismatch(format!(
@@ -159,7 +155,7 @@ pub(super) async fn try_resume_download(
                 &ctrl.completed_bitset,
                 ctrl.piece_count,
             );
-            if let Some(probe_piece) = piece_map.next_missing_excluding(&HashSet::new()) {
+            if let Some(probe_piece) = piece_map.first_missing() {
                 let (start, end) = piece_map.piece_range(probe_piece);
                 let probe_result = retry_with_backoff(
                     spec.max_retries,

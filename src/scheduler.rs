@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -12,38 +11,62 @@ pub(crate) type Scheduler = Arc<Mutex<SchedulerState>>;
 /// Manages piece assignment, completion, and reclamation.
 pub(crate) struct SchedulerState {
     piece_map: PieceMap,
-    inflight: HashSet<usize>,
+    inflight: Vec<bool>,
+    next_candidate: usize,
 }
 
 impl SchedulerState {
     pub fn new(piece_map: PieceMap) -> Self {
+        let piece_count = piece_map.piece_count();
+        let next_candidate = piece_map.first_missing().unwrap_or(0);
         Self {
             piece_map,
-            inflight: HashSet::new(),
+            inflight: vec![false; piece_count],
+            next_candidate,
         }
     }
 
     /// Assign the next available piece. Returns `None` when there is no more work.
     pub fn assign(&mut self) -> Option<Segment> {
-        let piece_id = self.piece_map.next_missing_excluding(&self.inflight)?;
-        self.inflight.insert(piece_id);
-        let (start, end) = self.piece_map.piece_range(piece_id);
-        Some(Segment {
-            piece_id,
-            start,
-            end,
-        })
+        let piece_count = self.piece_map.piece_count();
+        if piece_count == 0 || self.piece_map.all_done() {
+            return None;
+        }
+
+        for step in 0..piece_count {
+            let piece_id = (self.next_candidate + step) % piece_count;
+            if self.piece_map.is_complete(piece_id) || self.inflight[piece_id] {
+                continue;
+            }
+            self.inflight[piece_id] = true;
+            self.next_candidate = (piece_id + 1) % piece_count;
+            let (start, end) = self.piece_map.piece_range(piece_id);
+            return Some(Segment {
+                piece_id,
+                start,
+                end,
+            });
+        }
+
+        None
     }
 
     /// Mark a piece as completed and remove it from inflight.
     pub fn complete(&mut self, piece_id: usize) {
-        self.inflight.remove(&piece_id);
+        if piece_id < self.inflight.len() {
+            self.inflight[piece_id] = false;
+        }
         self.piece_map.mark_complete(piece_id);
     }
 
     /// Reclaim a piece (worker failed); it becomes available for reassignment.
     pub fn reclaim(&mut self, piece_id: usize) {
-        self.inflight.remove(&piece_id);
+        if piece_id < self.inflight.len() {
+            self.inflight[piece_id] = false;
+            if piece_id < self.next_candidate {
+                self.next_candidate = piece_id;
+            }
+        }
     }
 
     pub fn all_done(&self) -> bool {
@@ -144,6 +167,20 @@ mod tests {
         let seg2 = sched.assign().unwrap();
         assert_eq!(seg2.piece_id, 2);
         assert!(sched.assign().is_none());
+    }
+
+    #[test]
+    fn test_scheduler_reuses_reclaimed_lower_piece() {
+        let pm = PieceMap::new(4_000_000, 1_000_000);
+        let mut sched = SchedulerState::new(pm);
+
+        let seg0 = sched.assign().unwrap();
+        let _seg1 = sched.assign().unwrap();
+        let _seg2 = sched.assign().unwrap();
+
+        sched.reclaim(seg0.piece_id);
+        let reassigned = sched.assign().unwrap();
+        assert_eq!(reassigned.piece_id, 0);
     }
 
     #[test]

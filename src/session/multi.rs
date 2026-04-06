@@ -397,16 +397,21 @@ async fn worker_loop(
             return Err(stop_signal_error(signal).expect("stop signal must map to an error"));
         }
 
+        let assign_started = Instant::now();
         let segment = match scheduler.lock().assign() {
             Some(seg) => seg,
             None => {
-                log_debug!(log_level, download_id = download_id, worker_id = worker_id, "no more segments, worker exiting");
+                log_debug!(log_level, download_id = download_id, worker_id = worker_id,
+                    scheduler_lock_us = assign_started.elapsed().as_micros() as u64,
+                    "no more segments, worker exiting");
                 return Ok(());
             }
         };
 
         log_debug!(log_level, download_id = download_id, worker_id = worker_id,
-            piece_id = segment.piece_id, "assigned piece");
+            piece_id = segment.piece_id,
+            scheduler_lock_us = assign_started.elapsed().as_micros() as u64,
+            "assigned piece");
 
         let mut attempt = 0u32;
     let retry_started_at = Instant::now();

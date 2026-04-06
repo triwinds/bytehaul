@@ -1,5 +1,3 @@
-use std::collections::HashSet;
-
 use bitvec::prelude::*;
 
 /// Tracks piece-level completion state for a download.
@@ -8,6 +6,10 @@ pub struct PieceMap {
     total_size: u64,
     piece_count: usize,
     completed: BitVec<u8, Lsb0>,
+    completed_pieces: usize,
+    completed_bytes: u64,
+    next_candidate: usize,
+    highest_completed_piece: Option<usize>,
 }
 
 impl PieceMap {
@@ -19,6 +21,10 @@ impl PieceMap {
             total_size,
             piece_count,
             completed: bitvec![u8, Lsb0; 0; piece_count],
+            completed_pieces: 0,
+            completed_bytes: 0,
+            next_candidate: 0,
+            highest_completed_piece: None,
         }
     }
 
@@ -31,11 +37,30 @@ impl PieceMap {
     ) -> Self {
         let mut completed = BitVec::<u8, Lsb0>::from_slice(bitset);
         completed.resize(piece_count, false);
+        let mut completed_pieces = 0usize;
+        let mut completed_bytes = 0u64;
+        let mut next_candidate = piece_count;
+        let mut highest_completed_piece = None;
+
+        for piece_id in 0..piece_count {
+            if completed[piece_id] {
+                completed_pieces += 1;
+                completed_bytes += piece_len(total_size, piece_size, piece_id);
+                highest_completed_piece = Some(piece_id);
+            } else if next_candidate == piece_count {
+                next_candidate = piece_id;
+            }
+        }
+
         Self {
             piece_size,
             total_size,
             piece_count,
             completed,
+            completed_pieces,
+            completed_bytes,
+            next_candidate,
+            highest_completed_piece,
         }
     }
 
@@ -56,7 +81,7 @@ impl PieceMap {
     /// Byte range `[start, end)` for the given piece.
     pub fn piece_range(&self, piece_id: usize) -> (u64, u64) {
         let start = piece_id as u64 * self.piece_size;
-        let end = ((piece_id as u64 + 1) * self.piece_size).min(self.total_size);
+        let end = start + piece_len(self.total_size, self.piece_size, piece_id);
         (start, end)
     }
 
@@ -68,14 +93,28 @@ impl PieceMap {
 
     /// Mark the given piece as complete. Out-of-bounds IDs are silently ignored.
     pub fn mark_complete(&mut self, piece_id: usize) {
-        if piece_id < self.piece_count {
+        if piece_id < self.piece_count && !self.completed[piece_id] {
             self.completed.set(piece_id, true);
+            self.completed_pieces += 1;
+            self.completed_bytes += piece_len(self.total_size, self.piece_size, piece_id);
+            self.highest_completed_piece = Some(
+                self.highest_completed_piece
+                    .map_or(piece_id, |current| current.max(piece_id)),
+            );
+            if piece_id == self.next_candidate {
+                self.advance_next_candidate();
+            }
         }
     }
 
-    /// Return the first missing piece not in `exclude`.
-    pub fn next_missing_excluding(&self, exclude: &HashSet<usize>) -> Option<usize> {
-        (0..self.piece_count).find(|&i| !self.completed[i] && !exclude.contains(&i))
+    /// Return the first missing piece.
+    pub fn first_missing(&self) -> Option<usize> {
+        (self.next_candidate < self.piece_count).then_some(self.next_candidate)
+    }
+
+    /// Return the highest completed piece, if any.
+    pub fn highest_completed_piece(&self) -> Option<usize> {
+        self.highest_completed_piece
     }
 
     /// Returns `true` if every piece has been completed.
@@ -85,30 +124,34 @@ impl PieceMap {
 
     /// Returns the number of completed pieces.
     pub fn completed_count(&self) -> usize {
-        self.completed.count_ones()
+        self.completed_pieces
     }
 
     /// Returns the total number of bytes in completed pieces.
     pub fn completed_bytes(&self) -> u64 {
-        let mut bytes = 0u64;
-        for i in 0..self.piece_count {
-            if self.completed[i] {
-                let (start, end) = self.piece_range(i);
-                bytes += end - start;
-            }
-        }
-        bytes
+        self.completed_bytes
     }
 
     /// Returns the number of pieces that have not yet been completed.
     pub fn remaining_count(&self) -> usize {
-        self.piece_count - self.completed_count()
+        self.piece_count - self.completed_pieces
     }
 
     /// Serialize the bitset for storage in the control file.
     pub fn to_bitset_bytes(&self) -> Vec<u8> {
         self.completed.as_raw_slice().to_vec()
     }
+
+    fn advance_next_candidate(&mut self) {
+        while self.next_candidate < self.piece_count && self.completed[self.next_candidate] {
+            self.next_candidate += 1;
+        }
+    }
+}
+
+fn piece_len(total_size: u64, piece_size: u64, piece_id: usize) -> u64 {
+    let start = piece_id as u64 * piece_size;
+    ((piece_id as u64 + 1) * piece_size).min(total_size) - start
 }
 
 #[cfg(test)]
@@ -141,15 +184,14 @@ mod tests {
     }
 
     #[test]
-    fn test_next_missing_excluding() {
+    fn test_first_missing_tracks_next_gap() {
         let mut pm = PieceMap::new(5_000_000, 1_000_000);
         pm.mark_complete(0);
         pm.mark_complete(2);
 
-        let mut excl = HashSet::new();
-        assert_eq!(pm.next_missing_excluding(&excl), Some(1));
-        excl.insert(1);
-        assert_eq!(pm.next_missing_excluding(&excl), Some(3));
+        assert_eq!(pm.first_missing(), Some(1));
+        pm.mark_complete(1);
+        assert_eq!(pm.first_missing(), Some(3));
     }
 
     #[test]
@@ -207,5 +249,28 @@ mod tests {
         let mut pm = PieceMap::new(2_500_000, 1_000_000);
         pm.mark_complete(2); // last piece is 500,000 bytes
         assert_eq!(pm.completed_bytes(), 500_000);
+    }
+
+    #[test]
+    fn test_highest_completed_piece_updates() {
+        let mut pm = PieceMap::new(4_500_000, 1_000_000);
+        assert_eq!(pm.highest_completed_piece(), None);
+
+        pm.mark_complete(1);
+        assert_eq!(pm.highest_completed_piece(), Some(1));
+
+        pm.mark_complete(3);
+        assert_eq!(pm.highest_completed_piece(), Some(3));
+    }
+
+    #[test]
+    fn test_from_bitset_restores_counters() {
+        let bytes = vec![0b0000_0101];
+        let pm = PieceMap::from_bitset(3_500_000, 1_000_000, &bytes, 4);
+
+        assert_eq!(pm.completed_count(), 2);
+        assert_eq!(pm.completed_bytes(), 2_000_000);
+        assert_eq!(pm.first_missing(), Some(1));
+        assert_eq!(pm.highest_completed_piece(), Some(2));
     }
 }
