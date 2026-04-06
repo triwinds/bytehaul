@@ -5,13 +5,43 @@ use tempfile::tempdir;
 use bytehaul::bench::{ControlSnapshot, PieceMap, WriteBackCache};
 
 fn bench_cache_insert_coalesce(c: &mut Criterion) {
-    c.bench_function("cache_insert_1000_chunks", |b| {
+    c.bench_function("cache_seq_append_single_piece", |b| {
         b.iter(|| {
             let mut cache = WriteBackCache::new();
             for i in 0u64..1000 {
                 let offset = i * 4096;
                 let data = Bytes::from(vec![0xABu8; 4096]);
                 cache.insert(0, offset, data);
+            }
+            black_box(cache.total_bytes());
+        });
+    });
+
+    c.bench_function("cache_seq_append_multi_piece", |b| {
+        b.iter(|| {
+            let mut cache = WriteBackCache::new();
+            for piece_id in 0usize..64 {
+                for chunk_id in 0u64..32 {
+                    cache.insert(
+                        piece_id,
+                        chunk_id * 4096,
+                        Bytes::from(vec![0xBCu8; 4096]),
+                    );
+                }
+            }
+            black_box(cache.total_bytes());
+        });
+    });
+
+    c.bench_function("cache_overlap_fallback", |b| {
+        b.iter(|| {
+            let mut cache = WriteBackCache::new();
+            for i in 0u64..512 {
+                let offset = i * 4096;
+                cache.insert(0, offset, Bytes::from(vec![0xCDu8; 4096]));
+                if i % 16 == 0 {
+                    cache.insert(0, offset + 2048, Bytes::from(vec![0xEFu8; 4096]));
+                }
             }
             black_box(cache.total_bytes());
         });

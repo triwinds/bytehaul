@@ -18,6 +18,8 @@ pub struct WriteBackCache {
 struct PieceCacheEntry {
     /// Sorted, non-overlapping ranges: (offset, data).
     ranges: Vec<(u64, BytesMut)>,
+    /// Total resident bytes currently held for this piece.
+    resident_bytes: usize,
 }
 
 /// A contiguous block of data ready to be flushed to disk.
@@ -47,20 +49,22 @@ impl WriteBackCache {
         let entry = self
             .pieces
             .entry(piece_id)
-            .or_insert_with(|| PieceCacheEntry { ranges: Vec::new() });
-        entry.merge(offset, data);
-        self.total_bytes += len;
+            .or_insert_with(|| PieceCacheEntry {
+                ranges: Vec::new(),
+                resident_bytes: 0,
+            });
+        self.total_bytes += entry.merge(offset, data);
     }
 
     /// Drain all cached data for the given piece, returning flush blocks sorted by offset.
     pub fn drain_piece(&mut self, piece_id: usize) -> Vec<FlushBlock> {
         match self.pieces.remove(&piece_id) {
             Some(entry) => {
+                self.total_bytes = self.total_bytes.saturating_sub(entry.resident_bytes);
                 let blocks: Vec<FlushBlock> = entry
                     .ranges
                     .into_iter()
                     .map(|(offset, data)| {
-                        self.total_bytes -= data.len();
                         FlushBlock {
                             offset,
                             data: data.freeze(),
@@ -78,22 +82,27 @@ impl WriteBackCache {
         let mut blocks = Vec::new();
         let pieces = std::mem::take(&mut self.pieces);
         for (_piece_id, entry) in pieces {
+            self.total_bytes = self.total_bytes.saturating_sub(entry.resident_bytes);
             for (offset, data) in entry.ranges {
-                self.total_bytes -= data.len();
                 blocks.push(FlushBlock {
                     offset,
                     data: data.freeze(),
                 });
             }
         }
-        blocks.sort_by_key(|b| b.offset);
         blocks
     }
 }
 
 impl PieceCacheEntry {
     /// Merge new data at `offset` into the existing ranges, coalescing adjacent/overlapping ranges.
-    fn merge(&mut self, offset: u64, data: Bytes) {
+    fn merge(&mut self, offset: u64, data: Bytes) -> usize {
+        if let Some(delta) = self.try_append(offset, &data) {
+            self.resident_bytes += delta;
+            return delta;
+        }
+
+        let before = self.resident_bytes;
         let end = offset + data.len() as u64;
 
         // Find the insertion point
@@ -115,7 +124,8 @@ impl PieceCacheEntry {
                 }
                 // Now coalesce with subsequent ranges if they overlap
                 self.coalesce_from(idx);
-                return;
+                self.recompute_resident_bytes();
+                return self.resident_bytes - before;
             }
         }
 
@@ -128,7 +138,8 @@ impl PieceCacheEntry {
                 buf.extend_from_slice(&data);
                 self.ranges.insert(pos, (offset, buf));
                 self.coalesce_from(pos);
-                return;
+                self.recompute_resident_bytes();
+                return self.resident_bytes - before;
             }
         }
 
@@ -136,6 +147,24 @@ impl PieceCacheEntry {
         let mut buf = BytesMut::with_capacity(data.len());
         buf.extend_from_slice(&data);
         self.ranges.insert(pos, (offset, buf));
+        self.resident_bytes = before + data.len();
+        data.len()
+    }
+
+    fn try_append(&mut self, offset: u64, data: &Bytes) -> Option<usize> {
+        let (last_offset, last_data) = self.ranges.last_mut()?;
+        let last_end = *last_offset + last_data.len() as u64;
+        if offset < *last_offset || offset > last_end {
+            return None;
+        }
+
+        let overlap = last_end.saturating_sub(offset) as usize;
+        if overlap >= data.len() {
+            return Some(0);
+        }
+
+        last_data.extend_from_slice(&data[overlap..]);
+        Some(data.len() - overlap)
     }
 
     /// Starting from index `idx`, merge all subsequent ranges that are now contiguous/overlapping.
@@ -156,6 +185,10 @@ impl PieceCacheEntry {
                 break;
             }
         }
+    }
+
+    fn recompute_resident_bytes(&mut self) {
+        self.resident_bytes = self.ranges.iter().map(|(_, data)| data.len()).sum();
     }
 }
 
@@ -198,8 +231,7 @@ mod tests {
         let mut cache = WriteBackCache::new();
         cache.insert(0, 0, Bytes::from(vec![1u8; 100]));
         cache.insert(0, 50, Bytes::from(vec![2u8; 100]));
-        // total_bytes tracks inserts, not net unique bytes
-        assert_eq!(cache.total_bytes(), 200);
+        assert_eq!(cache.total_bytes(), 150);
 
         let blocks = cache.drain_piece(0);
         assert_eq!(blocks.len(), 1);
@@ -218,6 +250,19 @@ mod tests {
         assert_eq!(blocks[0].offset, 0);
         assert_eq!(blocks[1].offset, 1000);
         assert_eq!(cache.total_bytes(), 0);
+    }
+
+    #[test]
+    fn test_append_fast_path_tracks_resident_bytes() {
+        let mut cache = WriteBackCache::new();
+        cache.insert(0, 0, Bytes::from(vec![1u8; 100]));
+        cache.insert(0, 100, Bytes::from(vec![2u8; 50]));
+        cache.insert(0, 125, Bytes::from(vec![3u8; 50]));
+
+        assert_eq!(cache.total_bytes(), 175);
+        let blocks = cache.drain_piece(0);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].data.len(), 175);
     }
 
     #[test]
