@@ -1,11 +1,12 @@
-use bytes::Bytes;
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use tempfile::tempdir;
 use std::net::SocketAddr;
+use std::hint::black_box;
 use std::time::Duration;
 
 use bytehaul::Downloader;
 use bytehaul::bench::{ControlSnapshot, PieceMap, WriteBackCache};
+use bytes::Bytes;
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use tempfile::tempdir;
 
 fn bench_cache_insert_coalesce(c: &mut Criterion) {
     c.bench_function("cache_seq_append_single_piece", |b| {

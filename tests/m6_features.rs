@@ -4,6 +4,10 @@ use bytehaul::{Checksum, DownloadSpec, Downloader, FileAllocation};
 use sha2::{Digest, Sha256};
 use warp::Filter;
 
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 #[tokio::test]
 async fn test_rate_limiting() {
     // 10 KB of data
@@ -84,7 +88,7 @@ async fn test_no_rate_limit_is_fast() {
 async fn test_checksum_sha256_pass() {
     let body = b"Hello, checksum world!";
     let hash = Sha256::digest(body);
-    let hex = format!("{hash:x}");
+    let hex = hex_encode(hash.as_slice());
 
     let data = body.to_vec();
     let route = warp::path("file").map(move || warp::http::Response::new(data.clone()));
