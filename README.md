@@ -111,16 +111,16 @@ On Windows, Tarpaulin can leave locked binaries or produce incomplete summaries 
 ```powershell
 rustup component add llvm-tools-preview
 cargo install cargo-llvm-cov
-powershell -ExecutionPolicy Bypass -File scripts/coverage-windows.ps1 -Scope tests -Format html
+powershell -ExecutionPolicy Bypass -File scripts/coverage-windows.ps1 -Scope all-targets -Format html
 ```
 
 For a machine-readable summary on Windows:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts/coverage-windows.ps1 -Scope tests -Format json
+powershell -ExecutionPolicy Bypass -File scripts/coverage-windows.ps1 -Scope all-targets -Format json
 ```
 
-The helper forces `CARGO_BUILD_JOBS=1` and a dedicated `CARGO_TARGET_DIR`, which avoids the `os error 5`, `LNK1104`, and stale `cargo` / `rustc` handle conflicts that show up when multiple coverage builds overlap on Windows.
+The helper now defaults to the same `all-targets` scope as the CI gate, while still forcing `CARGO_BUILD_JOBS=1` and a fresh isolated `CARGO_TARGET_DIR` on each run to avoid the `os error 5`, `LNK1104`, and stale `cargo` / `rustc` handle conflicts that show up when multiple coverage builds overlap on Windows.
 
 ## Architecture
 

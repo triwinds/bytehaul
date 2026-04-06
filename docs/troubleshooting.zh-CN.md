@@ -166,13 +166,13 @@ pip install bytehaul
 ```powershell
 rustup component add llvm-tools-preview
 cargo install cargo-llvm-cov
-powershell -ExecutionPolicy Bypass -File scripts/coverage-windows.ps1 -Scope tests -Format html
+powershell -ExecutionPolicy Bypass -File scripts/coverage-windows.ps1 -Scope all-targets -Format html
 ```
 
 如果你需要机器可读的摘要报告，可以改用：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts/coverage-windows.ps1 -Scope tests -Format json
+powershell -ExecutionPolicy Bypass -File scripts/coverage-windows.ps1 -Scope all-targets -Format json
 ```
 
-仓库的最终覆盖率门禁仍然在 Linux CI 上通过 Tarpaulin 校验。
+该脚本默认按与 Linux CI 一致的 `all-targets` 口径执行，并为每次运行使用新的隔离 target 目录；仓库的最终覆盖率门禁仍然在 Linux CI 上通过 Tarpaulin 校验。

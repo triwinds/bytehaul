@@ -156,13 +156,13 @@ pip install bytehaul
 ```powershell
 rustup component add llvm-tools-preview
 cargo install cargo-llvm-cov
-powershell -ExecutionPolicy Bypass -File scripts/coverage-windows.ps1 -Scope tests -Format html
+powershell -ExecutionPolicy Bypass -File scripts/coverage-windows.ps1 -Scope all-targets -Format html
 ```
 
 If you want a JSON summary instead of HTML:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts/coverage-windows.ps1 -Scope tests -Format json
+powershell -ExecutionPolicy Bypass -File scripts/coverage-windows.ps1 -Scope all-targets -Format json
 ```
 
-The Linux CI gate still uses Tarpaulin for the repository-wide threshold check.
+The helper defaults to the same `all-targets` scope as the Linux CI gate and uses a fresh isolated target directory per run, while Linux CI still uses Tarpaulin for the repository-wide threshold check.

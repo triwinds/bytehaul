@@ -99,3 +99,29 @@ pub mod bench {
         downloader.bench_cached_client_count()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::bench::{bench_cached_client_lookup, bench_scheduler_snapshot};
+    use super::Downloader;
+    use std::time::Duration;
+
+    #[test]
+    fn test_bench_scheduler_snapshot_marks_all_bytes_complete() {
+        let (bitset_len, downloaded_bytes) = bench_scheduler_snapshot(1024, 256);
+
+        assert_eq!(downloaded_bytes, 1024);
+        assert!(bitset_len >= 1);
+    }
+
+    #[test]
+    fn test_bench_cached_client_lookup_reuses_existing_clients() {
+        let downloader = Downloader::builder().build().unwrap();
+
+        let cached_count = bench_cached_client_lookup(&downloader, Duration::from_secs(30), 3);
+        let distinct_count = bench_cached_client_lookup(&downloader, Duration::from_secs(3), 1);
+
+        assert_eq!(cached_count, 1);
+        assert_eq!(distinct_count, 2);
+    }
+}

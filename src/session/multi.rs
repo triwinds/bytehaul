@@ -759,6 +759,177 @@ async fn stream_segment(
 }
 
 #[cfg(test)]
+mod coverage_tests {
+    use super::*;
+
+    fn response_meta() -> ResponseMeta {
+        ResponseMeta {
+            content_length: Some(1024),
+            content_range_start: Some(0),
+            content_range_end: Some(255),
+            content_range_total: Some(1024),
+            accept_ranges: true,
+            etag: Some("\"multi\"".into()),
+            last_modified: Some("Thu, 01 Jan 2026 00:00:00 GMT".into()),
+            content_disposition: None,
+            content_encoding: None,
+        }
+    }
+
+    fn build_scheduler(total_size: u64, piece_size: u64) -> Scheduler {
+        Arc::new(parking_lot::Mutex::new(SchedulerState::new(PieceMap::new(
+            total_size,
+            piece_size,
+        ))))
+    }
+
+    fn complete_one_piece(scheduler: &Scheduler) {
+        let segment = scheduler.lock().assign().unwrap();
+        scheduler.lock().complete(segment.piece_id);
+    }
+
+    #[tokio::test]
+    async fn test_persist_multi_control_snapshot_defers_then_saves_autosave() {
+        let dir = tempfile::tempdir().unwrap();
+        let control_path = dir.path().join("multi.bytehaul");
+        let scheduler = build_scheduler(1024, 256);
+        let meta = response_meta();
+        let spec = DownloadSpec::new("https://example.com/multi.bin")
+            .resume(true)
+            .piece_size(256)
+            .autosave_sync_every(2);
+        let ctx = MultiControlSaveContext {
+            spec: &spec,
+            meta: &meta,
+            scheduler: &scheduler,
+            total_size: 1024,
+            control_path: &control_path,
+            log_level: LogLevel::Off,
+            download_id: 3,
+        };
+        let mut tracker = ControlSaveTracker::new(0);
+
+        complete_one_piece(&scheduler);
+        persist_multi_control_snapshot(
+            ControlSaveReason::Autosave,
+            None,
+            &mut tracker,
+            &ctx,
+        )
+        .await;
+
+        assert!(!control_path.exists());
+        assert_eq!(tracker.last_saved_downloaded_bytes(), 0);
+        assert_eq!(tracker.pending_autosaves(), 1);
+
+        complete_one_piece(&scheduler);
+        persist_multi_control_snapshot(
+            ControlSaveReason::Autosave,
+            None,
+            &mut tracker,
+            &ctx,
+        )
+        .await;
+
+        let loaded = ControlSnapshot::load(&control_path).await.unwrap();
+        assert_eq!(loaded.downloaded_bytes, 512);
+        assert_eq!(loaded.total_size, 1024);
+        assert_eq!(tracker.last_saved_downloaded_bytes(), 512);
+        assert_eq!(tracker.pending_autosaves(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_persist_multi_control_snapshot_returns_on_flush_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let control_path = dir.path().join("multi-failed.bytehaul");
+        let scheduler = build_scheduler(1024, 256);
+        let meta = response_meta();
+        let spec = DownloadSpec::new("https://example.com/multi.bin")
+            .resume(true)
+            .piece_size(256)
+            .autosave_sync_every(1);
+        let ctx = MultiControlSaveContext {
+            spec: &spec,
+            meta: &meta,
+            scheduler: &scheduler,
+            total_size: 1024,
+            control_path: &control_path,
+            log_level: LogLevel::Off,
+            download_id: 4,
+        };
+        let mut tracker = ControlSaveTracker::new(0);
+        let (write_tx, write_rx) = mpsc::channel(1);
+        drop(write_rx);
+
+        complete_one_piece(&scheduler);
+        persist_multi_control_snapshot(
+            ControlSaveReason::Terminal,
+            Some(&write_tx),
+            &mut tracker,
+            &ctx,
+        )
+        .await;
+
+        assert!(!control_path.exists());
+        assert_eq!(tracker.last_saved_downloaded_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_persist_multi_control_snapshot_skips_when_downloaded_does_not_advance() {
+        let dir = tempfile::tempdir().unwrap();
+        let control_path = dir.path().join("multi-stable.bytehaul");
+        let scheduler = build_scheduler(1024, 256);
+        let meta = response_meta();
+        let spec = DownloadSpec::new("https://example.com/multi.bin")
+            .resume(true)
+            .piece_size(256)
+            .autosave_sync_every(1);
+        let ctx = MultiControlSaveContext {
+            spec: &spec,
+            meta: &meta,
+            scheduler: &scheduler,
+            total_size: 1024,
+            control_path: &control_path,
+            log_level: LogLevel::Off,
+            download_id: 5,
+        };
+        let mut tracker = ControlSaveTracker::new(0);
+
+        complete_one_piece(&scheduler);
+        persist_multi_control_snapshot(
+            ControlSaveReason::Terminal,
+            None,
+            &mut tracker,
+            &ctx,
+        )
+        .await;
+        persist_multi_control_snapshot(
+            ControlSaveReason::Terminal,
+            None,
+            &mut tracker,
+            &ctx,
+        )
+        .await;
+
+        let loaded = ControlSnapshot::load(&control_path).await.unwrap();
+        assert_eq!(loaded.downloaded_bytes, 256);
+        assert_eq!(tracker.last_saved_downloaded_bytes(), 256);
+    }
+
+    #[test]
+    fn test_sampled_progress_update_sets_zero_eta_when_complete() {
+        let mut eta_estimator = EtaEstimator::new(Duration::from_secs(5), Duration::from_secs(1));
+        let now = Instant::now();
+        eta_estimator.record(512, now - Duration::from_secs(2));
+
+        let update = sampled_progress_update(&mut eta_estimator, 1024, 1024, now);
+
+        assert_eq!(update.downloaded, 1024);
+        assert_eq!(update.eta_secs, Some(0.0));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

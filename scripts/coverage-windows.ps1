@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
-    [ValidateSet("tests", "lib")]
-    [string]$Scope = "tests",
+    [ValidateSet("all-targets", "tests", "lib")]
+    [string]$Scope = "all-targets",
 
     [ValidateSet("html", "json")]
     [string]$Format = "html",
@@ -35,12 +35,14 @@ if ($activeBuilds) {
 }
 
 $scopeArgs = switch ($Scope) {
+    "all-targets" { @("-p", "bytehaul", "--all-targets") }
     "tests" { @("-p", "bytehaul", "--tests") }
     "lib" { @("-p", "bytehaul", "--lib") }
 }
 
 $reportRoot = Join-Path $repoRoot "target\windows-coverage"
-$targetDir = Join-Path $repoRoot "target\llvm-cov-windows-$Scope"
+$runId = [guid]::NewGuid().ToString("N")
+$targetDir = Join-Path $repoRoot "target\llvm-cov-windows-$Scope-$runId"
 
 if (-not $OutputPath) {
     $OutputPath = switch ($Format) {

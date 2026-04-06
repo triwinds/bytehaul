@@ -390,3 +390,128 @@ async fn persist_single_control_snapshot(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snapshot_template() -> ControlSnapshot {
+        ControlSnapshot {
+            url: "https://example.com/single.bin".into(),
+            total_size: 1024,
+            piece_size: 1024,
+            piece_count: 1,
+            completed_bitset: vec![0],
+            downloaded_bytes: 0,
+            etag: Some("\"single\"".into()),
+            last_modified: Some("Thu, 01 Jan 2026 00:00:00 GMT".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_persist_single_control_snapshot_defers_then_saves_autosave() {
+        let dir = tempfile::tempdir().unwrap();
+        let control_path = dir.path().join("single.bytehaul");
+        let snapshot = snapshot_template();
+        let mut tracker = ControlSaveTracker::new(0);
+        let ctx = SingleControlSaveContext {
+            control_path: &control_path,
+            snap_template: &snapshot,
+            autosave_sync_every: 2,
+            log_level: LogLevel::Off,
+            download_id: 1,
+        };
+
+        persist_single_control_snapshot(
+            ControlSaveReason::Autosave,
+            256,
+            None,
+            &mut tracker,
+            &ctx,
+        )
+        .await;
+
+        assert!(!control_path.exists());
+        assert_eq!(tracker.last_saved_downloaded_bytes(), 0);
+        assert_eq!(tracker.pending_autosaves(), 1);
+
+        persist_single_control_snapshot(
+            ControlSaveReason::Autosave,
+            512,
+            None,
+            &mut tracker,
+            &ctx,
+        )
+        .await;
+
+        let loaded = ControlSnapshot::load(&control_path).await.unwrap();
+        assert_eq!(loaded.downloaded_bytes, 512);
+        assert_eq!(tracker.last_saved_downloaded_bytes(), 512);
+        assert_eq!(tracker.pending_autosaves(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_persist_single_control_snapshot_returns_on_flush_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let control_path = dir.path().join("single-failed.bytehaul");
+        let snapshot = snapshot_template();
+        let mut tracker = ControlSaveTracker::new(0);
+        let ctx = SingleControlSaveContext {
+            control_path: &control_path,
+            snap_template: &snapshot,
+            autosave_sync_every: 1,
+            log_level: LogLevel::Off,
+            download_id: 2,
+        };
+        let (write_tx, write_rx) = mpsc::channel(1);
+        drop(write_rx);
+
+        persist_single_control_snapshot(
+            ControlSaveReason::Terminal,
+            256,
+            Some(&write_tx),
+            &mut tracker,
+            &ctx,
+        )
+        .await;
+
+        assert!(!control_path.exists());
+        assert_eq!(tracker.last_saved_downloaded_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_persist_single_control_snapshot_skips_when_downloaded_does_not_advance() {
+        let dir = tempfile::tempdir().unwrap();
+        let control_path = dir.path().join("single-stable.bytehaul");
+        let snapshot = snapshot_template();
+        let mut tracker = ControlSaveTracker::new(0);
+        let ctx = SingleControlSaveContext {
+            control_path: &control_path,
+            snap_template: &snapshot,
+            autosave_sync_every: 1,
+            log_level: LogLevel::Off,
+            download_id: 3,
+        };
+
+        persist_single_control_snapshot(
+            ControlSaveReason::Terminal,
+            256,
+            None,
+            &mut tracker,
+            &ctx,
+        )
+        .await;
+        persist_single_control_snapshot(
+            ControlSaveReason::Terminal,
+            256,
+            None,
+            &mut tracker,
+            &ctx,
+        )
+        .await;
+
+        let loaded = ControlSnapshot::load(&control_path).await.unwrap();
+        assert_eq!(loaded.downloaded_bytes, 256);
+        assert_eq!(tracker.last_saved_downloaded_bytes(), 256);
+    }
+}

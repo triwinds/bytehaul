@@ -113,16 +113,16 @@ cargo tarpaulin --engine llvm --workspace --all-targets --out Stdout --fail-unde
 ```powershell
 rustup component add llvm-tools-preview
 cargo install cargo-llvm-cov
-powershell -ExecutionPolicy Bypass -File scripts/coverage-windows.ps1 -Scope tests -Format html
+powershell -ExecutionPolicy Bypass -File scripts/coverage-windows.ps1 -Scope all-targets -Format html
 ```
 
 如果你需要机器可读的摘要，可以使用：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts/coverage-windows.ps1 -Scope tests -Format json
+powershell -ExecutionPolicy Bypass -File scripts/coverage-windows.ps1 -Scope all-targets -Format json
 ```
 
-该脚本会强制 `CARGO_BUILD_JOBS=1`，并使用隔离的 `CARGO_TARGET_DIR`，以减少 Windows 下 `os error 5`、`LNK1104` 以及残留 `cargo` / `rustc` 进程带来的冲突。
+该脚本现在默认按与 CI 一致的 `all-targets` 口径执行，并会强制 `CARGO_BUILD_JOBS=1`、为每次运行使用新的隔离 `CARGO_TARGET_DIR`，以减少 Windows 下 `os error 5`、`LNK1104` 以及残留 `cargo` / `rustc` 进程带来的冲突。
 
 ## 架构概览
 

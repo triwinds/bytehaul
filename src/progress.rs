@@ -269,4 +269,18 @@ mod tests {
         assert_eq!(snapshot.state, DownloadState::Completed);
         assert_eq!(snapshot.eta_secs, Some(0.0));
     }
+
+    #[test]
+    fn test_bench_progress_reporting_triggers_on_time_threshold() {
+        let reports = bench_progress_reporting(10, 32 * 1024, 50);
+
+        assert_eq!(reports, 2);
+    }
+
+    #[test]
+    fn test_bench_progress_reporting_triggers_on_byte_threshold() {
+        let reports = bench_progress_reporting(4, 300 * 1024, 10);
+
+        assert_eq!(reports, 4);
+    }
 }

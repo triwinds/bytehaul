@@ -456,6 +456,56 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_doh_server_rejects_empty_or_fragment_urls() {
+        let err = parse_doh_server("   ", true).unwrap_err().to_string();
+        assert!(err.contains("cannot be empty"));
+
+        let err = parse_doh_server("https://dns.google/dns-query#fragment", true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cannot include a fragment"));
+    }
+
+    #[test]
+    fn test_parse_doh_server_rejects_missing_host() {
+        let err = parse_doh_server("https:///dns-query", true)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("missing a host"));
+    }
+
+    #[test]
+    fn test_parse_doh_server_rejects_ipv6_only_result_when_ipv6_disabled() {
+        let err = parse_doh_server("https://[::1]/dns-query", false)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("did not resolve to any IPv4 address"));
+    }
+
+    #[test]
+    fn test_parse_doh_server_accepts_ipv6_literal_when_enabled() {
+        let config = parse_doh_server("https://[::1]/dns-query", true).unwrap();
+
+        assert_eq!(config.socket_addrs, vec![SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 443))]);
+        assert_eq!(config.tls_dns_name, "[::1]");
+        assert!(config.http_endpoint.is_none());
+    }
+
+    #[test]
+    fn test_load_cached_lookup_returns_none_for_missing_host() {
+        let cache = Arc::new(Mutex::new(HashMap::new()));
+
+        assert!(load_cached_lookup(&cache, "missing.example.com").is_none());
+    }
+
+    #[test]
+    fn test_duration_to_u64_millis_saturates() {
+        assert_eq!(duration_to_u64_millis(Duration::MAX), u64::MAX);
+    }
+
+    #[test]
     fn test_dns_lookup_cache_returns_fresh_entries() {
         let cache = Arc::new(Mutex::new(HashMap::new()));
         let addrs = vec![SocketAddr::from(([127, 0, 0, 1], 0))];
