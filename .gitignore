@@ -1,5 +1,6 @@
 docs/private/
 .claude/
+tmp/
 
 # Rust
 /target/
