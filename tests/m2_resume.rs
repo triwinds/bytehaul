@@ -138,8 +138,19 @@ async fn test_resume_after_cancel() {
         .file_allocation(FileAllocation::None);
     let handle = downloader.download(spec.clone());
 
-    // Wait for some data to arrive, then cancel
-    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    // Wait until some data is actually written, then cancel.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while tokio::time::Instant::now() < deadline {
+        if tokio::fs::metadata(&output_path)
+            .await
+            .map(|metadata| metadata.len() > 0)
+            .unwrap_or(false)
+        {
+            break;
+        }
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
     handle.cancel();
     let _ = handle.wait().await;
 
