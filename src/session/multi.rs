@@ -157,7 +157,7 @@ pub(super) async fn run_multi_worker(
     // Drop our sender so writer can finish once workers are done
     drop(write_tx);
 
-    // ── Monitor loop ──
+    // 鈹€鈹€ Monitor loop 鈹€鈹€
     let mut cancel_rx = cancel_rx;
     let mut save_ticker = tokio::time::interval(spec.control_save_interval);
     save_ticker.tick().await;
@@ -368,7 +368,10 @@ async fn persist_multi_control_snapshot(
     ctx: &MultiControlSaveContext<'_>,
 ) {
     let current_downloaded = ctx.scheduler.lock().completed_bytes();
-    if !control_save_tracker.should_save(reason, current_downloaded, ctx.spec.autosave_sync_every) {
+    let force_terminal_snapshot = matches!(reason, ControlSaveReason::Terminal);
+    if !force_terminal_snapshot
+        && !control_save_tracker.should_save(reason, current_downloaded, ctx.spec.autosave_sync_every)
+    {
         if matches!(reason, ControlSaveReason::Autosave)
             && current_downloaded > control_save_tracker.last_saved_downloaded_bytes()
         {
@@ -406,7 +409,9 @@ async fn persist_multi_control_snapshot(
             last_modified: ctx.meta.last_modified.clone(),
         }
     };
-    if snap.downloaded_bytes <= control_save_tracker.last_saved_downloaded_bytes() {
+    if !force_terminal_snapshot
+        && snap.downloaded_bytes <= control_save_tracker.last_saved_downloaded_bytes()
+    {
         return;
     }
 
@@ -428,9 +433,9 @@ async fn persist_multi_control_snapshot(
     }
 }
 
-// ──────────────────────────────────────────────────────────────
+// 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 //  Worker loop
-// ──────────────────────────────────────────────────────────────
+// 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 /// Immutable per-download configuration shared by all workers via `Arc`.
 struct WorkerConfig {
@@ -613,7 +618,7 @@ fn check_segment_status(
     retry_after_header: Option<&str>,
 ) -> Result<(), DownloadError> {
     if status == 200 {
-        // Server returned full content instead of partial — Range not supported
+        // Server returned full content instead of partial 鈥?Range not supported
         return Err(DownloadError::HttpStatus {
             status: 200,
             message: "server returned 200 instead of 206; Range not supported".into(),
@@ -916,6 +921,41 @@ mod coverage_tests {
         assert_eq!(tracker.last_saved_downloaded_bytes(), 256);
     }
 
+    #[tokio::test]
+    async fn test_persist_multi_control_snapshot_saves_terminal_snapshot_without_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let control_path = dir.path().join("multi-terminal.bytehaul");
+        let scheduler = build_scheduler(1024, 256);
+        let meta = response_meta();
+        let spec = DownloadSpec::new("https://example.com/multi.bin")
+            .resume(true)
+            .piece_size(256)
+            .autosave_sync_every(1);
+        let ctx = MultiControlSaveContext {
+            spec: &spec,
+            meta: &meta,
+            scheduler: &scheduler,
+            total_size: 1024,
+            control_path: &control_path,
+            log_level: LogLevel::Off,
+            download_id: 6,
+        };
+        let mut tracker = ControlSaveTracker::new(0);
+
+        persist_multi_control_snapshot(
+            ControlSaveReason::Terminal,
+            None,
+            &mut tracker,
+            &ctx,
+        )
+        .await;
+
+        let loaded = ControlSnapshot::load(&control_path).await.unwrap();
+        assert_eq!(loaded.downloaded_bytes, 0);
+        assert_eq!(loaded.total_size, 1024);
+        assert_eq!(tracker.last_saved_downloaded_bytes(), 0);
+    }
+
     #[test]
     fn test_sampled_progress_update_sets_zero_eta_when_complete() {
         let mut eta_estimator = EtaEstimator::new(Duration::from_secs(5), Duration::from_secs(1));
@@ -933,7 +973,7 @@ mod coverage_tests {
 mod tests {
     use super::*;
 
-    // ── check_segment_status tests ──
+    // 鈹€鈹€ check_segment_status tests 鈹€鈹€
 
     #[test]
     fn test_check_segment_status_206_ok() {
@@ -1000,7 +1040,7 @@ mod tests {
         }
     }
 
-    // ── validate_segment_meta tests ──
+    // 鈹€鈹€ validate_segment_meta tests 鈹€鈹€
 
     #[test]
     fn test_validate_segment_meta_ok() {

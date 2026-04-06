@@ -394,6 +394,119 @@ async fn persist_single_control_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::{Shutdown, TcpListener};
+    use std::thread;
+
+    fn snapshot_template_with(total_size: u64, downloaded_bytes: u64) -> ControlSnapshot {
+        let mut snapshot = snapshot_template();
+        snapshot.total_size = total_size;
+        snapshot.piece_size = total_size;
+        snapshot.downloaded_bytes = downloaded_bytes;
+        snapshot
+    }
+
+    fn single_response_meta(total_size: u64) -> ResponseMeta {
+        ResponseMeta {
+            content_length: Some(total_size),
+            content_range_start: None,
+            content_range_end: None,
+            content_range_total: None,
+            accept_ranges: true,
+            etag: Some("\"single\"".into()),
+            last_modified: Some("Thu, 01 Jan 2026 00:00:00 GMT".into()),
+            content_disposition: None,
+            content_encoding: None,
+        }
+    }
+
+    fn test_spec(url: &str) -> DownloadSpec {
+        let mut spec = DownloadSpec::new(url.to_string());
+        spec.resume = true;
+        spec.memory_budget = 1024;
+        spec.channel_buffer = 4;
+        spec.control_save_interval = Duration::from_millis(5);
+        spec.autosave_sync_every = 1;
+        spec
+    }
+
+    fn spawn_single_response_server(
+        declared_len: usize,
+        body: Vec<u8>,
+        body_delay: Duration,
+    ) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request);
+
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {declared_len}\r\nConnection: close\r\n\r\n"
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            if body_delay > Duration::ZERO {
+                thread::sleep(body_delay);
+            }
+            stream.write_all(&body).unwrap();
+            let _ = stream.shutdown(Shutdown::Both);
+        });
+
+        (format!("http://{addr}/file.bin"), handle)
+    }
+
+    async fn get_response(url: &str) -> (reqwest::Client, reqwest::Response) {
+        let client = reqwest::Client::new();
+        tokio::time::timeout(Duration::from_secs(5), client.get(url).send())
+            .await
+            .unwrap()
+            .map(|response| (client, response))
+            .unwrap()
+    }
+
+    fn spawn_ack_writer(
+        mut write_rx: mpsc::Receiver<WriterCommand>,
+        written_bytes: Arc<AtomicU64>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            while let Some(command) = write_rx.recv().await {
+                match command {
+                    WriterCommand::Data { offset, data, .. } => {
+                        written_bytes.store(offset + data.len() as u64, Ordering::Release);
+                    }
+                    WriterCommand::FlushPiece { ack, .. } => {
+                        let _ = ack.send(());
+                    }
+                    WriterCommand::FlushAll { ack, .. } => {
+                        let _ = ack.send(crate::storage::writer::FlushAllStats {
+                            written_bytes: written_bytes.load(Ordering::Acquire),
+                            flush_elapsed: Duration::ZERO,
+                            sync_elapsed: Some(Duration::ZERO),
+                        });
+                    }
+                }
+            }
+        })
+    }
+
+    async fn join_server(handle: thread::JoinHandle<()>) {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::task::spawn_blocking(move || handle.join().unwrap()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    }
+
+    async fn join_writer(handle: tokio::task::JoinHandle<()>) {
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .unwrap()
+            .unwrap();
+    }
 
     fn snapshot_template() -> ControlSnapshot {
         ControlSnapshot {
@@ -406,6 +519,230 @@ mod tests {
             etag: Some("\"single\"".into()),
             last_modified: Some("Thu, 01 Jan 2026 00:00:00 GMT".into()),
         }
+    }
+
+    #[tokio::test]
+    async fn test_run_single_connection_persists_control_on_stream_error() {
+        let (url, server) = spawn_single_response_server(8, b"fail".to_vec(), Duration::ZERO);
+        let (_client, response) = get_response(&url).await;
+        let meta = single_response_meta(8);
+        let spec = test_spec(&url);
+        let dir = tempfile::tempdir().unwrap();
+        let output_path = dir.path().join("single-error.bin");
+        let control_path = dir.path().join("single-error.bytehaul");
+        let (progress_tx, _) = watch::channel(ProgressSnapshot::default());
+        let (_cancel_tx, cancel_rx) = watch::channel(StopSignal::Running);
+
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_single_connection(
+                response,
+                &meta,
+                &spec,
+                &output_path,
+                0,
+                &progress_tx,
+                cancel_rx,
+                &control_path,
+                Some(8),
+                SpeedLimit::new(0),
+                LogLevel::Off,
+                11,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+
+        join_server(server).await;
+
+        assert!(matches!(err, DownloadError::Http(_)));
+        let loaded = ControlSnapshot::load(&control_path).await.unwrap();
+        assert_eq!(loaded.downloaded_bytes, 4);
+        assert_eq!(progress_tx.borrow().state, DownloadState::Failed);
+    }
+
+    #[tokio::test]
+    async fn test_run_single_connection_completes_and_clears_control_file() {
+        let (url, server) = spawn_single_response_server(4, b"done".to_vec(), Duration::ZERO);
+        let (_client, response) = get_response(&url).await;
+        let meta = single_response_meta(4);
+        let spec = test_spec(&url);
+        let dir = tempfile::tempdir().unwrap();
+        let output_path = dir.path().join("single-success.bin");
+        let control_path = dir.path().join("single-success.bytehaul");
+        snapshot_template_with(4, 1).save(&control_path).await.unwrap();
+        let (progress_tx, _) = watch::channel(ProgressSnapshot::default());
+        let (_cancel_tx, cancel_rx) = watch::channel(StopSignal::Running);
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            run_single_connection(
+                response,
+                &meta,
+                &spec,
+                &output_path,
+                0,
+                &progress_tx,
+                cancel_rx,
+                &control_path,
+                Some(4),
+                SpeedLimit::new(0),
+                LogLevel::Off,
+                12,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        join_server(server).await;
+
+        assert!(!control_path.exists());
+        assert_eq!(tokio::fs::read(&output_path).await.unwrap(), b"done");
+        let snapshot = progress_tx.borrow().clone();
+        assert_eq!(snapshot.downloaded, 4);
+        assert_eq!(snapshot.state, DownloadState::Completed);
+        assert_eq!(snapshot.eta_secs, Some(0.0));
+    }
+
+    #[tokio::test]
+    async fn test_stream_single_returns_channel_closed_when_writer_receiver_dropped() {
+        let (url, server) = spawn_single_response_server(4, b"data".to_vec(), Duration::ZERO);
+        let (_client, response) = get_response(&url).await;
+        let (write_tx, write_rx) = mpsc::channel(1);
+        drop(write_rx);
+        let (progress_tx, _) = watch::channel(ProgressSnapshot::default());
+        let (_cancel_tx, cancel_rx) = watch::channel(StopSignal::Running);
+        let mut tracker = ControlSaveTracker::new(0);
+
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            stream_single(
+                response,
+                &write_tx,
+                &progress_tx,
+                cancel_rx,
+                Some(4),
+                0,
+                None,
+                Arc::new(Semaphore::new(16)),
+                &SpeedLimit::new(0),
+                Duration::from_secs(60),
+                &mut tracker,
+                1,
+                LogLevel::Off,
+                13,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+
+        join_server(server).await;
+
+        assert!(matches!(err, DownloadError::ChannelClosed));
+    }
+
+    #[tokio::test]
+    async fn test_stream_single_pauses_and_saves_control_snapshot() {
+        let (url, server) =
+            spawn_single_response_server(4, b"data".to_vec(), Duration::from_millis(50));
+        let (_client, response) = get_response(&url).await;
+        let dir = tempfile::tempdir().unwrap();
+        let control_path = dir.path().join("single-pause.bytehaul");
+        let snapshot = snapshot_template_with(5, 0);
+        let written_bytes = Arc::new(AtomicU64::new(1));
+        let (write_tx, write_rx) = mpsc::channel(4);
+        let writer = spawn_ack_writer(write_rx, written_bytes);
+        let (progress_tx, _) = watch::channel(ProgressSnapshot::default());
+        let (cancel_tx, cancel_rx) = watch::channel(StopSignal::Running);
+        let mut tracker = ControlSaveTracker::new(0);
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let _ = cancel_tx.send(StopSignal::Pause);
+        });
+
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            stream_single(
+                response,
+                &write_tx,
+                &progress_tx,
+                cancel_rx,
+                Some(5),
+                1,
+                Some((&control_path, &snapshot)),
+                Arc::new(Semaphore::new(16)),
+                &SpeedLimit::new(0),
+                Duration::from_secs(60),
+                &mut tracker,
+                1,
+                LogLevel::Off,
+                14,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+
+        drop(write_tx);
+        join_writer(writer).await;
+        join_server(server).await;
+
+        assert!(matches!(err, DownloadError::Paused));
+        let loaded = ControlSnapshot::load(&control_path).await.unwrap();
+        assert_eq!(loaded.downloaded_bytes, 1);
+        assert_eq!(progress_tx.borrow().state, DownloadState::Paused);
+    }
+
+    #[tokio::test]
+    async fn test_stream_single_autosaves_existing_progress_before_body_arrives() {
+        let (url, server) =
+            spawn_single_response_server(4, b"data".to_vec(), Duration::from_millis(50));
+        let (_client, response) = get_response(&url).await;
+        let dir = tempfile::tempdir().unwrap();
+        let control_path = dir.path().join("single-autosave.bytehaul");
+        let snapshot = snapshot_template_with(5, 0);
+        let written_bytes = Arc::new(AtomicU64::new(1));
+        let (write_tx, write_rx) = mpsc::channel(4);
+        let writer = spawn_ack_writer(write_rx, written_bytes);
+        let (progress_tx, _) = watch::channel(ProgressSnapshot::default());
+        let (_cancel_tx, cancel_rx) = watch::channel(StopSignal::Running);
+        let mut tracker = ControlSaveTracker::new(0);
+
+        let summary = tokio::time::timeout(
+            Duration::from_secs(5),
+            stream_single(
+                response,
+                &write_tx,
+                &progress_tx,
+                cancel_rx,
+                Some(5),
+                1,
+                Some((&control_path, &snapshot)),
+                Arc::new(Semaphore::new(16)),
+                &SpeedLimit::new(0),
+                Duration::from_millis(5),
+                &mut tracker,
+                1,
+                LogLevel::Off,
+                15,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        drop(write_tx);
+        join_writer(writer).await;
+        join_server(server).await;
+
+        let loaded = ControlSnapshot::load(&control_path).await.unwrap();
+        assert_eq!(loaded.downloaded_bytes, 1);
+        assert_eq!(summary.downloaded, 5);
+        assert!(summary.speed_bytes_per_sec >= 0.0);
     }
 
     #[tokio::test]
@@ -513,5 +850,32 @@ mod tests {
         let loaded = ControlSnapshot::load(&control_path).await.unwrap();
         assert_eq!(loaded.downloaded_bytes, 256);
         assert_eq!(tracker.last_saved_downloaded_bytes(), 256);
+    }
+
+    #[tokio::test]
+    async fn test_persist_single_control_snapshot_ignores_save_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let control_path = dir.path().join("missing").join("single.bytehaul");
+        let snapshot = snapshot_template();
+        let mut tracker = ControlSaveTracker::new(0);
+        let ctx = SingleControlSaveContext {
+            control_path: &control_path,
+            snap_template: &snapshot,
+            autosave_sync_every: 1,
+            log_level: LogLevel::Off,
+            download_id: 4,
+        };
+
+        persist_single_control_snapshot(
+            ControlSaveReason::Terminal,
+            256,
+            None,
+            &mut tracker,
+            &ctx,
+        )
+        .await;
+
+        assert!(!control_path.exists());
+        assert_eq!(tracker.last_saved_downloaded_bytes(), 0);
     }
 }
