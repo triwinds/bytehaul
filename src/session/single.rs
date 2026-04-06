@@ -30,6 +30,14 @@ struct SingleStreamSummary {
     speed_bytes_per_sec: f64,
 }
 
+struct SingleControlSaveContext<'a> {
+    control_path: &'a Path,
+    snap_template: &'a ControlSnapshot,
+    autosave_sync_every: u32,
+    log_level: LogLevel,
+    download_id: u64,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_single_connection(
     response: reqwest::Response,
@@ -84,6 +92,13 @@ pub(super) async fn run_single_connection(
         last_modified: meta.last_modified.clone(),
     };
     let mut control_save_tracker = ControlSaveTracker::new(start_offset);
+    let control_save_ctx = SingleControlSaveContext {
+        control_path,
+        snap_template: &snap_template,
+        autosave_sync_every: spec.autosave_sync_every,
+        log_level,
+        download_id,
+    };
 
     let stream_result = stream_single(
         response,
@@ -118,12 +133,8 @@ pub(super) async fn run_single_connection(
                 ControlSaveReason::Terminal,
                 written_bytes.load(Ordering::Acquire),
                 None,
-                control_path,
-                &snap_template,
                 &mut control_save_tracker,
-                spec.autosave_sync_every,
-                log_level,
-                download_id,
+                &control_save_ctx,
             )
             .await;
         }
@@ -140,12 +151,8 @@ pub(super) async fn run_single_connection(
                 ControlSaveReason::Terminal,
                 written_bytes.load(Ordering::Acquire),
                 None,
-                control_path,
-                &snap_template,
                 &mut control_save_tracker,
-                spec.autosave_sync_every,
-                log_level,
-                download_id,
+                &control_save_ctx,
             )
             .await;
         }
@@ -236,12 +243,14 @@ async fn stream_single(
                                 ControlSaveReason::Terminal,
                                 downloaded,
                                 Some(write_tx),
-                                cp,
-                                tmpl,
                                 control_save_tracker,
-                                autosave_sync_every,
-                                log_level,
-                                download_id,
+                                &SingleControlSaveContext {
+                                    control_path: cp,
+                                    snap_template: tmpl,
+                                    autosave_sync_every,
+                                    log_level,
+                                    download_id,
+                                },
                             )
                             .await;
                         }
@@ -256,12 +265,14 @@ async fn stream_single(
                         ControlSaveReason::Autosave,
                         downloaded,
                         Some(write_tx),
-                        cp,
-                        tmpl,
                         control_save_tracker,
-                        autosave_sync_every,
-                        log_level,
-                        download_id,
+                        &SingleControlSaveContext {
+                            control_path: cp,
+                            snap_template: tmpl,
+                            autosave_sync_every,
+                            log_level,
+                            download_id,
+                        },
                     )
                     .await;
                 }
@@ -328,21 +339,17 @@ async fn persist_single_control_snapshot(
     reason: ControlSaveReason,
     downloaded: u64,
     write_tx: Option<&mpsc::Sender<WriterCommand>>,
-    control_path: &Path,
-    snap_template: &ControlSnapshot,
     control_save_tracker: &mut ControlSaveTracker,
-    autosave_sync_every: u32,
-    log_level: LogLevel,
-    download_id: u64,
+    ctx: &SingleControlSaveContext<'_>,
 ) {
-    if !control_save_tracker.should_save(reason, downloaded, autosave_sync_every) {
+    if !control_save_tracker.should_save(reason, downloaded, ctx.autosave_sync_every) {
         if matches!(reason, ControlSaveReason::Autosave)
             && downloaded > control_save_tracker.last_saved_downloaded_bytes()
         {
-            log_debug!(log_level, download_id = download_id,
+            log_debug!(ctx.log_level, download_id = ctx.download_id,
                 checkpoint = reason.label(), downloaded_bytes = downloaded,
                 pending_autosaves = control_save_tracker.pending_autosaves(),
-                autosave_sync_every = autosave_sync_every,
+                autosave_sync_every = ctx.autosave_sync_every,
                 "control snapshot deferred");
         }
         return;
@@ -352,7 +359,7 @@ async fn persist_single_control_snapshot(
         Some(write_tx) => match flush_all_and_wait(write_tx, true).await {
             Ok(stats) => Some(stats),
             Err(error) => {
-                log_warn!(log_level, download_id = download_id, checkpoint = reason.label(),
+                log_warn!(ctx.log_level, download_id = ctx.download_id, checkpoint = reason.label(),
                     error = %error, "control snapshot flush failed");
                 return;
             }
@@ -364,13 +371,13 @@ async fn persist_single_control_snapshot(
         return;
     }
 
-    let mut snapshot = snap_template.clone();
+    let mut snapshot = ctx.snap_template.clone();
     snapshot.downloaded_bytes = persisted_downloaded;
     let save_started = Instant::now();
-    match snapshot.save(control_path).await {
+    match snapshot.save(ctx.control_path).await {
         Ok(()) => {
             control_save_tracker.mark_saved(persisted_downloaded);
-            log_debug!(log_level, download_id = download_id,
+            log_debug!(ctx.log_level, download_id = ctx.download_id,
                 checkpoint = reason.label(), downloaded_bytes = persisted_downloaded,
                 flush_all_ms = flush_stats.map(|stats| stats.flush_elapsed.as_millis() as u64).unwrap_or(0),
                 sync_data_ms = flush_stats.and_then(|stats| stats.sync_elapsed.map(|elapsed| elapsed.as_millis() as u64)).unwrap_or(0),
@@ -378,7 +385,7 @@ async fn persist_single_control_snapshot(
                 "control snapshot saved");
         }
         Err(error) => {
-            log_warn!(log_level, download_id = download_id, checkpoint = reason.label(),
+            log_warn!(ctx.log_level, download_id = ctx.download_id, checkpoint = reason.label(),
                 error = %error, "control snapshot save failed");
         }
     }
