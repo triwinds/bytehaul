@@ -26,7 +26,7 @@ use self::single::run_single_connection;
 
 const SPEED_ESTIMATE_WINDOW: Duration = Duration::from_secs(5);
 const MIN_SPEED_SAMPLE_SPAN: Duration = Duration::from_secs(1);
-const MULTI_PROGRESS_INTERVAL: Duration = Duration::from_millis(200);
+const MULTI_PROGRESS_INTERVAL: Duration = crate::progress::PROGRESS_REPORT_INTERVAL;
 
 /// Attempt a range probe first; on failure fall back to a plain GET with retry.
 async fn probe_or_fallback_get(
@@ -271,6 +271,12 @@ pub(crate) async fn run_download(
     let output_path = match result {
         Ok(output_path) => output_path,
         Err(e) => {
+            if !matches!(e, DownloadError::Cancelled | DownloadError::Paused) {
+                progress_tx.send_modify(|progress| {
+                    progress.state = DownloadState::Failed;
+                    progress.eta_secs = None;
+                });
+            }
             log_error!(log_level, download_id, error = %e, "download failed");
             return Err(e);
         }

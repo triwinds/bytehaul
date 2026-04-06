@@ -92,10 +92,19 @@ fn bench_control_roundtrip(c: &mut Criterion) {
     });
 }
 
+fn bench_single_progress_reporting(c: &mut Criterion) {
+    c.bench_function("single_progress_reporting_throttled", |b| {
+        b.iter(|| {
+            black_box(bytehaul::bench::bench_progress_reporting(1024, 8 * 1024, 10));
+        });
+    });
+}
+
 criterion_group!(
     benches,
     bench_cache_insert_coalesce,
     bench_piece_map_serde,
-    bench_control_roundtrip
+    bench_control_roundtrip,
+    bench_single_progress_reporting
 );
 criterion_main!(benches);

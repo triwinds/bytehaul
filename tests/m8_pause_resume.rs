@@ -144,11 +144,13 @@ async fn test_pause_resume_single_connection() {
         .file_allocation(FileAllocation::None);
 
     let handle = downloader.download(spec.clone());
+    let mut rx = handle.subscribe_progress();
     tokio::time::sleep(Duration::from_millis(250)).await;
     handle.pause();
     wait_for_state(&handle, DownloadState::Paused).await;
 
     assert!(matches!(handle.wait().await, Err(DownloadError::Paused)));
+    assert_eq!(rx.borrow_and_update().state, DownloadState::Paused);
     assert!(ctrl_path.exists(), "control file should exist after pause");
 
     let partial_size = std::fs::metadata(&output_path)

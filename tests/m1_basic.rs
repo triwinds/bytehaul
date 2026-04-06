@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use bytehaul::{DownloadSpec, DownloadState, Downloader, FileAllocation, LogLevel};
 use warp::Filter;
 
@@ -131,6 +133,55 @@ async fn test_single_connection_eta_reports() {
 }
 
 #[tokio::test]
+async fn test_single_connection_progress_callback_is_throttled_and_terminal() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Mutex;
+
+    let route = warp::path("throttled-progress").map(|| {
+        let stream = futures::stream::unfold(0u32, |count| async move {
+            if count >= 60 {
+                return None;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let chunk = vec![0xAAu8; 8_192];
+            Some((Ok::<_, std::convert::Infallible>(chunk), count + 1))
+        });
+        let body = warp::hyper::Body::wrap_stream(stream);
+        warp::http::Response::builder()
+            .header("content-length", (60 * 8_192).to_string())
+            .body(body)
+            .unwrap()
+    });
+    let (addr, server) = warp::serve(route).bind_ephemeral(([127, 0, 0, 1], 0));
+    tokio::spawn(server);
+
+    let dir = tempfile::tempdir().unwrap();
+    let output_path = dir.path().join("throttled-progress.bin");
+
+    let downloader = Downloader::builder().build().unwrap();
+    let spec = DownloadSpec::new(format!("http://{addr}/throttled-progress"))
+        .output_path(output_path)
+        .file_allocation(FileAllocation::None);
+
+    let handle = downloader.download(spec);
+    let callback_count = Arc::new(AtomicU32::new(0));
+    let final_state = Arc::new(Mutex::new(None));
+    let callback_count_clone = callback_count.clone();
+    let final_state_clone = final_state.clone();
+    handle.on_progress(move |snap| {
+        callback_count_clone.fetch_add(1, Ordering::Relaxed);
+        *final_state_clone.lock().unwrap() = Some(snap.state);
+    });
+
+    handle.wait().await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let delivered = callback_count.load(Ordering::Relaxed);
+    assert!(delivered < 30, "expected throttled callback delivery, got {delivered}");
+    assert_eq!(*final_state.lock().unwrap(), Some(DownloadState::Completed));
+}
+
+#[tokio::test]
 async fn test_download_cancel() {
     // Serve a slow stream via chunked responses so cancel has time to fire.
     let route = warp::path("slowfile").map(|| {
@@ -160,6 +211,7 @@ async fn test_download_cancel() {
         .file_allocation(FileAllocation::None);
 
     let handle = downloader.download(spec);
+    let mut rx = handle.subscribe_progress();
 
     // Give it a moment to start, then cancel
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
@@ -167,6 +219,7 @@ async fn test_download_cancel() {
 
     let result = handle.wait().await;
     assert!(result.is_err());
+    assert_eq!(rx.borrow_and_update().state, DownloadState::Cancelled);
 }
 
 #[tokio::test]
@@ -189,8 +242,10 @@ async fn test_download_404() {
         .file_allocation(FileAllocation::None);
 
     let handle = downloader.download(spec);
+    let mut rx = handle.subscribe_progress();
     let result = handle.wait().await;
     assert!(result.is_err());
+    assert_eq!(rx.borrow_and_update().state, DownloadState::Failed);
 }
 
 #[tokio::test]

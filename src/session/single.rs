@@ -14,11 +14,20 @@ use crate::config::{DownloadSpec, LogLevel};
 use crate::error::DownloadError;
 use crate::eta::EtaEstimator;
 use crate::http::response::ResponseMeta;
-use crate::progress::{DownloadState, ProgressSnapshot};
+use crate::progress::{
+    DownloadState, ProgressReporter, ProgressSnapshot, ProgressUpdate, PROGRESS_REPORT_BYTES,
+    PROGRESS_REPORT_INTERVAL,
+};
 use crate::rate_limiter::SpeedLimit;
 use crate::storage::control::ControlSnapshot;
 use crate::storage::file::{create_output_file, open_existing_file};
 use crate::storage::writer::{WriterCommand, WriterTask};
+
+#[derive(Debug, Clone, Copy)]
+struct SingleStreamSummary {
+    downloaded: u64,
+    speed_bytes_per_sec: f64,
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_single_connection(
@@ -107,17 +116,28 @@ pub(super) async fn run_single_connection(
         if !matches!(e, DownloadError::Cancelled | DownloadError::Paused) {
             log_error!(log_level, download_id = download_id, error = %e,
                 "single-connection download failed");
-            progress_tx.send_modify(|p| p.state = DownloadState::Failed);
         }
-        return stream_result;
+        return stream_result.map(|_| ());
     }
-    writer_result?;
+    let summary = stream_result?;
+    if let Err(error) = writer_result {
+        log_error!(log_level, download_id = download_id, error = %error,
+            "single-connection writer failed");
+        progress_tx.send_modify(|p| {
+            p.downloaded = summary.downloaded;
+            p.speed_bytes_per_sec = summary.speed_bytes_per_sec;
+            p.state = DownloadState::Failed;
+        });
+        return Err(error);
+    }
 
     if use_control {
         let _ = ControlSnapshot::delete(control_path).await;
     }
     log_debug!(log_level, download_id = download_id, "single-connection download completed");
     progress_tx.send_modify(|p| {
+        p.downloaded = summary.downloaded;
+        p.speed_bytes_per_sec = summary.speed_bytes_per_sec;
         p.state = DownloadState::Completed;
         p.eta_secs = Some(0.0);
     });
@@ -137,15 +157,23 @@ async fn stream_single(
     budget: Arc<Semaphore>,
     speed_limit: &SpeedLimit,
     control_save_interval: Duration,
-) -> Result<(), DownloadError> {
+) -> Result<SingleStreamSummary, DownloadError> {
     let mut stream = response.bytes_stream();
     let mut downloaded: u64 = start_offset;
     let start_time = Instant::now();
     let mut eta_estimator = EtaEstimator::new(SPEED_ESTIMATE_WINDOW, MIN_SPEED_SAMPLE_SPAN);
+    let mut progress_reporter = ProgressReporter::new(
+        start_offset,
+        PROGRESS_REPORT_INTERVAL,
+        PROGRESS_REPORT_BYTES,
+        start_time,
+    );
     let mut cancel_rx = cancel_rx;
     let mut save_ticker = tokio::time::interval(control_save_interval);
     save_ticker.tick().await;
     eta_estimator.record(start_offset, start_time);
+    let mut last_speed = 0.0;
+    let mut last_eta_secs = None;
 
     progress_tx.send_modify(|p| {
         p.total_size = total_size;
@@ -164,7 +192,12 @@ async fn stream_single(
                     let signal = *cancel_rx.borrow_and_update();
                     if let Some(error) = stop_signal_error(signal) {
                         if let Some(state) = stop_signal_state(signal) {
-                            progress_tx.send_modify(|p| p.state = state);
+                            progress_reporter.force_report(
+                                progress_tx,
+                                ProgressUpdate::new(downloaded, last_speed, last_eta_secs)
+                                    .with_state(state),
+                                Instant::now(),
+                            );
                         }
                         if let Some((cp, tmpl)) = &control {
                             if let Ok(w) = flush_all_and_wait(write_tx, true).await {
@@ -217,14 +250,21 @@ async fn stream_single(
                                 eta_estimator.estimate(remaining)
                             }
                         });
-                        progress_tx.send_modify(|p| {
-                            p.downloaded = downloaded;
-                            p.speed_bytes_per_sec = speed;
-                            p.eta_secs = eta_secs;
-                        });
+                        last_speed = speed;
+                        last_eta_secs = eta_secs;
+                        progress_reporter.report_if_due(
+                            progress_tx,
+                            ProgressUpdate::new(downloaded, speed, eta_secs),
+                            now,
+                        );
                     }
                     Some(Err(e)) => {
-                        progress_tx.send_modify(|p| p.state = DownloadState::Failed);
+                        progress_reporter.force_report(
+                            progress_tx,
+                            ProgressUpdate::new(downloaded, last_speed, last_eta_secs)
+                                .with_state(DownloadState::Failed),
+                            Instant::now(),
+                        );
                         return Err(DownloadError::Http(e));
                     }
                     None => break,
@@ -232,5 +272,8 @@ async fn stream_single(
             }
         }
     }
-    Ok(())
+    Ok(SingleStreamSummary {
+        downloaded,
+        speed_bytes_per_sec: last_speed,
+    })
 }

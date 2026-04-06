@@ -58,6 +58,7 @@ pub use progress::{DownloadState, ProgressSnapshot};
 /// Re-exports for benchmarking. Not part of the public API.
 #[doc(hidden)]
 pub mod bench {
+    pub use crate::progress::bench_progress_reporting;
     pub use crate::storage::cache::WriteBackCache;
     pub use crate::storage::control::ControlSnapshot;
     pub use crate::storage::piece_map::PieceMap;
