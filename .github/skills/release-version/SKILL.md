@@ -1,11 +1,11 @@
 ---
 name: release-version
-description: "Update the workspace package version, optionally auto-bump the current version, regenerate Cargo.lock, create a release commit, create a git tag, and push the branch and tag. Use when the user asks to bump a version, auto-increment a version, update version numbers, regenerate Cargo.lock, commit a release, 打 tag, 发布版本, or push release changes."
+description: "Update the workspace package version, synchronize README and docs version references, optionally auto-bump the current version, regenerate Cargo.lock, create a release commit, create a git tag, and push the branch and tag. Use when the user asks to bump a version, auto-increment a version, update version numbers, regenerate Cargo.lock, commit a release, 打 tag, 发布版本, or push release changes."
 ---
 
 # Release Version
 
-Perform the repository's version bump workflow end-to-end: update the version, regenerate the Rust lockfile, create a focused release commit, create an annotated tag, and push the result.
+Perform the repository's version bump workflow end-to-end: update the version, synchronize README and docs version references, regenerate the Rust lockfile, create a focused release commit, create an annotated tag, and push the result.
 
 ## Gather Inputs
 
@@ -23,6 +23,7 @@ Accept:
 - The authoritative crate version lives in the root `Cargo.toml` under `[workspace.package].version`.
 - The root crate and `bindings/python/Cargo.toml` both inherit the version with `version.workspace = true`, so do not edit child crate versions directly.
 - `bindings/python/pyproject.toml` uses `dynamic = ["version"]`, so do not hardcode a Python package version there.
+- Release-related version references in `README.md` and `docs/**` should be kept in sync with the workspace version when they describe the current published package version.
 - Regenerate the lockfile from the repository root with `cargo generate-lockfile`.
 - Unless the user provides `version`, derive the release version from the current `[workspace.package].version` using dot-separated decimal carry semantics.
 
@@ -50,9 +51,10 @@ Accept:
    - Fail if the target tag already exists locally or on the remote.
    - Fail if the branch is behind the remote and would require a pull or rebase before push.
    - Never force-push as part of this workflow.
-5. Update the version.
-   - Edit only the root `Cargo.toml` and replace `[workspace.package].version` with the resolved target version.
-   - Do not change dependency versions.
+5. Update the version references.
+   - Edit the root `Cargo.toml` and replace `[workspace.package].version` with the resolved target version.
+   - Update release-related version references in `README.md` and `docs/**` that describe the current published package version, such as installation snippets or "current version" notes.
+   - Do not change unrelated dependency versions or historical examples that are not describing the current release.
    - Do not edit `bindings/python/Cargo.toml` unless the repository structure has changed away from `version.workspace = true`.
 6. Regenerate and verify the lockfile.
    - Run `cargo generate-lockfile` from the repository root.
@@ -63,7 +65,7 @@ Accept:
    - If `validationCommand` is provided, run it.
    - Otherwise, unless `skipValidation` is true, run a lightweight repository validation such as `cargo check --workspace --locked`.
 8. Review the diff before committing.
-   - Confirm the diff is limited to release metadata files, normally `Cargo.toml` and optionally `Cargo.lock`.
+   - Confirm the diff is limited to release metadata files, normally `Cargo.toml`, release-related README/docs updates, and optionally `Cargo.lock`.
    - If other files changed unexpectedly, stop and investigate before committing.
 9. Create the release commit.
    - Stage only the intended release files.
