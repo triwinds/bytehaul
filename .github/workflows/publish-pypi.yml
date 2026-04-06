@@ -142,7 +142,7 @@ jobs:
           manylinux: auto
 
       - name: Upload wheel
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: python-package-distributions-${{ matrix.label }}
           path: dist/*
@@ -166,7 +166,7 @@ jobs:
           args: --manifest-path bindings/python/Cargo.toml --out dist
 
       - name: Upload sdist
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: python-package-distributions-sdist
           path: dist/*
@@ -189,7 +189,7 @@ jobs:
 
     steps:
       - name: Download all distributions
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: python-package-distributions-*
           path: dist
