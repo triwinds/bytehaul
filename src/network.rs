@@ -265,6 +265,17 @@ fn parse_doh_server(server: &str, enable_ipv6: bool) -> Result<DohServerConfig, 
             "DoH server URLs cannot be empty".into(),
         ));
     }
+    if let Some(authority) = server.strip_prefix("https://") {
+        if authority.is_empty()
+            || authority.starts_with('/')
+            || authority.starts_with('?')
+            || authority.starts_with('#')
+        {
+            return Err(DownloadError::InvalidConfig(format!(
+                "DoH server URL '{server}' is missing a host"
+            )));
+        }
+    }
 
     if let Some(cached) = doh_config_cache()
         .lock()
@@ -275,7 +286,11 @@ fn parse_doh_server(server: &str, enable_ipv6: bool) -> Result<DohServerConfig, 
     }
 
     let url = reqwest::Url::parse(server).map_err(|err| {
-        DownloadError::InvalidConfig(format!("invalid DoH server URL '{server}': {err}"))
+        if err.to_string() == "empty host" {
+            DownloadError::InvalidConfig(format!("DoH server URL '{server}' is missing a host"))
+        } else {
+            DownloadError::InvalidConfig(format!("invalid DoH server URL '{server}': {err}"))
+        }
     })?;
 
     if url.scheme() != "https" {
@@ -294,23 +309,30 @@ fn parse_doh_server(server: &str, enable_ipv6: bool) -> Result<DohServerConfig, 
         )));
     }
 
-    let host = url.host_str().ok_or_else(|| {
+    let host = url.host().ok_or_else(|| {
         DownloadError::InvalidConfig(format!("DoH server URL '{server}' is missing a host"))
     })?;
+    let host_display = host.to_string();
     let port = url.port_or_known_default().ok_or_else(|| {
         DownloadError::InvalidConfig(format!(
             "DoH server URL '{server}' is missing a valid port"
         ))
     })?;
 
-    let mut socket_addrs: Vec<SocketAddr> = if let Ok(ip) = host.parse::<IpAddr>() {
+    let host_for_resolution = host_display
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(host_display.as_str());
+    let parsed_ip = host_for_resolution.parse::<IpAddr>().ok();
+
+    let mut socket_addrs: Vec<SocketAddr> = if let Some(ip) = parsed_ip {
         vec![SocketAddr::new(ip, port)]
     } else {
-        (host, port)
+        (host_for_resolution, port)
             .to_socket_addrs()
             .map_err(|err| {
                 DownloadError::InvalidConfig(format!(
-                    "failed to resolve DoH host '{host}' from '{server}': {err}"
+                    "failed to resolve DoH host '{host_display}' from '{server}': {err}"
                 ))
             })?
             .collect()
@@ -343,7 +365,11 @@ fn parse_doh_server(server: &str, enable_ipv6: bool) -> Result<DohServerConfig, 
 
     let config = DohServerConfig {
         socket_addrs,
-        tls_dns_name: host.to_string(),
+        tls_dns_name: match parsed_ip {
+            Some(IpAddr::V4(ipv4)) => ipv4.to_string(),
+            Some(IpAddr::V6(ipv6)) => format!("[{ipv6}]"),
+            None => host_display,
+        },
         http_endpoint: if http_endpoint.is_empty() || http_endpoint == "/dns-query" {
             None
         } else {
