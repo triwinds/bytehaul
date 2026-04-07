@@ -368,7 +368,7 @@ mod tests {
 
     #[test]
     fn resolve_redirect_target_rejects_unparseable_location() {
-        let err = resolve_redirect_target("https://example.com/", "ht!tp://inv alid")
+        let err = resolve_redirect_target("https://example.com/", "https://[::1")
             .unwrap_err()
             .to_string();
         assert!(

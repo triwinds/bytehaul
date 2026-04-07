@@ -948,4 +948,40 @@ mod tests {
         );
         clear_proxy_env();
     }
+
+    #[test]
+    fn test_proxy_uri_rejects_non_http_scheme() {
+        let err = proxy_uri(Some("ftp://127.0.0.1:21"), &[], "all_proxy")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must use http or https"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_warm_resolution_for_url_handles_proxy_invalid_and_hostless_urls() {
+        let _guard = env_lock().lock().unwrap();
+        clear_proxy_env();
+
+        let proxy_client = ClientNetworkConfig {
+            http_proxy: Some("http://127.0.0.1:8080".into()),
+            ..ClientNetworkConfig::default()
+        }
+        .build_client()
+        .unwrap();
+        proxy_client
+            .warm_resolution_for_url("http://example.com/file.bin")
+            .await
+            .unwrap();
+
+        let direct_client = ClientNetworkConfig::default().build_client().unwrap();
+        direct_client.warm_resolution_for_url("not a url").await.unwrap();
+        direct_client
+            .warm_resolution_for_url("file:///tmp/no-host")
+            .await
+            .unwrap();
+        direct_client
+            .warm_resolution_for_url("http://coverage-check.invalid/file.bin")
+            .await
+            .unwrap();
+    }
 }

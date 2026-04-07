@@ -768,6 +768,70 @@ async fn stream_segment(
 #[cfg(test)]
 mod coverage_tests {
     use super::*;
+    use warp::Filter;
+
+    fn spawn_writer_ack(
+        mut write_rx: mpsc::Receiver<WriterCommand>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            while let Some(command) = write_rx.recv().await {
+                match command {
+                    WriterCommand::Data { .. } => {}
+                    WriterCommand::FlushPiece { ack, .. } => {
+                        let _ = ack.send(());
+                    }
+                    WriterCommand::FlushAll { ack, .. } => {
+                        let _ = ack.send(crate::storage::writer::FlushAllStats {
+                            written_bytes: 0,
+                            flush_elapsed: Duration::ZERO,
+                            sync_elapsed: Some(Duration::ZERO),
+                        });
+                    }
+                }
+            }
+        })
+    }
+
+    fn spawn_flaky_range_server(
+        fail_count: usize,
+        retry_after_secs: Option<u64>,
+    ) -> (std::net::SocketAddr, impl std::future::Future<Output = ()>) {
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = requests.clone();
+        let route = warp::path("piece")
+            .and(warp::header::optional::<String>("range"))
+            .map(move |range_header: Option<String>| {
+                let request_index = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if request_index < fail_count {
+                    let mut builder = warp::http::Response::builder().status(503);
+                    if let Some(retry_after_secs) = retry_after_secs {
+                        builder = builder.header("retry-after", retry_after_secs.to_string());
+                    }
+                    return builder.body(Vec::<u8>::new()).unwrap();
+                }
+
+                let total = 256u64;
+                let (start, end) = match range_header {
+                    Some(range) => {
+                        let range = range.trim_start_matches("bytes=");
+                        let parts: Vec<&str> = range.split('-').collect();
+                        let start = parts[0].parse::<u64>().unwrap_or(0);
+                        let end = parts[1].parse::<u64>().unwrap_or(total - 1);
+                        (start, end)
+                    }
+                    None => (0, total - 1),
+                };
+                let len = (end - start + 1) as usize;
+                warp::http::Response::builder()
+                    .status(206)
+                    .header("content-length", len.to_string())
+                    .header("content-range", format!("bytes {}-{}/{}", start, end, total))
+                    .body(vec![0xAB; len])
+                    .unwrap()
+            });
+
+        warp::serve(route).bind_ephemeral(([127, 0, 0, 1], 0))
+    }
 
     fn response_meta() -> ResponseMeta {
         ResponseMeta {
@@ -972,6 +1036,102 @@ mod coverage_tests {
 
         assert_eq!(update.downloaded, 1024);
         assert_eq!(update.eta_secs, Some(0.0));
+    }
+
+    #[tokio::test]
+    async fn test_worker_loop_retries_then_completes_piece() {
+        let (addr, server) = spawn_flaky_range_server(2, Some(0));
+        tokio::spawn(server);
+
+        let client = crate::network::ClientNetworkConfig::default()
+            .build_client()
+            .unwrap();
+        let scheduler = build_scheduler(256, 256);
+        let (write_tx, write_rx) = mpsc::channel(8);
+        let writer = spawn_writer_ack(write_rx);
+        let downloaded = Arc::new(AtomicU64::new(0));
+        let (_cancel_tx, cancel_rx) = watch::channel(StopSignal::Running);
+        let cfg = Arc::new(WorkerConfig {
+            url: format!("http://{addr}/piece"),
+            headers: std::collections::HashMap::new(),
+            read_timeout: Duration::from_secs(2),
+            max_retries: 3,
+            retry_base_delay: Duration::from_millis(10),
+            retry_max_delay: Duration::from_millis(20),
+            max_retry_elapsed: Some(Duration::from_secs(2)),
+        });
+
+        worker_loop(
+            0,
+            client,
+            cfg,
+            scheduler.clone(),
+            write_tx,
+            downloaded.clone(),
+            cancel_rx,
+            Arc::new(Semaphore::new(1024)),
+            SpeedLimit::new(0),
+            None,
+            LogLevel::Off,
+            7,
+        )
+        .await
+        .unwrap();
+
+        writer.await.unwrap();
+        assert!(scheduler.lock().all_done());
+        assert_eq!(downloaded.load(Ordering::Relaxed), 256);
+    }
+
+    #[tokio::test]
+    async fn test_worker_loop_reclaims_piece_when_paused_during_backoff() {
+        let (addr, server) = spawn_flaky_range_server(10, Some(1));
+        tokio::spawn(server);
+
+        let client = crate::network::ClientNetworkConfig::default()
+            .build_client()
+            .unwrap();
+        let scheduler = build_scheduler(256, 256);
+        let (write_tx, write_rx) = mpsc::channel(8);
+        let writer = spawn_writer_ack(write_rx);
+        let downloaded = Arc::new(AtomicU64::new(0));
+        let (cancel_tx, cancel_rx) = watch::channel(StopSignal::Running);
+        let cfg = Arc::new(WorkerConfig {
+            url: format!("http://{addr}/piece"),
+            headers: std::collections::HashMap::new(),
+            read_timeout: Duration::from_secs(2),
+            max_retries: 5,
+            retry_base_delay: Duration::from_millis(10),
+            retry_max_delay: Duration::from_secs(2),
+            max_retry_elapsed: Some(Duration::from_secs(5)),
+        });
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let _ = cancel_tx.send(StopSignal::Pause);
+        });
+
+        let err = worker_loop(
+            0,
+            client,
+            cfg,
+            scheduler.clone(),
+            write_tx,
+            downloaded,
+            cancel_rx,
+            Arc::new(Semaphore::new(1024)),
+            SpeedLimit::new(0),
+            None,
+            LogLevel::Off,
+            8,
+        )
+        .await
+        .unwrap_err();
+
+        writer.await.unwrap();
+        assert!(matches!(err, DownloadError::Paused));
+        assert_eq!(scheduler.lock().remaining_count(), 1);
+        assert_eq!(scheduler.lock().assign().unwrap().piece_id, 0);
     }
 }
 
