@@ -20,13 +20,9 @@ pub(crate) async fn validate_local_resume_state(
     ctrl: &ControlSnapshot,
     spec: &DownloadSpec,
 ) -> Result<(), DownloadError> {
-    let metadata = tokio::fs::metadata(output_path).await.map_err(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            DownloadError::ResumeMismatch("local download file is missing".into())
-        } else {
-            DownloadError::Io(error)
-        }
-    })?;
+    let metadata = tokio::fs::metadata(output_path)
+        .await
+        .map_err(map_resume_metadata_error)?;
 
     if ctrl.downloaded_bytes > ctrl.total_size {
         return Err(DownloadError::ResumeMismatch(
@@ -101,6 +97,14 @@ pub(crate) async fn validate_local_resume_state(
     }
 
     Ok(())
+}
+
+fn map_resume_metadata_error(error: std::io::Error) -> DownloadError {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        DownloadError::ResumeMismatch("local download file is missing".into())
+    } else {
+        DownloadError::Io(error)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -454,18 +458,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_validate_resume_metadata_io_error_is_not_mapped_to_missing_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let parent_file = dir.path().join("parent.bin");
-        std::fs::write(&parent_file, b"seed").unwrap();
-        let invalid_child = parent_file.join("file.bin");
-        let ctrl = test_ctrl(1000, 500, 2, 0, vec![0b00]);
-        let spec = test_spec(4, FileAllocation::None);
-        let metadata_err = tokio::fs::metadata(&invalid_child).await.unwrap_err();
-        assert_ne!(metadata_err.kind(), std::io::ErrorKind::NotFound);
-
-        let err = validate_local_resume_state(&invalid_child, &ctrl, &spec)
-            .await
-            .unwrap_err();
+        let err = map_resume_metadata_error(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "resume metadata access denied",
+        ));
         assert!(matches!(err, DownloadError::Io(_)));
     }
 }
