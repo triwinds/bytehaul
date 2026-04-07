@@ -892,6 +892,33 @@ mod tests {
         assert_eq!(tracker.last_saved_downloaded_bytes(), 0);
     }
 
+    #[tokio::test]
+    async fn test_persist_single_control_snapshot_returns_when_downloaded_is_not_new() {
+        let dir = tempfile::tempdir().unwrap();
+        let control_path = dir.path().join("single-unchanged.bytehaul");
+        let snapshot = snapshot_template();
+        let mut tracker = ControlSaveTracker::new(256);
+        let ctx = SingleControlSaveContext {
+            control_path: &control_path,
+            snap_template: &snapshot,
+            autosave_sync_every: 1,
+            log_level: LogLevel::Off,
+            download_id: 5,
+        };
+
+        persist_single_control_snapshot(
+            ControlSaveReason::Terminal,
+            256,
+            None,
+            &mut tracker,
+            &ctx,
+        )
+        .await;
+
+        assert!(!control_path.exists());
+        assert_eq!(tracker.last_saved_downloaded_bytes(), 256);
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn test_run_single_connection_reports_writer_failure() {

@@ -376,4 +376,18 @@ mod tests {
             "got: {err}"
         );
     }
+
+    #[test]
+    fn resolve_redirect_target_rejects_invalid_base_url() {
+        let err = resolve_redirect_target("not a url", "/target")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid redirect base URL"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_redirect_target_preserves_literal_relative_path() {
+        let resolved = resolve_redirect_target("https://example.com/file", "%zz").unwrap();
+        assert_eq!(resolved, "https://example.com/%zz");
+    }
 }

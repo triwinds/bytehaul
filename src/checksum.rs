@@ -166,4 +166,16 @@ mod tests {
         );
         verify_checksum(&path, &expected).await.unwrap();
     }
+
+    #[tokio::test]
+    async fn test_verify_checksum_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.bin");
+        tokio::fs::write(&path, b"").await.unwrap();
+
+        let expected = Checksum::Sha256(
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".into(),
+        );
+        verify_checksum(&path, &expected).await.unwrap();
+    }
 }

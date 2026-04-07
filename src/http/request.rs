@@ -68,4 +68,15 @@ mod tests {
         assert_eq!(req.headers().get("authorization").unwrap(), "Bearer token");
         assert_eq!(req.version(), Version::HTTP_11);
     }
+
+    #[test]
+    fn test_build_range_request_with_custom_headers() {
+        let mut headers = HashMap::new();
+        headers.insert("X-Trace".to_string(), "abc".to_string());
+
+        let req = build_range_request("https://example.com/file.bin", &headers, 10, 19);
+
+        assert_eq!(req.headers().get("range").unwrap(), "bytes=10-19");
+        assert_eq!(req.headers().get("x-trace").unwrap(), "abc");
+    }
 }

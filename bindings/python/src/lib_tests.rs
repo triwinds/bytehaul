@@ -95,6 +95,20 @@ fn test_runtime_duration_and_non_zero_helpers() {
 }
 
 #[test]
+fn test_python_test_helpers_and_config_error() {
+    init_python();
+    let err = config_error("bad config");
+    assert!(err.to_string().contains("bad config"));
+
+    let path_a = unique_path("a");
+    let path_b = unique_path("b");
+    assert_ne!(path_a, path_b);
+
+    let value = with_python(|py| py.version().to_string());
+    assert!(!value.is_empty());
+}
+
+#[test]
 fn test_socket_dns_and_file_allocation_parsing() {
     init_python();
     assert!(parse_socket_addr("dns_servers", "   ")

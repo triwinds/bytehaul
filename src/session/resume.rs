@@ -451,4 +451,14 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, DownloadError::ResumeMismatch(msg) if msg.contains("completed bytes")));
     }
+
+    #[tokio::test]
+    async fn test_validate_resume_metadata_io_error_is_not_mapped_to_missing_file() {
+        let ctrl = test_ctrl(1000, 500, 2, 0, vec![0b00]);
+        let spec = test_spec(4, FileAllocation::None);
+        let err = validate_local_resume_state(std::path::Path::new("/dev/null/file.bin"), &ctrl, &spec)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DownloadError::Io(_)));
+    }
 }
