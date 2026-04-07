@@ -225,6 +225,51 @@
 
 虽然实验结果表明 native-tls 不能改善 CDN 性能，但该配置项保留下来，供用户自行排查 TLS 兼容性问题，或在特定平台上首选系统 TLS 的场景下使用。
 
+## 9. libcurl Rust 绑定实验（`curl` crate，8 线程并行 Range）
+
+### 背景
+
+上一轮实验（§8）已排除了 TLS 栈的影响，将嫌疑范围缩小到"HTTP 客户端实现层面"。本节直接在 Rust 中调用 libcurl（`curl` 0.4.49 crate，底层与 aria2 使用同一份系统 libcurl 8.5.0 + OpenSSL），用 8 个 OS 线程并行发起 Range 请求，彻底排查是否是 hyper/reqwest 导致了性能劣势。
+
+### 实现方式
+
+- 用 `curl::easy::Easy2` 对每个分片发起一次 `Range` GET 请求，8 个线程并行运行。
+- 强制 `HttpVersion::V11`，与 bytehaul 相同（避免 H2 连接合并）。
+- 接收到的数据直接丢弃（只计量字节数），与 bh_bench 测试逻辑一致（排除写盘影响）。
+- 不实现 resume / 进度回调 / 校验和，只测纯下载吞吐。
+
+### 结果（3 次测量，GitHub CDN，134.7 MiB）
+
+| 工具 | HTTP 库 | 测量 1 | 测量 2 | 测量 3 | 均速 |
+|------|---------|--------|--------|--------|------|
+| aria2 1.37.0 | libcurl (C) | 158.5 | 217.3 | 203.2 | **193 MiB/s** |
+| **curl crate**（本实验） | **libcurl (Rust FFI)** | 216.0 | 222.8 | 219.0 | **≈ 219 MiB/s** |
+| bytehaul | reqwest + rustls | 60.4 | 63.4 | 60.6 | **≈ 61 MiB/s** |
+| bytehaul | reqwest + native-tls | 63.4 | 60.5 | 66.6 | **≈ 63 MiB/s** |
+
+### 关键结论
+
+1. **`curl` crate（libcurl Rust 绑定）与 aria2 速度相当，均在 ~190–220 MiB/s。**
+   这直接证明：同一份 libcurl 被 Rust 通过 FFI 调用时，性能与 aria2 的 C 代码无显著差异。
+
+2. **bytehaul (reqwest/hyper) 在相同条件下仅有 ~61 MiB/s，比 libcurl 慢约 3.5 倍。**
+   这是迄今为止最关键的一个数据点：**性能差距的根本原因锁定在 HTTP 客户端库（reqwest/hyper vs libcurl）的实现差异上**，而不是 TLS、DNS、写入、分片策略或其他外部因素。
+
+3. **这不是"libcurl 的某些魔法"，而是 hyper 在该场景下的具体不足。**
+   从实现层面看，可能的原因包括：
+   - libcurl 内建了 socket 级 `SO_SNDBUF` / `SO_RCVBUF` 调优或更积极的 TCP 缓冲区管理；
+   - libcurl 在跟随重定向（GitHub → release-assets.githubusercontent.com）时的 TCP 握手更快；
+   - hyper 的异步 Waker 调度引入了额外延迟，在高带宽小文件（<1 s 的下载）场景下会被放大；
+   - libcurl 在并发多连接时维持独立 handle，不共享连接池，避免了 hyper 连接池竞争（虽然 bytehaul 也已配置 pool_max_idle_per_host(0)，但 hyper 的 connector 仍可能有额外开销）。
+
+### 下一步行动建议
+
+确认 HTTP 库是瓶颈后，有两条可行路径：
+
+**路径 A（验证性）**：测量 TTFB（Time To First Byte），确认差距主要来自连接建立阶段还是数据传输阶段，以便判断是否能通过调整 hyper 参数（缓冲区大小、连接超时等）弥补差距。
+
+**路径 B（工程性）**：评估将 bytehaul 的 HTTP 层从 reqwest 迁移到 `curl` crate 的可行性，或引入 `isahc`（基于 libcurl 的异步 Rust 客户端）。注意：这会引入系统依赖（需要安装 libcurl-dev），且与当前纯 Rust 的构建目标存在冲突，需要权衡。
+
 ## 当前阶段结论（更新）
 
 在已完成的所有实验后：
@@ -236,14 +281,12 @@
 | 本地写入路径 | ❌ 排除：受控环境速度一致 |
 | 请求头差异（`User-Agent` 等） | ❌ 排除：复刻后无稳定改善 |
 | HTTP/2 多路复用（Range 被折叠） | ✅ 已修复（强制 HTTP/1.1） |
-| **TLS 库（rustls vs OpenSSL）** | ❌ **本轮实验排除：换 native-tls 更慢** |
-| reqwest/hyper 连接建立与管理行为 | 🔍 **当前最可疑，尚未排除** |
+| TLS 库（rustls vs OpenSSL） | ❌ 排除：换 native-tls 更慢 |
+| **HTTP 客户端库（reqwest/hyper vs libcurl）** | ✅ **§9 实验确认：这是根本原因** |
 
 ## 建议的下一步
 
-1. 针对 hyper 的连接建立流程做更细的对照：
-   - 测量 bytehaul 从发起请求到收到第一个字节的延迟（TTFB），与 aria2 对比
-   - 检查 hyper 的 TCP keepalive、连接复用、流控窗口设置与 libcurl 的差异
-2. 尝试用 `isahc`（基于 libcurl 的 Rust 绑定）替换 reqwest，验证 HTTP 客户端实现本身是否是关键因素。
-3. 在同一远端源上做 `1 / 2 / 4 / 8` 连接完整曲线，找到 bytehaul 的最佳并发点，进一步判断连接建立开销是否随并发数放大。
+1. **TTFB 测量**：在单连接下对比 reqwest 和 libcurl 从发起请求到收到第一个字节的时间，判断差距在连接建立还是传输阶段。
+2. **hyper 调参**：尝试调整 `hyper` 的 socket 缓冲区 (`SO_RCVBUF`)、`nodelay`、连接池参数，看是否能缩小差距。
+3. **迁移评估**：评估将 HTTP 后端迁移到 `isahc` 或 `curl` crate 的成本，重点考量：跨平台静态链接、CI 复杂度、维护成本。
 4. 如果未来要把某些参数暴露给用户，优先考虑把并发数调优作为实际可用的 workaround，而不是盲目调大分片。
