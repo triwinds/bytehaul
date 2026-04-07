@@ -77,7 +77,9 @@ impl ClientNetworkConfig {
             builder = builder.dns_resolver2(resolver);
         }
 
-        builder.build().map_err(Into::into)
+        let client = builder.build().map_err(DownloadError::from)?;
+        log_os_socket_buffer_sizes();
+        Ok(client)
     }
 
     pub(crate) fn with_connect_timeout(&self, connect_timeout: Duration) -> Self {
@@ -93,6 +95,33 @@ impl ClientNetworkConfig {
 
         BytehaulDnsResolver::new(&self.dns_servers, &self.doh_servers, self.enable_ipv6)
             .map(Some)
+    }
+}
+
+/// Log OS-level TCP receive buffer settings at trace level so the caller can
+/// compare them against the throughput measurements from TTFB diagnostics.
+///
+/// On Linux the kernel exposes the current defaults via `/proc/sys`.
+/// On other platforms this is a no-op.
+///
+/// Note: reqwest 0.12 does not expose `SO_RCVBUF` control through its public
+/// API (the underlying `hyper_util::client::legacy::connect::HttpConnector`
+/// has `set_recv_buffer_size()` but it is hidden behind reqwest's sealed
+/// connector types).  To change these defaults, adjust the kernel parameters
+/// with `sysctl net.core.rmem_default=<bytes>` (Linux) before starting the
+/// process, or migrate to a custom hyper connector.
+fn log_os_socket_buffer_sizes() {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(val) = std::fs::read_to_string("/proc/sys/net/core/rmem_default") {
+            tracing::trace!(rmem_default_bytes = val.trim(), "OS TCP recv buffer default");
+        }
+        if let Ok(val) = std::fs::read_to_string("/proc/sys/net/core/rmem_max") {
+            tracing::trace!(rmem_max_bytes = val.trim(), "OS TCP recv buffer max");
+        }
+        if let Ok(val) = std::fs::read_to_string("/proc/sys/net/ipv4/tcp_rmem") {
+            tracing::trace!(tcp_rmem = val.trim(), "OS TCP recv buffer auto-tune range (min default max)");
+        }
     }
 }
 

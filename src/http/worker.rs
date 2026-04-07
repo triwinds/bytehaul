@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use crate::config::DownloadSpec;
 use crate::error::DownloadError;
 use crate::http::request;
@@ -25,10 +27,12 @@ impl HttpWorker {
     pub async fn send_get(&self) -> Result<(reqwest::Response, ResponseMeta), DownloadError> {
         tracing::debug!(url = %self.url, "sending GET request");
         let req = request::build_get_request(&self.client, &self.url, &self.headers, self.timeout);
+        let t0 = Instant::now();
         let response = req.send().await?;
+        let ttfb_ms = t0.elapsed().as_millis().min(u64::MAX as u128) as u64;
 
         let status = response.status();
-        tracing::debug!(status = status.as_u16(), "GET response received");
+        tracing::debug!(status = status.as_u16(), ttfb_ms = ttfb_ms, "GET response received");
         if !status.is_success() {
             return Err(make_http_error(&response, status.as_u16()));
         }
@@ -51,10 +55,12 @@ impl HttpWorker {
             start,
             end,
         );
+        let t0 = Instant::now();
         let response = req.send().await?;
+        let ttfb_ms = t0.elapsed().as_millis().min(u64::MAX as u128) as u64;
 
         let status = response.status();
-        tracing::debug!(status = status.as_u16(), start = start, end = end, "Range response received");
+        tracing::debug!(status = status.as_u16(), start = start, end = end, ttfb_ms = ttfb_ms, "Range response received");
         if status.as_u16() == 200 {
             // Server ignored Range, returned full content
             let meta = ResponseMeta::from_response(&response);
