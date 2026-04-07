@@ -454,9 +454,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_validate_resume_metadata_io_error_is_not_mapped_to_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent_file = dir.path().join("parent.bin");
+        std::fs::write(&parent_file, b"seed").unwrap();
+        let invalid_child = parent_file.join("file.bin");
         let ctrl = test_ctrl(1000, 500, 2, 0, vec![0b00]);
         let spec = test_spec(4, FileAllocation::None);
-        let err = validate_local_resume_state(std::path::Path::new("/dev/null/file.bin"), &ctrl, &spec)
+        let metadata_err = tokio::fs::metadata(&invalid_child).await.unwrap_err();
+        assert_ne!(metadata_err.kind(), std::io::ErrorKind::NotFound);
+
+        let err = validate_local_resume_state(&invalid_child, &ctrl, &spec)
             .await
             .unwrap_err();
         assert!(matches!(err, DownloadError::Io(_)));
