@@ -290,3 +290,51 @@
 2. **hyper 调参**：尝试调整 `hyper` 的 socket 缓冲区 (`SO_RCVBUF`)、`nodelay`、连接池参数，看是否能缩小差距。
 3. **迁移评估**：评估将 HTTP 后端迁移到 `isahc` 或 `curl` crate 的成本，重点考量：跨平台静态链接、CI 复杂度、维护成本。
 4. 如果未来要把某些参数暴露给用户，优先考虑把并发数调优作为实际可用的 workaround，而不是盲目调大分片。
+## 10. hyper 直接调参 + isahc 实验准备
+
+### 背景
+
+§9 实验确认 HTTP 客户端库是性能瓶颈后，本节建立两个独立的最小化下载实验程序，用于在相同条件下对比：
+
+- **hyper-dl**：直接使用 `hyper 1.x`（不经过 reqwest），并仿照 curl 的默认 socket 配置进行调参
+- **isahc-dl**：使用 `isahc 1.8`（基于 libcurl 的异步 Rust 封装），理论上应与 §9 的 curl crate 速度相近
+
+两者均位于 `experiments/` 目录，作为独立 Cargo 项目，**不修改现有 bytehaul 代码**。
+
+### hyper-dl 实现策略
+
+以 curl 的默认行为为参照，对 hyper 的 `HttpConnector` 进行如下调参：
+
+| 参数 | hyper-dl 设置 | curl 对应参数 |
+|------|-------------|-------------|
+| `TCP_NODELAY` | `true` | `CURLOPT_TCP_NODELAY=1`（curl 7.63.0 起默认） |
+| `SO_RCVBUF` | `512 KiB` | curl 的有效接收缓冲区大小 |
+| 连接超时 | `30 s` | `CURLOPT_CONNECTTIMEOUT=30` |
+| 连接池 | `pool_max_idle_per_host=0` | curl 每个 easy handle 独立连接 |
+| HTTP 版本 | `HTTP/1.1` 强制 | `CURLOPT_HTTP_VERSION=CURL_HTTP_VERSION_1_1` |
+
+### isahc-dl 实现策略
+
+- 每个 worker 使用独立的 `HttpClient`，`connection_cache_size=1`，避免连接复用
+- 强制 `HTTP/1.1`（`VersionNegotiation::http11()`）
+- 每个 worker 运行在 `tokio::task::spawn_blocking` 线程上（isahc 的 `send()` 是阻塞式）
+
+### 预期结论方向
+
+- 若 **hyper-dl** 速度接近 bytehaul（~60 MiB/s）→ 证明 hyper 本身无法仅靠调参达到 libcurl 水平
+- 若 **hyper-dl** 速度显著提升（~100+ MiB/s）→ 说明 reqwest 的封装层或连接池策略是主因，可考虑 bytehaul 内部切换到直接 hyper
+- 若 **isahc-dl** 速度接近 §9 curl crate（~200 MiB/s）→ 说明迁移到 isahc/libcurl 系是可行路径
+
+### 使用方法
+
+```bash
+# hyper-dl（自带 rustls，无需系统 libcurl）
+cd experiments/hyper-dl
+cargo run --release -- https://github.com/llvm/llvm-project/releases/download/llvmorg-19.1.0/llvm-project-19.1.0.src.tar.xz 8
+
+# isahc-dl（依赖系统 libcurl）
+cd experiments/isahc-dl
+cargo run --release -- https://github.com/llvm/llvm-project/releases/download/llvmorg-19.1.0/llvm-project-19.1.0.src.tar.xz 8
+```
+
+> 注：实验结果待 CI / 本地运行后填写。
