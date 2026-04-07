@@ -320,4 +320,60 @@ mod tests {
             .to_string();
         assert!(err.contains("must use http or https"));
     }
+
+    #[tokio::test]
+    async fn send_get_fails_with_too_many_redirects() {
+        let route = warp::path("loop-redirect").map(|| {
+            warp::http::Response::builder()
+                .status(302)
+                .header("location", "/loop-redirect")
+                .body(Vec::<u8>::new())
+                .unwrap()
+        });
+        let (addr, server) = warp::serve(route).bind_ephemeral(([127, 0, 0, 1], 0));
+        tokio::spawn(server);
+
+        let worker = worker_for(format!("http://{addr}/loop-redirect"));
+        let err = worker.send_get().await.unwrap_err();
+        match err {
+            DownloadError::HttpStatus { status, ref message } => {
+                assert_eq!(status, StatusCode::LOOP_DETECTED.as_u16());
+                assert!(message.contains("too many redirects"), "msg: {message}");
+            }
+            other => panic!("expected HttpStatus LOOP_DETECTED, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn send_get_fails_when_redirect_missing_location_header() {
+        let route = warp::path("no-location").map(|| {
+            warp::http::Response::builder()
+                .status(301)
+                .body(Vec::<u8>::new())
+                .unwrap()
+        });
+        let (addr, server) = warp::serve(route).bind_ephemeral(([127, 0, 0, 1], 0));
+        tokio::spawn(server);
+
+        let worker = worker_for(format!("http://{addr}/no-location"));
+        let err = worker.send_get().await.unwrap_err();
+        match err {
+            DownloadError::HttpStatus { status, ref message } => {
+                assert_eq!(status, 301);
+                assert!(message.contains("missing Location header"), "msg: {message}");
+            }
+            other => panic!("expected HttpStatus 301 missing Location, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_redirect_target_rejects_unparseable_location() {
+        let err = resolve_redirect_target("https://example.com/", "ht!tp://inv alid")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("invalid redirect location"),
+            "got: {err}"
+        );
+    }
 }
