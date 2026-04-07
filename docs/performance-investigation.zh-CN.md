@@ -338,3 +338,33 @@ cargo run --release -- https://github.com/llvm/llvm-project/releases/download/ll
 ```
 
 > 注：实验结果待 CI / 本地运行后填写。
+
+### 实验结果（Linux CI，Ubuntu 24.04，GitHub CDN，134.7 MiB，8 连接）
+
+| 工具 | HTTP 库 | 测量 1 | 测量 2 | 测量 3 | 均速 |
+|------|---------|--------|--------|--------|------|
+| aria2 1.37.0 | libcurl (C) | 377 | 400 | 367 | **≈ 381 MiB/s** |
+| **hyper-dl**（本实验） | **hyper 1.9 + rustls（curl 参数调优）** | 357 | 634 | 597 | **≈ 529 MiB/s** |
+| **isahc-dl**（本实验） | **isahc 1.8 / libcurl** | 385 | 359 | 385 | **≈ 376 MiB/s** |
+| bytehaul（§8 对比） | reqwest + rustls | — | — | — | **≈ 129 MiB/s** |
+
+### 关键结论
+
+1. **hyper 本身不是瓶颈。** 直接使用 `hyper 1.9`（绕过 reqwest），加上 curl 参数对齐后，速度达到 ~529 MiB/s，比 aria2 还快。这彻底推翻了"hyper 慢于 libcurl"的假设。
+
+2. **isahc（libcurl 异步封装）速度与 aria2 基本持平**（~376 vs ~381 MiB/s），与 §9 结论一致。
+
+3. **真正的瓶颈在 reqwest 的封装层。** 同一份 hyper，经过 reqwest 封装后吞吐下降到 ~129 MiB/s，而直接调用则达到 ~529 MiB/s。差距因此锁定在 reqwest 的连接管理或请求调度逻辑上，而不是 hyper 的底层 I/O 能力。
+
+4. **调查方向重新聚焦：reqwest 的连接池/请求行为差异。** 可能的原因包括：
+   - reqwest 的 `pool_idle_timeout` 或 `pool_max_idle_per_host` 与并发场景下的互动
+   - reqwest 在高并发时序列化连接建立的内部行为
+   - hyper-util 的 `LegacyClient` 相比直接调用 hyper 的额外开销
+
+### 更新后的嫌疑因素状态
+
+| 嫌疑因素 | 状态 |
+|--------|------|
+| TLS 库（rustls vs OpenSSL） | ❌ 排除（§8） |
+| HTTP 客户端库（hyper vs libcurl） | ❌ **已推翻**：hyper 直接调用远快于 aria2 |
+| **reqwest 封装层行为** | ✅ **新的最可疑方向**：同 hyper 经 reqwest 后慢 4× |

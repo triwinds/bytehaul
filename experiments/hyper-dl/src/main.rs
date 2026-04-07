@@ -48,6 +48,10 @@ fn build_client() -> HttpsClient {
     // Connect timeout = 30 s (curl default CURLOPT_CONNECTTIMEOUT).
     http.set_connect_timeout(Some(std::time::Duration::from_secs(30)));
 
+    // Allow https:// URIs to pass through; TLS wrapping is handled by the
+    // HttpsConnector layer on top of this connector.
+    http.enforce_http(false);
+
     // Use native OS certificate roots (same trust store as curl on most systems).
     let tls = HttpsConnectorBuilder::new()
         .with_native_roots()
@@ -63,27 +67,56 @@ fn build_client() -> HttpsClient {
         .build(tls)
 }
 
-/// Issue a HEAD request and return the `Content-Length` in bytes.
-async fn get_content_length(client: &HttpsClient, url: &str) -> u64 {
-    let req = Request::builder()
-        .method("HEAD")
-        .uri(url)
-        .header("User-Agent", "hyper-dl-experiment/0.1")
-        .body(Empty::<Bytes>::new())
-        .expect("HEAD request");
+/// Issue a HEAD request following redirects, return `(Content-Length, final_url)`.
+async fn get_content_length(client: &HttpsClient, url: &str) -> (u64, String) {
+    let mut current_url = url.to_string();
+    for _ in 0..10 {
+        let req = Request::builder()
+            .method("HEAD")
+            .uri(&current_url)
+            .header("User-Agent", "hyper-dl-experiment/0.1")
+            .body(Empty::<Bytes>::new())
+            .expect("HEAD request");
 
-    let resp = client.request(req).await.expect("HEAD failed");
-    let status = resp.status();
-    assert!(
-        status.is_success() || status.as_u16() == 206,
-        "HEAD returned {status}"
-    );
+        let resp = client.request(req).await.expect("HEAD failed");
+        let status = resp.status();
 
-    resp.headers()
-        .get("content-length")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<u64>().ok())
-        .expect("no Content-Length in HEAD response")
+        if status.is_redirection() {
+            let location = resp
+                .headers()
+                .get("location")
+                .and_then(|v| v.to_str().ok())
+                .expect("redirect with no Location header")
+                .to_string();
+            // Resolve relative redirects against the current URL.
+            current_url = if location.starts_with("http://") || location.starts_with("https://") {
+                location
+            } else {
+                let base: hyper::Uri = current_url.parse().expect("current url");
+                format!(
+                    "{}://{}{}",
+                    base.scheme_str().unwrap_or("https"),
+                    base.authority().expect("authority").as_str(),
+                    location
+                )
+            };
+            continue;
+        }
+
+        assert!(
+            status.is_success() || status.as_u16() == 206,
+            "HEAD returned {status}"
+        );
+
+        let len = resp
+            .headers()
+            .get("content-length")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+            .expect("no Content-Length in HEAD response");
+        return (len, current_url);
+    }
+    panic!("too many redirects for {url}");
 }
 
 /// Download byte range [start, end] (inclusive), counting bytes and discarding
@@ -159,14 +192,17 @@ async fn main() {
     let client = build_client();
 
     println!("Probing {url} with HEAD …");
-    let total_size = get_content_length(&client, &url).await;
+    let (total_size, final_url) = get_content_length(&client, &url).await;
+    if final_url != url {
+        println!("Redirected to: {final_url}");
+    }
     println!(
         "File size: {:.2} MiB ({total_size} bytes), connections: {connections}",
         total_size as f64 / (1024.0 * 1024.0)
     );
 
     // Pre-resolve DNS so connection latency below is just TCP+TLS.
-    let (host, port) = parse_host_port(&url);
+    let (host, port) = parse_host_port(&final_url);
     let _addr = resolve_first(&host, port); // warm DNS cache
 
     let chunk = total_size / connections;
@@ -182,7 +218,7 @@ async fn main() {
             (i + 1) * chunk - 1
         };
         let c = build_client(); // fresh client = fresh TCP connection
-        let u = url.clone();
+        let u = final_url.clone();
         let counter = total_downloaded.clone();
         set.spawn(async move {
             let n = download_range(c, u, seg_start, seg_end).await;

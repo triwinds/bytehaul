@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use isahc::config::VersionNegotiation;
+use isahc::config::{RedirectPolicy, VersionNegotiation};
 use isahc::prelude::*;
 use isahc::{HttpClient, Request};
 use tokio::task::JoinSet;
@@ -29,6 +29,8 @@ fn build_client() -> HttpClient {
     HttpClient::builder()
         // Force HTTP/1.1 — each worker keeps its own connection, mirrors curl §9.
         .version_negotiation(VersionNegotiation::http11())
+        // Follow redirects (GitHub release URLs redirect to CDN).
+        .redirect_policy(RedirectPolicy::Follow)
         // 30 s connect timeout, matching curl's CURLOPT_CONNECTTIMEOUT default.
         .connect_timeout(std::time::Duration::from_secs(30))
         // Disable connection reuse between workers (pool size = 1 per client).
@@ -40,18 +42,31 @@ fn build_client() -> HttpClient {
 }
 
 /// Issue a HEAD request and return `Content-Length`.
-fn get_content_length(url: &str) -> u64 {
-    let resp = isahc::head(url).expect("HEAD request failed");
-    assert!(
-        resp.status().is_success() || resp.status().as_u16() == 206,
-        "HEAD returned {}",
-        resp.status()
-    );
-    resp.headers()
+/// GitHub release URLs redirect to release-assets.githubusercontent.com;
+/// we follow redirects and read Content-Length from the final response.
+fn get_content_length(url: &str) -> (u64, String) {
+    // Use a GET + immediate disconnect instead of HEAD, because some CDNs
+    // return Content-Length on GET but not on HEAD after redirect.
+    // Actually use a HEAD-following client to get the final URL + size.
+    let client = HttpClient::builder()
+        .version_negotiation(VersionNegotiation::http11())
+        .redirect_policy(RedirectPolicy::Follow)
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("probe client");
+    let req = Request::head(url)
+        .body(())
+        .expect("HEAD request");
+    let resp = client.send(req).expect("HEAD request failed");
+    let final_url = resp.effective_uri()
+        .map(|u| u.to_string())
+        .unwrap_or_else(|| url.to_string());
+    let len = resp.headers()
         .get("content-length")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<u64>().ok())
-        .expect("no Content-Length in HEAD response")
+        .expect("no Content-Length in HEAD response");
+    (len, final_url)
 }
 
 /// Download byte range [start, end] (inclusive), discarding data.
@@ -96,7 +111,10 @@ async fn main() {
     let connections: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(8);
 
     println!("Probing {url} with HEAD …");
-    let total_size = get_content_length(&url);
+    let (total_size, final_url) = get_content_length(&url);
+    if final_url != url {
+        println!("Redirected to: {final_url}");
+    }
     println!(
         "File size: {:.2} MiB ({total_size} bytes), connections: {connections}",
         total_size as f64 / (1024.0 * 1024.0)
@@ -114,7 +132,7 @@ async fn main() {
         } else {
             (i + 1) * chunk - 1
         };
-        let u = url.clone();
+        let u = final_url.clone();
         let counter = total_downloaded.clone();
         // isahc's send() is blocking (it uses curl's multi-handle internally
         // with a background thread), so we run each worker on a Tokio spawn_blocking
