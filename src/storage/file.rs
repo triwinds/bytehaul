@@ -212,4 +212,15 @@ mod tests {
         let meta = std::fs::metadata(&path).unwrap();
         assert_eq!(meta.len(), 4096);
     }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_preallocate_sync_linux_fallback_returns_write_error() {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .unwrap();
+        let err = preallocate_sync(&file, 1024).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::StorageFull);
+    }
 }

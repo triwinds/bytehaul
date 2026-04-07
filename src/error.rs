@@ -369,4 +369,31 @@ mod tests {
         ));
         assert!(body.is_retryable());
     }
+
+    #[test]
+    fn test_error_chain_has_timeout_through_nested_io_sources() {
+        #[derive(Debug)]
+        struct Wrapper(std::io::Error);
+
+        impl std::fmt::Display for Wrapper {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("wrapper")
+            }
+        }
+
+        impl StdError for Wrapper {
+            fn source(&self) -> Option<&(dyn StdError + 'static)> {
+                Some(&self.0)
+            }
+        }
+
+        let nested = Wrapper(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "timed out",
+        ));
+        assert!(error_chain_has_timeout(&nested));
+
+        let other = std::io::Error::other("other");
+        assert!(!error_chain_has_timeout(&other));
+    }
 }
