@@ -1,3 +1,5 @@
+use hyper::{HeaderMap, StatusCode};
+
 /// Metadata extracted from an HTTP response.
 #[derive(Debug, Clone)]
 pub(crate) struct ResponseMeta {
@@ -15,8 +17,11 @@ pub(crate) struct ResponseMeta {
 }
 
 impl ResponseMeta {
-    pub fn from_response(response: &reqwest::Response) -> Self {
-        let headers = response.headers();
+    pub fn from_parts(
+        _status: StatusCode,
+        headers: &HeaderMap,
+        content_length_override: Option<u64>,
+    ) -> Self {
 
         let accept_ranges = headers
             .get("accept-ranges")
@@ -66,7 +71,12 @@ impl ResponseMeta {
             .unwrap_or((None, None, None));
 
         Self {
-            content_length: response.content_length(),
+            content_length: content_length_override.or_else(|| {
+                headers
+                    .get("content-length")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|value| value.parse::<u64>().ok())
+            }),
             content_range_start,
             content_range_end,
             content_range_total,
@@ -82,20 +92,26 @@ impl ResponseMeta {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
+    use http_body_util::Empty;
+    use hyper::Response;
+
+    fn meta_from_response(response: Response<Empty<Bytes>>) -> ResponseMeta {
+        let (parts, _) = response.into_parts();
+        ResponseMeta::from_parts(parts.status, &parts.headers, None)
+    }
 
     #[test]
     fn test_parse_content_range_metadata() {
-        let response = reqwest::Response::from(
-            http::Response::builder()
+        let response = Response::builder()
                 .status(206)
                 .header("content-range", "bytes 100-199/1000")
                 .header("content-length", "100")
                 .header("content-encoding", "identity")
-                .body("test")
-                .unwrap(),
-        );
+                .body(Empty::<Bytes>::new())
+                .unwrap();
 
-        let meta = ResponseMeta::from_response(&response);
+        let meta = meta_from_response(response);
         assert_eq!(meta.content_range_start, Some(100));
         assert_eq!(meta.content_range_end, Some(199));
         assert_eq!(meta.content_range_total, Some(1000));
@@ -105,15 +121,13 @@ mod tests {
 
     #[test]
     fn test_missing_content_range_metadata() {
-        let response = reqwest::Response::from(
-            http::Response::builder()
+        let response = Response::builder()
                 .status(200)
                 .header("content-length", "4")
-                .body("test")
-                .unwrap(),
-        );
+                .body(Empty::<Bytes>::new())
+                .unwrap();
 
-        let meta = ResponseMeta::from_response(&response);
+        let meta = meta_from_response(response);
         assert_eq!(meta.content_range_start, None);
         assert_eq!(meta.content_range_end, None);
         assert_eq!(meta.content_range_total, None);
@@ -121,41 +135,35 @@ mod tests {
 
     #[test]
     fn test_accept_ranges_bytes() {
-        let response = reqwest::Response::from(
-            http::Response::builder()
+        let response = Response::builder()
                 .status(200)
                 .header("accept-ranges", "bytes")
-                .body("test")
-                .unwrap(),
-        );
-        let meta = ResponseMeta::from_response(&response);
+                .body(Empty::<Bytes>::new())
+                .unwrap();
+        let meta = meta_from_response(response);
         assert!(meta.accept_ranges);
     }
 
     #[test]
     fn test_accept_ranges_none() {
-        let response = reqwest::Response::from(
-            http::Response::builder()
+        let response = Response::builder()
                 .status(200)
                 .header("accept-ranges", "none")
-                .body("test")
-                .unwrap(),
-        );
-        let meta = ResponseMeta::from_response(&response);
+                .body(Empty::<Bytes>::new())
+                .unwrap();
+        let meta = meta_from_response(response);
         assert!(!meta.accept_ranges);
     }
 
     #[test]
     fn test_etag_and_last_modified() {
-        let response = reqwest::Response::from(
-            http::Response::builder()
+        let response = Response::builder()
                 .status(200)
                 .header("etag", "\"abc123\"")
                 .header("last-modified", "Thu, 01 Jan 2026 00:00:00 GMT")
-                .body("test")
-                .unwrap(),
-        );
-        let meta = ResponseMeta::from_response(&response);
+                .body(Empty::<Bytes>::new())
+                .unwrap();
+        let meta = meta_from_response(response);
         assert_eq!(meta.etag.as_deref(), Some("\"abc123\""));
         assert_eq!(
             meta.last_modified.as_deref(),
@@ -165,14 +173,12 @@ mod tests {
 
     #[test]
     fn test_content_range_unknown_total() {
-        let response = reqwest::Response::from(
-            http::Response::builder()
+        let response = Response::builder()
                 .status(206)
                 .header("content-range", "bytes 0-99/*")
-                .body("test")
-                .unwrap(),
-        );
-        let meta = ResponseMeta::from_response(&response);
+                .body(Empty::<Bytes>::new())
+                .unwrap();
+        let meta = meta_from_response(response);
         assert_eq!(meta.content_range_start, Some(0));
         assert_eq!(meta.content_range_end, Some(99));
         assert_eq!(meta.content_range_total, None);
@@ -180,17 +186,28 @@ mod tests {
 
     #[test]
     fn test_content_disposition() {
-        let response = reqwest::Response::from(
-            http::Response::builder()
+        let response = Response::builder()
                 .status(200)
                 .header("content-disposition", "attachment; filename=test.bin")
-                .body("test")
-                .unwrap(),
-        );
-        let meta = ResponseMeta::from_response(&response);
+                .body(Empty::<Bytes>::new())
+                .unwrap();
+        let meta = meta_from_response(response);
         assert_eq!(
             meta.content_disposition.as_deref(),
             Some("attachment; filename=test.bin")
         );
+    }
+
+    #[test]
+    fn test_content_length_override_wins() {
+        let response = Response::builder()
+            .status(200)
+            .header("content-length", "999")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        let (parts, _) = response.into_parts();
+
+        let meta = ResponseMeta::from_parts(parts.status, &parts.headers, Some(4));
+        assert_eq!(meta.content_length, Some(4));
     }
 }

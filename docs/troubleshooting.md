@@ -24,19 +24,19 @@ The download will restart from scratch.
 
 **Resolution:**
 
-1. **SOCKS5 / HTTP proxy via API:**
+1. **HTTP / HTTPS proxy via API:**
    ```python
    import bytehaul
 
    dl = bytehaul.Downloader(
-       proxy="http://proxy.example.com:8080"  # all protocols
+       proxy="http://proxy.example.com:8080"  # shared proxy for HTTP and HTTPS
        # or:
        # http_proxy="http://proxy:8080",
        # https_proxy="http://proxy:8080",
    )
    ```
 
-2. **Environment variables:** bytehaul (via reqwest) also respects `HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY`.
+2. **Environment variables:** bytehaul also respects `HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY`. Explicit `DownloaderBuilder` proxy settings take precedence over environment variables.
 
 3. **Verify proxy reachability** independently:
    ```bash

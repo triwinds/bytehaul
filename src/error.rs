@@ -1,10 +1,112 @@
+use std::error::Error as StdError;
+
 use thiserror::Error;
+
+pub(crate) type BoxError = Box<dyn StdError + Send + Sync>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportErrorKind {
+    Connect,
+    Timeout,
+    Request,
+    Body,
+    Other,
+}
+
+impl std::fmt::Display for TransportErrorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let label = match self {
+            Self::Connect => "connect",
+            Self::Timeout => "timeout",
+            Self::Request => "request",
+            Self::Body => "body",
+            Self::Other => "other",
+        };
+        f.write_str(label)
+    }
+}
+
+#[derive(Debug, Error)]
+#[error("{kind} transport error: {source}")]
+pub struct TransportError {
+    kind: TransportErrorKind,
+    #[source]
+    source: BoxError,
+}
+
+impl TransportError {
+    pub(crate) fn new<E>(kind: TransportErrorKind, source: E) -> Self
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        Self {
+            kind,
+            source: Box::new(source),
+        }
+    }
+
+    pub(crate) fn timeout(message: impl Into<String>) -> Self {
+        Self::new(
+            TransportErrorKind::Timeout,
+            std::io::Error::new(std::io::ErrorKind::TimedOut, message.into()),
+        )
+    }
+
+    pub(crate) fn kind(&self) -> TransportErrorKind {
+        self.kind
+    }
+}
+
+fn error_chain_has_timeout(error: &(dyn StdError + 'static)) -> bool {
+    let mut current = Some(error);
+    while let Some(source) = current {
+        if let Some(io_error) = source.downcast_ref::<std::io::Error>() {
+            if io_error.kind() == std::io::ErrorKind::TimedOut {
+                return true;
+            }
+        }
+        current = source.source();
+    }
+    false
+}
+
+impl From<hyper_util::client::legacy::Error> for TransportError {
+    fn from(error: hyper_util::client::legacy::Error) -> Self {
+        let kind = if error.is_connect() {
+            TransportErrorKind::Connect
+        } else if error_chain_has_timeout(&error) {
+            TransportErrorKind::Timeout
+        } else {
+            TransportErrorKind::Request
+        };
+        Self::new(kind, error)
+    }
+}
+
+impl From<hyper::Error> for TransportError {
+    fn from(error: hyper::Error) -> Self {
+        let kind = if error.is_timeout() {
+            TransportErrorKind::Timeout
+        } else if error.is_body_write_aborted()
+            || error.is_incomplete_message()
+            || error.is_closed()
+            || error.is_canceled()
+        {
+            TransportErrorKind::Body
+        } else if error.is_parse() || error.is_user() || error.is_shutdown() {
+            TransportErrorKind::Request
+        } else {
+            TransportErrorKind::Other
+        };
+        Self::new(kind, error)
+    }
+}
 
 /// Errors that can occur during a download.
 #[derive(Debug, Error)]
 pub enum DownloadError {
-    #[error("HTTP error: {0}")]
-    Http(#[from] reqwest::Error),
+    #[error("transport error: {0}")]
+    Transport(#[from] TransportError),
 
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
@@ -47,15 +149,23 @@ pub enum DownloadError {
 }
 
 impl DownloadError {
+    pub(crate) fn timeout(message: impl Into<String>) -> Self {
+        Self::Transport(TransportError::timeout(message))
+    }
+
     /// Returns `true` if this error is transient and the request should be retried.
     ///
     /// Retryable conditions include timeouts, connection resets, and
     /// server errors (429, 500, 502, 503, 504).
     pub fn is_retryable(&self) -> bool {
         match self {
-            DownloadError::Http(e) => {
-                e.is_timeout() || e.is_connect() || e.is_request() || e.is_body()
-            }
+            DownloadError::Transport(error) => matches!(
+                error.kind(),
+                TransportErrorKind::Connect
+                    | TransportErrorKind::Timeout
+                    | TransportErrorKind::Request
+                    | TransportErrorKind::Body
+            ),
             DownloadError::HttpStatus { status, .. } => {
                 matches!(status, 429 | 500 | 502 | 503 | 504)
             }
@@ -192,6 +302,24 @@ mod tests {
     }
 
     #[test]
+    fn test_transport_error_classification() {
+        let connect = DownloadError::Transport(TransportError::new(
+            TransportErrorKind::Connect,
+            std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "connect"),
+        ));
+        assert!(connect.is_retryable());
+
+        let timeout = DownloadError::timeout("timed out");
+        assert!(timeout.is_retryable());
+
+        let other = DownloadError::Transport(TransportError::new(
+            TransportErrorKind::Other,
+            std::io::Error::other("other"),
+        ));
+        assert!(!other.is_retryable());
+    }
+
+    #[test]
     fn test_error_display() {
         let e = DownloadError::Cancelled;
         assert_eq!(format!("{e}"), "download cancelled");
@@ -214,5 +342,58 @@ mod tests {
             message: "Not Found".into(),
         };
         assert!(format!("{e}").contains("404"));
+    }
+
+    #[test]
+    fn test_transport_error_kind_display_all_variants() {
+        assert_eq!(TransportErrorKind::Connect.to_string(), "connect");
+        assert_eq!(TransportErrorKind::Timeout.to_string(), "timeout");
+        assert_eq!(TransportErrorKind::Request.to_string(), "request");
+        assert_eq!(TransportErrorKind::Body.to_string(), "body");
+        assert_eq!(TransportErrorKind::Other.to_string(), "other");
+    }
+
+    #[test]
+    fn test_transport_error_timeout_display_and_kind() {
+        let t = TransportError::timeout("deadline exceeded");
+        assert_eq!(t.kind(), TransportErrorKind::Timeout);
+        let s = format!("{t}");
+        assert!(s.contains("timeout transport error"), "got: {s}");
+    }
+
+    #[test]
+    fn test_is_retryable_body_transport() {
+        let body = DownloadError::Transport(TransportError::new(
+            TransportErrorKind::Body,
+            std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "body"),
+        ));
+        assert!(body.is_retryable());
+    }
+
+    #[test]
+    fn test_error_chain_has_timeout_through_nested_io_sources() {
+        #[derive(Debug)]
+        struct Wrapper(std::io::Error);
+
+        impl std::fmt::Display for Wrapper {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("wrapper")
+            }
+        }
+
+        impl StdError for Wrapper {
+            fn source(&self) -> Option<&(dyn StdError + 'static)> {
+                Some(&self.0)
+            }
+        }
+
+        let nested = Wrapper(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "timed out",
+        ));
+        assert!(error_chain_has_timeout(&nested));
+
+        let other = std::io::Error::other("other");
+        assert!(!error_chain_has_timeout(&other));
     }
 }

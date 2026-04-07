@@ -9,6 +9,7 @@ use super::{range_response_allowed, validate_metadata, StopSignal};
 use crate::config::{DownloadSpec, LogLevel};
 use crate::error::DownloadError;
 use crate::http::worker::HttpWorker;
+use crate::network::BytehaulClient;
 use crate::progress::ProgressSnapshot;
 use crate::rate_limiter::SpeedLimit;
 use crate::storage::control::ControlSnapshot;
@@ -19,13 +20,9 @@ pub(crate) async fn validate_local_resume_state(
     ctrl: &ControlSnapshot,
     spec: &DownloadSpec,
 ) -> Result<(), DownloadError> {
-    let metadata = tokio::fs::metadata(output_path).await.map_err(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            DownloadError::ResumeMismatch("local download file is missing".into())
-        } else {
-            DownloadError::Io(error)
-        }
-    })?;
+    let metadata = tokio::fs::metadata(output_path)
+        .await
+        .map_err(map_resume_metadata_error)?;
 
     if ctrl.downloaded_bytes > ctrl.total_size {
         return Err(DownloadError::ResumeMismatch(
@@ -102,9 +99,17 @@ pub(crate) async fn validate_local_resume_state(
     Ok(())
 }
 
+fn map_resume_metadata_error(error: std::io::Error) -> DownloadError {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        DownloadError::ResumeMismatch("local download file is missing".into())
+    } else {
+        DownloadError::Io(error)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn try_resume_download(
-    client: reqwest::Client,
+    client: BytehaulClient,
     worker: &HttpWorker,
     spec: &DownloadSpec,
     output_path: &Path,
@@ -179,9 +184,11 @@ pub(super) async fn try_resume_download(
                             completed_pieces = piece_map.completed_count(),
                             "download strategy selected"
                         );
+                        let request_url = worker.final_url().await?;
                         run_multi_worker(
                             client,
                             spec,
+                            &request_url,
                             output_path,
                             &meta,
                             ctrl.total_size,
@@ -222,9 +229,11 @@ pub(super) async fn try_resume_download(
                         total_size = ctrl.total_size,
                         "download strategy selected"
                     );
+                    let request_url = worker.final_url().await?;
                     run_single_connection(
                         resp,
                         &meta,
+                        &request_url,
                         spec,
                         output_path,
                         ctrl.downloaded_bytes,
@@ -445,5 +454,14 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, DownloadError::ResumeMismatch(msg) if msg.contains("completed bytes")));
+    }
+
+    #[tokio::test]
+    async fn test_validate_resume_metadata_io_error_is_not_mapped_to_missing_file() {
+        let err = map_resume_metadata_error(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "resume metadata access denied",
+        ));
+        assert!(matches!(err, DownloadError::Io(_)));
     }
 }

@@ -24,20 +24,20 @@ rm /path/to/your-file.zip.bytehaul
 
 **处理方法：**
 
-1. 通过 API 配置 SOCKS5 或 HTTP 代理：
+1. 通过 API 配置 HTTP 或 HTTPS 代理：
 
    ```python
    import bytehaul
 
    dl = bytehaul.Downloader(
-       proxy="http://proxy.example.com:8080"  # 所有协议共用
+       proxy="http://proxy.example.com:8080"  # HTTP/HTTPS 共用
        # 或者：
        # http_proxy="http://proxy:8080",
        # https_proxy="http://proxy:8080",
    )
    ```
 
-2. 使用环境变量：bytehaul（经由 reqwest）同样会读取 `HTTP_PROXY`、`HTTPS_PROXY` 和 `ALL_PROXY`。
+2. 使用环境变量：bytehaul 同样会读取 `HTTP_PROXY`、`HTTPS_PROXY` 和 `ALL_PROXY`。若同时显式配置了 `DownloaderBuilder` 代理参数，则显式配置优先。
 
 3. 单独验证代理本身是否可用：
 

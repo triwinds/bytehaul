@@ -31,7 +31,7 @@
 //!   with SHA-256, SHA-512, SHA-1, or MD5.
 //! - **Progress monitoring** – real-time progress snapshots with speed
 //!   and ETA, available via polling, watch channel, or callback.
-//! - **Proxy & custom DNS** – supports HTTP/HTTPS/SOCKS proxies and
+//! - **Proxy & custom DNS** – supports HTTP/HTTPS proxies and
 //!   custom DNS / DNS-over-HTTPS resolvers.
 
 mod checksum;
