@@ -585,8 +585,10 @@ fn parse_doh_server(server: &str, enable_ipv6: bool) -> Result<DohServerConfig, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http_body_util::BodyExt;
     use std::str::FromStr;
     use std::sync::Mutex as StdMutex;
+    use std::{io::{Read, Write}, net::TcpListener, thread};
 
     fn env_lock() -> &'static StdMutex<()> {
         static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
@@ -947,5 +949,140 @@ mod tests {
             "127.0.0.1:8443"
         );
         clear_proxy_env();
+    }
+
+    #[test]
+    fn test_proxy_uri_rejects_non_http_scheme() {
+        let err = proxy_uri(Some("ftp://127.0.0.1:21"), &[], "all_proxy")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must use http or https"), "got: {err}");
+    }
+
+    #[test]
+    fn test_proxy_uri_discards_fragment_after_url_parse() {
+        let proxy = proxy_uri(Some("http://127.0.0.1:8080#frag"), &[], "http_proxy")
+            .unwrap()
+            .unwrap();
+        assert_eq!(proxy.to_string(), "http://127.0.0.1:8080/");
+    }
+
+    #[tokio::test]
+    async fn test_warm_resolution_for_url_handles_proxy_invalid_and_hostless_urls() {
+        let (proxy_client, direct_client) = {
+            let _guard = env_lock().lock().unwrap();
+            clear_proxy_env();
+
+            let proxy_client = ClientNetworkConfig {
+                http_proxy: Some("http://127.0.0.1:8080".into()),
+                ..ClientNetworkConfig::default()
+            }
+            .build_client()
+            .unwrap();
+            let direct_client = ClientNetworkConfig::default().build_client().unwrap();
+
+            (proxy_client, direct_client)
+        };
+        proxy_client
+            .warm_resolution_for_url("http://example.com/file.bin")
+            .await
+            .unwrap();
+
+        direct_client.warm_resolution_for_url("not a url").await.unwrap();
+        direct_client
+            .warm_resolution_for_url("file:///tmp/no-host")
+            .await
+            .unwrap();
+        direct_client
+            .warm_resolution_for_url("http://coverage-check.invalid/file.bin")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_proxy_client_request_uses_proxy_branch() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let n = stream.read(&mut request).unwrap();
+            let text = String::from_utf8_lossy(&request[..n]);
+            assert!(text.starts_with("GET "), "request was: {text}");
+            let response = b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\npong";
+            stream.write_all(response).unwrap();
+        });
+
+        let client = {
+            let _guard = env_lock().lock().unwrap();
+            clear_proxy_env();
+            ClientNetworkConfig {
+                http_proxy: Some(format!("http://{addr}")),
+                ..ClientNetworkConfig::default()
+            }
+            .build_client()
+            .unwrap()
+        };
+
+        let req = hyper::Request::builder()
+            .method("GET")
+            .uri("http://example.com/proxy-test")
+            .body(HttpRequestBody::new())
+            .unwrap();
+        let response = client.request(req).await.unwrap();
+        assert_eq!(response.status(), hyper::StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&bytes[..], b"pong");
+
+        handle.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_request_with_timeout_returns_timeout_error() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request).unwrap();
+            thread::sleep(Duration::from_millis(100));
+            let response = b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nslow";
+            let _ = stream.write_all(response);
+        });
+
+        let client = ClientNetworkConfig::default().build_client().unwrap();
+        let req = hyper::Request::builder()
+            .method("GET")
+            .uri(format!("http://{addr}/slow"))
+            .body(HttpRequestBody::new())
+            .unwrap();
+
+        let err = client
+            .request_with_timeout(req, Duration::from_millis(20))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            DownloadError::Transport(ref transport)
+                if transport.kind() == crate::error::TransportErrorKind::Timeout
+        ));
+
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_parse_doh_server_reports_empty_host_parse_error() {
+        let err = parse_doh_server("https://:443/dns-query", true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("missing a host"), "got: {err}");
+    }
+
+    #[test]
+    fn test_parse_doh_server_reports_generic_parse_error() {
+        let err = parse_doh_server("https://[::1", true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid DoH server URL"), "got: {err}");
     }
 }

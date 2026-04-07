@@ -20,13 +20,9 @@ pub(crate) async fn validate_local_resume_state(
     ctrl: &ControlSnapshot,
     spec: &DownloadSpec,
 ) -> Result<(), DownloadError> {
-    let metadata = tokio::fs::metadata(output_path).await.map_err(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            DownloadError::ResumeMismatch("local download file is missing".into())
-        } else {
-            DownloadError::Io(error)
-        }
-    })?;
+    let metadata = tokio::fs::metadata(output_path)
+        .await
+        .map_err(map_resume_metadata_error)?;
 
     if ctrl.downloaded_bytes > ctrl.total_size {
         return Err(DownloadError::ResumeMismatch(
@@ -101,6 +97,14 @@ pub(crate) async fn validate_local_resume_state(
     }
 
     Ok(())
+}
+
+fn map_resume_metadata_error(error: std::io::Error) -> DownloadError {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        DownloadError::ResumeMismatch("local download file is missing".into())
+    } else {
+        DownloadError::Io(error)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -450,5 +454,14 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, DownloadError::ResumeMismatch(msg) if msg.contains("completed bytes")));
+    }
+
+    #[tokio::test]
+    async fn test_validate_resume_metadata_io_error_is_not_mapped_to_missing_file() {
+        let err = map_resume_metadata_error(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "resume metadata access denied",
+        ));
+        assert!(matches!(err, DownloadError::Io(_)));
     }
 }

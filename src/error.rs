@@ -343,4 +343,57 @@ mod tests {
         };
         assert!(format!("{e}").contains("404"));
     }
+
+    #[test]
+    fn test_transport_error_kind_display_all_variants() {
+        assert_eq!(TransportErrorKind::Connect.to_string(), "connect");
+        assert_eq!(TransportErrorKind::Timeout.to_string(), "timeout");
+        assert_eq!(TransportErrorKind::Request.to_string(), "request");
+        assert_eq!(TransportErrorKind::Body.to_string(), "body");
+        assert_eq!(TransportErrorKind::Other.to_string(), "other");
+    }
+
+    #[test]
+    fn test_transport_error_timeout_display_and_kind() {
+        let t = TransportError::timeout("deadline exceeded");
+        assert_eq!(t.kind(), TransportErrorKind::Timeout);
+        let s = format!("{t}");
+        assert!(s.contains("timeout transport error"), "got: {s}");
+    }
+
+    #[test]
+    fn test_is_retryable_body_transport() {
+        let body = DownloadError::Transport(TransportError::new(
+            TransportErrorKind::Body,
+            std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "body"),
+        ));
+        assert!(body.is_retryable());
+    }
+
+    #[test]
+    fn test_error_chain_has_timeout_through_nested_io_sources() {
+        #[derive(Debug)]
+        struct Wrapper(std::io::Error);
+
+        impl std::fmt::Display for Wrapper {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("wrapper")
+            }
+        }
+
+        impl StdError for Wrapper {
+            fn source(&self) -> Option<&(dyn StdError + 'static)> {
+                Some(&self.0)
+            }
+        }
+
+        let nested = Wrapper(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "timed out",
+        ));
+        assert!(error_chain_has_timeout(&nested));
+
+        let other = std::io::Error::other("other");
+        assert!(!error_chain_has_timeout(&other));
+    }
 }
