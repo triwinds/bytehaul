@@ -9,13 +9,13 @@ use tokio::task::JoinHandle;
 use crate::config::{DownloadSpec, LogLevel};
 use crate::error::DownloadError;
 use crate::logging::next_download_id;
-use crate::network::ClientNetworkConfig;
+use crate::network::{BytehaulClient, ClientNetworkConfig};
 use crate::progress::{DownloadState, ProgressSnapshot};
 use crate::session;
 
 /// Top-level downloader that manages shared resources (e.g. HTTP client).
 pub struct Downloader {
-    client_cache: Arc<Mutex<HashMap<ClientNetworkConfig, reqwest::Client>>>,
+    client_cache: Arc<Mutex<HashMap<ClientNetworkConfig, BytehaulClient>>>,
     client_config: ClientNetworkConfig,
     log_level: LogLevel,
     concurrency_limit: Option<Arc<Semaphore>>,
@@ -218,9 +218,9 @@ impl Downloader {
 }
 
 fn cached_client_for_config(
-    client_cache: &Arc<Mutex<HashMap<ClientNetworkConfig, reqwest::Client>>>,
+    client_cache: &Arc<Mutex<HashMap<ClientNetworkConfig, BytehaulClient>>>,
     requested_config: ClientNetworkConfig,
-) -> Result<reqwest::Client, DownloadError> {
+) -> Result<BytehaulClient, DownloadError> {
     if let Some(client) = client_cache.lock().get(&requested_config).cloned() {
         return Ok(client);
     }

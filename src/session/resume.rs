@@ -9,6 +9,7 @@ use super::{range_response_allowed, validate_metadata, StopSignal};
 use crate::config::{DownloadSpec, LogLevel};
 use crate::error::DownloadError;
 use crate::http::worker::HttpWorker;
+use crate::network::BytehaulClient;
 use crate::progress::ProgressSnapshot;
 use crate::rate_limiter::SpeedLimit;
 use crate::storage::control::ControlSnapshot;
@@ -104,7 +105,7 @@ pub(crate) async fn validate_local_resume_state(
 
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn try_resume_download(
-    client: reqwest::Client,
+    client: BytehaulClient,
     worker: &HttpWorker,
     spec: &DownloadSpec,
     output_path: &Path,
@@ -179,9 +180,11 @@ pub(super) async fn try_resume_download(
                             completed_pieces = piece_map.completed_count(),
                             "download strategy selected"
                         );
+                        let request_url = worker.final_url().await?;
                         run_multi_worker(
                             client,
                             spec,
+                            &request_url,
                             output_path,
                             &meta,
                             ctrl.total_size,
@@ -222,9 +225,11 @@ pub(super) async fn try_resume_download(
                         total_size = ctrl.total_size,
                         "download strategy selected"
                     );
+                    let request_url = worker.final_url().await?;
                     run_single_connection(
                         resp,
                         &meta,
+                        &request_url,
                         spec,
                         output_path,
                         ctrl.downloaded_bytes,

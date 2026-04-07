@@ -14,6 +14,8 @@ use crate::error::DownloadError;
 use crate::filename::{detect_filename, sanitize_relative_path};
 use crate::http::response::ResponseMeta;
 use crate::http::worker::HttpWorker;
+use crate::http::HttpResponse;
+use crate::network::BytehaulClient;
 use crate::progress::{DownloadState, ProgressSnapshot};
 use crate::rate_limiter::SpeedLimit;
 use crate::storage::control::ControlSnapshot;
@@ -33,7 +35,7 @@ async fn probe_or_fallback_get(
     worker: &HttpWorker,
     spec: &DownloadSpec,
     cancel_rx: &mut watch::Receiver<StopSignal>,
-) -> Result<(reqwest::Response, ResponseMeta, FreshResponseSource), DownloadError> {
+) -> Result<(HttpResponse, ResponseMeta, FreshResponseSource), DownloadError> {
     if spec.max_connections > 1 {
         let piece_end = spec.piece_size.saturating_sub(1);
         if let Ok((resp, meta)) = worker.send_range(0, piece_end).await {
@@ -199,19 +201,21 @@ fn resolve_static_output_path(spec: &DownloadSpec) -> Result<Option<PathBuf>, Do
 fn resolve_auto_output_path(
     spec: &DownloadSpec,
     meta: &ResponseMeta,
+    request_url: &str,
 ) -> Result<PathBuf, DownloadError> {
     Ok(resolve_output_dir(spec)?.join(detect_filename(
         meta.content_disposition.as_deref(),
-        &spec.url,
+        request_url,
     )))
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn run_fresh_from_response(
-    client: reqwest::Client,
+    client: BytehaulClient,
     spec: &DownloadSpec,
+    request_url: &str,
     output_path: &Path,
-    response: reqwest::Response,
+    response: HttpResponse,
     meta: ResponseMeta,
     source: FreshResponseSource,
     progress_tx: &watch::Sender<ProgressSnapshot>,
@@ -242,6 +246,7 @@ async fn run_fresh_from_response(
                 run_multi_worker(
                     client,
                     spec,
+                    request_url,
                     output_path,
                     &meta,
                     total_size,
@@ -271,6 +276,7 @@ async fn run_fresh_from_response(
         run_single_connection(
             response,
             &meta,
+            request_url,
             spec,
             output_path,
             0,
@@ -308,6 +314,7 @@ async fn run_fresh_from_response(
     run_single_connection(
         response,
         &meta,
+        request_url,
         spec,
         output_path,
         0,
@@ -324,7 +331,7 @@ async fn run_fresh_from_response(
 }
 
 pub(crate) async fn run_download(
-    client: reqwest::Client,
+    client: BytehaulClient,
     spec: DownloadSpec,
     log_level: LogLevel,
     download_id: u64,
@@ -367,7 +374,7 @@ pub(crate) async fn run_download(
 }
 
 async fn run_download_inner(
-    client: reqwest::Client,
+    client: BytehaulClient,
     spec: DownloadSpec,
     log_level: LogLevel,
     download_id: u64,
@@ -377,6 +384,8 @@ async fn run_download_inner(
     let worker = HttpWorker::new(client.clone(), &spec);
     let mut cancel_rx = cancel_rx;
     let speed_limit = SpeedLimit::new(spec.max_download_speed);
+
+    client.warm_resolution_for_url(&spec.url).await?;
 
     if let Some(output_path) = resolve_static_output_path(&spec)? {
         if let Some(resumed_path) = try_resume_download(
@@ -397,9 +406,11 @@ async fn run_download_inner(
 
         return {
             let (resp, meta, source) = probe_or_fallback_get(&worker, &spec, &mut cancel_rx).await?;
+            let request_url = worker.final_url().await?;
             run_fresh_from_response(
                 client,
                 &spec,
+                &request_url,
                 &output_path,
                 resp,
                 meta,
@@ -417,7 +428,8 @@ async fn run_download_inner(
     let (initial_response, initial_meta, source) =
         probe_or_fallback_get(&worker, &spec, &mut cancel_rx).await?;
 
-    let output_path = resolve_auto_output_path(&spec, &initial_meta)?;
+    let request_url = worker.final_url().await?;
+    let output_path = resolve_auto_output_path(&spec, &initial_meta, &request_url)?;
     if let Some(resumed_path) = try_resume_download(
         client.clone(),
         &worker,
@@ -437,6 +449,7 @@ async fn run_download_inner(
     run_fresh_from_response(
         client,
         &spec,
+        &request_url,
         &output_path,
         initial_response,
         initial_meta,

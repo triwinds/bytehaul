@@ -3,7 +3,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use futures::StreamExt;
 use tokio::sync::{mpsc, watch, Semaphore};
 
 use super::{
@@ -15,6 +14,7 @@ use crate::config::{DownloadSpec, LogLevel};
 use crate::error::DownloadError;
 use crate::eta::EtaEstimator;
 use crate::http::response::ResponseMeta;
+use crate::http::{next_data_chunk, HttpResponse};
 use crate::progress::{
     DownloadState, ProgressReporter, ProgressSnapshot, ProgressUpdate, PROGRESS_REPORT_BYTES,
     PROGRESS_REPORT_INTERVAL,
@@ -40,8 +40,9 @@ struct SingleControlSaveContext<'a> {
 
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_single_connection(
-    response: reqwest::Response,
+    response: HttpResponse,
     meta: &ResponseMeta,
+    request_url: &str,
     spec: &DownloadSpec,
     output_path: &Path,
     start_offset: u64,
@@ -82,7 +83,7 @@ pub(super) async fn run_single_connection(
 
     let ts = total_size.unwrap_or(0);
     let snap_template = ControlSnapshot {
-        url: spec.url.clone(),
+        url: request_url.to_string(),
         total_size: ts,
         piece_size: ts,
         piece_count: 1,
@@ -102,6 +103,7 @@ pub(super) async fn run_single_connection(
 
     let stream_result = stream_single(
         response,
+        spec.read_timeout,
         &write_tx,
         progress_tx,
         cancel_rx,
@@ -182,7 +184,8 @@ pub(super) async fn run_single_connection(
 /// Stream a single HTTP response body to the writer channel.
 #[allow(clippy::too_many_arguments)]
 async fn stream_single(
-    response: reqwest::Response,
+    response: HttpResponse,
+    read_timeout: Duration,
     write_tx: &mpsc::Sender<WriterCommand>,
     progress_tx: &watch::Sender<ProgressSnapshot>,
     cancel_rx: watch::Receiver<StopSignal>,
@@ -197,7 +200,7 @@ async fn stream_single(
     log_level: LogLevel,
     download_id: u64,
 ) -> Result<SingleStreamSummary, DownloadError> {
-    let mut stream = response.bytes_stream();
+    let mut body = response.into_body();
     let mut downloaded: u64 = start_offset;
     let start_time = Instant::now();
     let mut eta_estimator = EtaEstimator::new(SPEED_ESTIMATE_WINDOW, MIN_SPEED_SAMPLE_SPAN);
@@ -278,9 +281,9 @@ async fn stream_single(
                 }
             }
 
-            chunk = stream.next() => {
+            chunk = next_data_chunk(&mut body, read_timeout) => {
                 match chunk {
-                    Some(Ok(data)) => {
+                    Ok(Some(data)) => {
                         let len = data.len();
                         // Rate limiting
                         speed_limit.acquire(len).await;
@@ -315,16 +318,16 @@ async fn stream_single(
                             now,
                         );
                     }
-                    Some(Err(e)) => {
+                    Ok(None) => break,
+                    Err(error) => {
                         progress_reporter.force_report(
                             progress_tx,
                             ProgressUpdate::new(downloaded, last_speed, last_eta_secs)
                                 .with_state(DownloadState::Failed),
                             Instant::now(),
                         );
-                        return Err(DownloadError::Http(e));
+                        return Err(error);
                     }
-                    None => break,
                 }
             }
         }
@@ -457,12 +460,17 @@ mod tests {
         (format!("http://{addr}/file.bin"), handle)
     }
 
-    async fn get_response(url: &str) -> (reqwest::Client, reqwest::Response) {
-        let client = reqwest::Client::new();
-        tokio::time::timeout(Duration::from_secs(5), client.get(url).send())
+    async fn get_response(url: &str) -> HttpResponse {
+        let client = crate::network::ClientNetworkConfig::default()
+            .build_client()
+            .unwrap();
+        let req = crate::http::request::build_get_request(
+            url,
+            &std::collections::HashMap::new(),
+        );
+        tokio::time::timeout(Duration::from_secs(5), client.request(req))
             .await
             .unwrap()
-            .map(|response| (client, response))
             .unwrap()
     }
 
@@ -524,7 +532,7 @@ mod tests {
     #[tokio::test]
     async fn test_run_single_connection_persists_control_on_stream_error() {
         let (url, server) = spawn_single_response_server(8, b"fail".to_vec(), Duration::ZERO);
-        let (_client, response) = get_response(&url).await;
+        let response = get_response(&url).await;
         let meta = single_response_meta(8);
         let spec = test_spec(&url);
         let dir = tempfile::tempdir().unwrap();
@@ -538,6 +546,7 @@ mod tests {
             run_single_connection(
                 response,
                 &meta,
+                &url,
                 &spec,
                 &output_path,
                 0,
@@ -556,7 +565,7 @@ mod tests {
 
         join_server(server).await;
 
-        assert!(matches!(err, DownloadError::Http(_)));
+    assert!(matches!(err, DownloadError::Transport(_)));
         let loaded = ControlSnapshot::load(&control_path).await.unwrap();
         assert_eq!(loaded.downloaded_bytes, 4);
         assert_eq!(progress_tx.borrow().state, DownloadState::Failed);
@@ -565,7 +574,7 @@ mod tests {
     #[tokio::test]
     async fn test_run_single_connection_completes_and_clears_control_file() {
         let (url, server) = spawn_single_response_server(4, b"done".to_vec(), Duration::ZERO);
-        let (_client, response) = get_response(&url).await;
+        let response = get_response(&url).await;
         let meta = single_response_meta(4);
         let spec = test_spec(&url);
         let dir = tempfile::tempdir().unwrap();
@@ -580,6 +589,7 @@ mod tests {
             run_single_connection(
                 response,
                 &meta,
+                &url,
                 &spec,
                 &output_path,
                 0,
@@ -609,7 +619,7 @@ mod tests {
     #[tokio::test]
     async fn test_stream_single_returns_channel_closed_when_writer_receiver_dropped() {
         let (url, server) = spawn_single_response_server(4, b"data".to_vec(), Duration::ZERO);
-        let (_client, response) = get_response(&url).await;
+        let response = get_response(&url).await;
         let (write_tx, write_rx) = mpsc::channel(1);
         drop(write_rx);
         let (progress_tx, _) = watch::channel(ProgressSnapshot::default());
@@ -620,6 +630,7 @@ mod tests {
             Duration::from_secs(5),
             stream_single(
                 response,
+                Duration::from_secs(5),
                 &write_tx,
                 &progress_tx,
                 cancel_rx,
@@ -648,7 +659,7 @@ mod tests {
     async fn test_stream_single_pauses_and_saves_control_snapshot() {
         let (url, server) =
             spawn_single_response_server(4, b"data".to_vec(), Duration::from_millis(50));
-        let (_client, response) = get_response(&url).await;
+        let response = get_response(&url).await;
         let dir = tempfile::tempdir().unwrap();
         let control_path = dir.path().join("single-pause.bytehaul");
         let snapshot = snapshot_template_with(5, 0);
@@ -668,6 +679,7 @@ mod tests {
             Duration::from_secs(5),
             stream_single(
                 response,
+                Duration::from_secs(5),
                 &write_tx,
                 &progress_tx,
                 cancel_rx,
@@ -701,7 +713,7 @@ mod tests {
     async fn test_stream_single_autosaves_existing_progress_before_body_arrives() {
         let (url, server) =
             spawn_single_response_server(4, b"data".to_vec(), Duration::from_millis(50));
-        let (_client, response) = get_response(&url).await;
+        let response = get_response(&url).await;
         let dir = tempfile::tempdir().unwrap();
         let control_path = dir.path().join("single-autosave.bytehaul");
         let snapshot = snapshot_template_with(5, 0);
@@ -716,6 +728,7 @@ mod tests {
             Duration::from_secs(5),
             stream_single(
                 response,
+                Duration::from_secs(5),
                 &write_tx,
                 &progress_tx,
                 cancel_rx,

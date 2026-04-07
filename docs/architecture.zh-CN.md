@@ -6,7 +6,7 @@
 
 ## 概览
 
-bytehaul 是一个基于 Tokio 和 reqwest 构建的异步 HTTP 下载库。它支持多连接并行下载、通过控制文件实现断点续传、回写缓存，以及基于可配置内存预算的背压控制。
+bytehaul 是一个基于 Tokio、hyper 和 hyper-rustls 构建的异步 HTTP 下载库。它支持多连接并行下载、通过控制文件实现断点续传、回写缓存，以及基于可配置内存预算的背压控制。
 
 ## 数据流示意图
 
@@ -16,7 +16,7 @@ graph TD
     Downloader["Downloader"]
     Handle["DownloadHandle"]
     Session["Session (run_download)"]
-    Probe["HTTP 探测 (HEAD / Range GET)"]
+    Probe["HTTP 探测 (GET / Range GET)"]
     Single["单连接路径"]
     Multi["多 Worker 路径"]
     Scheduler["SchedulerState"]
@@ -60,7 +60,7 @@ graph TD
 
 ### Downloader / DownloaderBuilder
 
-入口对象。它会构建共享的 `reqwest::Client`（包含代理、DNS、TLS 等设置），以及可选的并发下载限制 `Semaphore`。每次调用 `download()` 都会启动一个独立的 Tokio 任务，并返回一个 `DownloadHandle`。
+入口对象。它会构建共享的 `BytehaulClient` 包装层（内部基于 hyper client stack，并包含代理、DNS、TLS、超时等设置），以及可选的并发下载限制 `Semaphore`。每次调用 `download()` 都会启动一个独立的 Tokio 任务，并返回一个 `DownloadHandle`。
 
 ### DownloadHandle
 

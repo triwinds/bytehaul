@@ -18,6 +18,8 @@ use crate::error::DownloadError;
 use crate::eta::EtaEstimator;
 use crate::http::request::build_range_request;
 use crate::http::response::ResponseMeta;
+use crate::http::{next_data_chunk, HttpResponse};
+use crate::network::BytehaulClient;
 use crate::progress::{DownloadState, ProgressReporter, ProgressSnapshot, ProgressUpdate};
 use crate::rate_limiter::SpeedLimit;
 use crate::scheduler::{Scheduler, SchedulerState};
@@ -30,6 +32,7 @@ use crate::storage::writer::{WriterCommand, WriterTask};
 struct MultiControlSaveContext<'a> {
     spec: &'a DownloadSpec,
     meta: &'a ResponseMeta,
+    request_url: &'a str,
     scheduler: &'a Scheduler,
     total_size: u64,
     control_path: &'a Path,
@@ -39,13 +42,14 @@ struct MultiControlSaveContext<'a> {
 
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_multi_worker(
-    client: reqwest::Client,
+    client: BytehaulClient,
     spec: &DownloadSpec,
+    request_url: &str,
     output_path: &Path,
     meta: &ResponseMeta,
     total_size: u64,
     piece_map: PieceMap,
-    probe_response: Option<(reqwest::Response, usize)>,
+    probe_response: Option<(HttpResponse, usize)>,
     progress_tx: &watch::Sender<ProgressSnapshot>,
     cancel_rx: watch::Receiver<StopSignal>,
     control_path: &Path,
@@ -113,6 +117,7 @@ pub(super) async fn run_multi_worker(
     let control_save_ctx = MultiControlSaveContext {
         spec,
         meta,
+        request_url,
         scheduler: &scheduler,
         total_size,
         control_path,
@@ -121,7 +126,7 @@ pub(super) async fn run_multi_worker(
     };
 
     let worker_cfg = Arc::new(WorkerConfig {
-        url: spec.url.clone(),
+        url: request_url.to_string(),
         headers: spec.headers.clone(),
         read_timeout: spec.read_timeout,
         max_retries: spec.max_retries,
@@ -399,7 +404,7 @@ async fn persist_multi_control_snapshot(
     let snap = {
         let sched = ctx.scheduler.lock();
         ControlSnapshot {
-            url: ctx.spec.url.clone(),
+            url: ctx.request_url.to_string(),
             total_size: ctx.total_size,
             piece_size: sched.piece_size(),
             piece_count: sched.piece_count(),
@@ -451,7 +456,7 @@ struct WorkerConfig {
 #[allow(clippy::too_many_arguments)]
 async fn worker_loop(
     worker_id: usize,
-    client: reqwest::Client,
+    client: BytehaulClient,
     cfg: Arc<WorkerConfig>,
     scheduler: Scheduler,
     write_tx: mpsc::Sender<WriterCommand>,
@@ -459,7 +464,7 @@ async fn worker_loop(
     cancel_rx: watch::Receiver<StopSignal>,
     budget: Arc<Semaphore>,
     speed_limit: SpeedLimit,
-    first_response: Option<(reqwest::Response, usize)>,
+    first_response: Option<(HttpResponse, usize)>,
     log_level: LogLevel,
     download_id: u64,
 ) -> Result<(), DownloadError> {
@@ -504,6 +509,7 @@ async fn worker_loop(
                 if pid == segment.piece_id {
                     stream_segment(
                         resp,
+                        cfg.read_timeout,
                         &segment,
                         &write_tx,
                         &downloaded,
@@ -663,7 +669,7 @@ fn validate_segment_meta(meta: &ResponseMeta, segment: &Segment) -> Result<(), D
 /// Download a segment by sending a fresh Range request.
 #[allow(clippy::too_many_arguments)]
 async fn download_segment(
-    client: &reqwest::Client,
+    client: &BytehaulClient,
     url: &str,
     headers: &std::collections::HashMap<String, String>,
     timeout: Duration,
@@ -674,15 +680,8 @@ async fn download_segment(
     budget: &Arc<Semaphore>,
     speed_limit: &SpeedLimit,
 ) -> Result<(), DownloadError> {
-    let req = build_range_request(
-        client,
-        url,
-        headers,
-        timeout,
-        segment.start,
-        segment.end - 1,
-    );
-    let response = req.send().await?;
+    let req = build_range_request(url, headers, segment.start, segment.end - 1);
+    let response = client.request_with_timeout(req, timeout).await?;
 
     let status = response.status().as_u16();
     let retry_after = response
@@ -691,11 +690,12 @@ async fn download_segment(
         .and_then(|v| v.to_str().ok().map(|s| s.to_owned()));
     check_segment_status(status, retry_after.as_deref())?;
 
-    let meta = ResponseMeta::from_response(&response);
+    let meta = ResponseMeta::from_parts(response.status(), response.headers(), None);
     validate_segment_meta(&meta, segment)?;
 
     stream_segment(
         response,
+        timeout,
         segment,
         write_tx,
         downloaded,
@@ -707,8 +707,10 @@ async fn download_segment(
 }
 
 /// Stream an already-opened response into the writer channel.
+#[allow(clippy::too_many_arguments)]
 async fn stream_segment(
-    response: reqwest::Response,
+    response: HttpResponse,
+    read_timeout: Duration,
     segment: &Segment,
     write_tx: &mpsc::Sender<WriterCommand>,
     downloaded: &Arc<AtomicU64>,
@@ -716,7 +718,7 @@ async fn stream_segment(
     budget: &Arc<Semaphore>,
     speed_limit: &SpeedLimit,
 ) -> Result<(), DownloadError> {
-    let mut stream = response.bytes_stream();
+    let mut body = response.into_body();
     let mut offset = segment.start;
 
     loop {
@@ -731,9 +733,9 @@ async fn stream_segment(
                 }
             }
 
-            chunk = stream.next() => {
+            chunk = next_data_chunk(&mut body, read_timeout) => {
                 match chunk {
-                    Some(Ok(data)) => {
+                    Ok(Some(data)) => {
                         let len = data.len();
                         // Rate limiting
                         speed_limit.acquire(len).await;
@@ -754,8 +756,8 @@ async fn stream_segment(
                         offset += len as u64;
                         downloaded.fetch_add(len as u64, Ordering::Relaxed);
                     }
-                    Some(Err(e)) => return Err(DownloadError::Http(e)),
-                    None => break,
+                    Ok(None) => break,
+                    Err(error) => return Err(error),
                 }
             }
         }
@@ -806,6 +808,7 @@ mod coverage_tests {
         let ctx = MultiControlSaveContext {
             spec: &spec,
             meta: &meta,
+            request_url: "https://example.com/multi.bin",
             scheduler: &scheduler,
             total_size: 1024,
             control_path: &control_path,
@@ -856,6 +859,7 @@ mod coverage_tests {
         let ctx = MultiControlSaveContext {
             spec: &spec,
             meta: &meta,
+            request_url: "https://example.com/multi.bin",
             scheduler: &scheduler,
             total_size: 1024,
             control_path: &control_path,
@@ -892,6 +896,7 @@ mod coverage_tests {
         let ctx = MultiControlSaveContext {
             spec: &spec,
             meta: &meta,
+            request_url: "https://example.com/multi.bin",
             scheduler: &scheduler,
             total_size: 1024,
             control_path: &control_path,
@@ -934,6 +939,7 @@ mod coverage_tests {
         let ctx = MultiControlSaveContext {
             spec: &spec,
             meta: &meta,
+            request_url: "https://example.com/multi.bin",
             scheduler: &scheduler,
             total_size: 1024,
             control_path: &control_path,

@@ -1,5 +1,7 @@
 use std::path::{Component, Path, PathBuf};
 
+use url::Url;
+
 const WINDOWS_RESERVED_NAMES: &[&str] = &[
     "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6",
     "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7",
@@ -55,7 +57,7 @@ pub(crate) fn parse_content_disposition(header_value: &str) -> Option<String> {
 }
 
 pub(crate) fn filename_from_url(url: &str) -> Option<String> {
-    let parsed = reqwest::Url::parse(url).ok()?;
+    let parsed = Url::parse(url).ok()?;
     let segment = parsed
         .path_segments()
         .and_then(|mut segments| segments.rfind(|segment: &&str| !segment.is_empty()))?;

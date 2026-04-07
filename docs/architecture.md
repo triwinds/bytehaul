@@ -6,7 +6,7 @@ This document describes bytehaul's internal data-flow pipeline and the key abstr
 
 ## Overview
 
-bytehaul is an async HTTP download library built on Tokio and reqwest. It supports multi-connection parallel downloading, resume via control files, write-back caching, and a configurable memory budget for back-pressure.
+bytehaul is an async HTTP download library built on Tokio, hyper, and hyper-rustls. It supports multi-connection parallel downloading, resume via control files, write-back caching, and a configurable memory budget for back-pressure.
 
 ## Data-Flow Diagram
 
@@ -16,7 +16,7 @@ graph TD
     Downloader["Downloader"]
     Handle["DownloadHandle"]
     Session["Session (run_download)"]
-    Probe["HTTP Probe (HEAD / Range GET)"]
+    Probe["HTTP Probe (GET / Range GET)"]
     Single["Single-Connection Path"]
     Multi["Multi-Worker Path"]
     Scheduler["SchedulerState"]
@@ -60,7 +60,7 @@ graph TD
 
 ### Downloader / DownloaderBuilder
 
-Entry point. Builds a shared `reqwest::Client` (with proxy, DNS, TLS settings) and an optional `Semaphore` for limiting concurrent downloads. Each call to `download()` spawns an independent Tokio task and returns a `DownloadHandle`.
+Entry point. Builds a shared `BytehaulClient` wrapper around the hyper client stack (with proxy, DNS, TLS, and timeout settings) and an optional `Semaphore` for limiting concurrent downloads. Each call to `download()` spawns an independent Tokio task and returns a `DownloadHandle`.
 
 ### DownloadHandle
 
