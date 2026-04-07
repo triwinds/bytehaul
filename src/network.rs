@@ -969,21 +969,25 @@ mod tests {
 
     #[tokio::test]
     async fn test_warm_resolution_for_url_handles_proxy_invalid_and_hostless_urls() {
-        let _guard = env_lock().lock().unwrap();
-        clear_proxy_env();
+        let (proxy_client, direct_client) = {
+            let _guard = env_lock().lock().unwrap();
+            clear_proxy_env();
 
-        let proxy_client = ClientNetworkConfig {
-            http_proxy: Some("http://127.0.0.1:8080".into()),
-            ..ClientNetworkConfig::default()
-        }
-        .build_client()
-        .unwrap();
+            let proxy_client = ClientNetworkConfig {
+                http_proxy: Some("http://127.0.0.1:8080".into()),
+                ..ClientNetworkConfig::default()
+            }
+            .build_client()
+            .unwrap();
+            let direct_client = ClientNetworkConfig::default().build_client().unwrap();
+
+            (proxy_client, direct_client)
+        };
         proxy_client
             .warm_resolution_for_url("http://example.com/file.bin")
             .await
             .unwrap();
 
-        let direct_client = ClientNetworkConfig::default().build_client().unwrap();
         direct_client.warm_resolution_for_url("not a url").await.unwrap();
         direct_client
             .warm_resolution_for_url("file:///tmp/no-host")
@@ -997,9 +1001,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_proxy_client_request_uses_proxy_branch() {
-        let _guard = env_lock().lock().unwrap();
-        clear_proxy_env();
-
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let addr = listener.local_addr().unwrap();
         let handle = thread::spawn(move || {
@@ -1012,12 +1013,16 @@ mod tests {
             stream.write_all(response).unwrap();
         });
 
-        let client = ClientNetworkConfig {
-            http_proxy: Some(format!("http://{addr}")),
-            ..ClientNetworkConfig::default()
-        }
-        .build_client()
-        .unwrap();
+        let client = {
+            let _guard = env_lock().lock().unwrap();
+            clear_proxy_env();
+            ClientNetworkConfig {
+                http_proxy: Some(format!("http://{addr}")),
+                ..ClientNetworkConfig::default()
+            }
+            .build_client()
+            .unwrap()
+        };
 
         let req = hyper::Request::builder()
             .method("GET")
@@ -1028,6 +1033,39 @@ mod tests {
         assert_eq!(response.status(), hyper::StatusCode::OK);
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(&bytes[..], b"pong");
+
+        handle.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_request_with_timeout_returns_timeout_error() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request).unwrap();
+            thread::sleep(Duration::from_millis(100));
+            let response = b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nslow";
+            let _ = stream.write_all(response);
+        });
+
+        let client = ClientNetworkConfig::default().build_client().unwrap();
+        let req = hyper::Request::builder()
+            .method("GET")
+            .uri(format!("http://{addr}/slow"))
+            .body(HttpRequestBody::new())
+            .unwrap();
+
+        let err = client
+            .request_with_timeout(req, Duration::from_millis(20))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            DownloadError::Transport(ref transport)
+                if transport.kind() == crate::error::TransportErrorKind::Timeout
+        ));
 
         handle.join().unwrap();
     }
