@@ -60,8 +60,6 @@ impl ClientNetworkConfig {
 
         if self.use_native_tls {
             builder = builder.use_native_tls();
-        } else {
-            builder = builder.use_rustls_tls();
         }
 
         // Add scheme-specific proxies first so they win over a later catch-all proxy.
