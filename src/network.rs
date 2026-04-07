@@ -26,6 +26,9 @@ pub(crate) struct ClientNetworkConfig {
     pub dns_servers: Vec<SocketAddr>,
     pub doh_servers: Vec<String>,
     pub enable_ipv6: bool,
+    /// Use the platform-native TLS stack (OpenSSL on Linux, SChannel on Windows,
+    /// Secure Transport on macOS) instead of the default rustls backend.
+    pub use_native_tls: bool,
 }
 
 impl Default for ClientNetworkConfig {
@@ -38,6 +41,7 @@ impl Default for ClientNetworkConfig {
             dns_servers: Vec::new(),
             doh_servers: Vec::new(),
             enable_ipv6: true,
+            use_native_tls: false,
         }
     }
 }
@@ -50,8 +54,15 @@ impl ClientNetworkConfig {
             custom_dns = !self.dns_servers.is_empty(),
             custom_doh = !self.doh_servers.is_empty(),
             enable_ipv6 = self.enable_ipv6,
+            use_native_tls = self.use_native_tls,
             "building HTTP client");
         let mut builder = reqwest::Client::builder().connect_timeout(self.connect_timeout);
+
+        if self.use_native_tls {
+            builder = builder.use_native_tls();
+        } else {
+            builder = builder.use_rustls_tls();
+        }
 
         // Add scheme-specific proxies first so they win over a later catch-all proxy.
         if let Some(proxy) = &self.http_proxy {

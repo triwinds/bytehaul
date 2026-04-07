@@ -90,6 +90,19 @@ impl DownloaderBuilder {
         self
     }
 
+    /// Use the platform-native TLS stack instead of the default rustls backend.
+    ///
+    /// When `true`, bytehaul will use the OS-native TLS implementation:
+    /// OpenSSL on Linux, SChannel on Windows, or Secure Transport on macOS.
+    /// When `false` (the default), the pure-Rust rustls library is used.
+    ///
+    /// Switching to native TLS may help diagnose CDN compatibility issues
+    /// caused by differences in TLS behaviour between rustls and OpenSSL.
+    pub fn use_native_tls(mut self, enabled: bool) -> Self {
+        self.client_config.use_native_tls = enabled;
+        self
+    }
+
     /// Set the log verbosity level for download tasks (default: [`LogLevel::Off`]).
     pub fn log_level(mut self, level: LogLevel) -> Self {
         self.log_level = level;

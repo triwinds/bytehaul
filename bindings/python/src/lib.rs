@@ -108,6 +108,7 @@ fn apply_client_options(
     dns_servers: Option<Vec<String>>,
     doh_servers: Option<Vec<String>>,
     enable_ipv6: Option<bool>,
+    use_native_tls: Option<bool>,
 ) -> PyResult<bytehaul::DownloaderBuilder> {
     if let Some(connect_timeout) = connect_timeout {
         builder = builder.connect_timeout(duration_from_secs("connect_timeout", connect_timeout)?);
@@ -132,6 +133,9 @@ fn apply_client_options(
     }
     if let Some(enable_ipv6) = enable_ipv6 {
         builder = builder.enable_ipv6(enable_ipv6);
+    }
+    if let Some(use_native_tls) = use_native_tls {
+        builder = builder.use_native_tls(use_native_tls);
     }
 
     Ok(builder)
@@ -483,6 +487,7 @@ impl PyDownloader {
         dns_servers = None,
         doh_servers = None,
         enable_ipv6 = None,
+        use_native_tls = None,
         log_level = None
     ))]
     #[allow(clippy::too_many_arguments)]
@@ -494,6 +499,7 @@ impl PyDownloader {
         dns_servers: Option<Vec<String>>,
         doh_servers: Option<Vec<String>>,
         enable_ipv6: Option<bool>,
+        use_native_tls: Option<bool>,
         log_level: Option<String>,
     ) -> PyResult<Self> {
         let level = match &log_level {
@@ -510,6 +516,7 @@ impl PyDownloader {
             dns_servers,
             doh_servers,
             enable_ipv6,
+            use_native_tls,
         )?;
         builder = builder.log_level(level);
         let inner = builder.build().map_err(map_download_error)?;
@@ -616,6 +623,7 @@ impl PyDownloader {
         dns_servers = None,
         doh_servers = None,
         enable_ipv6 = None,
+        use_native_tls = None,
         read_timeout = None,
         memory_budget = None,
         file_allocation = None,
@@ -649,6 +657,7 @@ fn download(
     dns_servers: Option<Vec<String>>,
     doh_servers: Option<Vec<String>>,
     enable_ipv6: Option<bool>,
+    use_native_tls: Option<bool>,
     read_timeout: Option<f64>,
     memory_budget: Option<usize>,
     file_allocation: Option<String>,
@@ -706,6 +715,7 @@ fn download(
             dns_servers,
             doh_servers,
             enable_ipv6,
+            use_native_tls,
         )?;
         builder = builder.log_level(level);
 

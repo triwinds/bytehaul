@@ -4,9 +4,10 @@
 
 ## 测试前提
 
-- 操作系统：Windows
+> 注：第 1–7 节的实验在 **Windows** 上执行；第 8 节的换 TLS 栈实验在 **Linux CI（Ubuntu 24.04）** 上执行。
+
 - 对比工具：bytehaul、aria2c、curl
-- 主要测试目标：
+- 主要测试目标（第 1–7 节）：
 
   - `https://nsa2.e6ex.com/gh/THZoria/NX_Firmware/releases/download/22.0.0/Firmware.22.0.0.zip`
   - `https://rn.e6ex.com/gh/THZoria/NX_Firmware/releases/download/22.0.0/Firmware.22.0.0.zip`
@@ -184,11 +185,65 @@
 - 本地受控环境下，bytehaul 与 aria2 可以跑出同样的多连接吞吐。
 - 真实远端源上，bytehaul 与 aria2 的差距依然显著，而且该差距不会因为简单调大 `piece_size` 或复刻常见 header 而消失。
 
+## 8. 换 TLS 栈实验（reqwest+rustls vs reqwest+native-tls，Linux CI 环境）
+
+本次在 Linux CI 环境（Ubuntu 24.04，Azure 虚拟机）中复现了 aria2 对比实验，并新增了将 TLS 栈从 rustls 切换为 native-tls（OpenSSL）的对照组。
+
+### 测试方法
+
+- 测试源：`https://github.com/llvm/llvm-project/releases/download/llvmorg-19.1.0/llvm-project-19.1.0.src.tar.xz`
+  - 文件大小：约 `134.7 MiB`，经 GitHub 跳转至 `release-assets.githubusercontent.com`（Azure Blob Storage，HTTPS）
+- 工具版本：`aria2 1.37.0`；bytehaul 使用 `reqwest 0.12`，分别编译两种 TLS 后端
+- 8 连接，下载完整文件，记录完成时间与平均速度（3 次取平均）
+
+> 注：该环境对 GitHub CDN 带宽极高（单连接超过 100 MiB/s），整个 134.7 MiB 文件在 0.5–1.2 秒内完成，因此无法使用 20 秒时间窗测量，改为记录完成耗时。
+
+### 结果（3 次平均）
+
+| 工具 | TLS 栈 | 平均耗时 | 平均速度 |
+|------|--------|----------|----------|
+| aria2 1.37.0 | libcurl + OpenSSL | ≈ 0.48 s | ≈ 281 MiB/s |
+| bytehaul | reqwest + **rustls** | ≈ 1.04 s | ≈ 129 MiB/s |
+| bytehaul | reqwest + **native-tls** (OpenSSL) | ≈ 1.15 s | ≈ 117 MiB/s |
+
+### 结论
+
+1. **native-tls 不比 rustls 快，反而略慢。** 将 TLS 栈从 rustls 换成与 aria2 相同的 OpenSSL，对性能没有改善作用，甚至略有下降。这直接排除了"rustls 与目标 CDN 不兼容导致性能差"的假设。
+
+2. **bytehaul 仍然慢于 aria2 约 2.2 倍**（在这个 CDN 上）。这与 Windows 上 nsa2.e6ex.com 的约 7 倍差距量级不同，说明性能差距的绝对量随环境变化，但差距本身可重现。
+
+3. **TLS 库已被排除。** 嫌疑点进一步收窄到 reqwest/hyper 的连接建立与管理行为（libcurl 与 hyper 的 TCP/HTTPS 连接建立流程、连接复用策略、流控调度等差异），以及其他与 HTTP 客户端实现相关的因素。
+
+### 已保留的代码变更
+
+本轮实验触发了一个有用的新配置项：`DownloaderBuilder::use_native_tls(bool)`。
+
+- Cargo.toml：reqwest 依赖增加了 `native-tls` feature
+- `ClientNetworkConfig`：新增 `use_native_tls: bool` 字段
+- `DownloaderBuilder`：新增 `use_native_tls(bool)` 方法，可在运行时选择 TLS 后端
+- Python 绑定：`Downloader(use_native_tls=True)` 以及 `download(use_native_tls=True)` 参数同步支持
+
+虽然实验结果表明 native-tls 不能改善 CDN 性能，但该配置项保留下来，供用户自行排查 TLS 兼容性问题，或在特定平台上首选系统 TLS 的场景下使用。
+
+## 当前阶段结论（更新）
+
+在已完成的所有实验后：
+
+| 嫌疑因素 | 状态 |
+|--------|------|
+| 默认 `piece_size = 1 MiB` | ❌ 排除：调大无显著改善 |
+| `resume / autosave` 机制 | ❌ 排除：本地测试无影响 |
+| 本地写入路径 | ❌ 排除：受控环境速度一致 |
+| 请求头差异（`User-Agent` 等） | ❌ 排除：复刻后无稳定改善 |
+| HTTP/2 多路复用（Range 被折叠） | ✅ 已修复（强制 HTTP/1.1） |
+| **TLS 库（rustls vs OpenSSL）** | ❌ **本轮实验排除：换 native-tls 更慢** |
+| reqwest/hyper 连接建立与管理行为 | 🔍 **当前最可疑，尚未排除** |
+
 ## 建议的下一步
 
-后续建议优先做这几类实验：
-
-1. 在同一远端源上做 `1 / 2 / 4 / 8` 连接完整曲线，找到 bytehaul 的最佳并发点。
-2. 针对 reqwest / rustls / hyper 的连接与 TLS 行为做更细的对照实验。
-3. 对比不同 TLS 栈或客户端配置是否会显著影响目标源行为。
+1. 针对 hyper 的连接建立流程做更细的对照：
+   - 测量 bytehaul 从发起请求到收到第一个字节的延迟（TTFB），与 aria2 对比
+   - 检查 hyper 的 TCP keepalive、连接复用、流控窗口设置与 libcurl 的差异
+2. 尝试用 `isahc`（基于 libcurl 的 Rust 绑定）替换 reqwest，验证 HTTP 客户端实现本身是否是关键因素。
+3. 在同一远端源上做 `1 / 2 / 4 / 8` 连接完整曲线，找到 bytehaul 的最佳并发点，进一步判断连接建立开销是否随并发数放大。
 4. 如果未来要把某些参数暴露给用户，优先考虑把并发数调优作为实际可用的 workaround，而不是盲目调大分片。
