@@ -1,11 +1,11 @@
 ---
 name: release-version
-description: "Update the workspace package version, synchronize README and docs version references, optionally auto-bump the current version, regenerate Cargo.lock, create a release commit, create a git tag, and push the branch and tag. Use when the user asks to bump a version, auto-increment a version, update version numbers, regenerate Cargo.lock, commit a release, 打 tag, 发布版本, or push release changes."
+description: "Update the workspace package version, synchronize README and docs version references, optionally auto-bump the current version, regenerate Cargo.lock, generate crate docs, create a release commit, create a git tag, and push the branch and tag. Use when the user asks to bump a version, auto-increment a version, update version numbers, regenerate Cargo.lock, commit a release, 打 tag, 发布版本, or push release changes."
 ---
 
 # Release Version
 
-Perform the repository's version bump workflow end-to-end: update the version, synchronize README and docs version references, regenerate the Rust lockfile, create a focused release commit, create an annotated tag, and push the result.
+Perform the repository's version bump workflow end-to-end: update the version, synchronize README and docs version references, regenerate the Rust lockfile, generate crate docs, create a focused release commit, create an annotated tag, and push the result.
 
 ## Gather Inputs
 
@@ -16,7 +16,7 @@ Accept:
 - `tag`: explicit tag name; default to `v<version>`
 - `commitMessage`: explicit commit message; default to `release: v<version>`
 - `validationCommand`: optional extra validation command to run before commit
-- `skipValidation`: if true, skip optional validation beyond lockfile regeneration and lockfile verification
+- `skipValidation`: if true, skip optional validation beyond lockfile regeneration, lockfile verification, and mandatory crate docs generation
 
 ## Repository Facts
 
@@ -25,6 +25,7 @@ Accept:
 - `bindings/python/pyproject.toml` uses `dynamic = ["version"]`, so do not hardcode a Python package version there.
 - Release-related version references in `README.md` and `docs/**` should be kept in sync with the workspace version when they describe the current published package version.
 - Regenerate the lockfile from the repository root with `cargo generate-lockfile`.
+- Generate crate docs before tagging with `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`.
 - Unless the user provides `version`, derive the release version from the current `[workspace.package].version` using dot-separated decimal carry semantics.
 
 ## Execute The Release Workflow
@@ -64,20 +65,24 @@ Accept:
    - Minimum validation for this workflow is successful lockfile regeneration plus successful `cargo metadata --locked --format-version 1`.
    - If `validationCommand` is provided, run it.
    - Otherwise, unless `skipValidation` is true, run a lightweight repository validation such as `cargo check --workspace --locked`.
-8. Review the diff before committing.
+8. Generate crate docs before tagging.
+   - Run `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` from the repository root.
+   - Treat crate docs generation as mandatory for this workflow even when `skipValidation` is true.
+   - Stop before commit or tag creation if the docs build fails.
+9. Review the diff before committing.
    - Confirm the diff is limited to release metadata files, normally `Cargo.toml`, release-related README/docs updates, and optionally `Cargo.lock`.
    - If other files changed unexpectedly, stop and investigate before committing.
-9. Create the release commit.
+10. Create the release commit.
    - Stage only the intended release files.
    - Commit with the resolved commit message.
-10. Create the annotated tag.
+11. Create the annotated tag.
    - Create an annotated tag for the release commit using the resolved tag name.
    - The tag message should match the tag name unless the user asked for a custom message.
-11. Push safely.
+12. Push safely.
    - Push the branch and annotated tag to the target remote.
    - Prefer `git push <remote> <branch> --follow-tags` when the branch is already configured.
    - If the branch has no upstream, use an explicit push that establishes upstream without force.
-12. Verify the result.
+13. Verify the result.
    - Confirm the branch push succeeded.
    - Confirm the new tag exists on the remote.
    - Confirm the worktree is clean after the push.
@@ -87,6 +92,7 @@ Accept:
 - Complete the whole workflow in one turn when there are no blockers.
 - Ask only when a blocker prevents a safe push, such as a dirty worktree, missing remote, detached HEAD, existing tag, or branch divergence.
 - Never force-push.
+- Never create the tag before crate docs generation succeeds.
 - Never create the tag before the commit succeeds.
 - Never push a tag that points to an unpushed or failed commit.
 - Never include unrelated files in the release commit.
