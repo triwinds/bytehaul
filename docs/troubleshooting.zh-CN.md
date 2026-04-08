@@ -29,15 +29,25 @@ rm /path/to/your-file.zip.bytehaul
    ```python
    import bytehaul
 
-   dl = bytehaul.Downloader(
-       proxy="http://proxy.example.com:8080"  # HTTP/HTTPS 共用
-       # 或者：
-       # http_proxy="http://proxy:8080",
-       # https_proxy="http://proxy:8080",
+   # 一次性下载
+   bytehaul.download(
+      "https://example.com/file.bin",
+      output_path="file.bin",
+      proxy="http://proxy.example.com:8080",
+   )
+
+   # 或者先在 Downloader 上设置默认值，需要时再在单个任务里覆盖
+   dl = bytehaul.Downloader(proxy="http://proxy.example.com:8080")
+   task = dl.download(
+      "https://example.com/file.bin",
+      output_path="file.bin",
+      # http_proxy="http://proxy:8080",
+      # https_proxy="http://proxy:8080",
+      # proxy="http://another-proxy:8080",  # 仅覆盖本次任务
    )
    ```
 
-2. 使用环境变量：bytehaul 同样会读取 `HTTP_PROXY`、`HTTPS_PROXY` 和 `ALL_PROXY`。若同时显式配置了 `DownloaderBuilder` 代理参数，则显式配置优先。
+2. 使用环境变量：bytehaul 同样会读取 `HTTP_PROXY`、`HTTPS_PROXY` 和 `ALL_PROXY`。若任务级显式配置了代理（Rust 的 `DownloadSpec::*_proxy(...)` 或 Python 的 `downloader.download(..., proxy=...)`），则任务级配置优先；若任务未覆盖，则 downloader 默认值优先于环境变量。
 
 3. 单独验证代理本身是否可用：
 

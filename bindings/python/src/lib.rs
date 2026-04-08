@@ -217,6 +217,9 @@ fn build_download_spec(
     headers: Option<HashMap<String, String>>,
     max_connections: Option<u32>,
     connect_timeout: Option<f64>,
+    proxy: Option<String>,
+    http_proxy: Option<String>,
+    https_proxy: Option<String>,
     read_timeout: Option<f64>,
     memory_budget: Option<usize>,
     file_allocation: Option<String>,
@@ -250,6 +253,15 @@ fn build_download_spec(
     }
     if let Some(connect_timeout) = connect_timeout {
         spec = spec.connect_timeout(duration_from_secs("connect_timeout", connect_timeout)?);
+    }
+    if let Some(proxy) = proxy {
+        spec = spec.all_proxy(proxy);
+    }
+    if let Some(http_proxy) = http_proxy {
+        spec = spec.http_proxy(http_proxy);
+    }
+    if let Some(https_proxy) = https_proxy {
+        spec = spec.https_proxy(https_proxy);
     }
     if let Some(read_timeout) = read_timeout {
         spec = spec.read_timeout(duration_from_secs("read_timeout", read_timeout)?);
@@ -524,6 +536,9 @@ impl PyDownloader {
             headers = None,
             max_connections = None,
             connect_timeout = None,
+            proxy = None,
+            http_proxy = None,
+            https_proxy = None,
             read_timeout = None,
             memory_budget = None,
             file_allocation = None,
@@ -550,6 +565,9 @@ impl PyDownloader {
         headers: Option<HashMap<String, String>>,
         max_connections: Option<u32>,
         connect_timeout: Option<f64>,
+        proxy: Option<String>,
+        http_proxy: Option<String>,
+        https_proxy: Option<String>,
         read_timeout: Option<f64>,
         memory_budget: Option<usize>,
         file_allocation: Option<String>,
@@ -573,6 +591,9 @@ impl PyDownloader {
             headers,
             max_connections,
             connect_timeout,
+            proxy,
+            http_proxy,
+            https_proxy,
             read_timeout,
             memory_budget,
             file_allocation,
@@ -678,6 +699,9 @@ fn download(
         headers,
         max_connections,
         connect_timeout,
+        proxy.clone(),
+        http_proxy.clone(),
+        https_proxy.clone(),
         read_timeout,
         memory_budget,
         file_allocation,

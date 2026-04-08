@@ -65,7 +65,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let downloader = Downloader::builder().build()?;
 
     let spec = DownloadSpec::new("https://example.com/largefile.zip")
-        .output_path("largefile.zip");
+        .output_path("largefile.zip")
+        .all_proxy("http://127.0.0.1:7890");
 
     let handle = downloader.download(spec);
     handle.wait().await?;
@@ -74,7 +75,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-更多配置、进度监控、取消下载等进阶用法，请参阅[进阶用法指南](advanced.zh-CN.md)。
+更多配置、进度监控、取消下载等进阶用法，请参阅[进阶用法指南](advanced.zh-CN.md)。如果要设置默认网络参数，可放在 `Downloader::builder()` 上；如果要只影响当前下载任务，则把代理等覆盖项放在 `DownloadSpec` 上。
 
 如果省略 `output_path`，bytehaul 会按 `Content-Disposition`、URL 路径最后一段、默认名 `download` 自动选择文件名。可结合 `.output_dir("downloads")` 指定目标目录；在未设置 `output_dir` 时，也仍然支持直接传绝对输出路径。
 

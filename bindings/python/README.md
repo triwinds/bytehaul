@@ -101,6 +101,7 @@ downloader = Downloader(
 task = downloader.download(
     "https://example.com/large.bin",
     output_dir="downloads",
+    proxy="http://127.0.0.1:7890",
 )
 
 # Poll progress
@@ -152,6 +153,8 @@ Reusable downloader instance.
 
 - `downloader.download(url, output_path=None, output_dir=None, **options) -> DownloadTask`
 
+Proxy settings passed to `Downloader(...)` act as defaults. You can override them per task by passing `proxy`, `http_proxy`, or `https_proxy` directly to `downloader.download(...)`.
+
 ### `DownloadTask`
 
 Handle to a running download.
@@ -202,7 +205,7 @@ Valid `log_level` values: `"off"`, `"error"`, `"warn"`, `"info"`, `"debug"`, `"t
 
 ### Network options
 
-Use these on `Downloader(...)` for the object API, or pass them directly to the blocking `download(...)` helper.
+Use these on `Downloader(...)` to set defaults, or pass `proxy`, `http_proxy`, and `https_proxy` directly to `downloader.download(...)` or the blocking `download(...)` helper.
 
 | Parameter      | Type                | Default |
 |----------------|---------------------|---------|

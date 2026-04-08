@@ -35,14 +35,14 @@ If you omit `.output_path(...)`, bytehaul will detect the filename from `Content
 
 ## Network Settings
 
-Network stack settings live on the shared downloader client:
+Network stack defaults live on the shared downloader client. DNS / DoH / IPv6 settings are configured on `Downloader::builder()`, and each download can still override `connect_timeout` and proxy settings on `DownloadSpec`:
 
 ```rust
 use std::net::SocketAddr;
-use bytehaul::Downloader;
+use std::time::Duration;
+use bytehaul::{DownloadSpec, Downloader};
 
 let downloader = Downloader::builder()
-    .all_proxy("http://127.0.0.1:7890")
     .dns_servers([
         SocketAddr::from(([1, 1, 1, 1], 53)),
         SocketAddr::from(([8, 8, 8, 8], 53)),
@@ -50,9 +50,16 @@ let downloader = Downloader::builder()
     .doh_server("https://dns.google/dns-query")
     .enable_ipv6(false)
     .build()?;
+
+let spec = DownloadSpec::new("https://example.com/file.bin")
+    .output_path("file.bin")
+    .all_proxy("http://127.0.0.1:7890")
+    .connect_timeout(Duration::from_secs(10));
+
+let handle = downloader.download(spec);
 ```
 
-`DownloadSpec::connect_timeout` is still supported. If a task overrides it, bytehaul builds an equivalent client just for that download.
+Builder-level `all_proxy(...)`, `http_proxy(...)`, and `https_proxy(...)` are still useful as defaults. If a task sets `DownloadSpec::all_proxy(...)`, `http_proxy(...)`, `https_proxy(...)`, or `connect_timeout(...)`, bytehaul derives an equivalent client for that effective configuration and reuses it for later downloads with the same settings.
 
 `doh_server(...)` and `doh_servers(...)` accept HTTPS URLs. When the DoH host is a domain name instead of a literal IP, bytehaul resolves that host once with the system resolver during client construction so it can bootstrap the DoH connection.
 

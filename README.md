@@ -63,7 +63,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let downloader = Downloader::builder().build()?;
 
     let spec = DownloadSpec::new("https://example.com/largefile.zip")
-        .output_path("largefile.zip");
+        .output_path("largefile.zip")
+        .all_proxy("http://127.0.0.1:7890");
 
     let handle = downloader.download(spec);
     handle.wait().await?;
@@ -72,7 +73,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-For configuration, progress monitoring, cancellation, and more, see the [Advanced Usage Guide](docs/advanced.md).
+Configure downloader-wide defaults on `Downloader::builder()`, and put per-download overrides such as proxies on `DownloadSpec` when you submit a task. For configuration, progress monitoring, cancellation, and more, see the [Advanced Usage Guide](docs/advanced.md).
 
 If you omit `output_path`, bytehaul will automatically choose a filename from `Content-Disposition`, then the URL path, and finally `download`. You can combine that with `.output_dir("downloads")` to control the destination directory. Absolute `output_path` values are still accepted when `output_dir` is not set.
 

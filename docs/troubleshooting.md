@@ -28,15 +28,25 @@ The download will restart from scratch.
    ```python
    import bytehaul
 
-   dl = bytehaul.Downloader(
-       proxy="http://proxy.example.com:8080"  # shared proxy for HTTP and HTTPS
-       # or:
-       # http_proxy="http://proxy:8080",
-       # https_proxy="http://proxy:8080",
+   # One-off download
+   bytehaul.download(
+      "https://example.com/file.bin",
+      output_path="file.bin",
+      proxy="http://proxy.example.com:8080",
+   )
+
+   # Or set defaults on the object, then override per task when needed
+   dl = bytehaul.Downloader(proxy="http://proxy.example.com:8080")
+   task = dl.download(
+      "https://example.com/file.bin",
+      output_path="file.bin",
+      # http_proxy="http://proxy:8080",
+      # https_proxy="http://proxy:8080",
+      # proxy="http://another-proxy:8080",  # task-level override
    )
    ```
 
-2. **Environment variables:** bytehaul also respects `HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY`. Explicit `DownloaderBuilder` proxy settings take precedence over environment variables.
+2. **Environment variables:** bytehaul also respects `HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY`. Explicit task-level proxy settings (`DownloadSpec::*_proxy(...)` in Rust or `downloader.download(..., proxy=...)` in Python) take precedence over downloader defaults and environment variables. Downloader defaults still take precedence over environment variables when the task does not override them.
 
 3. **Verify proxy reachability** independently:
    ```bash

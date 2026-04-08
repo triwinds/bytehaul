@@ -118,6 +118,10 @@ pub struct DownloadSpec {
     pub(crate) headers: HashMap<String, String>,
     pub(crate) max_connections: u32,
     pub(crate) connect_timeout: Duration,
+    pub(crate) connect_timeout_overridden: bool,
+    pub(crate) all_proxy: Option<String>,
+    pub(crate) http_proxy: Option<String>,
+    pub(crate) https_proxy: Option<String>,
     pub(crate) read_timeout: Duration,
     pub(crate) memory_budget: usize,
     pub(crate) file_allocation: FileAllocation,
@@ -156,6 +160,10 @@ impl DownloadSpec {
             headers: HashMap::new(),
             max_connections: 4,
             connect_timeout: Duration::from_secs(30),
+            connect_timeout_overridden: false,
+            all_proxy: None,
+            http_proxy: None,
+            https_proxy: None,
             read_timeout: Duration::from_secs(60),
             memory_budget: 64 * 1024 * 1024, // 64 MiB
             file_allocation: FileAllocation::default(),
@@ -205,9 +213,32 @@ impl DownloadSpec {
         self.connect_timeout
     }
 
+    /// Returns the proxy applied to all HTTP/HTTPS requests, if set.
+    pub fn get_all_proxy(&self) -> Option<&str> {
+        self.all_proxy.as_deref()
+    }
+
+    /// Returns the proxy applied only to plain HTTP requests, if set.
+    pub fn get_http_proxy(&self) -> Option<&str> {
+        self.http_proxy.as_deref()
+    }
+
+    /// Returns the proxy applied only to HTTPS requests, if set.
+    pub fn get_https_proxy(&self) -> Option<&str> {
+        self.https_proxy.as_deref()
+    }
+
     /// Returns the per-request read timeout.
     pub fn get_read_timeout(&self) -> Duration {
         self.read_timeout
+    }
+
+    pub(crate) fn has_connect_timeout_override(&self) -> bool {
+        self.connect_timeout_overridden
+    }
+
+    pub(crate) fn has_proxy_override(&self) -> bool {
+        self.all_proxy.is_some() || self.http_proxy.is_some() || self.https_proxy.is_some()
     }
 
     /// Returns the memory budget (in bytes) for the write-back cache.
@@ -309,6 +340,25 @@ impl DownloadSpec {
     /// Set the TCP connect timeout (default: 30 s).
     pub fn connect_timeout(mut self, connect_timeout: Duration) -> Self {
         self.connect_timeout = connect_timeout;
+        self.connect_timeout_overridden = true;
+        self
+    }
+
+    /// Set a proxy applied to all HTTP/HTTPS requests for this download only.
+    pub fn all_proxy(mut self, proxy: impl Into<String>) -> Self {
+        self.all_proxy = Some(proxy.into());
+        self
+    }
+
+    /// Set a proxy applied only to plain HTTP requests for this download.
+    pub fn http_proxy(mut self, proxy: impl Into<String>) -> Self {
+        self.http_proxy = Some(proxy.into());
+        self
+    }
+
+    /// Set a proxy applied only to HTTPS requests for this download.
+    pub fn https_proxy(mut self, proxy: impl Into<String>) -> Self {
+        self.https_proxy = Some(proxy.into());
         self
     }
 
@@ -420,6 +470,19 @@ impl DownloadSpec {
         if self.url.trim().is_empty() {
             return Err(DownloadError::InvalidConfig("url cannot be empty".into()));
         }
+        for (label, value) in [
+            ("all_proxy", self.all_proxy.as_deref()),
+            ("http_proxy", self.http_proxy.as_deref()),
+            ("https_proxy", self.https_proxy.as_deref()),
+        ] {
+            if let Some(value) = value {
+                if value.trim().is_empty() {
+                    return Err(DownloadError::InvalidConfig(format!(
+                        "{label} cannot be empty"
+                    )));
+                }
+            }
+        }
         if self.max_connections == 0 {
             return Err(DownloadError::InvalidConfig(
                 "max_connections must be >= 1".into(),
@@ -479,6 +542,10 @@ mod tests {
         assert_eq!(spec.output_dir, None);
         assert_eq!(spec.max_connections, 4);
         assert_eq!(spec.connect_timeout, Duration::from_secs(30));
+        assert!(!spec.connect_timeout_overridden);
+        assert_eq!(spec.all_proxy, None);
+        assert_eq!(spec.http_proxy, None);
+        assert_eq!(spec.https_proxy, None);
         assert_eq!(spec.read_timeout, Duration::from_secs(60));
         assert_eq!(spec.memory_budget, 64 * 1024 * 1024);
         assert_eq!(spec.file_allocation, FileAllocation::Prealloc);
@@ -512,6 +579,9 @@ mod tests {
             .headers(headers.clone())
             .max_connections(8)
             .connect_timeout(Duration::from_secs(10))
+            .all_proxy("http://127.0.0.1:8080")
+            .http_proxy("http://127.0.0.1:8081")
+            .https_proxy("http://127.0.0.1:8443")
             .read_timeout(Duration::from_secs(20))
             .memory_budget(1024)
             .file_allocation(FileAllocation::None)
@@ -528,6 +598,10 @@ mod tests {
         assert_eq!(spec.headers, headers);
         assert_eq!(spec.max_connections, 8);
         assert_eq!(spec.connect_timeout, Duration::from_secs(10));
+        assert!(spec.connect_timeout_overridden);
+        assert_eq!(spec.all_proxy.as_deref(), Some("http://127.0.0.1:8080"));
+        assert_eq!(spec.http_proxy.as_deref(), Some("http://127.0.0.1:8081"));
+        assert_eq!(spec.https_proxy.as_deref(), Some("http://127.0.0.1:8443"));
         assert_eq!(spec.read_timeout, Duration::from_secs(20));
         assert_eq!(spec.memory_budget, 1024);
         assert_eq!(spec.file_allocation, FileAllocation::None);
@@ -563,6 +637,12 @@ mod tests {
             .validate()
             .unwrap_err();
         assert!(err.to_string().contains("checksum"));
+
+        let err = DownloadSpec::new("https://example.com/file")
+            .all_proxy("   ")
+            .validate()
+            .unwrap_err();
+        assert!(err.to_string().contains("all_proxy"));
 
         let err = DownloadSpec::new("https://example.com/file")
             .autosave_sync_every(0)
@@ -680,6 +760,9 @@ mod tests {
             .headers(headers)
             .max_connections(8)
             .connect_timeout(Duration::from_secs(10))
+            .all_proxy("http://127.0.0.1:8080")
+            .http_proxy("http://127.0.0.1:8081")
+            .https_proxy("http://127.0.0.1:8443")
             .read_timeout(Duration::from_secs(20))
             .memory_budget(2048)
             .file_allocation(FileAllocation::None)
@@ -702,6 +785,9 @@ mod tests {
         assert_eq!(spec.get_headers().len(), 1);
         assert_eq!(spec.get_max_connections(), 8);
         assert_eq!(spec.get_connect_timeout(), Duration::from_secs(10));
+        assert_eq!(spec.get_all_proxy(), Some("http://127.0.0.1:8080"));
+        assert_eq!(spec.get_http_proxy(), Some("http://127.0.0.1:8081"));
+        assert_eq!(spec.get_https_proxy(), Some("http://127.0.0.1:8443"));
         assert_eq!(spec.get_read_timeout(), Duration::from_secs(20));
         assert_eq!(spec.get_memory_budget(), 2048);
         assert_eq!(spec.get_file_allocation(), FileAllocation::None);
@@ -724,6 +810,9 @@ mod tests {
         let spec = DownloadSpec::new("https://example.com");
         assert!(spec.get_output_path().is_none());
         assert!(spec.get_output_dir().is_none());
+        assert!(spec.get_all_proxy().is_none());
+        assert!(spec.get_http_proxy().is_none());
+        assert!(spec.get_https_proxy().is_none());
         assert!(spec.get_max_retry_elapsed().is_none());
         assert!(spec.get_checksum().is_none());
     }

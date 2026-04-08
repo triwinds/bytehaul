@@ -29,25 +29,33 @@ pub struct DownloaderBuilder {
 }
 
 impl DownloaderBuilder {
-    /// Set the default TCP connect timeout for the HTTP client (default: 30 s).
+    /// Set the default TCP connect timeout for HTTP clients (default: 30 s).
+    ///
+    /// Individual downloads can override this via [`DownloadSpec::connect_timeout`].
     pub fn connect_timeout(mut self, timeout: Duration) -> Self {
         self.client_config.connect_timeout = timeout;
         self
     }
 
-    /// Set an HTTP/HTTPS/SOCKS proxy for all requests.
+    /// Set the default proxy for all requests built by this downloader.
+    ///
+    /// Individual downloads can override this via [`DownloadSpec::all_proxy`].
     pub fn all_proxy(mut self, proxy: impl Into<String>) -> Self {
         self.client_config.all_proxy = Some(proxy.into());
         self
     }
 
-    /// Set a proxy used only for plain HTTP requests.
+    /// Set the default proxy used only for plain HTTP requests.
+    ///
+    /// Individual downloads can override this via [`DownloadSpec::http_proxy`].
     pub fn http_proxy(mut self, proxy: impl Into<String>) -> Self {
         self.client_config.http_proxy = Some(proxy.into());
         self
     }
 
-    /// Set a proxy used only for HTTPS requests.
+    /// Set the default proxy used only for HTTPS requests.
+    ///
+    /// Individual downloads can override this via [`DownloadSpec::https_proxy`].
     pub fn https_proxy(mut self, proxy: impl Into<String>) -> Self {
         self.client_config.https_proxy = Some(proxy.into());
         self
@@ -199,11 +207,7 @@ impl Downloader {
                 })?),
                 None => None,
             };
-            let requested_config = if spec.connect_timeout == client_config.connect_timeout {
-                client_config.clone()
-            } else {
-                client_config.with_connect_timeout(spec.connect_timeout)
-            };
+            let requested_config = requested_client_config_for_spec(&client_config, &spec);
             let client = cached_client_for_config(&client_cache, requested_config)?;
             session::run_download(client, spec, log_level, download_id, progress_tx, cancel_rx)
                 .await
@@ -215,6 +219,35 @@ impl Downloader {
             task,
         }
     }
+}
+
+fn requested_client_config_for_spec(
+    base_config: &ClientNetworkConfig,
+    spec: &DownloadSpec,
+) -> ClientNetworkConfig {
+    let mut requested = base_config.clone();
+
+    if spec.has_connect_timeout_override() {
+        requested.connect_timeout = spec.get_connect_timeout();
+    }
+
+    if spec.has_proxy_override() {
+        requested.all_proxy = None;
+        requested.http_proxy = None;
+        requested.https_proxy = None;
+
+        if let Some(proxy) = spec.get_all_proxy() {
+            requested.all_proxy = Some(proxy.to_owned());
+        }
+        if let Some(proxy) = spec.get_http_proxy() {
+            requested.http_proxy = Some(proxy.to_owned());
+        }
+        if let Some(proxy) = spec.get_https_proxy() {
+            requested.https_proxy = Some(proxy.to_owned());
+        }
+    }
+
+    requested
 }
 
 fn cached_client_for_config(
@@ -444,9 +477,9 @@ mod tests {
     #[tokio::test]
     async fn test_download_rebuilds_client_for_spec_timeout_override() {
         let downloader = Downloader::builder().build().unwrap();
-        let mut spec = crate::config::DownloadSpec::new("http://127.0.0.1:1/nonexistent")
-            .output_path(std::env::temp_dir().join("bytehaul_test_timeout_override"));
-        spec.connect_timeout = Duration::from_secs(1);
+        let spec = crate::config::DownloadSpec::new("http://127.0.0.1:1/nonexistent")
+            .output_path(std::env::temp_dir().join("bytehaul_test_timeout_override"))
+            .connect_timeout(Duration::from_secs(1));
 
         assert_eq!(downloader.client_cache.lock().len(), 1);
         let handle = downloader.download(spec);
@@ -458,15 +491,70 @@ mod tests {
     #[tokio::test]
     async fn test_download_reuses_cached_timeout_override_client() {
         let downloader = Downloader::builder().build().unwrap();
-        let mut spec = crate::config::DownloadSpec::new("http://127.0.0.1:1/nonexistent")
-            .output_path(std::env::temp_dir().join("bytehaul_test_timeout_override_reuse"));
-        spec.connect_timeout = Duration::from_secs(1);
+        let spec = crate::config::DownloadSpec::new("http://127.0.0.1:1/nonexistent")
+            .output_path(std::env::temp_dir().join("bytehaul_test_timeout_override_reuse"))
+            .connect_timeout(Duration::from_secs(1));
 
         let _ = downloader.download(spec.clone()).wait().await;
         assert_eq!(downloader.client_cache.lock().len(), 2);
 
         let _ = downloader.download(spec).wait().await;
         assert_eq!(downloader.client_cache.lock().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_download_uses_builder_timeout_when_spec_has_no_override() {
+        let downloader = Downloader::builder()
+            .connect_timeout(Duration::from_secs(3))
+            .build()
+            .unwrap();
+        let spec = crate::config::DownloadSpec::new("http://127.0.0.1:1/nonexistent")
+            .output_path(std::env::temp_dir().join("bytehaul_test_builder_timeout_default"));
+
+        let _ = downloader.download(spec).wait().await;
+        assert_eq!(downloader.client_cache.lock().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_download_rebuilds_client_for_spec_proxy_override() {
+        let downloader = Downloader::builder().build().unwrap();
+        let spec = crate::config::DownloadSpec::new("http://127.0.0.1:1/nonexistent")
+            .output_path(std::env::temp_dir().join("bytehaul_test_proxy_override"))
+            .all_proxy("http://127.0.0.1:7890");
+
+        assert_eq!(downloader.client_cache.lock().len(), 1);
+        let _ = downloader.download(spec).wait().await;
+        assert_eq!(downloader.client_cache.lock().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_download_proxy_override_reuses_cached_client() {
+        let downloader = Downloader::builder().build().unwrap();
+        let spec = crate::config::DownloadSpec::new("http://127.0.0.1:1/nonexistent")
+            .output_path(std::env::temp_dir().join("bytehaul_test_proxy_override_reuse"))
+            .all_proxy("http://127.0.0.1:7890");
+
+        let _ = downloader.download(spec.clone()).wait().await;
+        assert_eq!(downloader.client_cache.lock().len(), 2);
+
+        let _ = downloader.download(spec).wait().await;
+        assert_eq!(downloader.client_cache.lock().len(), 2);
+    }
+
+    #[test]
+    fn test_download_proxy_override_replaces_builder_proxy_defaults() {
+        let downloader = Downloader::builder()
+            .http_proxy("http://127.0.0.1:8080")
+            .https_proxy("http://127.0.0.1:8443")
+            .build()
+            .unwrap();
+        let spec = crate::config::DownloadSpec::new("http://127.0.0.1:1/nonexistent")
+            .all_proxy("http://127.0.0.1:7890");
+
+        let requested = requested_client_config_for_spec(&downloader.client_config, &spec);
+        assert_eq!(requested.all_proxy.as_deref(), Some("http://127.0.0.1:7890"));
+        assert!(requested.http_proxy.is_none());
+        assert!(requested.https_proxy.is_none());
     }
 
     #[test]

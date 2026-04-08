@@ -35,14 +35,14 @@ let spec = DownloadSpec::new("https://example.com/file.bin")
 
 ## 网络层配置
 
-网络相关配置位于共享的下载器客户端上：
+下载器客户端上保存的是默认网络配置。DNS / DoH / IPv6 仍通过 `Downloader::builder()` 设置；单个任务则可以在 `DownloadSpec` 上覆盖 `connect_timeout` 和代理：
 
 ```rust
 use std::net::SocketAddr;
-use bytehaul::Downloader;
+use std::time::Duration;
+use bytehaul::{DownloadSpec, Downloader};
 
 let downloader = Downloader::builder()
-    .all_proxy("http://127.0.0.1:7890")
     .dns_servers([
         SocketAddr::from(([1, 1, 1, 1], 53)),
         SocketAddr::from(([8, 8, 8, 8], 53)),
@@ -50,9 +50,16 @@ let downloader = Downloader::builder()
     .doh_server("https://dns.google/dns-query")
     .enable_ipv6(false)
     .build()?;
+
+let spec = DownloadSpec::new("https://example.com/file.bin")
+    .output_path("file.bin")
+    .all_proxy("http://127.0.0.1:7890")
+    .connect_timeout(Duration::from_secs(10));
+
+let handle = downloader.download(spec);
 ```
 
-`DownloadSpec::connect_timeout` 仍然可用；如果单个任务覆盖了它，bytehaul 会为该任务临时构建一个等价 client。
+builder 上的 `all_proxy(...)`、`http_proxy(...)`、`https_proxy(...)` 仍然适合作为默认值。若任务通过 `DownloadSpec::all_proxy(...)`、`http_proxy(...)`、`https_proxy(...)` 或 `connect_timeout(...)` 做覆盖，bytehaul 会按这组生效配置派生出一个等价 client，并在后续遇到相同配置时复用它。
 
 `doh_server(...)` 和 `doh_servers(...)` 接收 HTTPS URL。如果 DoH 主机是域名而不是字面 IP，bytehaul 会在构建 client 时先用一次系统解析器把它 bootstrap 成目标地址。
 

@@ -60,7 +60,7 @@ graph TD
 
 ### Downloader / DownloaderBuilder
 
-Entry point. Builds a shared `BytehaulClient` wrapper around the hyper client stack (with proxy, DNS, TLS, and timeout settings) and an optional `Semaphore` for limiting concurrent downloads. Each call to `download()` spawns an independent Tokio task and returns a `DownloadHandle`.
+Entry point. Holds downloader-wide default network settings plus a cache of `BytehaulClient` instances built from the hyper client stack (proxy, DNS, TLS, timeout). Each call to `download()` combines those defaults with task-level overrides (currently timeout and proxies), reuses or derives the matching client, and returns a `DownloadHandle`. An optional `Semaphore` limits concurrent downloads.
 
 ### DownloadHandle
 

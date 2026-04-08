@@ -33,20 +33,39 @@ fn unique_path(name: &str) -> PathBuf {
 
 fn spawn_static_server(status_line: &str, body: Vec<u8>) -> (String, thread::JoinHandle<()>) {
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    listener.set_nonblocking(true).unwrap();
     let addr = listener.local_addr().unwrap();
     let status_line = status_line.to_string();
 
     let handle = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        let mut request = [0u8; 4096];
-        let _ = stream.read(&mut request);
+        let mut served_any = false;
+        let mut idle_deadline = Instant::now() + Duration::from_secs(5);
 
-        let response = format!(
-            "HTTP/1.1 {status_line}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            body.len()
-        );
-        stream.write_all(response.as_bytes()).unwrap();
-        stream.write_all(&body).unwrap();
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    served_any = true;
+                    idle_deadline = Instant::now() + Duration::from_millis(250);
+
+                    let mut request = [0u8; 4096];
+                    let _ = stream.read(&mut request);
+
+                    let response = format!(
+                        "HTTP/1.1 {status_line}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    stream.write_all(response.as_bytes()).unwrap();
+                    stream.write_all(&body).unwrap();
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if served_any && Instant::now() >= idle_deadline {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("test server accept failed: {error}"),
+            }
+        }
     });
 
     (format!("http://{addr}"), handle)
@@ -200,6 +219,9 @@ fn test_apply_client_options_and_build_download_spec() {
         Some(headers.clone()),
         Some(3),
         Some(1.25),
+        Some("http://127.0.0.1:8080".into()),
+        Some("http://127.0.0.1:8081".into()),
+        Some("http://127.0.0.1:8443".into()),
         Some(3.5),
         Some(8192),
         Some("none".into()),
@@ -224,6 +246,9 @@ fn test_apply_client_options_and_build_download_spec() {
     assert_eq!(spec.get_headers(), &headers);
     assert_eq!(spec.get_max_connections(), 3);
     assert_eq!(spec.get_connect_timeout(), Duration::from_secs_f64(1.25));
+    assert_eq!(spec.get_all_proxy(), Some("http://127.0.0.1:8080"));
+    assert_eq!(spec.get_http_proxy(), Some("http://127.0.0.1:8081"));
+    assert_eq!(spec.get_https_proxy(), Some("http://127.0.0.1:8443"));
     assert_eq!(spec.get_read_timeout(), Duration::from_secs_f64(3.5));
     assert_eq!(spec.get_memory_budget(), 8192);
     assert_eq!(spec.get_file_allocation(), FileAllocation::None);
@@ -243,6 +268,9 @@ fn test_apply_client_options_and_build_download_spec() {
     assert!(build_download_spec(
         "https://example.com/file.bin".into(),
         Some(unique_path("empty-checksum")),
+        None,
+        None,
+        None,
         None,
         None,
         None,
@@ -314,6 +342,9 @@ fn test_build_download_spec_with_checksum_and_control_interval() {
     let spec = build_download_spec(
         "https://example.com/file.bin".into(),
         Some(unique_path("checksum-spec")),
+        None,
+        None,
+        None,
         None,
         None,
         None,
@@ -446,6 +477,9 @@ fn test_download_task_methods_and_consumption_errors() {
             None,
             None,
             None,
+            None,
+            None,
+            None,
         )
         .unwrap();
 
@@ -491,6 +525,9 @@ fn test_download_task_pause_maps_to_paused_error() {
         .download(
             "http://127.0.0.1:1/unreachable".into(),
             Some(unique_path("task-paused")),
+            None,
+            None,
+            None,
             None,
             None,
             None,
@@ -566,6 +603,9 @@ fn test_py_downloader_download_success_and_module_registration() {
             Some(headers),
             Some(2),
             Some(1.0),
+            None,
+            None,
+            None,
             Some(2.0),
             Some(4096),
             Some("none".into()),

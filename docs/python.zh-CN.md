@@ -91,7 +91,7 @@ bytehaul.download(
 
 `doh_servers` 需要传 HTTPS URL。如果使用像 `dns.google` 这样的域名，bytehaul 会在构建客户端时先用一次系统解析器来 bootstrap 这个 DoH 端点的 IP 地址。
 
-对象 API 下，这些网络层参数应放在 `Downloader(...)` 构造器上：
+对象 API 下，`dns_servers`、`doh_servers`、`enable_ipv6` 仍放在 `Downloader(...)` 构造器上；`proxy`、`http_proxy`、`https_proxy` 既可以放在 `Downloader(...)` 上作为默认值，也可以在 `downloader.download(...)` 时按任务覆盖：
 
 ```python
 from bytehaul import Downloader
@@ -101,6 +101,12 @@ downloader = Downloader(
     dns_servers=["1.1.1.1"],
     doh_servers=["https://dns.google/dns-query"],
     enable_ipv6=False,
+)
+
+task = downloader.download(
+    "https://example.com/file.bin",
+    output_path="file.bin",
+    proxy="http://127.0.0.1:7890",
 )
 ```
 
@@ -131,6 +137,7 @@ downloader = Downloader(connect_timeout=15.0)
 task = downloader.download(
     "https://example.com/large.bin",
     output_path="large.bin",
+    proxy="http://127.0.0.1:7890",
     max_connections=8,
     resume=True,
 )
@@ -187,6 +194,8 @@ except DownloadFailedError as exc:
 
 - `downloader.download(url, output_path=None, output_dir=None, **options) -> DownloadTask`
 
+传给 `Downloader(...)` 的代理参数会作为默认值保留。若需要按任务切换代理，可在 `downloader.download(...)` 上继续传 `proxy`、`http_proxy` 或 `https_proxy` 覆盖本次下载。
+
 ### `DownloadTask`
 
 运行中下载任务的句柄。
@@ -234,6 +243,8 @@ except DownloadFailedError as exc:
 | `log_level` | `str \| None` | `None`（`"off"`） | 日志级别 |
 
 ## 网络层参数
+
+对象 API 中，`proxy`、`http_proxy`、`https_proxy` 既可用于 `Downloader(...)` 默认值，也可用于 `downloader.download(...)` 的单次覆盖；`dns_servers`、`doh_servers`、`enable_ipv6` 仍通过 `Downloader(...)` 配置。
 
 | 参数 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |

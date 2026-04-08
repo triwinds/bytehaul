@@ -60,7 +60,7 @@ graph TD
 
 ### Downloader / DownloaderBuilder
 
-入口对象。它会构建共享的 `BytehaulClient` 包装层（内部基于 hyper client stack，并包含代理、DNS、TLS、超时等设置），以及可选的并发下载限制 `Semaphore`。每次调用 `download()` 都会启动一个独立的 Tokio 任务，并返回一个 `DownloadHandle`。
+入口对象。它维护 downloader 级别的默认网络配置，以及一组按“生效网络配置”缓存的 `BytehaulClient`（内部基于 hyper client stack，并包含代理、DNS、TLS、超时等设置）。每次调用 `download()` 时，都会把默认值与任务级覆盖项（目前包括超时和代理）合并，复用或派生出匹配的 client，并返回一个 `DownloadHandle`。可选的 `Semaphore` 用于限制并发下载数。
 
 ### DownloadHandle
 
