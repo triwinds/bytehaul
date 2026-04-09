@@ -15,7 +15,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 bytehaul = { path = "../.." }
-pyo3 = { version = "0.23", features = ["abi3-py39", "extension-module"] }
+pyo3 = { version = "0.28", features = ["abi3-py39", "extension-module"] }
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
