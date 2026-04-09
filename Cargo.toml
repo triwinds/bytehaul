@@ -58,7 +58,7 @@ libc = "0.2"
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 tracing-subscriber = "0.3"
-warp = "0.3"
+warp = "0.4"
 tempfile = "3"
 rand = "0.8"
 http = "1"
