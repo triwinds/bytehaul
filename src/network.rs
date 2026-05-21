@@ -90,7 +90,7 @@ impl BytehaulClient {
                 let mut req = req;
                 let uri = req.uri().clone();
                 if let Some(headers) = client.connector.http_headers(&uri) {
-                    req.headers_mut().extend(headers.clone().into_iter());
+                    req.headers_mut().extend(headers.clone());
                 }
                 client
                     .client
