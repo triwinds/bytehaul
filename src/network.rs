@@ -485,6 +485,39 @@ fn parse_doh_server(server: &str, enable_ipv6: bool) -> Result<DohServerConfig, 
         return Ok(cached);
     }
 
+    let config = parse_doh_server_uncached(server, enable_ipv6, resolve_doh_host)?;
+    doh_config_cache()
+        .lock()
+        .insert((server.to_string(), enable_ipv6), config.clone());
+    Ok(config)
+}
+
+fn parse_doh_server_uncached<F>(
+    server: &str,
+    enable_ipv6: bool,
+    resolve_host: F,
+) -> Result<DohServerConfig, DownloadError>
+where
+    F: FnOnce(&str, u16) -> std::io::Result<Vec<SocketAddr>>,
+{
+    let server = server.trim();
+    if server.is_empty() {
+        return Err(DownloadError::InvalidConfig(
+            "DoH server URLs cannot be empty".into(),
+        ));
+    }
+    if let Some(authority) = server.strip_prefix("https://") {
+        if authority.is_empty()
+            || authority.starts_with('/')
+            || authority.starts_with('?')
+            || authority.starts_with('#')
+        {
+            return Err(DownloadError::InvalidConfig(format!(
+                "DoH server URL '{server}' is missing a host"
+            )));
+        }
+    }
+
     let url = Url::parse(server).map_err(|error| {
         if error.to_string() == "empty host" {
             DownloadError::InvalidConfig(format!("DoH server URL '{server}' is missing a host"))
@@ -528,14 +561,11 @@ fn parse_doh_server(server: &str, enable_ipv6: bool) -> Result<DohServerConfig, 
     let mut socket_addrs: Vec<SocketAddr> = if let Some(ip) = parsed_ip {
         vec![SocketAddr::new(ip, port)]
     } else {
-        (host_for_resolution, port)
-            .to_socket_addrs()
-            .map_err(|err| {
-                DownloadError::InvalidConfig(format!(
-                    "failed to resolve DoH host '{host_display}' from '{server}': {err}"
-                ))
-            })?
-            .collect()
+        resolve_host(host_for_resolution, port).map_err(|err| {
+            DownloadError::InvalidConfig(format!(
+                "failed to resolve DoH host '{host_display}' from '{server}': {err}"
+            ))
+        })?
     };
 
     if !enable_ipv6 {
@@ -563,7 +593,7 @@ fn parse_doh_server(server: &str, enable_ipv6: bool) -> Result<DohServerConfig, 
         http_endpoint.push_str(query);
     }
 
-    let config = DohServerConfig {
+    Ok(DohServerConfig {
         socket_addrs,
         tls_dns_name: match parsed_ip {
             Some(IpAddr::V4(ipv4)) => ipv4.to_string(),
@@ -575,11 +605,11 @@ fn parse_doh_server(server: &str, enable_ipv6: bool) -> Result<DohServerConfig, 
         } else {
             Some(http_endpoint)
         },
-    };
-    doh_config_cache()
-        .lock()
-        .insert((server.to_string(), enable_ipv6), config.clone());
-    Ok(config)
+    })
+}
+
+fn resolve_doh_host(host: &str, port: u16) -> std::io::Result<Vec<SocketAddr>> {
+    (host, port).to_socket_addrs().map(|addrs| addrs.collect())
 }
 
 #[cfg(test)]
@@ -764,7 +794,16 @@ mod tests {
 
     #[test]
     fn test_parse_doh_server_reports_resolution_failures() {
-        let err = parse_doh_server("https://resolver-test.invalid/dns-query", true)
+        let err = parse_doh_server_uncached(
+            "https://resolver-test.invalid/dns-query",
+            true,
+            |_, _| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "simulated resolution failure",
+                ))
+            },
+        )
             .unwrap_err()
             .to_string();
 
