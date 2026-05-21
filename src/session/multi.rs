@@ -16,8 +16,8 @@ use super::{
 use crate::config::{DownloadSpec, LogLevel};
 use crate::error::DownloadError;
 use crate::eta::EtaEstimator;
-use crate::http::request::build_range_request;
 use crate::http::response::ResponseMeta;
+use crate::http::worker::HttpWorker;
 use crate::http::{next_data_chunk, HttpResponse};
 use crate::network::BytehaulClient;
 use crate::progress::{DownloadState, ProgressReporter, ProgressSnapshot, ProgressUpdate};
@@ -126,8 +126,7 @@ pub(super) async fn run_multi_worker(
     };
 
     let worker_cfg = Arc::new(WorkerConfig {
-        url: request_url.to_string(),
-        headers: spec.headers.clone(),
+        worker: HttpWorker::new(client.clone(), spec),
         read_timeout: spec.read_timeout,
         max_retries: spec.max_retries,
         retry_base_delay: spec.retry_base_delay,
@@ -143,7 +142,6 @@ pub(super) async fn run_multi_worker(
         };
         let handle = tokio::spawn(worker_loop(
             worker_id,
-            client.clone(),
             worker_cfg.clone(),
             scheduler.clone(),
             write_tx.clone(),
@@ -444,8 +442,7 @@ async fn persist_multi_control_snapshot(
 
 /// Immutable per-download configuration shared by all workers via `Arc`.
 struct WorkerConfig {
-    url: String,
-    headers: std::collections::HashMap<String, String>,
+    worker: HttpWorker,
     read_timeout: Duration,
     max_retries: u32,
     retry_base_delay: Duration,
@@ -456,7 +453,6 @@ struct WorkerConfig {
 #[allow(clippy::too_many_arguments)]
 async fn worker_loop(
     worker_id: usize,
-    client: BytehaulClient,
     cfg: Arc<WorkerConfig>,
     scheduler: Scheduler,
     write_tx: mpsc::Sender<WriterCommand>,
@@ -520,9 +516,7 @@ async fn worker_loop(
                     .await
                 } else {
                     download_segment(
-                        &client,
-                        &cfg.url,
-                        &cfg.headers,
+                        &cfg.worker,
                         cfg.read_timeout,
                         &segment,
                         &write_tx,
@@ -535,9 +529,7 @@ async fn worker_loop(
                 }
             } else {
                 download_segment(
-                    &client,
-                    &cfg.url,
-                    &cfg.headers,
+                    &cfg.worker,
                     cfg.read_timeout,
                     &segment,
                     &write_tx,
@@ -669,9 +661,7 @@ fn validate_segment_meta(meta: &ResponseMeta, segment: &Segment) -> Result<(), D
 /// Download a segment by sending a fresh Range request.
 #[allow(clippy::too_many_arguments)]
 async fn download_segment(
-    client: &BytehaulClient,
-    url: &str,
-    headers: &std::collections::HashMap<String, String>,
+    worker: &HttpWorker,
     timeout: Duration,
     segment: &Segment,
     write_tx: &mpsc::Sender<WriterCommand>,
@@ -680,8 +670,7 @@ async fn download_segment(
     budget: &Arc<Semaphore>,
     speed_limit: &SpeedLimit,
 ) -> Result<(), DownloadError> {
-    let req = build_range_request(url, headers, segment.start, segment.end - 1);
-    let response = client.request_with_timeout(req, timeout).await?;
+    let (response, meta) = worker.send_range(segment.start, segment.end - 1).await?;
 
     let status = response.status().as_u16();
     let retry_after = response
@@ -690,7 +679,6 @@ async fn download_segment(
         .and_then(|v| v.to_str().ok().map(|s| s.to_owned()));
     check_segment_status(status, retry_after.as_deref())?;
 
-    let meta = ResponseMeta::from_parts(response.status(), response.headers(), None);
     validate_segment_meta(&meta, segment)?;
 
     stream_segment(
@@ -769,6 +757,15 @@ async fn stream_segment(
 mod coverage_tests {
     use super::*;
     use warp::Filter;
+
+    fn worker_for(url: String) -> HttpWorker {
+        let mut spec = DownloadSpec::new(url).output_path("unused.bin");
+        spec.read_timeout = Duration::from_secs(5);
+        let client = crate::network::ClientNetworkConfig::default()
+            .build_client()
+            .unwrap();
+        HttpWorker::new(client, &spec)
+    }
 
     fn spawn_writer_ack(
         mut write_rx: mpsc::Receiver<WriterCommand>,
@@ -1077,17 +1074,13 @@ mod coverage_tests {
         let (addr, server) = spawn_flaky_range_server(2, Some(0));
         tokio::spawn(server);
 
-        let client = crate::network::ClientNetworkConfig::default()
-            .build_client()
-            .unwrap();
         let scheduler = build_scheduler(256, 256);
         let (write_tx, write_rx) = mpsc::channel(8);
         let writer = spawn_writer_ack(write_rx);
         let downloaded = Arc::new(AtomicU64::new(0));
         let (_cancel_tx, cancel_rx) = watch::channel(StopSignal::Running);
         let cfg = Arc::new(WorkerConfig {
-            url: format!("http://{addr}/piece"),
-            headers: std::collections::HashMap::new(),
+            worker: worker_for(format!("http://{addr}/piece")),
             read_timeout: Duration::from_secs(2),
             max_retries: 3,
             retry_base_delay: Duration::from_millis(10),
@@ -1097,7 +1090,6 @@ mod coverage_tests {
 
         worker_loop(
             0,
-            client,
             cfg,
             scheduler.clone(),
             write_tx,
@@ -1122,17 +1114,13 @@ mod coverage_tests {
         let (addr, server) = spawn_flaky_range_server(10, Some(1));
         tokio::spawn(server);
 
-        let client = crate::network::ClientNetworkConfig::default()
-            .build_client()
-            .unwrap();
         let scheduler = build_scheduler(256, 256);
         let (write_tx, write_rx) = mpsc::channel(8);
         let writer = spawn_writer_ack(write_rx);
         let downloaded = Arc::new(AtomicU64::new(0));
         let (cancel_tx, cancel_rx) = watch::channel(StopSignal::Running);
         let cfg = Arc::new(WorkerConfig {
-            url: format!("http://{addr}/piece"),
-            headers: std::collections::HashMap::new(),
+            worker: worker_for(format!("http://{addr}/piece")),
             read_timeout: Duration::from_secs(2),
             max_retries: 5,
             retry_base_delay: Duration::from_millis(10),
@@ -1147,7 +1135,6 @@ mod coverage_tests {
 
         let err = worker_loop(
             0,
-            client,
             cfg,
             scheduler.clone(),
             write_tx,

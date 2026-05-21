@@ -1,9 +1,10 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use hyper::header::LOCATION;
 use hyper::{HeaderMap, StatusCode};
-use tokio::sync::OnceCell;
+use tokio::sync::Mutex;
 use url::Url;
 
 use crate::config::DownloadSpec;
@@ -14,12 +15,13 @@ use crate::http::HttpResponse;
 use crate::network::BytehaulClient;
 
 /// HTTP worker responsible for sending requests and validating responses.
+#[derive(Clone)]
 pub(crate) struct HttpWorker {
     client: BytehaulClient,
     url: String,
     headers: HashMap<String, String>,
     timeout: Duration,
-    final_url: OnceCell<String>,
+    final_url: Arc<Mutex<Option<String>>>,
 }
 
 impl HttpWorker {
@@ -29,32 +31,34 @@ impl HttpWorker {
             url: spec.url.clone(),
             headers: spec.headers.clone(),
             timeout: spec.read_timeout,
-            final_url: OnceCell::new(),
+            final_url: Arc::new(Mutex::new(None)),
         }
     }
 
     pub async fn final_url(&self) -> Result<String, DownloadError> {
-        self.final_url
-            .get_or_try_init(|| async { self.resolve_redirects(&self.url).await })
-            .await
-            .cloned()
+        if let Some(url) = self.cached_final_url().await {
+            return Ok(url);
+        }
+
+        let resolved = self.resolve_redirects(&self.url).await?;
+        self.set_final_url(resolved.clone()).await;
+        Ok(resolved)
     }
 
     /// Send an initial GET request (no Range) and validate the response.
     pub async fn send_get(&self) -> Result<(HttpResponse, ResponseMeta), DownloadError> {
-        let final_url = self.final_url().await?;
-        tracing::debug!(url = %final_url, "sending GET request");
-        let req = request::build_get_request(&final_url, &self.headers);
-        let response = self.client.request_with_timeout(req, self.timeout).await?;
-
-        let status = response.status();
-        tracing::debug!(status = status.as_u16(), "GET response received");
-        if !status.is_success() {
-            return Err(make_http_error(response.headers(), status.as_u16()));
+        let start_url = self
+            .cached_final_url()
+            .await
+            .unwrap_or_else(|| self.url.clone());
+        let can_refresh = start_url != self.url;
+        match self.send_get_following_redirects(&start_url).await {
+            Err(error) if can_refresh && is_stale_redirect_target_error(&error) => {
+                self.clear_final_url().await;
+                self.send_get_following_redirects(&self.url).await
+            }
+            result => result,
         }
-
-        let meta = ResponseMeta::from_parts(status, response.headers(), None);
-        Ok((response, meta))
     }
 
     /// Send a Range GET request and validate the 206 response.
@@ -63,29 +67,104 @@ impl HttpWorker {
         start: u64,
         end: u64,
     ) -> Result<(HttpResponse, ResponseMeta), DownloadError> {
-        let final_url = self.final_url().await?;
-        let req = request::build_range_request(&final_url, &self.headers, start, end);
-        let response = self.client.request_with_timeout(req, self.timeout).await?;
+        let start_url = self
+            .cached_final_url()
+            .await
+            .unwrap_or_else(|| self.url.clone());
+        let can_refresh = start_url != self.url;
+        match self
+            .send_range_following_redirects(&start_url, start, end)
+            .await
+        {
+            Err(error) if can_refresh && is_stale_redirect_target_error(&error) => {
+                self.clear_final_url().await;
+                self.send_range_following_redirects(&self.url, start, end)
+                    .await
+            }
+            result => result,
+        }
+    }
 
-        let status = response.status();
-        tracing::debug!(status = status.as_u16(), start = start, end = end, "Range response received");
-        if status.as_u16() == 200 {
+    async fn cached_final_url(&self) -> Option<String> {
+        self.final_url.lock().await.clone()
+    }
+
+    async fn set_final_url(&self, url: String) {
+        *self.final_url.lock().await = Some(url);
+    }
+
+    async fn clear_final_url(&self) {
+        *self.final_url.lock().await = None;
+    }
+
+    async fn send_get_following_redirects(
+        &self,
+        start_url: &str,
+    ) -> Result<(HttpResponse, ResponseMeta), DownloadError> {
+        let mut current = parse_download_url(start_url)?;
+
+        for _ in 0..10 {
+            tracing::debug!(url = %current, "sending GET request");
+            let req = request::build_get_request(&current, &self.headers);
+            let response = self.client.request_with_timeout(req, self.timeout).await?;
+            let status = response.status();
+            tracing::debug!(status = status.as_u16(), "GET response received");
+
+            if status.is_redirection() {
+                current = redirect_location(&current, response.headers(), status)?;
+                continue;
+            }
+
+            self.set_final_url(current.clone()).await;
+            if !status.is_success() {
+                return Err(make_http_error(response.headers(), status.as_u16()));
+            }
+
             let meta = ResponseMeta::from_parts(status, response.headers(), None);
             return Ok((response, meta));
         }
-        if status.as_u16() != 206 {
-            return Err(make_http_error(response.headers(), status.as_u16()));
+
+        too_many_redirects_error()
+    }
+
+    async fn send_range_following_redirects(
+        &self,
+        start_url: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<(HttpResponse, ResponseMeta), DownloadError> {
+        let mut current = parse_download_url(start_url)?;
+
+        for _ in 0..10 {
+            let req = request::build_range_request(&current, &self.headers, start, end);
+            let response = self.client.request_with_timeout(req, self.timeout).await?;
+
+            let status = response.status();
+            tracing::debug!(status = status.as_u16(), start = start, end = end, url = %current, "Range response received");
+
+            if status.is_redirection() {
+                current = redirect_location(&current, response.headers(), status)?;
+                continue;
+            }
+
+            self.set_final_url(current.clone()).await;
+            if status.as_u16() == 200 {
+                let meta = ResponseMeta::from_parts(status, response.headers(), None);
+                return Ok((response, meta));
+            }
+            if status.as_u16() != 206 {
+                return Err(make_http_error(response.headers(), status.as_u16()));
+            }
+
+            let meta = ResponseMeta::from_parts(status, response.headers(), None);
+            return Ok((response, meta));
         }
 
-        let meta = ResponseMeta::from_parts(status, response.headers(), None);
-        Ok((response, meta))
+        too_many_redirects_error()
     }
 
     async fn resolve_redirects(&self, url: &str) -> Result<String, DownloadError> {
-        let mut current = validate_redirect_target(Url::parse(url).map_err(|error| {
-            DownloadError::InvalidConfig(format!("invalid download URL '{url}': {error}"))
-        })?)?
-        .to_string();
+        let mut current = parse_download_url(url)?;
 
         for _ in 0..10 {
             let req = request::build_get_request(&current, &self.headers);
@@ -95,22 +174,18 @@ impl HttpWorker {
                 return Ok(current);
             }
 
-            let location = response
-                .headers()
-                .get(LOCATION)
-                .and_then(|value| value.to_str().ok())
-                .ok_or_else(|| DownloadError::HttpStatus {
-                    status: status.as_u16(),
-                    message: "redirect response missing Location header".into(),
-                })?;
-            current = resolve_redirect_target(&current, location)?;
+            current = redirect_location(&current, response.headers(), status)?;
         }
 
-        Err(DownloadError::HttpStatus {
-            status: StatusCode::LOOP_DETECTED.as_u16(),
-            message: "too many redirects".into(),
-        })
+        too_many_redirects_error()
     }
+}
+
+fn parse_download_url(url: &str) -> Result<String, DownloadError> {
+    validate_redirect_target(Url::parse(url).map_err(|error| {
+        DownloadError::InvalidConfig(format!("invalid download URL '{url}': {error}"))
+    })?)
+    .map(|url| url.to_string())
 }
 
 fn validate_redirect_target(url: Url) -> Result<Url, DownloadError> {
@@ -125,7 +200,9 @@ fn validate_redirect_target(url: Url) -> Result<Url, DownloadError> {
 
 fn resolve_redirect_target(current_url: &str, location: &str) -> Result<String, DownloadError> {
     let base = Url::parse(current_url).map_err(|error| {
-        DownloadError::InvalidConfig(format!("invalid redirect base URL '{current_url}': {error}"))
+        DownloadError::InvalidConfig(format!(
+            "invalid redirect base URL '{current_url}': {error}"
+        ))
     })?;
     let target = match Url::parse(location) {
         Ok(url) => url,
@@ -141,6 +218,38 @@ fn resolve_redirect_target(current_url: &str, location: &str) -> Result<String, 
         }
     };
     Ok(validate_redirect_target(target)?.to_string())
+}
+
+fn redirect_location(
+    current_url: &str,
+    headers: &HeaderMap,
+    status: StatusCode,
+) -> Result<String, DownloadError> {
+    let location = headers
+        .get(LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| DownloadError::HttpStatus {
+            status: status.as_u16(),
+            message: "redirect response missing Location header".into(),
+        })?;
+    resolve_redirect_target(current_url, location)
+}
+
+fn too_many_redirects_error<T>() -> Result<T, DownloadError> {
+    Err(DownloadError::HttpStatus {
+        status: StatusCode::LOOP_DETECTED.as_u16(),
+        message: "too many redirects".into(),
+    })
+}
+
+fn is_stale_redirect_target_error(error: &DownloadError) -> bool {
+    matches!(
+        error,
+        DownloadError::HttpStatus {
+            status: 403 | 404,
+            ..
+        }
+    )
 }
 
 /// Build an appropriate HttpStatus error, embedding Retry-After hint for 429/503.
@@ -167,6 +276,8 @@ mod tests {
     use bytes::Bytes;
     use http_body_util::Empty;
     use hyper::Response;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use warp::Filter;
 
     fn worker_for(url: String) -> HttpWorker {
@@ -251,9 +362,8 @@ mod tests {
 
     #[tokio::test]
     async fn send_get_caches_final_url_after_redirect() {
-        let redirect = warp::path("redirect").map(|| {
-            warp::redirect::temporary(warp::http::Uri::from_static("/target"))
-        });
+        let redirect = warp::path("redirect")
+            .map(|| warp::redirect::temporary(warp::http::Uri::from_static("/target")));
         let target = warp::path("target").map(|| {
             warp::http::Response::builder()
                 .status(200)
@@ -268,7 +378,60 @@ mod tests {
         let worker = worker_for(format!("http://{addr}/redirect"));
         worker.send_get().await.unwrap();
 
-        assert_eq!(worker.final_url().await.unwrap(), format!("http://{addr}/target"));
+        assert_eq!(
+            worker.final_url().await.unwrap(),
+            format!("http://{addr}/target")
+        );
+    }
+
+    #[tokio::test]
+    async fn send_range_refreshes_stale_redirect_target_after_404() {
+        let active_asset = Arc::new(AtomicUsize::new(1));
+        let active_for_redirect = active_asset.clone();
+        let active_for_asset = active_asset.clone();
+
+        let release = warp::path("release").map(move || {
+            let active = active_for_redirect.load(Ordering::SeqCst);
+            let location = format!("/asset/{active}");
+            warp::http::Response::builder()
+                .status(302)
+                .header("location", location)
+                .body(Vec::<u8>::new())
+                .unwrap()
+        });
+        let asset = warp::path!("asset" / usize)
+            .and(warp::header::optional::<String>("range"))
+            .map(move |asset_id: usize, _range: Option<String>| {
+                if asset_id != active_for_asset.load(Ordering::SeqCst) {
+                    return warp::http::Response::builder()
+                        .status(404)
+                        .body(Vec::<u8>::new())
+                        .unwrap();
+                }
+
+                active_for_asset.store(asset_id + 1, Ordering::SeqCst);
+                warp::http::Response::builder()
+                    .status(206)
+                    .header("content-length", "3")
+                    .header("content-range", "bytes 0-2/3")
+                    .header("accept-ranges", "bytes")
+                    .body(b"abc".to_vec())
+                    .unwrap()
+            });
+        let routes = release.or(asset);
+        let (addr, server) = warp::serve(routes).bind_ephemeral(([127, 0, 0, 1], 0));
+        tokio::spawn(server);
+
+        let worker = worker_for(format!("http://{addr}/release"));
+        let (_, meta) = worker.send_range(0, 2).await.unwrap();
+        assert_eq!(meta.content_range_total, Some(3));
+
+        let (_, meta) = worker.send_range(0, 2).await.unwrap();
+        assert_eq!(meta.content_range_total, Some(3));
+        assert_eq!(
+            worker.final_url().await.unwrap(),
+            format!("http://{addr}/asset/2")
+        );
     }
 
     #[tokio::test]
@@ -336,7 +499,10 @@ mod tests {
         let worker = worker_for(format!("http://{addr}/loop-redirect"));
         let err = worker.send_get().await.unwrap_err();
         match err {
-            DownloadError::HttpStatus { status, ref message } => {
+            DownloadError::HttpStatus {
+                status,
+                ref message,
+            } => {
                 assert_eq!(status, StatusCode::LOOP_DETECTED.as_u16());
                 assert!(message.contains("too many redirects"), "msg: {message}");
             }
@@ -358,9 +524,15 @@ mod tests {
         let worker = worker_for(format!("http://{addr}/no-location"));
         let err = worker.send_get().await.unwrap_err();
         match err {
-            DownloadError::HttpStatus { status, ref message } => {
+            DownloadError::HttpStatus {
+                status,
+                ref message,
+            } => {
                 assert_eq!(status, 301);
-                assert!(message.contains("missing Location header"), "msg: {message}");
+                assert!(
+                    message.contains("missing Location header"),
+                    "msg: {message}"
+                );
             }
             other => panic!("expected HttpStatus 301 missing Location, got {other:?}"),
         }
@@ -371,10 +543,7 @@ mod tests {
         let err = resolve_redirect_target("https://example.com/", "https://[::1")
             .unwrap_err()
             .to_string();
-        assert!(
-            err.contains("invalid redirect location"),
-            "got: {err}"
-        );
+        assert!(err.contains("invalid redirect location"), "got: {err}");
     }
 
     #[test]
