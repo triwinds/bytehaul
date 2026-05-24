@@ -283,6 +283,140 @@ fn range_file_server(
     warp::serve(route).bind_ephemeral(([127, 0, 0, 1], 0))
 }
 
+#[derive(Clone, Copy)]
+enum MalformedRangeMode {
+    ShortBody,
+    LongBody,
+}
+
+fn malformed_range_server(
+    path_segment: &'static str,
+    data: Vec<u8>,
+    mode: MalformedRangeMode,
+) -> (std::net::SocketAddr, impl std::future::Future<Output = ()>) {
+    let data = Arc::new(data);
+    let first_range = Arc::new(AtomicUsize::new(0));
+    let d = data.clone();
+    let f = first_range.clone();
+
+    let route = warp::path(path_segment)
+        .and(warp::header::optional::<String>("range"))
+        .map(move |range_header: Option<String>| {
+            let data = d.clone();
+            let total = data.len();
+
+            match range_header {
+                Some(range) => {
+                    let range = range.trim_start_matches("bytes=");
+                    let parts: Vec<&str> = range.split('-').collect();
+                    let start: u64 = parts[0].parse().unwrap_or(0);
+                    let end: u64 = if parts.len() > 1 && !parts[1].is_empty() {
+                        parts[1]
+                            .parse::<u64>()
+                            .unwrap_or(total as u64 - 1)
+                            .min(total as u64 - 1)
+                    } else {
+                        total as u64 - 1
+                    };
+                    let slice = &data[start as usize..=end as usize];
+                    let should_mangle = f.fetch_add(1, Ordering::SeqCst) == 0;
+                    let body = if should_mangle {
+                        match mode {
+                            MalformedRangeMode::ShortBody => slice[..slice.len() - 1].to_vec(),
+                            MalformedRangeMode::LongBody => {
+                                let mut body = slice.to_vec();
+                                body.push(0xFF);
+                                body
+                            }
+                        }
+                    } else {
+                        slice.to_vec()
+                    };
+
+                    warp::http::Response::builder()
+                        .status(206)
+                        .header("content-length", body.len().to_string())
+                        .header(
+                            "content-range",
+                            format!("bytes {}-{}/{}", start, end, total),
+                        )
+                        .header("accept-ranges", "bytes")
+                        .body(body)
+                        .unwrap()
+                }
+                None => warp::http::Response::builder()
+                    .status(200)
+                    .header("content-length", total.to_string())
+                    .header("accept-ranges", "bytes")
+                    .body(data.to_vec())
+                    .unwrap(),
+            }
+        });
+
+    warp::serve(route).bind_ephemeral(([127, 0, 0, 1], 0))
+}
+
+fn truncated_once_range_server(
+    path_segment: &'static str,
+    data: Vec<u8>,
+    truncate_start: usize,
+) -> (std::net::SocketAddr, impl std::future::Future<Output = ()>) {
+    let data = Arc::new(data);
+    let truncated = Arc::new(AtomicUsize::new(0));
+    let d = data.clone();
+    let t = truncated.clone();
+
+    let route = warp::path(path_segment)
+        .and(warp::header::optional::<String>("range"))
+        .map(move |range_header: Option<String>| {
+            let data = d.clone();
+            let total = data.len();
+
+            match range_header {
+                Some(range) => {
+                    let range = range.trim_start_matches("bytes=");
+                    let parts: Vec<&str> = range.split('-').collect();
+                    let start: u64 = parts[0].parse().unwrap_or(0);
+                    let end: u64 = if parts.len() > 1 && !parts[1].is_empty() {
+                        parts[1]
+                            .parse::<u64>()
+                            .unwrap_or(total as u64 - 1)
+                            .min(total as u64 - 1)
+                    } else {
+                        total as u64 - 1
+                    };
+                    let slice = &data[start as usize..=end as usize];
+                    let should_truncate =
+                        start as usize == truncate_start && t.fetch_add(1, Ordering::SeqCst) == 0;
+                    let body = if should_truncate {
+                        slice[..slice.len() / 2].to_vec()
+                    } else {
+                        slice.to_vec()
+                    };
+
+                    warp::http::Response::builder()
+                        .status(206)
+                        .header("content-length", body.len().to_string())
+                        .header(
+                            "content-range",
+                            format!("bytes {}-{}/{}", start, end, total),
+                        )
+                        .header("accept-ranges", "bytes")
+                        .body(body)
+                        .unwrap()
+                }
+                None => warp::http::Response::builder()
+                    .status(200)
+                    .header("content-length", total.to_string())
+                    .header("accept-ranges", "bytes")
+                    .body(data.to_vec())
+                    .unwrap(),
+            }
+        });
+
+    warp::serve(route).bind_ephemeral(([127, 0, 0, 1], 0))
+}
+
 /// Test server that does NOT support Range (always returns 200 with full body).
 fn no_range_server(
     path_segment: &'static str,
@@ -416,6 +550,90 @@ async fn test_multi_worker_progress() {
     assert_eq!(snap.downloaded, expected_len);
     assert_eq!(snap.total_size, Some(expected_len));
     assert_eq!(snap.eta_secs, Some(0.0));
+}
+
+#[tokio::test]
+async fn test_multi_worker_rejects_short_initial_range_body() {
+    let size = 12 * 1024 * 1024;
+    let content: Vec<u8> = (0..size).map(|i| (i % 199) as u8).collect();
+    let (addr, server) =
+        malformed_range_server("short-initial", content, MalformedRangeMode::ShortBody);
+    tokio::spawn(server);
+
+    let dir = tempfile::tempdir().unwrap();
+    let output_path = dir.path().join("short-initial.bin");
+
+    let downloader = Downloader::builder().build().unwrap();
+    let spec = DownloadSpec::new(format!("http://{addr}/short-initial"))
+        .output_path(output_path)
+        .file_allocation(FileAllocation::None)
+        .max_connections(4)
+        .piece_size(1024 * 1024)
+        .min_split_size(1)
+        .max_retries(0);
+
+    let handle = downloader.download(spec);
+    assert!(handle.wait().await.is_err());
+}
+
+#[tokio::test]
+async fn test_multi_worker_rejects_long_initial_range_body() {
+    let size = 12 * 1024 * 1024;
+    let content: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+    let (addr, server) =
+        malformed_range_server("long-initial", content, MalformedRangeMode::LongBody);
+    tokio::spawn(server);
+
+    let dir = tempfile::tempdir().unwrap();
+    let output_path = dir.path().join("long-initial.bin");
+
+    let downloader = Downloader::builder().build().unwrap();
+    let spec = DownloadSpec::new(format!("http://{addr}/long-initial"))
+        .output_path(output_path)
+        .file_allocation(FileAllocation::None)
+        .max_connections(4)
+        .piece_size(1024 * 1024)
+        .min_split_size(1)
+        .max_retries(0);
+
+    let handle = downloader.download(spec);
+    assert!(handle.wait().await.is_err());
+}
+
+#[tokio::test]
+async fn test_multi_worker_retries_truncated_segment_without_overcounting_progress() {
+    let piece_size = 1024 * 1024usize;
+    let size = 12 * piece_size;
+    let content: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+    let expected = content.clone();
+    let (addr, server) = truncated_once_range_server("retry-truncated", content, piece_size);
+    tokio::spawn(server);
+
+    let dir = tempfile::tempdir().unwrap();
+    let output_path = dir.path().join("retry-truncated.bin");
+
+    let downloader = Downloader::builder().build().unwrap();
+    let spec = DownloadSpec::new(format!("http://{addr}/retry-truncated"))
+        .output_path(output_path.clone())
+        .file_allocation(FileAllocation::None)
+        .max_connections(2)
+        .piece_size(piece_size as u64)
+        .min_split_size(1)
+        .retry_policy(
+            2,
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_millis(1),
+        );
+
+    let handle = downloader.download(spec);
+    let rx = handle.subscribe_progress();
+    handle.wait().await.unwrap();
+    let snap = rx.borrow().clone();
+    assert_eq!(snap.state, DownloadState::Completed);
+    assert_eq!(snap.downloaded, size as u64);
+
+    let downloaded = std::fs::read(&output_path).unwrap();
+    assert_eq!(downloaded, expected);
 }
 
 #[tokio::test]

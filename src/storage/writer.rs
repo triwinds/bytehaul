@@ -28,6 +28,11 @@ pub(crate) enum WriterCommand {
         piece_id: usize,
         ack: oneshot::Sender<()>,
     },
+    /// A piece attempt failed before completion; discard its cached bytes.
+    DiscardPiece {
+        piece_id: usize,
+        ack: oneshot::Sender<usize>,
+    },
     /// Flush all cached data and optionally sync it before acknowledging.
     FlushAll {
         sync_data: bool,
@@ -93,6 +98,13 @@ impl WriterTask {
                 WriterCommand::FlushPiece { piece_id, ack } => {
                     self.flush_piece(piece_id).await?;
                     let _ = ack.send(());
+                }
+                WriterCommand::DiscardPiece { piece_id, ack } => {
+                    let discarded = self.cache.discard_piece(piece_id);
+                    if discarded > 0 {
+                        self.budget_return.add_permits(discarded);
+                    }
+                    let _ = ack.send(discarded);
                 }
                 WriterCommand::FlushAll { sync_data, ack } => {
                     let flush_started = Instant::now();
@@ -292,6 +304,58 @@ mod tests {
 
         drop(tx);
         handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_writer_discard_piece_drops_cached_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test_discard_piece.bin");
+        std::fs::write(&path, vec![0u8; 128]).unwrap();
+        let file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .await
+            .unwrap();
+
+        let budget = Arc::new(tokio::sync::Semaphore::new(1024));
+        let written = Arc::new(AtomicU64::new(0));
+        let (tx, rx) = mpsc::channel(16);
+
+        let writer = WriterTask::new(rx, file, written.clone(), budget.clone(), 1024);
+        let handle = tokio::spawn(writer.run());
+
+        tx.send(WriterCommand::Data {
+            offset: 0,
+            data: Bytes::from(vec![0xEE; 64]),
+            piece_id: Some(0),
+        })
+        .await
+        .unwrap();
+
+        let (ack_tx, ack_rx) = oneshot::channel();
+        tx.send(WriterCommand::DiscardPiece {
+            piece_id: 0,
+            ack: ack_tx,
+        })
+        .await
+        .unwrap();
+        assert_eq!(ack_rx.await.unwrap(), 64);
+
+        let (ack_tx, ack_rx) = oneshot::channel();
+        tx.send(WriterCommand::FlushPiece {
+            piece_id: 0,
+            ack: ack_tx,
+        })
+        .await
+        .unwrap();
+        ack_rx.await.unwrap();
+
+        drop(tx);
+        handle.await.unwrap().unwrap();
+
+        let content = std::fs::read(&path).unwrap();
+        assert!(content.iter().all(|&b| b == 0));
+        assert_eq!(written.load(Ordering::Acquire), 0);
     }
 
     #[tokio::test]

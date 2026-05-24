@@ -193,7 +193,7 @@ pub(super) async fn try_resume_download(
                             &meta,
                             ctrl.total_size,
                             piece_map,
-                            Some((resp, probe_piece)),
+                            Some((resp, meta.clone(), probe_piece)),
                             progress_tx,
                             cancel_rx.clone(),
                             &control_path,

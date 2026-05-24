@@ -487,6 +487,9 @@ mod tests {
                     WriterCommand::FlushPiece { ack, .. } => {
                         let _ = ack.send(());
                     }
+                    WriterCommand::DiscardPiece { ack, .. } => {
+                        let _ = ack.send(0);
+                    }
                     WriterCommand::FlushAll { ack, .. } => {
                         let _ = ack.send(crate::storage::writer::FlushAllStats {
                             written_bytes: written_bytes.load(Ordering::Acquire),

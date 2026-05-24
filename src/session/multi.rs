@@ -8,10 +8,9 @@ use futures::StreamExt;
 use tokio::sync::{mpsc, watch, Semaphore};
 
 use super::{
-    flush_all_and_wait, flush_piece_and_wait, range_response_allowed,
-    ControlSaveReason, ControlSaveTracker,
-    stop_signal_error, stop_signal_label, stop_signal_state,
-    MIN_SPEED_SAMPLE_SPAN, MULTI_PROGRESS_INTERVAL, SPEED_ESTIMATE_WINDOW, StopSignal,
+    discard_piece_and_wait, flush_all_and_wait, flush_piece_and_wait, range_response_allowed,
+    stop_signal_error, stop_signal_label, stop_signal_state, ControlSaveReason, ControlSaveTracker,
+    StopSignal, MIN_SPEED_SAMPLE_SPAN, MULTI_PROGRESS_INTERVAL, SPEED_ESTIMATE_WINDOW,
 };
 use crate::config::{DownloadSpec, LogLevel};
 use crate::error::DownloadError;
@@ -49,7 +48,7 @@ pub(super) async fn run_multi_worker(
     meta: &ResponseMeta,
     total_size: u64,
     piece_map: PieceMap,
-    probe_response: Option<(HttpResponse, usize)>,
+    probe_response: Option<(HttpResponse, ResponseMeta, usize)>,
     progress_tx: &watch::Sender<ProgressSnapshot>,
     cancel_rx: watch::Receiver<StopSignal>,
     control_path: &Path,
@@ -104,10 +103,15 @@ pub(super) async fn run_multi_worker(
     // Spawn workers
     let remaining = scheduler.lock().remaining_count();
     let num_workers = (spec.max_connections as usize).min(remaining).max(1);
-    log_info!(log_level, download_id = download_id,
-        workers = num_workers, remaining_pieces = remaining,
-        total_size = total_size, initial_downloaded = initial_downloaded,
-        "multi-worker download started");
+    log_info!(
+        log_level,
+        download_id = download_id,
+        workers = num_workers,
+        remaining_pieces = remaining,
+        total_size = total_size,
+        initial_downloaded = initial_downloaded,
+        "multi-worker download started"
+    );
 
     let mut abort_handles = Vec::with_capacity(num_workers);
     let mut workers = FuturesUnordered::new();
@@ -150,6 +154,7 @@ pub(super) async fn run_multi_worker(
             budget.clone(),
             speed_limit.clone(),
             first,
+            total_size,
             log_level,
             download_id,
         ));
@@ -280,7 +285,8 @@ pub(super) async fn run_multi_worker(
                 None,
                 &mut control_save_tracker,
                 &control_save_ctx,
-            ).await;
+            )
+            .await;
         }
         if !matches!(e, DownloadError::Cancelled | DownloadError::Paused) {
             let now = Instant::now();
@@ -319,7 +325,8 @@ pub(super) async fn run_multi_worker(
                 None,
                 &mut control_save_tracker,
                 &control_save_ctx,
-            ).await;
+            )
+            .await;
         }
         let now = Instant::now();
         let update = sampled_progress_update(
@@ -330,7 +337,11 @@ pub(super) async fn run_multi_worker(
         )
         .with_state(DownloadState::Failed);
         progress_reporter.force_report(progress_tx, update, now);
-        log_error!(log_level, download_id = download_id, "multi-worker download incomplete");
+        log_error!(
+            log_level,
+            download_id = download_id,
+            "multi-worker download incomplete"
+        );
         return Err(DownloadError::Internal("download incomplete".into()));
     }
 
@@ -340,9 +351,13 @@ pub(super) async fn run_multi_worker(
     let now = Instant::now();
     let update = sampled_progress_update(&mut eta_estimator, d, total_size, now)
         .with_state(DownloadState::Completed);
-    log_info!(log_level, download_id = download_id,
-        total_bytes = d, elapsed_secs = format!("{:.2}", start_time.elapsed().as_secs_f64()),
-        "multi-worker download completed");
+    log_info!(
+        log_level,
+        download_id = download_id,
+        total_bytes = d,
+        elapsed_secs = format!("{:.2}", start_time.elapsed().as_secs_f64()),
+        "multi-worker download completed"
+    );
     progress_reporter.force_report(progress_tx, update, now);
     Ok(())
 }
@@ -373,16 +388,24 @@ async fn persist_multi_control_snapshot(
     let current_downloaded = ctx.scheduler.lock().completed_bytes();
     let force_terminal_snapshot = matches!(reason, ControlSaveReason::Terminal);
     if !force_terminal_snapshot
-        && !control_save_tracker.should_save(reason, current_downloaded, ctx.spec.autosave_sync_every)
+        && !control_save_tracker.should_save(
+            reason,
+            current_downloaded,
+            ctx.spec.autosave_sync_every,
+        )
     {
         if matches!(reason, ControlSaveReason::Autosave)
             && current_downloaded > control_save_tracker.last_saved_downloaded_bytes()
         {
-            log_debug!(ctx.log_level, download_id = ctx.download_id,
-                checkpoint = reason.label(), downloaded_bytes = current_downloaded,
+            log_debug!(
+                ctx.log_level,
+                download_id = ctx.download_id,
+                checkpoint = reason.label(),
+                downloaded_bytes = current_downloaded,
                 pending_autosaves = control_save_tracker.pending_autosaves(),
                 autosave_sync_every = ctx.spec.autosave_sync_every,
-                "control snapshot deferred");
+                "control snapshot deferred"
+            );
         }
         return;
     }
@@ -422,12 +445,22 @@ async fn persist_multi_control_snapshot(
     match snap.save(ctx.control_path).await {
         Ok(()) => {
             control_save_tracker.mark_saved(snap.downloaded_bytes);
-            log_debug!(ctx.log_level, download_id = ctx.download_id,
-                checkpoint = reason.label(), downloaded_bytes = snap.downloaded_bytes,
-                flush_all_ms = flush_stats.map(|stats| stats.flush_elapsed.as_millis() as u64).unwrap_or(0),
-                sync_data_ms = flush_stats.and_then(|stats| stats.sync_elapsed.map(|elapsed| elapsed.as_millis() as u64)).unwrap_or(0),
+            log_debug!(
+                ctx.log_level,
+                download_id = ctx.download_id,
+                checkpoint = reason.label(),
+                downloaded_bytes = snap.downloaded_bytes,
+                flush_all_ms = flush_stats
+                    .as_ref()
+                    .map(|stats| stats.flush_elapsed.as_millis() as u64)
+                    .unwrap_or(0),
+                sync_data_ms = flush_stats
+                    .as_ref()
+                    .and_then(|stats| stats.sync_elapsed.map(|elapsed| elapsed.as_millis() as u64))
+                    .unwrap_or(0),
                 control_save_ms = save_started.elapsed().as_millis() as u64,
-                "control snapshot saved");
+                "control snapshot saved"
+            );
         }
         Err(error) => {
             log_warn!(ctx.log_level, download_id = ctx.download_id, checkpoint = reason.label(),
@@ -460,13 +493,19 @@ async fn worker_loop(
     cancel_rx: watch::Receiver<StopSignal>,
     budget: Arc<Semaphore>,
     speed_limit: SpeedLimit,
-    first_response: Option<(HttpResponse, usize)>,
+    first_response: Option<(HttpResponse, ResponseMeta, usize)>,
+    total_size: u64,
     log_level: LogLevel,
     download_id: u64,
 ) -> Result<(), DownloadError> {
     let mut cancel_rx = cancel_rx;
     let mut first_response = first_response;
-    log_debug!(log_level, download_id = download_id, worker_id = worker_id, "worker started");
+    log_debug!(
+        log_level,
+        download_id = download_id,
+        worker_id = worker_id,
+        "worker started"
+    );
 
     loop {
         let signal = *cancel_rx.borrow();
@@ -485,39 +524,54 @@ async fn worker_loop(
         let segment = match scheduler.lock().assign() {
             Some(seg) => seg,
             None => {
-                log_debug!(log_level, download_id = download_id, worker_id = worker_id,
+                log_debug!(
+                    log_level,
+                    download_id = download_id,
+                    worker_id = worker_id,
                     scheduler_lock_us = assign_started.elapsed().as_micros() as u64,
-                    "no more segments, worker exiting");
+                    "no more segments, worker exiting"
+                );
                 return Ok(());
             }
         };
 
-        log_debug!(log_level, download_id = download_id, worker_id = worker_id,
+        log_debug!(
+            log_level,
+            download_id = download_id,
+            worker_id = worker_id,
             piece_id = segment.piece_id,
             scheduler_lock_us = assign_started.elapsed().as_micros() as u64,
-            "assigned piece");
+            "assigned piece"
+        );
 
         let mut attempt = 0u32;
-    let retry_started_at = Instant::now();
+        let retry_started_at = Instant::now();
 
         loop {
-            let result = if let Some((resp, pid)) = first_response.take() {
+            let result = if let Some((resp, meta, pid)) = first_response.take() {
                 if pid == segment.piece_id {
-                    stream_segment(
-                        resp,
-                        cfg.read_timeout,
-                        &segment,
-                        &write_tx,
-                        &downloaded,
-                        &mut cancel_rx,
-                        &budget,
-                        &speed_limit,
-                    )
-                    .await
+                    match validate_segment_meta(&meta, &segment, total_size) {
+                        Ok(()) => {
+                            stream_segment(
+                                resp,
+                                cfg.read_timeout,
+                                total_size,
+                                &segment,
+                                &write_tx,
+                                &downloaded,
+                                &mut cancel_rx,
+                                &budget,
+                                &speed_limit,
+                            )
+                            .await
+                        }
+                        Err(error) => Err((error, 0)),
+                    }
                 } else {
                     download_segment(
                         &cfg.worker,
                         cfg.read_timeout,
+                        total_size,
                         &segment,
                         &write_tx,
                         &downloaded,
@@ -531,6 +585,7 @@ async fn worker_loop(
                 download_segment(
                     &cfg.worker,
                     cfg.read_timeout,
+                    total_size,
                     &segment,
                     &write_tx,
                     &downloaded,
@@ -542,14 +597,29 @@ async fn worker_loop(
             };
 
             match result {
-                Ok(()) => {
+                Ok(_bytes_read) => {
                     flush_piece_and_wait(&write_tx, segment.piece_id).await?;
                     scheduler.lock().complete(segment.piece_id);
-                    log_debug!(log_level, download_id = download_id, worker_id = worker_id,
-                        piece_id = segment.piece_id, "piece completed");
+                    log_debug!(
+                        log_level,
+                        download_id = download_id,
+                        worker_id = worker_id,
+                        piece_id = segment.piece_id,
+                        "piece completed"
+                    );
                     break;
                 }
-                Err(e) => {
+                Err((e, bytes_read)) => {
+                    if bytes_read > 0 {
+                        downloaded.fetch_sub(bytes_read, Ordering::Relaxed);
+                        if let Err(error) =
+                            discard_piece_and_wait(&write_tx, segment.piece_id).await
+                        {
+                            scheduler.lock().reclaim(segment.piece_id);
+                            return Err(error);
+                        }
+                    }
+
                     if !e.is_retryable() || attempt >= cfg.max_retries {
                         log_warn!(log_level, download_id = download_id, worker_id = worker_id,
                             piece_id = segment.piece_id, error = %e,
@@ -641,13 +711,17 @@ fn check_segment_status(
 }
 
 /// Validate that a segment response's metadata matches the expected range.
-fn validate_segment_meta(meta: &ResponseMeta, segment: &Segment) -> Result<(), DownloadError> {
+fn validate_segment_meta(
+    meta: &ResponseMeta,
+    segment: &Segment,
+    total_size: u64,
+) -> Result<(), DownloadError> {
     if !range_response_allowed(meta) {
         return Err(DownloadError::ResumeMismatch(
             "range responses with content-encoding are not supported".into(),
         ));
     }
-    if meta.content_range_total.is_none()
+    if meta.content_range_total != Some(total_size)
         || meta.content_range_start != Some(segment.start)
         || meta.content_range_end != Some(segment.end - 1)
     {
@@ -663,27 +737,32 @@ fn validate_segment_meta(meta: &ResponseMeta, segment: &Segment) -> Result<(), D
 async fn download_segment(
     worker: &HttpWorker,
     timeout: Duration,
+    total_size: u64,
     segment: &Segment,
     write_tx: &mpsc::Sender<WriterCommand>,
     downloaded: &Arc<AtomicU64>,
     cancel_rx: &mut watch::Receiver<StopSignal>,
     budget: &Arc<Semaphore>,
     speed_limit: &SpeedLimit,
-) -> Result<(), DownloadError> {
-    let (response, meta) = worker.send_range(segment.start, segment.end - 1).await?;
+) -> Result<u64, (DownloadError, u64)> {
+    let (response, meta) = worker
+        .send_range(segment.start, segment.end - 1)
+        .await
+        .map_err(|error| (error, 0))?;
 
     let status = response.status().as_u16();
     let retry_after = response
         .headers()
         .get("retry-after")
         .and_then(|v| v.to_str().ok().map(|s| s.to_owned()));
-    check_segment_status(status, retry_after.as_deref())?;
+    check_segment_status(status, retry_after.as_deref()).map_err(|error| (error, 0))?;
 
-    validate_segment_meta(&meta, segment)?;
+    validate_segment_meta(&meta, segment, total_size).map_err(|error| (error, 0))?;
 
     stream_segment(
         response,
         timeout,
+        total_size,
         segment,
         write_tx,
         downloaded,
@@ -699,15 +778,19 @@ async fn download_segment(
 async fn stream_segment(
     response: HttpResponse,
     read_timeout: Duration,
+    total_size: u64,
     segment: &Segment,
     write_tx: &mpsc::Sender<WriterCommand>,
     downloaded: &Arc<AtomicU64>,
     cancel_rx: &mut watch::Receiver<StopSignal>,
     budget: &Arc<Semaphore>,
     speed_limit: &SpeedLimit,
-) -> Result<(), DownloadError> {
+) -> Result<u64, (DownloadError, u64)> {
     let mut body = response.into_body();
     let mut offset = segment.start;
+    let mut bytes_read = 0u64;
+    let expected_len = segment.end - segment.start;
+    debug_assert!(total_size >= segment.end);
 
     loop {
         tokio::select! {
@@ -716,7 +799,7 @@ async fn stream_segment(
             result = cancel_rx.changed() => {
                 if result.is_ok() {
                     if let Some(error) = stop_signal_error(*cancel_rx.borrow_and_update()) {
-                        return Err(error);
+                        return Err((error, bytes_read));
                     }
                 }
             }
@@ -725,32 +808,59 @@ async fn stream_segment(
                 match chunk {
                     Ok(Some(data)) => {
                         let len = data.len();
+                        let len_u64 = len as u64;
+                        if bytes_read.saturating_add(len_u64) > expected_len {
+                            return Err((
+                                DownloadError::ResumeMismatch(
+                                    "server sent more bytes than requested for segment".into(),
+                                ),
+                                bytes_read,
+                            ));
+                        }
                         // Rate limiting
                         speed_limit.acquire(len).await;
                         // Acquire budget permits before buffering
                         let permit = budget
                             .acquire_many(len as u32)
                             .await
-                            .map_err(|_| DownloadError::Internal("budget semaphore closed".into()))?;
+                            .map_err(|_| {
+                                (
+                                    DownloadError::Internal("budget semaphore closed".into()),
+                                    bytes_read,
+                                )
+                            })?;
 
                         if write_tx.send(WriterCommand::Data {
                             offset,
                             data,
                             piece_id: Some(segment.piece_id),
                         }).await.is_err() {
-                            return Err(DownloadError::ChannelClosed);
+                            return Err((DownloadError::ChannelClosed, bytes_read));
                         }
                         permit.forget(); // permits returned by writer after flush
-                        offset += len as u64;
-                        downloaded.fetch_add(len as u64, Ordering::Relaxed);
+                        offset += len_u64;
+                        bytes_read += len_u64;
+                        downloaded.fetch_add(len_u64, Ordering::Relaxed);
                     }
                     Ok(None) => break,
-                    Err(error) => return Err(error),
+                    Err(error) => return Err((error, bytes_read)),
                 }
             }
         }
     }
-    Ok(())
+    if bytes_read != expected_len {
+        return Err((
+            DownloadError::Transport(crate::error::TransportError::new(
+                crate::error::TransportErrorKind::Body,
+                std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!("segment body ended after {bytes_read} bytes, expected {expected_len}"),
+                ),
+            )),
+            bytes_read,
+        ));
+    }
+    Ok(bytes_read)
 }
 
 #[cfg(test)]
@@ -776,6 +886,9 @@ mod coverage_tests {
                     WriterCommand::Data { .. } => {}
                     WriterCommand::FlushPiece { ack, .. } => {
                         let _ = ack.send(());
+                    }
+                    WriterCommand::DiscardPiece { ack, .. } => {
+                        let _ = ack.send(0);
                     }
                     WriterCommand::FlushAll { ack, .. } => {
                         let _ = ack.send(crate::storage::writer::FlushAllStats {
@@ -822,7 +935,10 @@ mod coverage_tests {
                 warp::http::Response::builder()
                     .status(206)
                     .header("content-length", len.to_string())
-                    .header("content-range", format!("bytes {}-{}/{}", start, end, total))
+                    .header(
+                        "content-range",
+                        format!("bytes {}-{}/{}", start, end, total),
+                    )
                     .body(vec![0xAB; len])
                     .unwrap()
             });
@@ -830,8 +946,7 @@ mod coverage_tests {
         warp::serve(route).bind_ephemeral(([127, 0, 0, 1], 0))
     }
 
-    fn spawn_slow_range_server(
-    ) -> (std::net::SocketAddr, impl std::future::Future<Output = ()>) {
+    fn spawn_slow_range_server() -> (std::net::SocketAddr, impl std::future::Future<Output = ()>) {
         let route = warp::path("slow-piece")
             .and(warp::header::optional::<String>("range"))
             .map(move |range_header: Option<String>| {
@@ -856,7 +971,10 @@ mod coverage_tests {
                 warp::http::Response::builder()
                     .status(206)
                     .header("content-length", len.to_string())
-                    .header("content-range", format!("bytes {}-{}/{}", start, end, total))
+                    .header(
+                        "content-range",
+                        format!("bytes {}-{}/{}", start, end, total),
+                    )
                     .body(body)
                     .unwrap()
             });
@@ -880,8 +998,7 @@ mod coverage_tests {
 
     fn build_scheduler(total_size: u64, piece_size: u64) -> Scheduler {
         Arc::new(parking_lot::Mutex::new(SchedulerState::new(PieceMap::new(
-            total_size,
-            piece_size,
+            total_size, piece_size,
         ))))
     }
 
@@ -913,26 +1030,14 @@ mod coverage_tests {
         let mut tracker = ControlSaveTracker::new(0);
 
         complete_one_piece(&scheduler);
-        persist_multi_control_snapshot(
-            ControlSaveReason::Autosave,
-            None,
-            &mut tracker,
-            &ctx,
-        )
-        .await;
+        persist_multi_control_snapshot(ControlSaveReason::Autosave, None, &mut tracker, &ctx).await;
 
         assert!(!control_path.exists());
         assert_eq!(tracker.last_saved_downloaded_bytes(), 0);
         assert_eq!(tracker.pending_autosaves(), 1);
 
         complete_one_piece(&scheduler);
-        persist_multi_control_snapshot(
-            ControlSaveReason::Autosave,
-            None,
-            &mut tracker,
-            &ctx,
-        )
-        .await;
+        persist_multi_control_snapshot(ControlSaveReason::Autosave, None, &mut tracker, &ctx).await;
 
         let loaded = ControlSnapshot::load(&control_path).await.unwrap();
         assert_eq!(loaded.downloaded_bytes, 512);
@@ -1001,20 +1106,8 @@ mod coverage_tests {
         let mut tracker = ControlSaveTracker::new(0);
 
         complete_one_piece(&scheduler);
-        persist_multi_control_snapshot(
-            ControlSaveReason::Terminal,
-            None,
-            &mut tracker,
-            &ctx,
-        )
-        .await;
-        persist_multi_control_snapshot(
-            ControlSaveReason::Terminal,
-            None,
-            &mut tracker,
-            &ctx,
-        )
-        .await;
+        persist_multi_control_snapshot(ControlSaveReason::Terminal, None, &mut tracker, &ctx).await;
+        persist_multi_control_snapshot(ControlSaveReason::Terminal, None, &mut tracker, &ctx).await;
 
         let loaded = ControlSnapshot::load(&control_path).await.unwrap();
         assert_eq!(loaded.downloaded_bytes, 256);
@@ -1043,13 +1136,7 @@ mod coverage_tests {
         };
         let mut tracker = ControlSaveTracker::new(0);
 
-        persist_multi_control_snapshot(
-            ControlSaveReason::Terminal,
-            None,
-            &mut tracker,
-            &ctx,
-        )
-        .await;
+        persist_multi_control_snapshot(ControlSaveReason::Terminal, None, &mut tracker, &ctx).await;
 
         let loaded = ControlSnapshot::load(&control_path).await.unwrap();
         assert_eq!(loaded.downloaded_bytes, 0);
@@ -1098,6 +1185,7 @@ mod coverage_tests {
             Arc::new(Semaphore::new(1024)),
             SpeedLimit::new(0),
             None,
+            256,
             LogLevel::Off,
             7,
         )
@@ -1143,6 +1231,7 @@ mod coverage_tests {
             Arc::new(Semaphore::new(1024)),
             SpeedLimit::new(0),
             None,
+            256,
             LogLevel::Off,
             8,
         )
@@ -1306,7 +1395,7 @@ mod tests {
             start: 0,
             end: 1000,
         };
-        assert!(validate_segment_meta(&meta, &segment).is_ok());
+        assert!(validate_segment_meta(&meta, &segment, 5000).is_ok());
     }
 
     #[test]
@@ -1328,7 +1417,7 @@ mod tests {
             end: 1000,
         };
         assert!(matches!(
-            validate_segment_meta(&meta, &segment),
+            validate_segment_meta(&meta, &segment, 5000),
             Err(DownloadError::ResumeMismatch(_))
         ));
     }
@@ -1352,7 +1441,7 @@ mod tests {
             end: 1000,
         };
         assert!(matches!(
-            validate_segment_meta(&meta, &segment),
+            validate_segment_meta(&meta, &segment, 5000),
             Err(DownloadError::ResumeMismatch(_))
         ));
     }
@@ -1376,7 +1465,7 @@ mod tests {
             end: 1000,
         };
         assert!(matches!(
-            validate_segment_meta(&meta, &segment),
+            validate_segment_meta(&meta, &segment, 5000),
             Err(DownloadError::ResumeMismatch(_))
         ));
     }
@@ -1400,7 +1489,7 @@ mod tests {
             end: 1000,
         };
         assert!(matches!(
-            validate_segment_meta(&meta, &segment),
+            validate_segment_meta(&meta, &segment, 5000),
             Err(DownloadError::ResumeMismatch(_))
         ));
     }

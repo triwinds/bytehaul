@@ -251,7 +251,7 @@ async fn run_fresh_from_response(
                     &meta,
                     total_size,
                     piece_map,
-                    Some((response, 0)),
+                    Some((response, meta.clone(), 0)),
                     progress_tx,
                     cancel_rx,
                     &control_path,
@@ -508,6 +508,21 @@ async fn flush_piece_and_wait(
     ack_rx.await.map_err(|_| DownloadError::ChannelClosed)
 }
 
+async fn discard_piece_and_wait(
+    write_tx: &mpsc::Sender<WriterCommand>,
+    piece_id: usize,
+) -> Result<usize, DownloadError> {
+    let (ack_tx, ack_rx) = oneshot::channel();
+    write_tx
+        .send(WriterCommand::DiscardPiece {
+            piece_id,
+            ack: ack_tx,
+        })
+        .await
+        .map_err(|_| DownloadError::ChannelClosed)?;
+    ack_rx.await.map_err(|_| DownloadError::ChannelClosed)
+}
+
 async fn flush_all_and_wait(
     write_tx: &mpsc::Sender<WriterCommand>,
     sync_data: bool,
@@ -737,6 +752,14 @@ mod tests {
         let (tx, rx) = mpsc::channel::<WriterCommand>(1);
         drop(rx);
         let result = flush_piece_and_wait(&tx, 0).await;
+        assert!(matches!(result, Err(DownloadError::ChannelClosed)));
+    }
+
+    #[tokio::test]
+    async fn test_discard_piece_and_wait_closed_channel() {
+        let (tx, rx) = mpsc::channel::<WriterCommand>(1);
+        drop(rx);
+        let result = discard_piece_and_wait(&tx, 0).await;
         assert!(matches!(result, Err(DownloadError::ChannelClosed)));
     }
 

@@ -64,16 +64,25 @@ impl WriteBackCache {
                 let blocks: Vec<FlushBlock> = entry
                     .ranges
                     .into_iter()
-                    .map(|(offset, data)| {
-                        FlushBlock {
-                            offset,
-                            data: data.freeze(),
-                        }
+                    .map(|(offset, data)| FlushBlock {
+                        offset,
+                        data: data.freeze(),
                     })
                     .collect();
                 blocks
             }
             None => Vec::new(),
+        }
+    }
+
+    /// Discard all cached data for a failed piece attempt.
+    pub fn discard_piece(&mut self, piece_id: usize) -> usize {
+        match self.pieces.remove(&piece_id) {
+            Some(entry) => {
+                self.total_bytes = self.total_bytes.saturating_sub(entry.resident_bytes);
+                entry.resident_bytes
+            }
+            None => 0,
         }
     }
 
@@ -288,6 +297,18 @@ mod tests {
         let mut cache = WriteBackCache::new();
         let blocks = cache.drain_piece(99);
         assert!(blocks.is_empty());
+    }
+
+    #[test]
+    fn test_discard_piece_removes_cached_data_without_flushing() {
+        let mut cache = WriteBackCache::new();
+        cache.insert(0, 0, Bytes::from(vec![1u8; 100]));
+        cache.insert(1, 1000, Bytes::from(vec![2u8; 50]));
+
+        assert_eq!(cache.discard_piece(0), 100);
+        assert_eq!(cache.total_bytes(), 50);
+        assert!(cache.drain_piece(0).is_empty());
+        assert_eq!(cache.drain_piece(1).len(), 1);
     }
 
     #[test]
