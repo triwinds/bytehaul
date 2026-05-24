@@ -5,8 +5,28 @@ use serde::{Deserialize, Serialize};
 use crate::error::DownloadError;
 
 const MAGIC: u32 = 0x4259_4845; // "BYHE"
-const VERSION: u32 = 1;
+const VERSION_V1: u32 = 1;
+const VERSION_V2: u32 = 2;
+const VERSION: u32 = VERSION_V2;
 const HEADER_SIZE: usize = 16; // magic(4) + version(4) + payload_len(4) + checksum(4)
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ControlHints {
+    pub dirty_piece_ids: Vec<usize>,
+    pub inflight_piece_ids: Vec<usize>,
+    pub snapshot_seq: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ControlSnapshotV2 {
+    snapshot: ControlSnapshot,
+    hints: ControlHints,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum ControlPayload {
+    V2(ControlSnapshotV2),
+}
 
 /// Control file snapshot for resume support.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -21,7 +41,11 @@ pub struct ControlSnapshot {
     pub piece_count: usize,
     /// Bitset encoding which pieces have been completed.
     pub completed_bitset: Vec<u8>,
-    /// For single-connection resume: the byte offset written so far.
+    /// Durable progress stored in the control file.
+    ///
+    /// For single-connection resume this is the persisted prefix length. For
+    /// multi-connection resume it counts only bytes belonging to fully
+    /// completed pieces.
     pub downloaded_bytes: u64,
     /// HTTP `ETag` header from the server, used to detect file changes.
     pub etag: Option<String>,
@@ -39,19 +63,33 @@ impl ControlSnapshot {
 
     /// Save the snapshot atomically: write to tmp → fsync → rename.
     pub async fn save(&self, control_path: &Path) -> Result<(), DownloadError> {
-        tracing::debug!(path = %control_path.display(), downloaded_bytes = self.downloaded_bytes, "saving control file");
+        self.save_with_hints(control_path, ControlHints::default()).await
+    }
+
+    pub(crate) async fn save_with_hints(
+        &self,
+        control_path: &Path,
+        hints: ControlHints,
+    ) -> Result<(), DownloadError> {
+        tracing::debug!(path = %control_path.display(), control_downloaded_bytes = self.downloaded_bytes, "saving control file");
         let snapshot = self.clone();
         let path = control_path.to_path_buf();
-        tokio::task::spawn_blocking(move || save_sync(&snapshot, &path))
+        tokio::task::spawn_blocking(move || save_sync(&snapshot, hints, &path))
             .await
             .map_err(|e| DownloadError::TaskFailed(format!("spawn_blocking: {e}")))?
     }
 
     /// Load and validate a control snapshot from disk.
     pub async fn load(control_path: &Path) -> Result<Self, DownloadError> {
+        Ok(Self::load_with_hints(control_path).await?.0)
+    }
+
+    pub(crate) async fn load_with_hints(
+        control_path: &Path,
+    ) -> Result<(Self, ControlHints), DownloadError> {
         tracing::debug!(path = %control_path.display(), "loading control file");
         let path = control_path.to_path_buf();
-        tokio::task::spawn_blocking(move || load_sync(&path))
+        tokio::task::spawn_blocking(move || load_sync_with_hints(&path))
             .await
             .map_err(|e| DownloadError::TaskFailed(format!("spawn_blocking: {e}")))?
     }
@@ -67,10 +105,17 @@ impl ControlSnapshot {
     }
 }
 
-fn save_sync(snapshot: &ControlSnapshot, path: &Path) -> Result<(), DownloadError> {
+fn save_sync(
+    snapshot: &ControlSnapshot,
+    hints: ControlHints,
+    path: &Path,
+) -> Result<(), DownloadError> {
     use std::io::Write;
 
-    let payload = bincode::serialize(snapshot)
+    let payload = bincode::serialize(&ControlPayload::V2(ControlSnapshotV2 {
+        snapshot: snapshot.clone(),
+        hints,
+    }))
         .map_err(|e| DownloadError::Internal(format!("control file serialize failed: {e}")))?;
     let checksum = crc32fast::hash(&payload);
 
@@ -91,7 +136,7 @@ fn save_sync(snapshot: &ControlSnapshot, path: &Path) -> Result<(), DownloadErro
     Ok(())
 }
 
-fn load_sync(path: &Path) -> Result<ControlSnapshot, DownloadError> {
+fn load_sync_with_hints(path: &Path) -> Result<(ControlSnapshot, ControlHints), DownloadError> {
     use std::io::Read;
 
     let mut file = std::fs::File::open(path)?;
@@ -110,7 +155,7 @@ fn load_sync(path: &Path) -> Result<ControlSnapshot, DownloadError> {
     if magic != MAGIC {
         return Err(DownloadError::ControlFileCorrupted("bad magic".into()));
     }
-    if version != VERSION {
+    if version != VERSION_V1 && version != VERSION_V2 {
         return Err(DownloadError::ControlFileCorrupted(format!(
             "unsupported version: {version}"
         )));
@@ -129,8 +174,21 @@ fn load_sync(path: &Path) -> Result<ControlSnapshot, DownloadError> {
         ));
     }
 
-    bincode::deserialize(payload)
-        .map_err(|e| DownloadError::ControlFileCorrupted(format!("deserialize: {e}")))
+    match version {
+        VERSION_V1 => {
+            let snapshot: ControlSnapshot = bincode::deserialize(payload)
+                .map_err(|e| DownloadError::ControlFileCorrupted(format!("deserialize: {e}")))?;
+            Ok((snapshot, ControlHints::default()))
+        }
+        VERSION_V2 => {
+            let payload: ControlPayload = bincode::deserialize(payload)
+                .map_err(|e| DownloadError::ControlFileCorrupted(format!("deserialize: {e}")))?;
+            match payload {
+                ControlPayload::V2(snapshot) => Ok((snapshot.snapshot, snapshot.hints)),
+            }
+        }
+        _ => unreachable!("unsupported versions are rejected above"),
+    }
 }
 
 #[cfg(test)]
@@ -194,7 +252,7 @@ mod tests {
         // Write a file with wrong magic but enough header bytes
         let mut data = vec![0u8; 20];
         data[0..4].copy_from_slice(&0xDEADBEEFu32.to_le_bytes());
-        data[4..8].copy_from_slice(&1u32.to_le_bytes());
+        data[4..8].copy_from_slice(&VERSION_V1.to_le_bytes());
         data[8..12].copy_from_slice(&0u32.to_le_bytes());
         data[12..16].copy_from_slice(&0u32.to_le_bytes());
         std::fs::write(&ctrl_path, &data).unwrap();
@@ -266,6 +324,71 @@ mod tests {
 
         let result = ControlSnapshot::load(&ctrl_path).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_save_load_roundtrip_with_hints() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctrl_path = dir.path().join("test-v2.bytehaul");
+
+        let snapshot = ControlSnapshot {
+            url: "https://example.com/file.bin".to_string(),
+            total_size: 1_000_000,
+            piece_size: 256_000,
+            piece_count: 4,
+            completed_bitset: vec![0b0000_0011],
+            downloaded_bytes: 512_000,
+            etag: Some("\"abc123\"".to_string()),
+            last_modified: Some("Thu, 01 Jan 2026 00:00:00 GMT".to_string()),
+        };
+        let hints = ControlHints {
+            dirty_piece_ids: vec![2],
+            inflight_piece_ids: vec![3],
+            snapshot_seq: 7,
+        };
+
+        snapshot
+            .save_with_hints(&ctrl_path, hints.clone())
+            .await
+            .unwrap();
+        let (loaded, loaded_hints) = ControlSnapshot::load_with_hints(&ctrl_path).await.unwrap();
+
+        assert_eq!(loaded.url, snapshot.url);
+        assert_eq!(loaded.downloaded_bytes, snapshot.downloaded_bytes);
+        assert_eq!(loaded_hints, hints);
+    }
+
+    #[tokio::test]
+    async fn test_load_v1_snapshot_upgrades_with_empty_hints() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctrl_path = dir.path().join("legacy-v1.bytehaul");
+
+        let snapshot = ControlSnapshot {
+            url: "https://example.com/file.bin".to_string(),
+            total_size: 64,
+            piece_size: 64,
+            piece_count: 1,
+            completed_bitset: vec![0],
+            downloaded_bytes: 32,
+            etag: None,
+            last_modified: None,
+        };
+
+        let payload = bincode::serialize(&snapshot).unwrap();
+        let checksum = crc32fast::hash(&payload);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&MAGIC.to_le_bytes());
+        bytes.extend_from_slice(&VERSION_V1.to_le_bytes());
+        bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&checksum.to_le_bytes());
+        bytes.extend_from_slice(&payload);
+        std::fs::write(&ctrl_path, bytes).unwrap();
+
+        let (loaded, hints) = ControlSnapshot::load_with_hints(&ctrl_path).await.unwrap();
+        assert_eq!(loaded.downloaded_bytes, snapshot.downloaded_bytes);
+        assert!(hints.dirty_piece_ids.is_empty());
+        assert!(hints.inflight_piece_ids.is_empty());
+        assert_eq!(hints.snapshot_seq, 0);
     }
 
     #[tokio::test]

@@ -30,7 +30,11 @@ pub enum DownloadState {
 pub struct ProgressSnapshot {
     /// Total file size in bytes, if known from the server response.
     pub total_size: Option<u64>,
-    /// Number of bytes downloaded so far.
+    /// UI-oriented downloaded byte count.
+    ///
+    /// In multi-worker mode this tracks bytes currently received from the network,
+    /// so retries may temporarily move it backward. It is not the durable resume
+    /// byte count stored in the control file.
     pub downloaded: u64,
     /// Current download state.
     pub state: DownloadState,

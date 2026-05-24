@@ -3,7 +3,10 @@ use std::hint::black_box;
 use std::time::Duration;
 
 use bytehaul::Downloader;
-use bytehaul::bench::{ControlSnapshot, PieceMap, WriteBackCache};
+use bytehaul::bench::{
+    bench_cache_drain_lease_len, bench_cache_insert, bench_cache_new, bench_cache_total_bytes,
+    ControlSnapshot, PieceMap,
+};
 use bytes::Bytes;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use tempfile::tempdir;
@@ -11,58 +14,65 @@ use tempfile::tempdir;
 fn bench_cache_insert_coalesce(c: &mut Criterion) {
     c.bench_function("cache_seq_append_single_piece", |b| {
         b.iter(|| {
-            let mut cache = WriteBackCache::new();
+            let mut cache = bench_cache_new();
             for i in 0u64..1000 {
                 let offset = i * 4096;
                 let data = Bytes::from(vec![0xABu8; 4096]);
-                cache.insert(0, offset, data);
+                bench_cache_insert(&mut cache, 0, 1, offset, data);
             }
-            black_box(cache.total_bytes());
+            black_box(bench_cache_total_bytes(&cache));
         });
     });
 
     c.bench_function("cache_seq_append_multi_piece", |b| {
         b.iter(|| {
-            let mut cache = WriteBackCache::new();
+            let mut cache = bench_cache_new();
             for piece_id in 0usize..64 {
                 for chunk_id in 0u64..32 {
-                    cache.insert(
+                    bench_cache_insert(
+                        &mut cache,
                         piece_id,
+                        1,
                         chunk_id * 4096,
                         Bytes::from(vec![0xBCu8; 4096]),
                     );
                 }
             }
-            black_box(cache.total_bytes());
+            black_box(bench_cache_total_bytes(&cache));
         });
     });
 
     c.bench_function("cache_overlap_fallback", |b| {
         b.iter(|| {
-            let mut cache = WriteBackCache::new();
+            let mut cache = bench_cache_new();
             for i in 0u64..512 {
                 let offset = i * 4096;
-                cache.insert(0, offset, Bytes::from(vec![0xCDu8; 4096]));
+                bench_cache_insert(&mut cache, 0, 1, offset, Bytes::from(vec![0xCDu8; 4096]));
                 if i % 16 == 0 {
-                    cache.insert(0, offset + 2048, Bytes::from(vec![0xEFu8; 4096]));
+                    bench_cache_insert(
+                        &mut cache,
+                        0,
+                        1,
+                        offset + 2048,
+                        Bytes::from(vec![0xEFu8; 4096]),
+                    );
                 }
             }
-            black_box(cache.total_bytes());
+            black_box(bench_cache_total_bytes(&cache));
         });
     });
 
     c.bench_function("cache_drain_piece", |b| {
         b.iter_batched(
             || {
-                let mut cache = WriteBackCache::new();
+                let mut cache = bench_cache_new();
                 for i in 0u64..500 {
-                    cache.insert(0, i * 4096, Bytes::from(vec![0xCDu8; 4096]));
+                    bench_cache_insert(&mut cache, 0, 1, i * 4096, Bytes::from(vec![0xCDu8; 4096]));
                 }
                 cache
             },
             |mut cache| {
-                let blocks = cache.drain_piece(0);
-                black_box(blocks.len());
+                black_box(bench_cache_drain_lease_len(&mut cache, 0, 1));
             },
             criterion::BatchSize::SmallInput,
         );

@@ -59,6 +59,7 @@ pub use progress::{DownloadState, ProgressSnapshot};
 #[doc(hidden)]
 pub mod bench {
     use crate::scheduler::SchedulerState;
+    use crate::storage::segment::LeaseKey;
     use std::time::Duration;
 
     pub use crate::progress::bench_progress_reporting;
@@ -69,7 +70,7 @@ pub mod bench {
     pub fn bench_scheduler_snapshot(total_size: u64, piece_size: u64) -> (usize, u64) {
         let mut scheduler = SchedulerState::new(PieceMap::new(total_size, piece_size));
         while let Some(segment) = scheduler.assign() {
-            scheduler.complete(segment.piece_id);
+            scheduler.complete(segment.lease_key());
         }
 
         let snapshot = ControlSnapshot {
@@ -98,6 +99,32 @@ pub mod bench {
         }
         downloader.bench_cached_client_count()
     }
+
+            pub fn bench_cache_new() -> WriteBackCache {
+                WriteBackCache::new()
+            }
+
+            pub fn bench_cache_insert(
+                cache: &mut WriteBackCache,
+                piece_id: usize,
+                lease_id: u64,
+                offset: u64,
+                data: bytes::Bytes,
+            ) {
+                cache.insert(LeaseKey { piece_id, lease_id }, offset, data);
+            }
+
+            pub fn bench_cache_total_bytes(cache: &WriteBackCache) -> usize {
+                cache.total_bytes()
+            }
+
+            pub fn bench_cache_drain_lease_len(
+                cache: &mut WriteBackCache,
+                piece_id: usize,
+                lease_id: u64,
+            ) -> usize {
+                cache.drain_lease(LeaseKey { piece_id, lease_id }).len()
+            }
 }
 
 #[cfg(test)]

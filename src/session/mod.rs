@@ -1,4 +1,5 @@
 mod multi;
+mod range_validate;
 mod resume;
 pub(crate) mod retry;
 mod single;
@@ -19,9 +20,14 @@ use crate::network::BytehaulClient;
 use crate::progress::{DownloadState, ProgressSnapshot};
 use crate::rate_limiter::SpeedLimit;
 use crate::storage::control::ControlSnapshot;
+use crate::storage::segment::LeaseKey;
 use crate::storage::writer::{FlushAllStats, WriterCommand};
 
 use self::multi::run_multi_worker;
+use self::range_validate::{
+    validate_range_response, ExpectedRange, FreshRangeFallbackReason,
+    RangeValidationDecision, RangeValidationMode,
+};
 use self::resume::try_resume_download;
 use self::retry::retry_with_backoff;
 use self::single::run_single_connection;
@@ -225,36 +231,131 @@ async fn run_fresh_from_response(
     download_id: u64,
 ) -> Result<PathBuf, DownloadError> {
     let control_path = ControlSnapshot::control_path(output_path);
+    let mut cancel_rx = cancel_rx;
 
-    if spec.max_connections > 1
-        && matches!(source, FreshResponseSource::RangeProbe)
-        && response.status().as_u16() == 206
-        && range_response_allowed(&meta)
-    {
-        if let Some(total_size) = meta.content_range_total {
-            if total_size > spec.min_split_size {
+    let mut response = response;
+    let mut meta = meta;
+
+    if spec.max_connections > 1 && matches!(source, FreshResponseSource::RangeProbe) {
+        let validation = validate_range_response(
+            response.status().as_u16(),
+            response
+                .headers()
+                .get("retry-after")
+                .and_then(|value| value.to_str().ok()),
+            &meta,
+            RangeValidationMode::FreshProbe,
+            ExpectedRange {
+                start: 0,
+                end_inclusive: spec.piece_size.saturating_sub(1),
+                total_size: None,
+            },
+        )?;
+
+        match validation {
+            RangeValidationDecision::Accept => {
+                let total_size = meta
+                    .content_range_total
+                    .expect("fresh probe validation requires a total size");
+                if total_size > spec.min_split_size {
+                    log_info!(
+                        log_level,
+                        download_id,
+                        strategy = "fresh multi",
+                        total_size,
+                        max_connections = spec.max_connections,
+                        piece_size = spec.piece_size,
+                        "download strategy selected"
+                    );
+                    let piece_map = crate::storage::piece_map::PieceMap::new(total_size, spec.piece_size);
+                    run_multi_worker(
+                        client,
+                        spec,
+                        request_url,
+                        output_path,
+                        &meta,
+                        total_size,
+                        piece_map,
+                        Some((response, meta.clone(), 0)),
+                        progress_tx,
+                        cancel_rx,
+                        &control_path,
+                        speed_limit,
+                        log_level,
+                        download_id,
+                    )
+                    .await?;
+                    return Ok(output_path.to_path_buf());
+                }
+
+                let should_refetch_full_body = !range_probe_response_covers_full_file(&meta);
                 log_info!(
                     log_level,
                     download_id,
-                    strategy = "fresh multi",
+                    strategy = "fresh single",
                     total_size,
-                    max_connections = spec.max_connections,
-                    piece_size = spec.piece_size,
+                    reason = if should_refetch_full_body {
+                        "file below min_split_size; refetching full body"
+                    } else {
+                        "file below min_split_size"
+                    },
                     "download strategy selected"
                 );
-                let piece_map = crate::storage::piece_map::PieceMap::new(total_size, spec.piece_size);
-                run_multi_worker(
-                    client,
-                    spec,
-                    request_url,
-                    output_path,
+
+                if should_refetch_full_body {
+                    (response, meta) = retry_plain_get(client.clone(), spec, &mut cancel_rx).await?;
+                }
+
+                let total = single_response_total_size(response.status().as_u16(), &meta);
+                run_single_connection(
+                    response,
                     &meta,
-                    total_size,
-                    piece_map,
-                    Some((response, meta.clone(), 0)),
+                    request_url,
+                    spec,
+                    output_path,
+                    0,
                     progress_tx,
                     cancel_rx,
                     &control_path,
+                    total,
+                    speed_limit,
+                    log_level,
+                    download_id,
+                )
+                .await?;
+                return Ok(output_path.to_path_buf());
+            }
+            RangeValidationDecision::FallbackToSingle(reason) => {
+                let log_reason = match reason {
+                    FreshRangeFallbackReason::RangeNotSupported => {
+                        "range not supported (200 response)"
+                    }
+                    FreshRangeFallbackReason::EncodedResponse => {
+                        (response, meta) = retry_plain_get(client.clone(), spec, &mut cancel_rx).await?;
+                        "range probe returned encoded response; refetching full body"
+                    }
+                };
+
+                log_info!(
+                    log_level,
+                    download_id,
+                    strategy = "fresh single",
+                    reason = log_reason,
+                    "download strategy selected"
+                );
+
+                let total = single_response_total_size(response.status().as_u16(), &meta);
+                run_single_connection(
+                    response,
+                    &meta,
+                    request_url,
+                    spec,
+                    output_path,
+                    0,
+                    progress_tx,
+                    cancel_rx,
+                    &control_path,
+                    total,
                     speed_limit,
                     log_level,
                     download_id,
@@ -263,33 +364,6 @@ async fn run_fresh_from_response(
                 return Ok(output_path.to_path_buf());
             }
         }
-
-        let total = meta.content_range_total;
-        log_info!(
-            log_level,
-            download_id,
-            strategy = "fresh single",
-            total_size = total,
-            reason = "file below min_split_size",
-            "download strategy selected"
-        );
-        run_single_connection(
-            response,
-            &meta,
-            request_url,
-            spec,
-            output_path,
-            0,
-            progress_tx,
-            cancel_rx,
-            &control_path,
-            total,
-            speed_limit,
-            log_level,
-            download_id,
-        )
-        .await?;
-        return Ok(output_path.to_path_buf());
     }
 
     let reason = match source {
@@ -306,11 +380,7 @@ async fn run_fresh_from_response(
         reason,
         "download strategy selected"
     );
-    let total = if response.status().as_u16() == 206 {
-        meta.content_range_total
-    } else {
-        meta.content_length
-    };
+    let total = single_response_total_size(response.status().as_u16(), &meta);
     run_single_connection(
         response,
         &meta,
@@ -486,21 +556,60 @@ fn validate_metadata(meta: &ResponseMeta, ctrl: &ControlSnapshot) -> bool {
     true
 }
 
-fn range_response_allowed(meta: &ResponseMeta) -> bool {
-    !matches!(
-        meta.content_encoding.as_deref(),
-        Some(encoding) if !encoding.eq_ignore_ascii_case("identity")
+fn range_probe_response_covers_full_file(meta: &ResponseMeta) -> bool {
+    matches!(
+        (
+            meta.content_range_start,
+            meta.content_range_end,
+            meta.content_range_total,
+        ),
+        (Some(0), Some(end), Some(total)) if end.checked_add(1) == Some(total)
     )
 }
 
-async fn flush_piece_and_wait(
+fn single_response_total_size(status: u16, meta: &ResponseMeta) -> Option<u64> {
+    if status == 206 {
+        meta.content_range_total
+    } else {
+        meta.content_length
+    }
+}
+
+async fn retry_plain_get(
+    client: BytehaulClient,
+    spec: &DownloadSpec,
+    cancel_rx: &mut watch::Receiver<StopSignal>,
+) -> Result<(HttpResponse, ResponseMeta), DownloadError> {
+    let worker = HttpWorker::new(client, spec);
+    retry_with_backoff(
+        spec.max_retries,
+        spec.retry_base_delay,
+        spec.retry_max_delay,
+        spec.max_retry_elapsed,
+        cancel_rx,
+        || worker.send_get(),
+    )
+    .await
+}
+
+async fn begin_lease_and_wait(
     write_tx: &mpsc::Sender<WriterCommand>,
-    piece_id: usize,
+    lease_key: LeaseKey,
+) -> Result<(), DownloadError> {
+    write_tx
+        .send(WriterCommand::BeginLease { lease_key })
+        .await
+        .map_err(|_| DownloadError::ChannelClosed)
+}
+
+async fn flush_lease_and_wait(
+    write_tx: &mpsc::Sender<WriterCommand>,
+    lease_key: LeaseKey,
 ) -> Result<(), DownloadError> {
     let (ack_tx, ack_rx) = oneshot::channel();
     write_tx
-        .send(WriterCommand::FlushPiece {
-            piece_id,
+        .send(WriterCommand::FlushLease {
+            lease_key,
             ack: ack_tx,
         })
         .await
@@ -508,14 +617,14 @@ async fn flush_piece_and_wait(
     ack_rx.await.map_err(|_| DownloadError::ChannelClosed)
 }
 
-async fn discard_piece_and_wait(
+async fn discard_lease_and_wait(
     write_tx: &mpsc::Sender<WriterCommand>,
-    piece_id: usize,
+    lease_key: LeaseKey,
 ) -> Result<usize, DownloadError> {
     let (ack_tx, ack_rx) = oneshot::channel();
     write_tx
-        .send(WriterCommand::DiscardPiece {
-            piece_id,
+        .send(WriterCommand::DiscardLease {
+            lease_key,
             ack: ack_tx,
         })
         .await
@@ -555,7 +664,7 @@ mod tests {
             content_disposition: None,
             content_encoding: None,
         };
-        assert!(range_response_allowed(&meta));
+        assert!(super::range_validate::range_response_allowed(&meta));
     }
 
     #[test]
@@ -571,7 +680,7 @@ mod tests {
             content_disposition: None,
             content_encoding: Some("identity".into()),
         };
-        assert!(range_response_allowed(&meta));
+        assert!(super::range_validate::range_response_allowed(&meta));
     }
 
     #[test]
@@ -587,7 +696,7 @@ mod tests {
             content_disposition: None,
             content_encoding: Some("gzip".into()),
         };
-        assert!(!range_response_allowed(&meta));
+        assert!(!super::range_validate::range_response_allowed(&meta));
     }
 
     #[test]
@@ -751,7 +860,14 @@ mod tests {
     async fn test_flush_piece_and_wait_closed_channel() {
         let (tx, rx) = mpsc::channel::<WriterCommand>(1);
         drop(rx);
-        let result = flush_piece_and_wait(&tx, 0).await;
+        let result = flush_lease_and_wait(
+            &tx,
+            LeaseKey {
+                piece_id: 0,
+                lease_id: 1,
+            },
+        )
+        .await;
         assert!(matches!(result, Err(DownloadError::ChannelClosed)));
     }
 
@@ -759,7 +875,14 @@ mod tests {
     async fn test_discard_piece_and_wait_closed_channel() {
         let (tx, rx) = mpsc::channel::<WriterCommand>(1);
         drop(rx);
-        let result = discard_piece_and_wait(&tx, 0).await;
+        let result = discard_lease_and_wait(
+            &tx,
+            LeaseKey {
+                piece_id: 0,
+                lease_id: 1,
+            },
+        )
+        .await;
         assert!(matches!(result, Err(DownloadError::ChannelClosed)));
     }
 

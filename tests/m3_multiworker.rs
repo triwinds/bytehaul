@@ -521,6 +521,57 @@ async fn test_multi_worker_range_requests_use_distinct_connections() {
 }
 
 #[tokio::test]
+async fn test_multi_worker_dynamic_split_issues_subranges_with_single_piece() {
+    let size = 256 * 1024usize;
+    let content: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+
+    let (addr, request_log, shutdown_tx, server) =
+        spawn_connection_counting_range_server("dynamic-split", content.clone());
+
+    let dir = tempfile::tempdir().unwrap();
+    let output_path = dir.path().join("dynamic-split.bin");
+
+    let downloader = Downloader::builder().build().unwrap();
+    let spec = DownloadSpec::new(format!("http://{addr}/dynamic-split"))
+        .output_path(output_path.clone())
+        .file_allocation(FileAllocation::None)
+        .max_connections(4)
+        .piece_size(size as u64)
+        .min_split_size(1)
+        .min_segment_size((size / 4) as u64);
+
+    let handle = downloader.download(spec);
+    handle.wait().await.unwrap();
+
+    let _ = shutdown_tx.send(());
+    server.await.unwrap();
+
+    let downloaded = std::fs::read(&output_path).unwrap();
+    assert_eq!(downloaded, content);
+
+    let expected_ranges: HashSet<_> = [
+        format!("bytes=0-{}", size / 4 - 1),
+        format!("bytes={}-{}", size / 4, size / 2 - 1),
+        format!("bytes={}-{}", size / 2, size * 3 / 4 - 1),
+        format!("bytes={}-{}", size * 3 / 4, size - 1),
+    ]
+    .into_iter()
+    .collect();
+
+    let observed_ranges: HashSet<_> = request_log
+        .snapshot()
+        .into_iter()
+        .filter_map(|event| event.range_header)
+        .collect();
+
+    assert!(
+        expected_ranges.is_subset(&observed_ranges),
+        "dynamic split did not issue all expected subranges: {:?}",
+        observed_ranges
+    );
+}
+
+#[tokio::test]
 async fn test_multi_worker_progress() {
     let size = 15 * 1024 * 1024;
     let content: Vec<u8> = (0..size).map(|i| (i % 199) as u8).collect();
@@ -783,6 +834,34 @@ async fn test_small_file_uses_single_connection() {
         .output_path(output_path.clone())
         .file_allocation(FileAllocation::None)
         .max_connections(4)
+        .min_split_size(10 * 1024 * 1024);
+
+    let handle = downloader.download(spec);
+    handle.wait().await.unwrap();
+
+    let downloaded = std::fs::read(&output_path).unwrap();
+    assert_eq!(downloaded, expected);
+}
+
+#[tokio::test]
+async fn test_small_file_below_min_split_size_refetches_full_body() {
+    // File stays below min_split_size, but the initial probe only covers the first piece.
+    // Fresh fallback must refetch a full GET instead of reusing the partial 206 body.
+    let content: Vec<u8> = (0..1_500_000u32).map(|i| (i % 251) as u8).collect();
+    let expected = content.clone();
+
+    let (addr, server) = range_file_server("small-partial-probe", content);
+    tokio::spawn(server);
+
+    let dir = tempfile::tempdir().unwrap();
+    let output_path = dir.path().join("small-partial-probe.bin");
+
+    let downloader = Downloader::builder().build().unwrap();
+    let spec = DownloadSpec::new(format!("http://{addr}/small-partial-probe"))
+        .output_path(output_path.clone())
+        .file_allocation(FileAllocation::None)
+        .max_connections(4)
+        .piece_size(256 * 1024)
         .min_split_size(10 * 1024 * 1024);
 
     let handle = downloader.download(spec);

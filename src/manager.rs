@@ -37,6 +37,13 @@ impl DownloaderBuilder {
         self
     }
 
+    /// Configure the experimental HTTP idle pool for clients built by this downloader.
+    pub fn http_idle_pool(mut self, max_idle_per_host: usize, idle_timeout: Duration) -> Self {
+        self.client_config.pool_max_idle_per_host = max_idle_per_host;
+        self.client_config.pool_idle_timeout = idle_timeout;
+        self
+    }
+
     /// Set the default proxy for all requests built by this downloader.
     ///
     /// Individual downloads can override this via [`DownloadSpec::all_proxy`].
@@ -127,6 +134,8 @@ impl DownloaderBuilder {
             log_level,
             log_level = %log_level,
             connect_timeout_ms = self.client_config.connect_timeout.as_millis() as u64,
+            pool_max_idle_per_host = self.client_config.pool_max_idle_per_host,
+            pool_idle_timeout_ms = self.client_config.pool_idle_timeout.as_millis() as u64,
             has_proxy = self.client_config.all_proxy.is_some()
                 || self.client_config.http_proxy.is_some()
                 || self.client_config.https_proxy.is_some(),
@@ -229,6 +238,11 @@ fn requested_client_config_for_spec(
 
     if spec.has_connect_timeout_override() {
         requested.connect_timeout = spec.get_connect_timeout();
+    }
+
+    if spec.has_pool_override() {
+        requested.pool_max_idle_per_host = spec.get_pool_max_idle_per_host();
+        requested.pool_idle_timeout = spec.get_pool_idle_timeout();
     }
 
     if spec.has_proxy_override() {
@@ -369,6 +383,16 @@ mod tests {
             .build()
             .unwrap();
         drop(downloader);
+    }
+
+    #[test]
+    fn test_downloader_builder_http_idle_pool() {
+        let downloader = Downloader::builder()
+            .http_idle_pool(2, Duration::from_secs(11))
+            .build()
+            .unwrap();
+        assert_eq!(downloader.client_config.pool_max_idle_per_host, 2);
+        assert_eq!(downloader.client_config.pool_idle_timeout, Duration::from_secs(11));
     }
 
     #[test]
@@ -528,6 +552,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_download_rebuilds_client_for_spec_idle_pool_override() {
+        let downloader = Downloader::builder().build().unwrap();
+        let spec = crate::config::DownloadSpec::new("http://127.0.0.1:1/nonexistent")
+            .output_path(std::env::temp_dir().join("bytehaul_test_idle_pool_override"))
+            .http_idle_pool(2, Duration::from_secs(5));
+
+        assert_eq!(downloader.client_cache.lock().len(), 1);
+        let _ = downloader.download(spec).wait().await;
+        assert_eq!(downloader.client_cache.lock().len(), 2);
+    }
+
+    #[tokio::test]
     async fn test_download_proxy_override_reuses_cached_client() {
         let downloader = Downloader::builder().build().unwrap();
         let spec = crate::config::DownloadSpec::new("http://127.0.0.1:1/nonexistent")
@@ -555,6 +591,20 @@ mod tests {
         assert_eq!(requested.all_proxy.as_deref(), Some("http://127.0.0.1:7890"));
         assert!(requested.http_proxy.is_none());
         assert!(requested.https_proxy.is_none());
+    }
+
+    #[test]
+    fn test_download_pool_override_replaces_builder_pool_defaults() {
+        let downloader = Downloader::builder()
+            .http_idle_pool(3, Duration::from_secs(20))
+            .build()
+            .unwrap();
+        let spec = crate::config::DownloadSpec::new("http://127.0.0.1:1/nonexistent")
+            .disable_http_idle_pool();
+
+        let requested = requested_client_config_for_spec(&downloader.client_config, &spec);
+        assert_eq!(requested.pool_max_idle_per_host, 0);
+        assert_eq!(requested.pool_idle_timeout, Duration::from_secs(20));
     }
 
     #[test]

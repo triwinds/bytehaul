@@ -2,14 +2,16 @@ use std::collections::BTreeMap;
 
 use bytes::{Bytes, BytesMut};
 
+use crate::storage::segment::LeaseKey;
+
 /// A write-back cache that aggregates small data chunks by offset before flushing.
 ///
 /// Data is stored per piece, and within each piece by contiguous byte ranges.
 /// Adjacent or overlapping writes are merged to reduce the number of disk I/O operations.
 #[derive(Default)]
 pub struct WriteBackCache {
-    /// Cached entries keyed by piece_id.
-    pieces: BTreeMap<usize, PieceCacheEntry>,
+    /// Cached entries keyed by lease identity.
+    pieces: BTreeMap<LeaseKey, PieceCacheEntry>,
     /// Total bytes currently held in the cache.
     total_bytes: usize,
 }
@@ -31,24 +33,24 @@ pub struct FlushBlock {
 }
 
 impl WriteBackCache {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
     /// Total bytes currently buffered in the cache.
-    pub fn total_bytes(&self) -> usize {
+    pub(crate) fn total_bytes(&self) -> usize {
         self.total_bytes
     }
 
-    /// Insert data for a specific piece at the given file offset.
-    pub fn insert(&mut self, piece_id: usize, offset: u64, data: Bytes) {
+    /// Insert data for a specific lease at the given file offset.
+    pub(crate) fn insert(&mut self, lease_key: LeaseKey, offset: u64, data: Bytes) {
         let len = data.len();
         if len == 0 {
             return;
         }
         let entry = self
             .pieces
-            .entry(piece_id)
+            .entry(lease_key)
             .or_insert_with(|| PieceCacheEntry {
                 ranges: Vec::new(),
                 resident_bytes: 0,
@@ -56,9 +58,9 @@ impl WriteBackCache {
         self.total_bytes += entry.merge(offset, data);
     }
 
-    /// Drain all cached data for the given piece, returning flush blocks sorted by offset.
-    pub fn drain_piece(&mut self, piece_id: usize) -> Vec<FlushBlock> {
-        match self.pieces.remove(&piece_id) {
+    /// Drain all cached data for the given lease, returning flush blocks sorted by offset.
+    pub(crate) fn drain_lease(&mut self, lease_key: LeaseKey) -> Vec<FlushBlock> {
+        match self.pieces.remove(&lease_key) {
             Some(entry) => {
                 self.total_bytes = self.total_bytes.saturating_sub(entry.resident_bytes);
                 let blocks: Vec<FlushBlock> = entry
@@ -75,9 +77,9 @@ impl WriteBackCache {
         }
     }
 
-    /// Discard all cached data for a failed piece attempt.
-    pub fn discard_piece(&mut self, piece_id: usize) -> usize {
-        match self.pieces.remove(&piece_id) {
+    /// Discard all cached data for a failed lease attempt.
+    pub(crate) fn discard_lease(&mut self, lease_key: LeaseKey) -> usize {
+        match self.pieces.remove(&lease_key) {
             Some(entry) => {
                 self.total_bytes = self.total_bytes.saturating_sub(entry.resident_bytes);
                 entry.resident_bytes
@@ -87,10 +89,10 @@ impl WriteBackCache {
     }
 
     /// Drain ALL cached data across all pieces, returning flush blocks sorted by offset.
-    pub fn drain_all(&mut self) -> Vec<FlushBlock> {
+    pub(crate) fn drain_all(&mut self) -> Vec<FlushBlock> {
         let mut blocks = Vec::new();
         let pieces = std::mem::take(&mut self.pieces);
-        for (_piece_id, entry) in pieces {
+        for (_lease_key, entry) in pieces {
             self.total_bytes = self.total_bytes.saturating_sub(entry.resident_bytes);
             for (offset, data) in entry.ranges {
                 blocks.push(FlushBlock {
@@ -208,11 +210,15 @@ mod tests {
     #[test]
     fn test_basic_insert_and_drain() {
         let mut cache = WriteBackCache::new();
-        cache.insert(0, 0, Bytes::from(vec![1u8; 100]));
-        cache.insert(0, 100, Bytes::from(vec![2u8; 100]));
+        let lease = LeaseKey {
+            piece_id: 0,
+            lease_id: 1,
+        };
+        cache.insert(lease, 0, Bytes::from(vec![1u8; 100]));
+        cache.insert(lease, 100, Bytes::from(vec![2u8; 100]));
         assert_eq!(cache.total_bytes(), 200);
 
-        let blocks = cache.drain_piece(0);
+        let blocks = cache.drain_lease(lease);
         // Should merge into one contiguous block
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].offset, 0);
@@ -223,11 +229,15 @@ mod tests {
     #[test]
     fn test_non_contiguous_ranges() {
         let mut cache = WriteBackCache::new();
-        cache.insert(0, 0, Bytes::from(vec![1u8; 100]));
-        cache.insert(0, 200, Bytes::from(vec![2u8; 100]));
+        let lease = LeaseKey {
+            piece_id: 0,
+            lease_id: 1,
+        };
+        cache.insert(lease, 0, Bytes::from(vec![1u8; 100]));
+        cache.insert(lease, 200, Bytes::from(vec![2u8; 100]));
         assert_eq!(cache.total_bytes(), 200);
 
-        let blocks = cache.drain_piece(0);
+        let blocks = cache.drain_lease(lease);
         assert_eq!(blocks.len(), 2);
         assert_eq!(blocks[0].offset, 0);
         assert_eq!(blocks[0].data.len(), 100);
@@ -238,11 +248,15 @@ mod tests {
     #[test]
     fn test_overlapping_merge() {
         let mut cache = WriteBackCache::new();
-        cache.insert(0, 0, Bytes::from(vec![1u8; 100]));
-        cache.insert(0, 50, Bytes::from(vec![2u8; 100]));
+        let lease = LeaseKey {
+            piece_id: 0,
+            lease_id: 1,
+        };
+        cache.insert(lease, 0, Bytes::from(vec![1u8; 100]));
+        cache.insert(lease, 50, Bytes::from(vec![2u8; 100]));
         assert_eq!(cache.total_bytes(), 150);
 
-        let blocks = cache.drain_piece(0);
+        let blocks = cache.drain_lease(lease);
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].offset, 0);
         assert_eq!(blocks[0].data.len(), 150);
@@ -251,8 +265,22 @@ mod tests {
     #[test]
     fn test_drain_all() {
         let mut cache = WriteBackCache::new();
-        cache.insert(0, 0, Bytes::from(vec![1u8; 100]));
-        cache.insert(1, 1000, Bytes::from(vec![2u8; 100]));
+        cache.insert(
+            LeaseKey {
+                piece_id: 0,
+                lease_id: 1,
+            },
+            0,
+            Bytes::from(vec![1u8; 100]),
+        );
+        cache.insert(
+            LeaseKey {
+                piece_id: 1,
+                lease_id: 2,
+            },
+            1000,
+            Bytes::from(vec![2u8; 100]),
+        );
 
         let blocks = cache.drain_all();
         assert_eq!(blocks.len(), 2);
@@ -264,12 +292,16 @@ mod tests {
     #[test]
     fn test_append_fast_path_tracks_resident_bytes() {
         let mut cache = WriteBackCache::new();
-        cache.insert(0, 0, Bytes::from(vec![1u8; 100]));
-        cache.insert(0, 100, Bytes::from(vec![2u8; 50]));
-        cache.insert(0, 125, Bytes::from(vec![3u8; 50]));
+        let lease = LeaseKey {
+            piece_id: 0,
+            lease_id: 1,
+        };
+        cache.insert(lease, 0, Bytes::from(vec![1u8; 100]));
+        cache.insert(lease, 100, Bytes::from(vec![2u8; 50]));
+        cache.insert(lease, 125, Bytes::from(vec![3u8; 50]));
 
         assert_eq!(cache.total_bytes(), 175);
-        let blocks = cache.drain_piece(0);
+        let blocks = cache.drain_lease(lease);
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].data.len(), 175);
     }
@@ -277,17 +309,25 @@ mod tests {
     #[test]
     fn test_multiple_pieces() {
         let mut cache = WriteBackCache::new();
-        cache.insert(0, 0, Bytes::from(vec![1u8; 100]));
-        cache.insert(1, 1000, Bytes::from(vec![2u8; 200]));
-        cache.insert(0, 100, Bytes::from(vec![3u8; 50]));
+        let lease0 = LeaseKey {
+            piece_id: 0,
+            lease_id: 1,
+        };
+        let lease1 = LeaseKey {
+            piece_id: 1,
+            lease_id: 2,
+        };
+        cache.insert(lease0, 0, Bytes::from(vec![1u8; 100]));
+        cache.insert(lease1, 1000, Bytes::from(vec![2u8; 200]));
+        cache.insert(lease0, 100, Bytes::from(vec![3u8; 50]));
 
         assert_eq!(cache.total_bytes(), 350);
 
-        let blocks = cache.drain_piece(0);
+        let blocks = cache.drain_lease(lease0);
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].data.len(), 150);
 
-        let blocks = cache.drain_piece(1);
+        let blocks = cache.drain_lease(lease1);
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].data.len(), 200);
     }
@@ -295,40 +335,65 @@ mod tests {
     #[test]
     fn test_drain_piece_empty() {
         let mut cache = WriteBackCache::new();
-        let blocks = cache.drain_piece(99);
+        let blocks = cache.drain_lease(LeaseKey {
+            piece_id: 99,
+            lease_id: 1,
+        });
         assert!(blocks.is_empty());
     }
 
     #[test]
     fn test_discard_piece_removes_cached_data_without_flushing() {
         let mut cache = WriteBackCache::new();
-        cache.insert(0, 0, Bytes::from(vec![1u8; 100]));
-        cache.insert(1, 1000, Bytes::from(vec![2u8; 50]));
+        let lease0 = LeaseKey {
+            piece_id: 0,
+            lease_id: 1,
+        };
+        let lease1 = LeaseKey {
+            piece_id: 1,
+            lease_id: 2,
+        };
+        cache.insert(lease0, 0, Bytes::from(vec![1u8; 100]));
+        cache.insert(lease1, 1000, Bytes::from(vec![2u8; 50]));
 
-        assert_eq!(cache.discard_piece(0), 100);
+        assert_eq!(cache.discard_lease(lease0), 100);
         assert_eq!(cache.total_bytes(), 50);
-        assert!(cache.drain_piece(0).is_empty());
-        assert_eq!(cache.drain_piece(1).len(), 1);
+        assert!(cache.drain_lease(lease0).is_empty());
+        assert_eq!(cache.drain_lease(lease1).len(), 1);
     }
 
     #[test]
     fn test_insert_empty_data() {
         let mut cache = WriteBackCache::new();
-        cache.insert(0, 0, Bytes::new());
+        cache.insert(
+            LeaseKey {
+                piece_id: 0,
+                lease_id: 1,
+            },
+            0,
+            Bytes::new(),
+        );
         assert_eq!(cache.total_bytes(), 0);
-        let blocks = cache.drain_piece(0);
+        let blocks = cache.drain_lease(LeaseKey {
+            piece_id: 0,
+            lease_id: 1,
+        });
         assert!(blocks.is_empty());
     }
 
     #[test]
     fn test_overlap_with_next_range() {
         let mut cache = WriteBackCache::new();
+        let lease = LeaseKey {
+            piece_id: 0,
+            lease_id: 1,
+        };
         // Insert a range at offset 100
-        cache.insert(0, 100, Bytes::from(vec![2u8; 50]));
+        cache.insert(lease, 100, Bytes::from(vec![2u8; 50]));
         // Insert a range at offset 0 that overlaps with the one at 100
-        cache.insert(0, 0, Bytes::from(vec![1u8; 120]));
+        cache.insert(lease, 0, Bytes::from(vec![1u8; 120]));
 
-        let blocks = cache.drain_piece(0);
+        let blocks = cache.drain_lease(lease);
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].offset, 0);
         assert_eq!(blocks[0].data.len(), 150); // 0..120 merged with 100..150
@@ -337,14 +402,18 @@ mod tests {
     #[test]
     fn test_coalesce_multiple_ranges() {
         let mut cache = WriteBackCache::new();
+        let lease = LeaseKey {
+            piece_id: 0,
+            lease_id: 1,
+        };
         // Create three separate ranges
-        cache.insert(0, 0, Bytes::from(vec![1u8; 50]));
-        cache.insert(0, 100, Bytes::from(vec![2u8; 50]));
-        cache.insert(0, 200, Bytes::from(vec![3u8; 50]));
+        cache.insert(lease, 0, Bytes::from(vec![1u8; 50]));
+        cache.insert(lease, 100, Bytes::from(vec![2u8; 50]));
+        cache.insert(lease, 200, Bytes::from(vec![3u8; 50]));
         // Now insert something that bridges all three
-        cache.insert(0, 40, Bytes::from(vec![4u8; 170]));
+        cache.insert(lease, 40, Bytes::from(vec![4u8; 170]));
 
-        let blocks = cache.drain_piece(0);
+        let blocks = cache.drain_lease(lease);
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].offset, 0);
         assert_eq!(blocks[0].data.len(), 250);
@@ -353,10 +422,14 @@ mod tests {
     #[test]
     fn test_insert_contiguous_extends_previous() {
         let mut cache = WriteBackCache::new();
-        cache.insert(0, 0, Bytes::from(vec![1u8; 100]));
+        let lease = LeaseKey {
+            piece_id: 0,
+            lease_id: 1,
+        };
+        cache.insert(lease, 0, Bytes::from(vec![1u8; 100]));
         // Exactly contiguous
-        cache.insert(0, 100, Bytes::from(vec![2u8; 100]));
-        let blocks = cache.drain_piece(0);
+        cache.insert(lease, 100, Bytes::from(vec![2u8; 100]));
+        let blocks = cache.drain_lease(lease);
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].data.len(), 200);
     }
@@ -364,10 +437,14 @@ mod tests {
     #[test]
     fn test_fully_overlapping_insert() {
         let mut cache = WriteBackCache::new();
-        cache.insert(0, 0, Bytes::from(vec![1u8; 200]));
+        let lease = LeaseKey {
+            piece_id: 0,
+            lease_id: 1,
+        };
+        cache.insert(lease, 0, Bytes::from(vec![1u8; 200]));
         // Insert completely within existing range
-        cache.insert(0, 50, Bytes::from(vec![2u8; 50]));
-        let blocks = cache.drain_piece(0);
+        cache.insert(lease, 50, Bytes::from(vec![2u8; 50]));
+        let blocks = cache.drain_lease(lease);
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].offset, 0);
         assert_eq!(blocks[0].data.len(), 200);
@@ -376,9 +453,30 @@ mod tests {
     #[test]
     fn test_drain_all_sorts_by_offset() {
         let mut cache = WriteBackCache::new();
-        cache.insert(5, 5000, Bytes::from(vec![1u8; 10]));
-        cache.insert(0, 0, Bytes::from(vec![2u8; 10]));
-        cache.insert(3, 3000, Bytes::from(vec![3u8; 10]));
+        cache.insert(
+            LeaseKey {
+                piece_id: 5,
+                lease_id: 1,
+            },
+            5000,
+            Bytes::from(vec![1u8; 10]),
+        );
+        cache.insert(
+            LeaseKey {
+                piece_id: 0,
+                lease_id: 2,
+            },
+            0,
+            Bytes::from(vec![2u8; 10]),
+        );
+        cache.insert(
+            LeaseKey {
+                piece_id: 3,
+                lease_id: 3,
+            },
+            3000,
+            Bytes::from(vec![3u8; 10]),
+        );
 
         let blocks = cache.drain_all();
         assert_eq!(blocks.len(), 3);
@@ -391,12 +489,16 @@ mod tests {
     #[test]
     fn test_coalesce_stops_at_gap() {
         let mut cache = WriteBackCache::new();
+        let lease = LeaseKey {
+            piece_id: 0,
+            lease_id: 1,
+        };
         // Three ranges with a gap between second and third
-        cache.insert(0, 0, Bytes::from(vec![1u8; 50]));
-        cache.insert(0, 50, Bytes::from(vec![2u8; 50]));
-        cache.insert(0, 200, Bytes::from(vec![3u8; 50]));
+        cache.insert(lease, 0, Bytes::from(vec![1u8; 50]));
+        cache.insert(lease, 50, Bytes::from(vec![2u8; 50]));
+        cache.insert(lease, 200, Bytes::from(vec![3u8; 50]));
 
-        let blocks = cache.drain_piece(0);
+        let blocks = cache.drain_lease(lease);
         // First two should merge, third should be separate
         assert_eq!(blocks.len(), 2);
         assert_eq!(blocks[0].offset, 0);
@@ -408,14 +510,18 @@ mod tests {
     #[test]
     fn test_coalesce_breaks_when_next_range_is_still_gapped() {
         let mut cache = WriteBackCache::new();
-        cache.insert(0, 0, Bytes::from(vec![1u8; 50]));
-        cache.insert(0, 100, Bytes::from(vec![2u8; 50]));
-        cache.insert(0, 200, Bytes::from(vec![3u8; 50]));
+        let lease = LeaseKey {
+            piece_id: 0,
+            lease_id: 1,
+        };
+        cache.insert(lease, 0, Bytes::from(vec![1u8; 50]));
+        cache.insert(lease, 100, Bytes::from(vec![2u8; 50]));
+        cache.insert(lease, 200, Bytes::from(vec![3u8; 50]));
 
         // This extends the first range, but still leaves a gap before the second.
-        cache.insert(0, 40, Bytes::from(vec![4u8; 40]));
+        cache.insert(lease, 40, Bytes::from(vec![4u8; 40]));
 
-        let blocks = cache.drain_piece(0);
+        let blocks = cache.drain_lease(lease);
         assert_eq!(blocks.len(), 3);
         assert_eq!(blocks[0].offset, 0);
         assert_eq!(blocks[0].data.len(), 80);

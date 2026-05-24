@@ -119,6 +119,9 @@ pub struct DownloadSpec {
     pub(crate) max_connections: u32,
     pub(crate) connect_timeout: Duration,
     pub(crate) connect_timeout_overridden: bool,
+    pub(crate) pool_max_idle_per_host: usize,
+    pub(crate) pool_idle_timeout: Duration,
+    pub(crate) pool_config_overridden: bool,
     pub(crate) all_proxy: Option<String>,
     pub(crate) http_proxy: Option<String>,
     pub(crate) https_proxy: Option<String>,
@@ -129,6 +132,7 @@ pub struct DownloadSpec {
     pub(crate) resume: bool,
     pub(crate) piece_size: u64,
     pub(crate) min_split_size: u64,
+    pub(crate) min_segment_size: u64,
     /// Maximum retry attempts per segment (0 = no retries).
     pub(crate) max_retries: u32,
     /// Base delay for exponential backoff between retries.
@@ -161,6 +165,9 @@ impl DownloadSpec {
             max_connections: 4,
             connect_timeout: Duration::from_secs(30),
             connect_timeout_overridden: false,
+            pool_max_idle_per_host: 0,
+            pool_idle_timeout: Duration::from_secs(30),
+            pool_config_overridden: false,
             all_proxy: None,
             http_proxy: None,
             https_proxy: None,
@@ -171,6 +178,7 @@ impl DownloadSpec {
             resume: true,
             piece_size: 1024 * 1024,          // 1 MiB
             min_split_size: 10 * 1024 * 1024, // 10 MiB
+            min_segment_size: 256 * 1024,     // 256 KiB
             max_retries: 5,
             retry_base_delay: Duration::from_secs(1),
             retry_max_delay: Duration::from_secs(30),
@@ -218,6 +226,16 @@ impl DownloadSpec {
         self.all_proxy.as_deref()
     }
 
+    /// Returns the maximum idle HTTP connections kept per host.
+    pub fn get_pool_max_idle_per_host(&self) -> usize {
+        self.pool_max_idle_per_host
+    }
+
+    /// Returns how long idle pooled HTTP connections are retained.
+    pub fn get_pool_idle_timeout(&self) -> Duration {
+        self.pool_idle_timeout
+    }
+
     /// Returns the proxy applied only to plain HTTP requests, if set.
     pub fn get_http_proxy(&self) -> Option<&str> {
         self.http_proxy.as_deref()
@@ -239,6 +257,10 @@ impl DownloadSpec {
 
     pub(crate) fn has_proxy_override(&self) -> bool {
         self.all_proxy.is_some() || self.http_proxy.is_some() || self.https_proxy.is_some()
+    }
+
+    pub(crate) fn has_pool_override(&self) -> bool {
+        self.pool_config_overridden
     }
 
     /// Returns the memory budget (in bytes) for the write-back cache.
@@ -270,6 +292,11 @@ impl DownloadSpec {
     /// across multiple connections.
     pub fn get_min_split_size(&self) -> u64 {
         self.min_split_size
+    }
+
+    /// Returns the minimum sub-segment size used by dynamic multi-worker splitting.
+    pub fn get_min_segment_size(&self) -> u64 {
+        self.min_segment_size
     }
 
     /// Returns the maximum number of retry attempts per segment.
@@ -344,6 +371,21 @@ impl DownloadSpec {
         self
     }
 
+    /// Configure the experimental HTTP idle pool for this download only.
+    pub fn http_idle_pool(mut self, max_idle_per_host: usize, idle_timeout: Duration) -> Self {
+        self.pool_max_idle_per_host = max_idle_per_host;
+        self.pool_idle_timeout = idle_timeout;
+        self.pool_config_overridden = true;
+        self
+    }
+
+    /// Disable HTTP idle connection reuse for this download even if the downloader enables it.
+    pub fn disable_http_idle_pool(mut self) -> Self {
+        self.pool_max_idle_per_host = 0;
+        self.pool_config_overridden = true;
+        self
+    }
+
     /// Set a proxy applied to all HTTP/HTTPS requests for this download only.
     pub fn all_proxy(mut self, proxy: impl Into<String>) -> Self {
         self.all_proxy = Some(proxy.into());
@@ -401,6 +443,12 @@ impl DownloadSpec {
     /// Set the minimum file size before splitting across connections (default: 10 MiB).
     pub fn min_split_size(mut self, min_split_size: u64) -> Self {
         self.min_split_size = min_split_size;
+        self
+    }
+
+    /// Set the minimum sub-segment size for dynamic multi-worker splitting.
+    pub fn min_segment_size(mut self, min_segment_size: u64) -> Self {
+        self.min_segment_size = min_segment_size;
         self
     }
 
@@ -506,6 +554,11 @@ impl DownloadSpec {
                 "min_split_size must be >= 1".into(),
             ));
         }
+        if self.min_segment_size == 0 {
+            return Err(DownloadError::InvalidConfig(
+                "min_segment_size must be >= 1".into(),
+            ));
+        }
         if self.autosave_sync_every == 0 {
             return Err(DownloadError::InvalidConfig(
                 "autosave_sync_every must be >= 1".into(),
@@ -543,6 +596,9 @@ mod tests {
         assert_eq!(spec.max_connections, 4);
         assert_eq!(spec.connect_timeout, Duration::from_secs(30));
         assert!(!spec.connect_timeout_overridden);
+        assert_eq!(spec.pool_max_idle_per_host, 0);
+        assert_eq!(spec.pool_idle_timeout, Duration::from_secs(30));
+        assert!(!spec.pool_config_overridden);
         assert_eq!(spec.all_proxy, None);
         assert_eq!(spec.http_proxy, None);
         assert_eq!(spec.https_proxy, None);
@@ -553,6 +609,7 @@ mod tests {
         assert!(spec.resume);
         assert_eq!(spec.piece_size, 1024 * 1024);
         assert_eq!(spec.min_split_size, 10 * 1024 * 1024);
+        assert_eq!(spec.min_segment_size, 256 * 1024);
         assert_eq!(spec.max_retries, 5);
         assert_eq!(spec.max_retry_elapsed, None);
         assert_eq!(spec.max_download_speed, 0);
@@ -579,6 +636,7 @@ mod tests {
             .headers(headers.clone())
             .max_connections(8)
             .connect_timeout(Duration::from_secs(10))
+            .http_idle_pool(3, Duration::from_secs(15))
             .all_proxy("http://127.0.0.1:8080")
             .http_proxy("http://127.0.0.1:8081")
             .https_proxy("http://127.0.0.1:8443")
@@ -589,6 +647,7 @@ mod tests {
             .resume(false)
             .piece_size(2048)
             .min_split_size(4096)
+            .min_segment_size(1024)
             .retry_policy(7, Duration::from_millis(10), Duration::from_millis(50))
             .max_retry_elapsed(Duration::from_secs(3))
             .max_download_speed(12345)
@@ -599,6 +658,9 @@ mod tests {
         assert_eq!(spec.max_connections, 8);
         assert_eq!(spec.connect_timeout, Duration::from_secs(10));
         assert!(spec.connect_timeout_overridden);
+        assert_eq!(spec.pool_max_idle_per_host, 3);
+        assert_eq!(spec.pool_idle_timeout, Duration::from_secs(15));
+        assert!(spec.pool_config_overridden);
         assert_eq!(spec.all_proxy.as_deref(), Some("http://127.0.0.1:8080"));
         assert_eq!(spec.http_proxy.as_deref(), Some("http://127.0.0.1:8081"));
         assert_eq!(spec.https_proxy.as_deref(), Some("http://127.0.0.1:8443"));
@@ -609,6 +671,7 @@ mod tests {
         assert!(!spec.resume);
         assert_eq!(spec.piece_size, 2048);
         assert_eq!(spec.min_split_size, 4096);
+        assert_eq!(spec.min_segment_size, 1024);
         assert_eq!(spec.max_retries, 7);
         assert_eq!(spec.retry_base_delay, Duration::from_millis(10));
         assert_eq!(spec.retry_max_delay, Duration::from_millis(50));
@@ -649,6 +712,12 @@ mod tests {
             .validate()
             .unwrap_err();
         assert!(err.to_string().contains("autosave_sync_every"));
+
+        let err = DownloadSpec::new("https://example.com/file")
+            .min_segment_size(0)
+            .validate()
+            .unwrap_err();
+        assert!(err.to_string().contains("min_segment_size"));
     }
 
     #[test]
@@ -760,6 +829,7 @@ mod tests {
             .headers(headers)
             .max_connections(8)
             .connect_timeout(Duration::from_secs(10))
+            .http_idle_pool(4, Duration::from_secs(9))
             .all_proxy("http://127.0.0.1:8080")
             .http_proxy("http://127.0.0.1:8081")
             .https_proxy("http://127.0.0.1:8443")
@@ -770,6 +840,7 @@ mod tests {
             .resume(false)
             .piece_size(4096)
             .min_split_size(8192)
+            .min_segment_size(2048)
             .max_retries(3)
             .retry_base_delay(Duration::from_millis(100))
             .retry_max_delay(Duration::from_secs(5))
@@ -785,6 +856,8 @@ mod tests {
         assert_eq!(spec.get_headers().len(), 1);
         assert_eq!(spec.get_max_connections(), 8);
         assert_eq!(spec.get_connect_timeout(), Duration::from_secs(10));
+        assert_eq!(spec.get_pool_max_idle_per_host(), 4);
+        assert_eq!(spec.get_pool_idle_timeout(), Duration::from_secs(9));
         assert_eq!(spec.get_all_proxy(), Some("http://127.0.0.1:8080"));
         assert_eq!(spec.get_http_proxy(), Some("http://127.0.0.1:8081"));
         assert_eq!(spec.get_https_proxy(), Some("http://127.0.0.1:8443"));
@@ -795,6 +868,7 @@ mod tests {
         assert!(!spec.get_resume());
         assert_eq!(spec.get_piece_size(), 4096);
         assert_eq!(spec.get_min_split_size(), 8192);
+        assert_eq!(spec.get_min_segment_size(), 2048);
         assert_eq!(spec.get_max_retries(), 3);
         assert_eq!(spec.get_retry_base_delay(), Duration::from_millis(100));
         assert_eq!(spec.get_retry_max_delay(), Duration::from_secs(5));
@@ -857,6 +931,15 @@ mod tests {
             .validate()
             .unwrap_err();
         assert!(err.to_string().contains("min_split_size"));
+    }
+
+    #[test]
+    fn test_validate_zero_min_segment_size() {
+        let err = DownloadSpec::new("https://x.com")
+            .min_segment_size(0)
+            .validate()
+            .unwrap_err();
+        assert!(err.to_string().contains("min_segment_size"));
     }
 
     #[test]

@@ -5,7 +5,10 @@ use tokio::sync::watch;
 use super::retry::retry_with_backoff;
 use super::single::run_single_connection;
 use super::multi::run_multi_worker;
-use super::{range_response_allowed, validate_metadata, StopSignal};
+use super::range_validate::{
+    validate_range_response, ExpectedRange, RangeValidationDecision, RangeValidationMode,
+};
+use super::{validate_metadata, StopSignal};
 use crate::config::{DownloadSpec, LogLevel};
 use crate::error::DownloadError;
 use crate::http::worker::HttpWorker;
@@ -121,16 +124,28 @@ pub(super) async fn try_resume_download(
 ) -> Result<Option<PathBuf>, DownloadError> {
     let control_path = ControlSnapshot::control_path(output_path);
     let resume_ctrl = if spec.resume {
-        match ControlSnapshot::load(&control_path).await {
-            Ok(ctrl) => {
+        match ControlSnapshot::load_with_hints(&control_path).await {
+            Ok((ctrl, hints)) => {
                 log_debug!(
                     log_level,
                     download_id,
-                    downloaded_bytes = ctrl.downloaded_bytes,
+                    control_downloaded_bytes = ctrl.downloaded_bytes,
                     total_size = ctrl.total_size,
                     piece_count = ctrl.piece_count,
+                    dirty_piece_count = hints.dirty_piece_ids.len(),
+                    inflight_piece_count = hints.inflight_piece_ids.len(),
+                    snapshot_seq = hints.snapshot_seq,
                     "control file loaded"
                 );
+                if !hints.dirty_piece_ids.is_empty() || !hints.inflight_piece_ids.is_empty() {
+                    log_debug!(
+                        log_level,
+                        download_id,
+                        dirty_piece_ids = ?hints.dirty_piece_ids,
+                        inflight_piece_ids = ?hints.inflight_piece_ids,
+                        "resume control file contains non-durable dirty/inflight hints"
+                    );
+                }
                 Some(ctrl)
             }
             Err(_) => None,
@@ -172,8 +187,20 @@ pub(super) async fn try_resume_download(
                 )
                 .await;
                 if let Ok((resp, meta)) = probe_result {
-                    if resp.status().as_u16() == 206
-                        && range_response_allowed(&meta)
+                    let validation = validate_range_response(
+                        resp.status().as_u16(),
+                        resp.headers()
+                            .get("retry-after")
+                            .and_then(|value| value.to_str().ok()),
+                        &meta,
+                        RangeValidationMode::ResumeProbe,
+                        ExpectedRange {
+                            start,
+                            end_inclusive: end - 1,
+                            total_size: Some(ctrl.total_size),
+                        },
+                    );
+                    if matches!(validation, Ok(RangeValidationDecision::Accept))
                         && validate_metadata(&meta, &ctrl)
                     {
                         log_info!(
@@ -217,8 +244,20 @@ pub(super) async fn try_resume_download(
             )
             .await;
             if let Ok((resp, meta)) = probe_result {
-                if resp.status().as_u16() == 206
-                    && range_response_allowed(&meta)
+                let validation = validate_range_response(
+                    resp.status().as_u16(),
+                    resp.headers()
+                        .get("retry-after")
+                        .and_then(|value| value.to_str().ok()),
+                    &meta,
+                    RangeValidationMode::ResumeProbe,
+                    ExpectedRange {
+                        start: ctrl.downloaded_bytes,
+                        end_inclusive: ctrl.total_size - 1,
+                        total_size: Some(ctrl.total_size),
+                    },
+                );
+                if matches!(validation, Ok(RangeValidationDecision::Accept))
                     && validate_metadata(&meta, &ctrl)
                 {
                     log_info!(

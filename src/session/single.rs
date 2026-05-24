@@ -295,7 +295,15 @@ async fn stream_single(
 
                         let offset = downloaded;
                         downloaded += len as u64;
-                        if write_tx.send(WriterCommand::Data { offset, data, piece_id: None }).await.is_err() {
+                        if write_tx
+                            .send(WriterCommand::Data {
+                                offset,
+                                data,
+                                lease_key: None,
+                            })
+                            .await
+                            .is_err()
+                        {
                             return Err(DownloadError::ChannelClosed);
                         }
                         permit.forget(); // permits returned by writer after flush
@@ -340,17 +348,17 @@ async fn stream_single(
 
 async fn persist_single_control_snapshot(
     reason: ControlSaveReason,
-    downloaded: u64,
+    current_downloaded: u64,
     write_tx: Option<&mpsc::Sender<WriterCommand>>,
     control_save_tracker: &mut ControlSaveTracker,
     ctx: &SingleControlSaveContext<'_>,
 ) {
-    if !control_save_tracker.should_save(reason, downloaded, ctx.autosave_sync_every) {
+    if !control_save_tracker.should_save(reason, current_downloaded, ctx.autosave_sync_every) {
         if matches!(reason, ControlSaveReason::Autosave)
-            && downloaded > control_save_tracker.last_saved_downloaded_bytes()
+            && current_downloaded > control_save_tracker.last_saved_downloaded_bytes()
         {
             log_debug!(ctx.log_level, download_id = ctx.download_id,
-                checkpoint = reason.label(), downloaded_bytes = downloaded,
+                checkpoint = reason.label(), pending_prefix_bytes = current_downloaded,
                 pending_autosaves = control_save_tracker.pending_autosaves(),
                 autosave_sync_every = ctx.autosave_sync_every,
                 "control snapshot deferred");
@@ -369,19 +377,20 @@ async fn persist_single_control_snapshot(
         },
         None => None,
     };
-    let persisted_downloaded = flush_stats.map_or(downloaded, |stats| stats.written_bytes);
-    if persisted_downloaded <= control_save_tracker.last_saved_downloaded_bytes() {
+    let persisted_prefix_bytes =
+        flush_stats.map_or(current_downloaded, |stats| stats.written_bytes);
+    if persisted_prefix_bytes <= control_save_tracker.last_saved_downloaded_bytes() {
         return;
     }
 
     let mut snapshot = ctx.snap_template.clone();
-    snapshot.downloaded_bytes = persisted_downloaded;
+    snapshot.downloaded_bytes = persisted_prefix_bytes;
     let save_started = Instant::now();
     match snapshot.save(ctx.control_path).await {
         Ok(()) => {
-            control_save_tracker.mark_saved(persisted_downloaded);
+            control_save_tracker.mark_saved(persisted_prefix_bytes);
             log_debug!(ctx.log_level, download_id = ctx.download_id,
-                checkpoint = reason.label(), downloaded_bytes = persisted_downloaded,
+                checkpoint = reason.label(), persisted_prefix_bytes = persisted_prefix_bytes,
                 flush_all_ms = flush_stats.map(|stats| stats.flush_elapsed.as_millis() as u64).unwrap_or(0),
                 sync_data_ms = flush_stats.and_then(|stats| stats.sync_elapsed.map(|elapsed| elapsed.as_millis() as u64)).unwrap_or(0),
                 control_save_ms = save_started.elapsed().as_millis() as u64,
@@ -481,13 +490,14 @@ mod tests {
         tokio::spawn(async move {
             while let Some(command) = write_rx.recv().await {
                 match command {
+                    WriterCommand::BeginLease { .. } => {}
                     WriterCommand::Data { offset, data, .. } => {
                         written_bytes.store(offset + data.len() as u64, Ordering::Release);
                     }
-                    WriterCommand::FlushPiece { ack, .. } => {
+                    WriterCommand::FlushLease { ack, .. } => {
                         let _ = ack.send(());
                     }
-                    WriterCommand::DiscardPiece { ack, .. } => {
+                    WriterCommand::DiscardLease { ack, .. } => {
                         let _ = ack.send(0);
                     }
                     WriterCommand::FlushAll { ack, .. } => {

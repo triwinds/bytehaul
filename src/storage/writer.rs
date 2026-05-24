@@ -1,6 +1,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use std::collections::HashSet;
 
 use bytes::Bytes;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
@@ -8,6 +9,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::error::DownloadError;
 use crate::storage::cache::WriteBackCache;
+use crate::storage::segment::LeaseKey;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct FlushAllStats {
@@ -17,20 +19,23 @@ pub(crate) struct FlushAllStats {
 }
 
 pub(crate) enum WriterCommand {
+    BeginLease {
+        lease_key: LeaseKey,
+    },
     Data {
         offset: u64,
         data: Bytes,
-        /// Which piece this data belongs to (for cache aggregation).
-        piece_id: Option<usize>,
+        /// Which lease this data belongs to (for cache aggregation).
+        lease_key: Option<LeaseKey>,
     },
-    /// A piece is fully downloaded; flush its cached data to disk.
-    FlushPiece {
-        piece_id: usize,
+    /// A lease is fully downloaded; flush its cached data to disk.
+    FlushLease {
+        lease_key: LeaseKey,
         ack: oneshot::Sender<()>,
     },
-    /// A piece attempt failed before completion; discard its cached bytes.
-    DiscardPiece {
-        piece_id: usize,
+    /// A lease attempt failed before completion; discard its cached bytes.
+    DiscardLease {
+        lease_key: LeaseKey,
         ack: oneshot::Sender<usize>,
     },
     /// Flush all cached data and optionally sync it before acknowledging.
@@ -47,6 +52,7 @@ pub(crate) struct WriterTask {
     file: tokio::fs::File,
     written_bytes: Arc<AtomicU64>,
     cache: WriteBackCache,
+    active_leases: HashSet<LeaseKey>,
     /// Budget permit sender 鈥?returned when data is flushed to disk.
     budget_return: Arc<tokio::sync::Semaphore>,
     /// Maximum bytes to buffer before forcing a flush.
@@ -66,6 +72,7 @@ impl WriterTask {
             file,
             written_bytes,
             cache: WriteBackCache::new(),
+            active_leases: HashSet::new(),
             budget_return,
             cache_high_watermark,
         }
@@ -74,15 +81,21 @@ impl WriterTask {
     pub async fn run(mut self) -> Result<(), DownloadError> {
         while let Some(cmd) = self.rx.recv().await {
             match cmd {
+                WriterCommand::BeginLease { lease_key } => {
+                    self.active_leases.insert(lease_key);
+                }
                 WriterCommand::Data {
                     offset,
                     data,
-                    piece_id,
+                    lease_key,
                 } => {
                     let data_len = data.len();
-                    match piece_id {
-                        Some(piece_id) => {
-                            self.cache.insert(piece_id, offset, data);
+                    match lease_key {
+                        Some(lease_key) if self.active_leases.contains(&lease_key) => {
+                            self.cache.insert(lease_key, offset, data);
+                        }
+                        Some(_) => {
+                            self.budget_return.add_permits(data_len);
                         }
                         None => {
                             // Single-connection mode: write directly.
@@ -95,12 +108,14 @@ impl WriterTask {
                         self.flush_all().await?;
                     }
                 }
-                WriterCommand::FlushPiece { piece_id, ack } => {
-                    self.flush_piece(piece_id).await?;
+                WriterCommand::FlushLease { lease_key, ack } => {
+                    self.flush_lease(lease_key).await?;
+                    self.active_leases.remove(&lease_key);
                     let _ = ack.send(());
                 }
-                WriterCommand::DiscardPiece { piece_id, ack } => {
-                    let discarded = self.cache.discard_piece(piece_id);
+                WriterCommand::DiscardLease { lease_key, ack } => {
+                    self.active_leases.remove(&lease_key);
+                    let discarded = self.cache.discard_lease(lease_key);
                     if discarded > 0 {
                         self.budget_return.add_permits(discarded);
                     }
@@ -133,8 +148,8 @@ impl WriterTask {
         Ok(())
     }
 
-    async fn flush_piece(&mut self, piece_id: usize) -> Result<(), DownloadError> {
-        let blocks = self.cache.drain_piece(piece_id);
+    async fn flush_lease(&mut self, lease_key: LeaseKey) -> Result<(), DownloadError> {
+        let blocks = self.cache.drain_lease(lease_key);
         let mut flushed = 0usize;
         for block in blocks {
             self.write_block(block.offset, &block.data).await?;
@@ -196,7 +211,7 @@ mod tests {
         tx.send(WriterCommand::Data {
             offset: 0,
             data: Bytes::from(vec![0xAA; 100]),
-            piece_id: None,
+            lease_key: None,
         })
         .await
         .unwrap();
@@ -204,7 +219,7 @@ mod tests {
         tx.send(WriterCommand::Data {
             offset: 100,
             data: Bytes::from(vec![0xBB; 100]),
-            piece_id: None,
+            lease_key: None,
         })
         .await
         .unwrap();
@@ -238,19 +253,26 @@ mod tests {
         let writer = WriterTask::new(rx, file, written.clone(), budget.clone(), 1024 * 1024);
         let handle = tokio::spawn(writer.run());
 
+        let lease_key = LeaseKey {
+            piece_id: 0,
+            lease_id: 1,
+        };
+
+        tx.send(WriterCommand::BeginLease { lease_key }).await.unwrap();
+
         // Send data with piece_id (cached write)
         tx.send(WriterCommand::Data {
             offset: 0,
             data: Bytes::from(vec![0xCC; 100]),
-            piece_id: Some(0),
+            lease_key: Some(lease_key),
         })
         .await
         .unwrap();
 
         // Flush piece
         let (ack_tx, ack_rx) = oneshot::channel();
-        tx.send(WriterCommand::FlushPiece {
-            piece_id: 0,
+        tx.send(WriterCommand::FlushLease {
+            lease_key,
             ack: ack_tx,
         })
         .await
@@ -282,10 +304,16 @@ mod tests {
         let writer = WriterTask::new(rx, file, written.clone(), budget.clone(), 1024 * 1024);
         let handle = tokio::spawn(writer.run());
 
+        let lease_key = LeaseKey {
+            piece_id: 0,
+            lease_id: 1,
+        };
+        tx.send(WriterCommand::BeginLease { lease_key }).await.unwrap();
+
         tx.send(WriterCommand::Data {
             offset: 0,
             data: Bytes::from(vec![0xDD; 50]),
-            piece_id: Some(0),
+            lease_key: Some(lease_key),
         })
         .await
         .unwrap();
@@ -324,17 +352,23 @@ mod tests {
         let writer = WriterTask::new(rx, file, written.clone(), budget.clone(), 1024);
         let handle = tokio::spawn(writer.run());
 
+        let lease_key = LeaseKey {
+            piece_id: 0,
+            lease_id: 1,
+        };
+        tx.send(WriterCommand::BeginLease { lease_key }).await.unwrap();
+
         tx.send(WriterCommand::Data {
             offset: 0,
             data: Bytes::from(vec![0xEE; 64]),
-            piece_id: Some(0),
+            lease_key: Some(lease_key),
         })
         .await
         .unwrap();
 
         let (ack_tx, ack_rx) = oneshot::channel();
-        tx.send(WriterCommand::DiscardPiece {
-            piece_id: 0,
+        tx.send(WriterCommand::DiscardLease {
+            lease_key,
             ack: ack_tx,
         })
         .await
@@ -342,8 +376,8 @@ mod tests {
         assert_eq!(ack_rx.await.unwrap(), 64);
 
         let (ack_tx, ack_rx) = oneshot::channel();
-        tx.send(WriterCommand::FlushPiece {
-            piece_id: 0,
+        tx.send(WriterCommand::FlushLease {
+            lease_key,
             ack: ack_tx,
         })
         .await
@@ -356,6 +390,133 @@ mod tests {
         let content = std::fs::read(&path).unwrap();
         assert!(content.iter().all(|&b| b == 0));
         assert_eq!(written.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn test_writer_drops_late_data_for_discarded_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test_late_data.bin");
+        std::fs::write(&path, vec![0u8; 64]).unwrap();
+        let file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .await
+            .unwrap();
+
+        let budget = Arc::new(tokio::sync::Semaphore::new(0));
+        let written = Arc::new(AtomicU64::new(0));
+        let (tx, rx) = mpsc::channel(16);
+
+        let writer = WriterTask::new(rx, file, written.clone(), budget.clone(), 1024);
+        let handle = tokio::spawn(writer.run());
+
+        let lease_key = LeaseKey {
+            piece_id: 0,
+            lease_id: 1,
+        };
+        tx.send(WriterCommand::BeginLease { lease_key }).await.unwrap();
+
+        let (ack_tx, ack_rx) = oneshot::channel();
+        tx.send(WriterCommand::DiscardLease { lease_key, ack: ack_tx })
+            .await
+            .unwrap();
+        assert_eq!(ack_rx.await.unwrap(), 0);
+
+        tx.send(WriterCommand::Data {
+            offset: 0,
+            data: Bytes::from(vec![0xAB; 32]),
+            lease_key: Some(lease_key),
+        })
+        .await
+        .unwrap();
+
+        drop(tx);
+        handle.await.unwrap().unwrap();
+
+        let content = std::fs::read(&path).unwrap();
+        assert!(content.iter().all(|&b| b == 0));
+        assert_eq!(budget.available_permits(), 32);
+        assert_eq!(written.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn test_writer_keeps_same_piece_leases_isolated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test_isolated_leases.bin");
+        std::fs::write(&path, vec![0u8; 128]).unwrap();
+        let file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .await
+            .unwrap();
+
+        let budget = Arc::new(tokio::sync::Semaphore::new(1024));
+        let written = Arc::new(AtomicU64::new(0));
+        let (tx, rx) = mpsc::channel(16);
+
+        let writer = WriterTask::new(rx, file, written.clone(), budget.clone(), 1024);
+        let handle = tokio::spawn(writer.run());
+
+        let first_lease = LeaseKey {
+            piece_id: 0,
+            lease_id: 1,
+        };
+        let second_lease = LeaseKey {
+            piece_id: 0,
+            lease_id: 2,
+        };
+
+        tx.send(WriterCommand::BeginLease {
+            lease_key: first_lease,
+        })
+        .await
+        .unwrap();
+        tx.send(WriterCommand::BeginLease {
+            lease_key: second_lease,
+        })
+        .await
+        .unwrap();
+
+        tx.send(WriterCommand::Data {
+            offset: 0,
+            data: Bytes::from(vec![0x11; 32]),
+            lease_key: Some(first_lease),
+        })
+        .await
+        .unwrap();
+        tx.send(WriterCommand::Data {
+            offset: 32,
+            data: Bytes::from(vec![0x22; 32]),
+            lease_key: Some(second_lease),
+        })
+        .await
+        .unwrap();
+
+        let (discard_tx, discard_rx) = oneshot::channel();
+        tx.send(WriterCommand::DiscardLease {
+            lease_key: first_lease,
+            ack: discard_tx,
+        })
+        .await
+        .unwrap();
+        assert_eq!(discard_rx.await.unwrap(), 32);
+
+        let (flush_tx, flush_rx) = oneshot::channel();
+        tx.send(WriterCommand::FlushLease {
+            lease_key: second_lease,
+            ack: flush_tx,
+        })
+        .await
+        .unwrap();
+        flush_rx.await.unwrap();
+
+        drop(tx);
+        handle.await.unwrap().unwrap();
+
+        let content = std::fs::read(&path).unwrap();
+        assert!(content[..32].iter().all(|&b| b == 0));
+        assert!(content[32..64].iter().all(|&b| b == 0x22));
+        assert_eq!(written.load(Ordering::Acquire), 64);
     }
 
     #[tokio::test]
@@ -376,10 +537,16 @@ mod tests {
         let writer = WriterTask::new(rx, file, written.clone(), budget.clone(), 1024 * 1024);
         let handle = tokio::spawn(writer.run());
 
+        let lease_key = LeaseKey {
+            piece_id: 0,
+            lease_id: 1,
+        };
+        tx.send(WriterCommand::BeginLease { lease_key }).await.unwrap();
+
         tx.send(WriterCommand::Data {
             offset: 0,
             data: Bytes::from(vec![0x11; 64]),
-            piece_id: Some(0),
+            lease_key: Some(lease_key),
         })
         .await
         .unwrap();
@@ -419,11 +586,17 @@ mod tests {
         let writer = WriterTask::new(rx, file, written.clone(), budget.clone(), 50);
         let handle = tokio::spawn(writer.run());
 
+        let lease_key = LeaseKey {
+            piece_id: 0,
+            lease_id: 1,
+        };
+        tx.send(WriterCommand::BeginLease { lease_key }).await.unwrap();
+
         // Send data that exceeds the high watermark
         tx.send(WriterCommand::Data {
             offset: 0,
             data: Bytes::from(vec![0xEE; 100]),
-            piece_id: Some(0),
+            lease_key: Some(lease_key),
         })
         .await
         .unwrap();

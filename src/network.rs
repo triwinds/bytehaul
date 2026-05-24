@@ -36,6 +36,8 @@ type ProxyRustlsClient = Client<ProxyRustlsConnector, HttpRequestBody>;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct ClientNetworkConfig {
     pub connect_timeout: Duration,
+    pub pool_max_idle_per_host: usize,
+    pub pool_idle_timeout: Duration,
     pub all_proxy: Option<String>,
     pub http_proxy: Option<String>,
     pub https_proxy: Option<String>,
@@ -135,6 +137,8 @@ impl Default for ClientNetworkConfig {
     fn default() -> Self {
         Self {
             connect_timeout: Duration::from_secs(30),
+            pool_max_idle_per_host: 0,
+            pool_idle_timeout: Duration::from_secs(30),
             all_proxy: None,
             http_proxy: None,
             https_proxy: None,
@@ -150,6 +154,8 @@ impl ClientNetworkConfig {
         let effective_proxies = self.effective_proxies()?;
         #[cfg(not(tarpaulin))]
         tracing::debug!(connect_timeout_ms = self.connect_timeout.as_millis() as u64,
+            pool_max_idle_per_host = self.pool_max_idle_per_host,
+            pool_idle_timeout_ms = self.pool_idle_timeout.as_millis() as u64,
             has_proxy = effective_proxies.has_proxy(),
             custom_dns = !self.dns_servers.is_empty(),
             custom_doh = !self.doh_servers.is_empty(),
@@ -159,7 +165,10 @@ impl ClientNetworkConfig {
         let resolver = self.build_dns_resolver()?;
         let https = self.build_https_connector(resolver.clone())?;
         let mut builder = Client::builder(TokioExecutor::new());
-        builder.pool_max_idle_per_host(0);
+        builder.pool_max_idle_per_host(self.pool_max_idle_per_host);
+        if self.pool_max_idle_per_host > 0 {
+            builder.pool_idle_timeout(self.pool_idle_timeout);
+        }
 
         if effective_proxies.has_proxy() {
             let mut proxy_connector = ProxyConnector::new(https).map_err(|error| {
@@ -642,6 +651,8 @@ mod tests {
     fn test_network_config_defaults() {
         let config = ClientNetworkConfig::default();
         assert_eq!(config.connect_timeout, Duration::from_secs(30));
+        assert_eq!(config.pool_max_idle_per_host, 0);
+        assert_eq!(config.pool_idle_timeout, Duration::from_secs(30));
         assert!(config.all_proxy.is_none());
         assert!(config.http_proxy.is_none());
         assert!(config.https_proxy.is_none());
@@ -675,6 +686,7 @@ mod tests {
 
         assert_eq!(config.connect_timeout, Duration::from_secs(30));
         assert_eq!(updated.connect_timeout, Duration::from_secs(9));
+        assert_eq!(updated.pool_max_idle_per_host, 0);
         assert!(updated.enable_ipv6);
     }
 
@@ -1107,6 +1119,142 @@ mod tests {
         ));
 
         handle.join().unwrap();
+    }
+
+    fn spawn_connection_pool_test_server(
+        close_after_response: bool,
+        expected_requests: usize,
+    ) -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>, thread::JoinHandle<()>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let accepted_for_thread = accepted.clone();
+
+        let handle = thread::spawn(move || {
+            let mut served = 0usize;
+            while served < expected_requests {
+                let (mut stream, _) = listener.accept().unwrap();
+                accepted_for_thread.fetch_add(1, Ordering::SeqCst);
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+
+                loop {
+                    let mut request = Vec::new();
+                    let mut byte = [0u8; 1];
+                    loop {
+                        match stream.read(&mut byte) {
+                            Ok(0) => return,
+                            Ok(_) => {
+                                request.push(byte[0]);
+                                if request.ends_with(b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                continue;
+                            }
+                            Err(error) => panic!("failed to read request: {error}"),
+                        }
+                    }
+
+                    let (body, start, end, total) = match served {
+                        0 => (b"pong".as_slice(), 0, 3, 8),
+                        _ => (b"more".as_slice(), 4, 7, 8),
+                    };
+                    let connection_header = if close_after_response {
+                        "close"
+                    } else {
+                        "keep-alive"
+                    };
+                    let response = format!(
+                        concat!(
+                            "HTTP/1.1 206 Partial Content\r\n",
+                            "Content-Length: {}\r\n",
+                            "Content-Range: bytes {}-{}/{}\r\n",
+                            "Connection: {}\r\n\r\n",
+                        ),
+                        body.len(),
+                        start,
+                        end,
+                        total,
+                        connection_header,
+                    );
+                    stream.write_all(response.as_bytes()).unwrap();
+                    stream.write_all(body).unwrap();
+                    stream.flush().unwrap();
+
+                    served += 1;
+                    if close_after_response || served >= expected_requests {
+                        break;
+                    }
+                }
+            }
+        });
+
+        (addr, accepted, handle)
+    }
+
+    #[tokio::test]
+    async fn test_idle_pool_reuses_keep_alive_connection() {
+        use std::sync::atomic::Ordering;
+
+        let (addr, accepted, handle) = spawn_connection_pool_test_server(false, 2);
+        let client = ClientNetworkConfig {
+            pool_max_idle_per_host: 1,
+            pool_idle_timeout: Duration::from_secs(30),
+            ..ClientNetworkConfig::default()
+        }
+        .build_client()
+        .unwrap();
+
+        for (expected_start, expected_end) in [(0, 3), (4, 7)] {
+            let req = hyper::Request::builder()
+                .method("GET")
+                .uri(format!("http://{addr}/range"))
+                .header("range", format!("bytes={expected_start}-{expected_end}"))
+                .body(HttpRequestBody::new())
+                .unwrap();
+            let response = client.request(req).await.unwrap();
+            assert_eq!(response.status(), hyper::StatusCode::PARTIAL_CONTENT);
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(bytes.len(), 4);
+        }
+
+        handle.join().unwrap();
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_idle_pool_reconnects_after_connection_close() {
+        use std::sync::atomic::Ordering;
+
+        let (addr, accepted, handle) = spawn_connection_pool_test_server(true, 2);
+        let client = ClientNetworkConfig {
+            pool_max_idle_per_host: 1,
+            pool_idle_timeout: Duration::from_secs(30),
+            ..ClientNetworkConfig::default()
+        }
+        .build_client()
+        .unwrap();
+
+        for (expected_start, expected_end) in [(0, 3), (4, 7)] {
+            let req = hyper::Request::builder()
+                .method("GET")
+                .uri(format!("http://{addr}/range"))
+                .header("range", format!("bytes={expected_start}-{expected_end}"))
+                .body(HttpRequestBody::new())
+                .unwrap();
+            let response = client.request(req).await.unwrap();
+            assert_eq!(response.status(), hyper::StatusCode::PARTIAL_CONTENT);
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(bytes.len(), 4);
+        }
+
+        handle.join().unwrap();
+        assert_eq!(accepted.load(Ordering::SeqCst), 2);
     }
 
     #[test]
