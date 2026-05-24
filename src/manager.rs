@@ -210,12 +210,13 @@ impl Downloader {
         let task = tokio::spawn(async move {
             // Acquire a concurrency permit if a limit is configured.
             // The permit is held for the lifetime of this download task.
-            let _permit = match &concurrency_limit {
-                Some(sem) => Some(sem.acquire().await.map_err(|_| {
-                    DownloadError::Internal("concurrency semaphore closed".into())
-                })?),
-                None => None,
-            };
+            let _permit =
+                match &concurrency_limit {
+                    Some(sem) => Some(sem.acquire().await.map_err(|_| {
+                        DownloadError::Internal("concurrency semaphore closed".into())
+                    })?),
+                    None => None,
+                };
             let requested_config = requested_client_config_for_spec(&client_config, &spec);
             let client = cached_client_for_config(&client_cache, requested_config)?;
             session::run_download(client, spec, log_level, download_id, progress_tx, cancel_rx)
@@ -330,7 +331,10 @@ impl DownloadHandle {
         tokio::spawn(async move {
             while rx.changed().await.is_ok() {
                 let snap = rx.borrow().clone();
-                let terminal = !matches!(snap.state, DownloadState::Pending | DownloadState::Downloading);
+                let terminal = !matches!(
+                    snap.state,
+                    DownloadState::Pending | DownloadState::Downloading
+                );
                 callback(snap);
                 if terminal {
                     break;
@@ -394,7 +398,10 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(downloader.client_config.pool_max_idle_per_host, 2);
-        assert_eq!(downloader.client_config.pool_idle_timeout, Duration::from_secs(11));
+        assert_eq!(
+            downloader.client_config.pool_idle_timeout,
+            Duration::from_secs(11)
+        );
     }
 
     #[test]
@@ -452,7 +459,9 @@ mod tests {
 
         let handle = downloader.download(spec);
         let err = handle.wait().await.unwrap_err();
-        assert!(matches!(err, crate::error::DownloadError::InvalidConfig(message) if message.contains("max_connections")));
+        assert!(
+            matches!(err, crate::error::DownloadError::InvalidConfig(message) if message.contains("max_connections"))
+        );
     }
 
     #[test]
@@ -461,7 +470,10 @@ mod tests {
             .max_concurrent_downloads(3)
             .build()
             .unwrap();
-        let sem = d.concurrency_limit.as_ref().expect("semaphore should exist");
+        let sem = d
+            .concurrency_limit
+            .as_ref()
+            .expect("semaphore should exist");
         assert_eq!(sem.available_permits(), 3);
     }
 
@@ -590,9 +602,34 @@ mod tests {
             .all_proxy("http://127.0.0.1:7890");
 
         let requested = requested_client_config_for_spec(&downloader.client_config, &spec);
-        assert_eq!(requested.all_proxy.as_deref(), Some("http://127.0.0.1:7890"));
+        assert_eq!(
+            requested.all_proxy.as_deref(),
+            Some("http://127.0.0.1:7890")
+        );
         assert!(requested.http_proxy.is_none());
         assert!(requested.https_proxy.is_none());
+    }
+
+    #[test]
+    fn test_download_proxy_override_sets_scheme_specific_proxies() {
+        let downloader = Downloader::builder()
+            .all_proxy("http://127.0.0.1:9000")
+            .build()
+            .unwrap();
+        let spec = crate::config::DownloadSpec::new("http://127.0.0.1:1/nonexistent")
+            .http_proxy("http://127.0.0.1:8080")
+            .https_proxy("http://127.0.0.1:8443");
+
+        let requested = requested_client_config_for_spec(&downloader.client_config, &spec);
+        assert!(requested.all_proxy.is_none());
+        assert_eq!(
+            requested.http_proxy.as_deref(),
+            Some("http://127.0.0.1:8080")
+        );
+        assert_eq!(
+            requested.https_proxy.as_deref(),
+            Some("http://127.0.0.1:8443")
+        );
     }
 
     #[test]
@@ -645,7 +682,9 @@ mod tests {
             .output_path(std::env::temp_dir().join("bytehaul_test_closed_semaphore"));
 
         let err = downloader.download(spec).wait().await.unwrap_err();
-        assert!(matches!(err, crate::error::DownloadError::Internal(message) if message.contains("concurrency semaphore closed")));
+        assert!(
+            matches!(err, crate::error::DownloadError::Internal(message) if message.contains("concurrency semaphore closed"))
+        );
     }
 
     #[tokio::test]
