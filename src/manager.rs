@@ -242,7 +242,9 @@ fn requested_client_config_for_spec(
 
     if spec.has_pool_override() {
         requested.pool_max_idle_per_host = spec.get_pool_max_idle_per_host();
-        requested.pool_idle_timeout = spec.get_pool_idle_timeout();
+        if requested.pool_max_idle_per_host > 0 {
+            requested.pool_idle_timeout = spec.get_pool_idle_timeout();
+        }
     }
 
     if spec.has_proxy_override() {

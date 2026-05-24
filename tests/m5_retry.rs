@@ -70,6 +70,38 @@ fn flaky_server(
     warp::serve(route).bind_ephemeral(([127, 0, 0, 1], 0))
 }
 
+/// Server that rate-limits only the initial Range probe but would allow a plain GET.
+fn range_probe_retryable_error_server(
+    path_segment: &'static str,
+    data: Vec<u8>,
+) -> (std::net::SocketAddr, impl std::future::Future<Output = ()>) {
+    let data = Arc::new(data);
+    let d = data.clone();
+
+    let route = warp::path(path_segment)
+        .and(warp::header::optional::<String>("range"))
+        .map(move |range_header: Option<String>| {
+            let data = d.clone();
+            let total = data.len();
+
+            if range_header.is_some() {
+                return warp::http::Response::builder()
+                    .status(503)
+                    .header("retry-after", "0")
+                    .body(Vec::new())
+                    .unwrap();
+            }
+
+            warp::http::Response::builder()
+                .status(200)
+                .header("content-length", total.to_string())
+                .body(data.to_vec())
+                .unwrap()
+        });
+
+    warp::serve(route).bind_ephemeral(([127, 0, 0, 1], 0))
+}
+
 /// Server that always returns 403 (non-retryable).
 fn forbidden_server(
     path_segment: &'static str,
@@ -82,6 +114,33 @@ fn forbidden_server(
     });
 
     warp::serve(route).bind_ephemeral(([127, 0, 0, 1], 0))
+}
+
+#[tokio::test]
+async fn test_fresh_probe_503_does_not_fallback_to_plain_get() {
+    let content: Vec<u8> = (0..50_000u32).map(|i| (i % 199) as u8).collect();
+    let (addr, server) = range_probe_retryable_error_server("probe503", content);
+    tokio::spawn(server);
+
+    let dir = tempfile::tempdir().unwrap();
+    let output_path = dir.path().join("probe503.bin");
+
+    let downloader = Downloader::builder().build().unwrap();
+    let spec = DownloadSpec::new(format!("http://{addr}/probe503"))
+        .output_path(output_path)
+        .file_allocation(FileAllocation::None)
+        .max_connections(4)
+        .max_retries(0);
+
+    let err = downloader.download(spec).wait().await.unwrap_err();
+
+    match err {
+        bytehaul::DownloadError::HttpStatus { status, message } => {
+            assert_eq!(status, 503);
+            assert_eq!(message, "retry-after:0");
+        }
+        other => panic!("expected HttpStatus 503, got: {other:?}"),
+    }
 }
 
 #[tokio::test]

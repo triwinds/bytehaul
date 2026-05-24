@@ -44,8 +44,23 @@ async fn probe_or_fallback_get(
 ) -> Result<(HttpResponse, ResponseMeta, FreshResponseSource), DownloadError> {
     if spec.max_connections > 1 {
         let piece_end = spec.piece_size.saturating_sub(1);
-        if let Ok((resp, meta)) = worker.send_range(0, piece_end).await {
-            return Ok((resp, meta, FreshResponseSource::RangeProbe));
+        match retry_with_backoff(
+            spec.max_retries,
+            spec.retry_base_delay,
+            spec.retry_max_delay,
+            spec.max_retry_elapsed,
+            cancel_rx,
+            || worker.send_range(0, piece_end),
+        )
+        .await
+        {
+            Ok((resp, meta)) => {
+                return Ok((resp, meta, FreshResponseSource::RangeProbe));
+            }
+            Err(error) if should_abort_range_probe_fallback(&error) => {
+                return Err(error);
+            }
+            Err(_) => {}
         }
     }
     let (resp, meta) = retry_with_backoff(
@@ -58,6 +73,19 @@ async fn probe_or_fallback_get(
     )
     .await?;
     Ok((resp, meta, FreshResponseSource::FallbackGet))
+}
+
+fn should_abort_range_probe_fallback(error: &DownloadError) -> bool {
+    matches!(
+        error,
+        DownloadError::Cancelled
+            | DownloadError::Paused
+            | DownloadError::RetryBudgetExceeded { .. }
+            | DownloadError::HttpStatus {
+                status: 429 | 500 | 502 | 503 | 504,
+                ..
+            }
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -543,13 +571,13 @@ fn validate_metadata(meta: &ResponseMeta, ctrl: &ControlSnapshot) -> bool {
             return false;
         }
     }
-    if let (Some(expected), Some(actual)) = (&ctrl.etag, &meta.etag) {
-        if expected != actual {
+    if let Some(expected) = &ctrl.etag {
+        if meta.etag.as_ref() != Some(expected) {
             return false;
         }
     }
-    if let (Some(expected), Some(actual)) = (&ctrl.last_modified, &meta.last_modified) {
-        if expected != actual {
+    if let Some(expected) = &ctrl.last_modified {
+        if meta.last_modified.as_ref() != Some(expected) {
             return false;
         }
     }
@@ -779,6 +807,41 @@ mod tests {
     }
 
     #[test]
+    fn test_should_abort_range_probe_fallback_for_retryable_http_status() {
+        assert!(should_abort_range_probe_fallback(&DownloadError::HttpStatus {
+            status: 503,
+            message: "retry-after:0".into(),
+        }));
+        assert!(should_abort_range_probe_fallback(&DownloadError::HttpStatus {
+            status: 429,
+            message: "retry-after:1".into(),
+        }));
+    }
+
+    #[test]
+    fn test_should_abort_range_probe_fallback_for_stop_or_budget() {
+        assert!(should_abort_range_probe_fallback(&DownloadError::Cancelled));
+        assert!(should_abort_range_probe_fallback(&DownloadError::Paused));
+        assert!(should_abort_range_probe_fallback(
+            &DownloadError::RetryBudgetExceeded {
+                elapsed: Duration::from_secs(1),
+                limit: Duration::from_millis(500),
+            },
+        ));
+    }
+
+    #[test]
+    fn test_should_not_abort_range_probe_fallback_for_non_retryable_http_status() {
+        assert!(!should_abort_range_probe_fallback(&DownloadError::HttpStatus {
+            status: 416,
+            message: "Range Not Satisfiable".into(),
+        }));
+        assert!(!should_abort_range_probe_fallback(&DownloadError::InvalidConfig(
+            "bad url".into(),
+        )));
+    }
+
+    #[test]
     fn test_validate_metadata_etag_mismatch() {
         let meta = ResponseMeta {
             content_length: None,
@@ -787,6 +850,32 @@ mod tests {
             content_range_total: Some(1000),
             accept_ranges: true,
             etag: Some("\"new\"".into()),
+            last_modified: None,
+            content_disposition: None,
+            content_encoding: None,
+        };
+        let ctrl = ControlSnapshot {
+            url: "https://example.com".into(),
+            total_size: 1000,
+            piece_size: 1000,
+            piece_count: 1,
+            completed_bitset: vec![0],
+            downloaded_bytes: 0,
+            etag: Some("\"old\"".into()),
+            last_modified: None,
+        };
+        assert!(!validate_metadata(&meta, &ctrl));
+    }
+
+    #[test]
+    fn test_validate_metadata_missing_expected_etag_is_mismatch() {
+        let meta = ResponseMeta {
+            content_length: None,
+            content_range_start: None,
+            content_range_end: None,
+            content_range_total: Some(1000),
+            accept_ranges: true,
+            etag: None,
             last_modified: None,
             content_disposition: None,
             content_encoding: None,
@@ -814,6 +903,32 @@ mod tests {
             accept_ranges: true,
             etag: None,
             last_modified: Some("Fri, 02 Jan 2026".into()),
+            content_disposition: None,
+            content_encoding: None,
+        };
+        let ctrl = ControlSnapshot {
+            url: "https://example.com".into(),
+            total_size: 1000,
+            piece_size: 1000,
+            piece_count: 1,
+            completed_bitset: vec![0],
+            downloaded_bytes: 0,
+            etag: None,
+            last_modified: Some("Thu, 01 Jan 2026".into()),
+        };
+        assert!(!validate_metadata(&meta, &ctrl));
+    }
+
+    #[test]
+    fn test_validate_metadata_missing_expected_last_modified_is_mismatch() {
+        let meta = ResponseMeta {
+            content_length: None,
+            content_range_start: None,
+            content_range_end: None,
+            content_range_total: Some(1000),
+            accept_ranges: true,
+            etag: None,
+            last_modified: None,
             content_disposition: None,
             content_encoding: None,
         };
