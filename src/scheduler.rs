@@ -166,12 +166,8 @@ impl PieceRuntimeState {
         *next_lease_id = next_lease_id.saturating_add(1);
         let attempt = self.attempt_counter.saturating_add(1);
         self.attempt_counter = attempt;
-        self.active_leases.insert(
-            lease_id,
-            ActiveLeaseState {
-                range,
-            },
-        );
+        self.active_leases
+            .insert(lease_id, ActiveLeaseState { range });
 
         Some(Segment {
             piece_id,
@@ -243,10 +239,7 @@ impl SchedulerState {
         let pieces = (0..piece_count)
             .map(|piece_id| {
                 let (start, end) = piece_map.piece_range(piece_id);
-                PieceRuntimeState::new(
-                    ByteRange { start, end },
-                    piece_map.is_complete(piece_id),
-                )
+                PieceRuntimeState::new(ByteRange { start, end }, piece_map.is_complete(piece_id))
             })
             .collect();
         Self {
@@ -312,9 +305,12 @@ impl SchedulerState {
             return None;
         }
         let range = ByteRange::new(start, end)?;
-        self.pieces
-            .get_mut(piece_id)?
-            .issue_lease(range, worker_id, &mut self.next_lease_id, piece_id)
+        self.pieces.get_mut(piece_id)?.issue_lease(
+            range,
+            worker_id,
+            &mut self.next_lease_id,
+            piece_id,
+        )
     }
 
     /// Replace an active lease with a fresh lease identity for the same piece.
@@ -417,7 +413,10 @@ impl SchedulerState {
     }
 
     fn active_lease_count(&self) -> usize {
-        self.pieces.iter().map(PieceRuntimeState::active_lease_count).sum()
+        self.pieces
+            .iter()
+            .map(PieceRuntimeState::active_lease_count)
+            .sum()
     }
 
     fn available_range_count(&self) -> usize {
@@ -453,7 +452,7 @@ impl SchedulerState {
         }
 
         let desired_units_from_range = desired_units_from_range as u64;
-        let target_len = (range_len + desired_units_from_range - 1) / desired_units_from_range;
+        let target_len = range_len.div_ceil(desired_units_from_range);
         let segment_len = target_len.max(min_segment_size);
 
         if segment_len >= range_len || range_len - segment_len < min_segment_size {
@@ -619,6 +618,65 @@ mod tests {
         assert!(ranges.covers(ByteRange::new(0, 1_000).unwrap()));
         assert_eq!(ranges.ranges.len(), 1);
         assert_eq!(ranges.ranges[0], ByteRange::new(0, 1_000).unwrap());
+    }
+
+    #[test]
+    fn test_range_set_insert_handles_non_overlapping_positions() {
+        let mut ranges = RangeSet::default();
+        ranges.insert(ByteRange::new(10, 20).unwrap());
+        ranges.insert(ByteRange::new(30, 40).unwrap());
+        ranges.insert(ByteRange::new(0, 5).unwrap());
+
+        assert_eq!(
+            ranges.ranges,
+            vec![
+                ByteRange::new(0, 5).unwrap(),
+                ByteRange::new(10, 20).unwrap(),
+                ByteRange::new(30, 40).unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_range_set_remove_rejects_missing_range_and_splits_existing_range() {
+        let mut missing = RangeSet::new_full(0, 100);
+        assert!(!missing.remove(ByteRange::new(150, 200).unwrap()));
+
+        let mut split = RangeSet::new_full(0, 100);
+        assert!(split.remove(ByteRange::new(25, 75).unwrap()));
+        assert_eq!(
+            split.ranges,
+            vec![
+                ByteRange::new(0, 25).unwrap(),
+                ByteRange::new(75, 100).unwrap()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_scheduler_invalid_lease_operations_return_false_or_none() {
+        let pm = PieceMap::new(1_000, 1_000);
+        let mut sched = SchedulerState::new(pm);
+
+        assert!(sched.assign_subrange(99, 0, 100, 1).is_none());
+
+        let lease = LeaseKey {
+            piece_id: 0,
+            lease_id: 999,
+        };
+        assert!(!sched.complete(lease));
+        assert!(!sched.reclaim(lease));
+    }
+
+    #[test]
+    fn test_scheduler_rejects_completed_piece_subrange_and_renewal() {
+        let pm = PieceMap::new(1_000, 1_000);
+        let mut sched = SchedulerState::new(pm);
+
+        let segment = sched.assign().unwrap();
+        assert!(sched.complete(segment.lease_key()));
+        assert!(sched.assign_subrange(0, 0, 100, 1).is_none());
+        assert!(sched.renew(segment.lease_key(), 1).is_none());
     }
 
     #[test]

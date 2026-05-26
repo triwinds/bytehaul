@@ -25,8 +25,8 @@ use crate::storage::writer::{FlushAllStats, WriterCommand};
 
 use self::multi::run_multi_worker;
 use self::range_validate::{
-    validate_range_response, ExpectedRange, FreshRangeFallbackReason,
-    RangeValidationDecision, RangeValidationMode,
+    validate_range_response, ExpectedRange, FreshRangeFallbackReason, RangeValidationDecision,
+    RangeValidationMode,
 };
 use self::resume::try_resume_download;
 use self::retry::retry_with_backoff;
@@ -169,8 +169,7 @@ impl ControlSaveTracker {
 
         match reason {
             ControlSaveReason::Autosave => {
-                self.autosave_ticks_since_save =
-                    self.autosave_ticks_since_save.saturating_add(1);
+                self.autosave_ticks_since_save = self.autosave_ticks_since_save.saturating_add(1);
                 self.autosave_ticks_since_save >= autosave_sync_every
             }
             ControlSaveReason::Terminal => true,
@@ -225,8 +224,7 @@ fn resolve_static_output_path(spec: &DownloadSpec) -> Result<Option<PathBuf>, Do
     }
     let relative = sanitize_relative_path(output_path).ok_or_else(|| {
         DownloadError::InvalidConfig(
-            "output_path must be a relative path without root prefixes or parent traversal"
-                .into(),
+            "output_path must be a relative path without root prefixes or parent traversal".into(),
         )
     })?;
     Ok(Some(resolve_output_dir(spec)?.join(relative)))
@@ -295,7 +293,8 @@ async fn run_fresh_from_response(
                         piece_size = spec.piece_size,
                         "download strategy selected"
                     );
-                    let piece_map = crate::storage::piece_map::PieceMap::new(total_size, spec.piece_size);
+                    let piece_map =
+                        crate::storage::piece_map::PieceMap::new(total_size, spec.piece_size);
                     run_multi_worker(
                         client,
                         spec,
@@ -331,7 +330,8 @@ async fn run_fresh_from_response(
                 );
 
                 if should_refetch_full_body {
-                    (response, meta) = retry_plain_get(client.clone(), spec, &mut cancel_rx).await?;
+                    (response, meta) =
+                        retry_plain_get(client.clone(), spec, &mut cancel_rx).await?;
                 }
 
                 let total = single_response_total_size(response.status().as_u16(), &meta);
@@ -359,7 +359,8 @@ async fn run_fresh_from_response(
                         "range not supported (200 response)"
                     }
                     FreshRangeFallbackReason::EncodedResponse => {
-                        (response, meta) = retry_plain_get(client.clone(), spec, &mut cancel_rx).await?;
+                        (response, meta) =
+                            retry_plain_get(client.clone(), spec, &mut cancel_rx).await?;
                         "range probe returned encoded response; refetching full body"
                     }
                 };
@@ -399,7 +400,9 @@ async fn run_fresh_from_response(
             "range not supported (200 response)"
         }
         FreshResponseSource::RangeProbe => "file below min_split_size",
-        FreshResponseSource::FallbackGet => "fallback GET (single connection or range probe failed)",
+        FreshResponseSource::FallbackGet => {
+            "fallback GET (single connection or range probe failed)"
+        }
     };
     log_info!(
         log_level,
@@ -437,7 +440,15 @@ pub(crate) async fn run_download(
     cancel_rx: watch::Receiver<StopSignal>,
 ) -> Result<(), DownloadError> {
     let checksum = spec.checksum.clone();
-    let result = run_download_inner(client, spec, log_level, download_id, &progress_tx, cancel_rx).await;
+    let result = run_download_inner(
+        client,
+        spec,
+        log_level,
+        download_id,
+        &progress_tx,
+        cancel_rx,
+    )
+    .await;
 
     let output_path = match result {
         Ok(output_path) => output_path,
@@ -455,7 +466,12 @@ pub(crate) async fn run_download(
 
     // Post-download checksum verification
     if let Some(ref expected) = checksum {
-        log_info!(log_level, download_id, algorithm = "sha256", "checksum verification started");
+        log_info!(
+            log_level,
+            download_id,
+            algorithm = "sha256",
+            "checksum verification started"
+        );
         match verify_checksum(&output_path, expected).await {
             Ok(()) => {
                 log_info!(log_level, download_id, "checksum verification passed");
@@ -503,7 +519,8 @@ async fn run_download_inner(
         }
 
         return {
-            let (resp, meta, source) = probe_or_fallback_get(&worker, &spec, &mut cancel_rx).await?;
+            let (resp, meta, source) =
+                probe_or_fallback_get(&worker, &spec, &mut cancel_rx).await?;
             let request_url = worker.final_url().await?;
             run_fresh_from_response(
                 client,
@@ -678,6 +695,27 @@ async fn flush_all_and_wait(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use warp::Filter;
+
+    fn worker_for(
+        url: String,
+        max_connections: u32,
+        max_retries: u32,
+    ) -> (HttpWorker, DownloadSpec) {
+        let spec = DownloadSpec::new(url)
+            .output_path("unused.bin")
+            .max_connections(max_connections)
+            .max_retries(max_retries);
+        let client = crate::network::ClientNetworkConfig::default()
+            .build_client()
+            .unwrap();
+        (HttpWorker::new(client, &spec), spec)
+    }
+
+    fn running_cancel_rx() -> watch::Receiver<StopSignal> {
+        let (_cancel_tx, cancel_rx) = watch::channel(StopSignal::Running);
+        cancel_rx
+    }
 
     #[test]
     fn test_range_response_allowed_no_encoding() {
@@ -808,14 +846,18 @@ mod tests {
 
     #[test]
     fn test_should_abort_range_probe_fallback_for_retryable_http_status() {
-        assert!(should_abort_range_probe_fallback(&DownloadError::HttpStatus {
-            status: 503,
-            message: "retry-after:0".into(),
-        }));
-        assert!(should_abort_range_probe_fallback(&DownloadError::HttpStatus {
-            status: 429,
-            message: "retry-after:1".into(),
-        }));
+        assert!(should_abort_range_probe_fallback(
+            &DownloadError::HttpStatus {
+                status: 503,
+                message: "retry-after:0".into(),
+            }
+        ));
+        assert!(should_abort_range_probe_fallback(
+            &DownloadError::HttpStatus {
+                status: 429,
+                message: "retry-after:1".into(),
+            }
+        ));
     }
 
     #[test]
@@ -832,13 +874,107 @@ mod tests {
 
     #[test]
     fn test_should_not_abort_range_probe_fallback_for_non_retryable_http_status() {
-        assert!(!should_abort_range_probe_fallback(&DownloadError::HttpStatus {
-            status: 416,
-            message: "Range Not Satisfiable".into(),
-        }));
-        assert!(!should_abort_range_probe_fallback(&DownloadError::InvalidConfig(
-            "bad url".into(),
-        )));
+        assert!(!should_abort_range_probe_fallback(
+            &DownloadError::HttpStatus {
+                status: 416,
+                message: "Range Not Satisfiable".into(),
+            }
+        ));
+        assert!(!should_abort_range_probe_fallback(
+            &DownloadError::InvalidConfig("bad url".into(),)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_probe_or_fallback_get_uses_range_probe_when_available() {
+        let route = warp::path("probe-ok")
+            .and(warp::header::optional::<String>("range"))
+            .map(|range_header: Option<String>| match range_header {
+                Some(_) => warp::http::Response::builder()
+                    .status(206)
+                    .header("content-length", "4")
+                    .header("content-range", "bytes 0-3/8")
+                    .body("test")
+                    .unwrap(),
+                None => warp::http::Response::builder()
+                    .status(200)
+                    .header("content-length", "8")
+                    .body("testdata")
+                    .unwrap(),
+            });
+        let (addr, server) = warp::serve(route).bind_ephemeral(([127, 0, 0, 1], 0));
+        tokio::spawn(server);
+
+        let (worker, spec) = worker_for(format!("http://{addr}/probe-ok"), 4, 0);
+        let mut cancel_rx = running_cancel_rx();
+        let (_, meta, source) = probe_or_fallback_get(&worker, &spec, &mut cancel_rx)
+            .await
+            .unwrap();
+
+        assert!(matches!(source, FreshResponseSource::RangeProbe));
+        assert_eq!(meta.content_range_start, Some(0));
+        assert_eq!(meta.content_range_end, Some(3));
+        assert_eq!(meta.content_range_total, Some(8));
+    }
+
+    #[tokio::test]
+    async fn test_probe_or_fallback_get_returns_retryable_probe_error() {
+        let route = warp::path("probe-503")
+            .and(warp::header::optional::<String>("range"))
+            .map(|range_header: Option<String>| match range_header {
+                Some(_) => warp::http::Response::builder()
+                    .status(503)
+                    .header("retry-after", "0")
+                    .body(String::new())
+                    .unwrap(),
+                None => warp::http::Response::builder()
+                    .status(200)
+                    .header("content-length", "8")
+                    .body(String::from("testdata"))
+                    .unwrap(),
+            });
+        let (addr, server) = warp::serve(route).bind_ephemeral(([127, 0, 0, 1], 0));
+        tokio::spawn(server);
+
+        let (worker, spec) = worker_for(format!("http://{addr}/probe-503"), 4, 0);
+        let mut cancel_rx = running_cancel_rx();
+        let err = probe_or_fallback_get(&worker, &spec, &mut cancel_rx)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            DownloadError::HttpStatus { status: 503, ref message } if message == "retry-after:0"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_probe_or_fallback_get_falls_back_after_non_abort_probe_error() {
+        let route = warp::path("probe-fallback")
+            .and(warp::header::optional::<String>("range"))
+            .map(|range_header: Option<String>| match range_header {
+                Some(_) => warp::http::Response::builder()
+                    .status(416)
+                    .body(String::new())
+                    .unwrap(),
+                None => warp::http::Response::builder()
+                    .status(200)
+                    .header("content-length", "8")
+                    .body(String::from("testdata"))
+                    .unwrap(),
+            });
+        let (addr, server) = warp::serve(route).bind_ephemeral(([127, 0, 0, 1], 0));
+        tokio::spawn(server);
+
+        let (worker, spec) = worker_for(format!("http://{addr}/probe-fallback"), 4, 0);
+        let mut cancel_rx = running_cancel_rx();
+        let (_, meta, source) = probe_or_fallback_get(&worker, &spec, &mut cancel_rx)
+            .await
+            .unwrap();
+
+        assert!(matches!(source, FreshResponseSource::FallbackGet));
+        assert_eq!(meta.content_length, Some(8));
+        assert_eq!(meta.content_range_start, None);
     }
 
     #[test]
@@ -1051,8 +1187,8 @@ mod tests {
 
     #[test]
     fn test_resolve_output_dir_uses_cwd_when_none() {
-        let spec = DownloadSpec::new("http://example.com/file")
-            .output_path(PathBuf::from("file.bin"));
+        let spec =
+            DownloadSpec::new("http://example.com/file").output_path(PathBuf::from("file.bin"));
         let dir = resolve_output_dir(&spec).unwrap();
         assert!(dir.is_absolute());
     }
@@ -1085,8 +1221,7 @@ mod tests {
     #[test]
     fn test_resolve_static_output_path_absolute() {
         let abs_path = std::env::temp_dir().join("bytehaul_test_abs.bin");
-        let spec = DownloadSpec::new("http://example.com/file")
-            .output_path(abs_path.clone());
+        let spec = DownloadSpec::new("http://example.com/file").output_path(abs_path.clone());
         let result = resolve_static_output_path(&spec).unwrap();
         assert_eq!(result, Some(abs_path));
     }
@@ -1094,8 +1229,7 @@ mod tests {
     #[test]
     fn test_resolve_static_output_path_absolute_with_output_dir_is_error() {
         let abs_path = std::env::temp_dir().join("bytehaul_test_abs.bin");
-        let mut spec = DownloadSpec::new("http://example.com/file")
-            .output_path(abs_path);
+        let mut spec = DownloadSpec::new("http://example.com/file").output_path(abs_path);
         spec.output_dir = Some(std::env::temp_dir());
         let result = resolve_static_output_path(&spec);
         assert!(matches!(result, Err(DownloadError::InvalidConfig(_))));
@@ -1103,8 +1237,8 @@ mod tests {
 
     #[test]
     fn test_resolve_static_output_path_relative() {
-        let spec = DownloadSpec::new("http://example.com/file")
-            .output_path(PathBuf::from("data.bin"));
+        let spec =
+            DownloadSpec::new("http://example.com/file").output_path(PathBuf::from("data.bin"));
         let result = resolve_static_output_path(&spec).unwrap().unwrap();
         assert!(result.is_absolute());
         assert!(result.ends_with("data.bin"));
