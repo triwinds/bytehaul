@@ -52,6 +52,13 @@ impl TransportError {
         )
     }
 
+    pub(crate) fn body<E>(source: E) -> Self
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        Self::new(TransportErrorKind::Body, source)
+    }
+
     pub(crate) fn kind(&self) -> TransportErrorKind {
         self.kind
     }
