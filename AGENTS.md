@@ -1,8 +1,21 @@
-# Project Notes
+<!-- TRELLIS:START -->
+# Trellis Instructions
 
-- For Python work under `bindings/python`, use `uv` to manage the project environment and dev dependencies.
-- Prefer `uv sync --project bindings/python` before running Python-side tooling.
-- Prefer `uv run --project bindings/python maturin build`, `uv run --project bindings/python maturin develop`, and `uv run --project bindings/python pytest` over ad-hoc `pip install` or manual `venv` setup.
-- After every code change, run `cargo tarpaulin --engine llvm --workspace --all-targets --out Stdout --fail-under 95` on Linux/CI and make sure local unit test coverage stays at or above 96% so CI keeps headroom above the 95% gate.
-- On Windows, generate local coverage reports with `powershell -ExecutionPolicy Bypass -File scripts/coverage-windows.ps1 -Scope all-targets -Format html` or `-Format json`; the helper defaults to the same `all-targets` scope as CI and uses `cargo-llvm-cov` with `CARGO_BUILD_JOBS=1` plus a fresh isolated target dir per run to avoid locked files and incomplete reports.
-- After every push, check that GitHub Actions workflows complete successfully; if CI reports any warnings, fix them promptly.
+These instructions are for AI assistants working in this project.
+
+This project is managed by Trellis. The working knowledge you need lives under `.trellis/`:
+
+- `.trellis/workflow.md` — development phases, when to create tasks, skill routing
+- `.trellis/spec/` — package- and layer-scoped coding guidelines (read before writing code in a given layer)
+- `.trellis/workspace/` — per-developer journals and session traces
+- `.trellis/tasks/` — active and archived tasks (PRDs, research, jsonl context)
+
+If a Trellis command is available on your platform (e.g. `/trellis:finish-work`, `/trellis:continue`), prefer it over manual steps. Not every platform exposes every command.
+
+If you're using Codex or another agent-capable tool, additional project-scoped helpers may live in:
+- `.agents/skills/` — reusable Trellis skills
+- `.codex/agents/` — optional custom subagents
+
+Managed by Trellis. Edits outside this block are preserved; edits inside may be overwritten by a future `trellis update`.
+
+<!-- TRELLIS:END -->
