@@ -18,6 +18,14 @@ rm /path/to/your-file.zip.bytehaul
 
 删除后，下载会从头开始。
 
+## 响应体传输中断
+
+**现象：** 单连接下载在读取响应体时遇到超时、连接重置或提前 EOF。
+
+**处理方法：** 这些网络错误会在同一个重试预算内自动重试。已知文件大小时，bytehaul 只从 writer flush barrier 确认的连续前缀发送 Range 请求；如果服务端忽略 Range，或 ETag、Last-Modified、总大小发生变化，会先清空输出再从零开始，避免把两个对象拼接起来。`max_retries` 是初次尝试之后的额外重试次数，设为 `0` 可关闭重试。
+
+若日志中出现 `restart_from_zero`，请重点检查对象是否被覆盖、下载 URL 是否指向动态内容，以及服务端是否稳定支持 Range。
+
 ## 代理配置
 
 **现象：** 在代理网络后出现连接失败，或者日志里有 `ProxyError`。

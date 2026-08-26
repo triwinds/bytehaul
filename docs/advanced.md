@@ -29,7 +29,7 @@ let spec = DownloadSpec::new("https://example.com/file.bin")
 
 bytehaul now validates these task-level settings through `DownloadSpec::validate()` before network work starts, so invalid combinations fail consistently instead of relying on scattered runtime checks.
 
-`max_retries` still controls how many retry attempts are allowed. `max_retry_elapsed` adds a separate time budget. If the retry loop would exceed that budget, the request stops with `DownloadError::RetryBudgetExceeded` instead of continuing until the retry count is exhausted.
+`max_retries` controls the additional retries allowed after the initial request/transfer attempt. `max_retry_elapsed` adds a separate time budget. In single-connection mode, body failures stay in one transfer retry scope and resume from the contiguous prefix confirmed by the writer flush barrier; later Range connection and validation failures consume the same budget. If the retry loop would exceed that budget, the request stops with `DownloadError::RetryBudgetExceeded` instead of continuing until the retry count is exhausted.
 
 If you omit `.output_path(...)`, bytehaul will detect the filename from `Content-Disposition`, then the URL path, then `download`. Absolute output paths are still accepted when `.output_dir(...)` is not set.
 

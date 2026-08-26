@@ -105,4 +105,4 @@ graph TD
 
 ## 重试与韧性
 
-失败的 HTTP 请求会采用指数退避并叠加完整抖动（`fastrand`）进行重试。可配置参数包括：`max_retries`、`retry_base_delay`、`retry_max_delay`、`max_retry_elapsed`。恢复下载时，控制文件会先做校验（magic、version、CRC32）；如果文件损坏，bytehaul 会安全地丢弃它并从头开始。
+失败的 HTTP 请求和响应体传输会采用统一的指数退避并叠加等抖动（equal jitter，`fastrand`）进行重试。单连接在 body 失败后只从 writer flush barrier 确认的连续前缀发起 Range 续传；Range/metadata 不匹配或无法证明非零偏移时会先清空输出再从零重启。`max_retries` 表示初次尝试之后允许的额外重试次数，`0` 表示不重试。可配置参数包括：`max_retries`、`retry_base_delay`、`retry_max_delay`、`max_retry_elapsed`。恢复下载时，控制文件会先做校验（magic、version、CRC32）；如果文件损坏，bytehaul 会安全地丢弃它并从头开始。

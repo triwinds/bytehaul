@@ -21,7 +21,7 @@ A Rust async HTTP download library with Python bindings (also available on PyPI)
 - **Pause / resume** — cooperative pause with persisted control files for later continuation
 - **Write-back cache** — piece-based aggregation to reduce random I/O
 - **Memory budget & backpressure** — semaphore-based flow control
-- **Retry with exponential backoff** — configurable max retries, respects `Retry-After`
+- **Retry with exponential backoff** — shared by single/multi transfers, resumes body failures safely, respects `Retry-After`
 - **Rate limiting** — shared token-bucket across all workers
 - **SHA-256 checksum verification** — post-download integrity check
 - **Cancellation** — cooperative cancel via stop signal

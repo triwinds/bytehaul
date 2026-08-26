@@ -18,6 +18,14 @@ rm /path/to/your-file.zip.bytehaul
 
 The download will restart from scratch.
 
+## Response Body Interrupted
+
+**Symptom:** A single-connection download hits a timeout, connection reset, or early EOF while reading the response body.
+
+**Resolution:** These network errors are retried within the same retry budget. When the file size is known, bytehaul sends the next Range request only from the contiguous prefix confirmed by the writer flush barrier. If the server ignores Range, or the ETag, Last-Modified, or total size changes, bytehaul truncates the output and restarts from zero so two objects are never concatenated. `max_retries` counts additional retries after the initial attempt; set it to `0` to disable retries.
+
+If logs contain `restart_from_zero`, check whether the remote object is being replaced, the URL serves dynamic content, or the server consistently supports Range.
+
 ## Proxy Configuration
 
 **Symptom:** Connection failures when behind a proxy, or `ProxyError` in logs.

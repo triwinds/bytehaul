@@ -235,7 +235,7 @@ except DownloadFailedError as exc:
 | `resume` | `bool` | `True` | 是否启用断点续传 |
 | `piece_size` | `int` | `1048576` | 分片大小，单位字节 |
 | `min_split_size` | `int` | `10485760` | 文件大于该值时才拆分 |
-| `max_retries` | `int` | `5` | 最大重试次数 |
+| `max_retries` | `int` | `5` | 初次请求/传输失败后的额外重试次数；`0` 表示不重试 |
 | `retry_base_delay` | `float` | `1.0` | 重试基础退避时间，单位秒 |
 | `retry_max_delay` | `float` | `30.0` | 重试最大退避时间，单位秒 |
 | `max_download_speed` | `int` | `0` | 最大下载速度，`0` 表示不限速 |

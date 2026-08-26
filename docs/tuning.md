@@ -113,12 +113,12 @@ Rate limiter for the download. Set to a non-zero value to cap bandwidth usage. U
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `max_retries` | 5 | Maximum retry attempts per failed request |
+| `max_retries` | 5 | Maximum additional retries after the initial request/transfer attempt (`0` = no retries) |
 | `retry_base_delay` | 1 s | Initial back-off delay |
 | `retry_max_delay` | 30 s | Maximum back-off cap |
 | `max_retry_elapsed` | None | Total retry time budget (None = unlimited) |
 
-Retries use exponential back-off with full jitter to avoid thundering-herd effects when multiple clients retry against the same server.
+Requests and response-body retries share exponential back-off with equal jitter to avoid thundering-herd effects when multiple clients retry against the same server. A single-connection body failure resumes from the writer's flushed contiguous prefix; a Range or object-metadata mismatch safely truncates and restarts from zero.
 
 ## Benchmark Snapshot
 
