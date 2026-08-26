@@ -1,0 +1,4 @@
+{"file":".trellis/tasks/08-26-single-connection-retry/research/repository-evidence.md","reason":"实现前加载当前行为、关键代码锚点和历史决策，守住 retry scope、writer barrier 与兼容性边界。"}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"改造跨越 HTTP、session、writer/control、progress 与 Python 文档层，需要逐层核对数据流和语义。"}
+{"file":".trellis/spec/guides/code-reuse-thinking-guide.md","reason":"共享重试状态机与 Range/metadata validator 必须优先复用并消除重复策略。"}
+{"file": ".trellis/spec/bytehaul-python/backend/errors-and-observability.md", "reason": "实现时遵循 DownloadError 分类、RetryState scope、durable prefix 与日志字段契约。"}

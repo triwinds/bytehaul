@@ -1,0 +1,4 @@
+{"file":".trellis/tasks/08-26-single-connection-retry/research/repository-evidence.md","reason":"检查实现是否覆盖已确认缺口，并没有改变 multi、control 与公开重试语义。"}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"验证 HTTP response、durable prefix、progress、control snapshot 和 binding 文档的端到端一致性。"}
+{"file": ".trellis/spec/bytehaul-python/backend/errors-and-observability.md", "reason": "校验单/多连接共享重试策略、writer barrier 错误传播、终止状态与结构化日志契约。"}
+{"file": ".trellis/spec/bytehaul-python/backend/testing-and-quality.md", "reason": "最终门禁包括 no-proxy 全量 Rust 目标、clippy、rustdoc，以及 workspace Python 链接限制记录。"}
