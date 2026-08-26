@@ -128,7 +128,10 @@ async fn test_single_connection_eta_reports() {
     handle.wait().await.unwrap();
     let final_snap = rx.borrow_and_update().clone();
     assert!(saw_eta, "eta should become available during download");
-    assert!(saw_speed, "speed should be driven by the same recent samples as eta");
+    assert!(
+        saw_speed,
+        "speed should be driven by the same recent samples as eta"
+    );
     assert_eq!(final_snap.eta_secs, Some(0.0));
 }
 
@@ -177,7 +180,10 @@ async fn test_single_connection_progress_callback_is_throttled_and_terminal() {
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     let delivered = callback_count.load(Ordering::Relaxed);
-    assert!(delivered < 30, "expected throttled callback delivery, got {delivered}");
+    assert!(
+        delivered < 30,
+        "expected throttled callback delivery, got {delivered}"
+    );
     assert_eq!(*final_state.lock().unwrap(), Some(DownloadState::Completed));
 }
 

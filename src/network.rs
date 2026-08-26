@@ -153,14 +153,16 @@ impl ClientNetworkConfig {
     pub(crate) fn build_client(&self) -> Result<BytehaulClient, DownloadError> {
         let effective_proxies = self.effective_proxies()?;
         #[cfg(not(tarpaulin))]
-        tracing::debug!(connect_timeout_ms = self.connect_timeout.as_millis() as u64,
+        tracing::debug!(
+            connect_timeout_ms = self.connect_timeout.as_millis() as u64,
             pool_max_idle_per_host = self.pool_max_idle_per_host,
             pool_idle_timeout_ms = self.pool_idle_timeout.as_millis() as u64,
             has_proxy = effective_proxies.has_proxy(),
             custom_dns = !self.dns_servers.is_empty(),
             custom_doh = !self.doh_servers.is_empty(),
             enable_ipv6 = self.enable_ipv6,
-            "building HTTP client");
+            "building HTTP client"
+        );
 
         let resolver = self.build_dns_resolver()?;
         let https = self.build_https_connector(resolver.clone())?;
@@ -172,7 +174,9 @@ impl ClientNetworkConfig {
 
         if effective_proxies.has_proxy() {
             let mut proxy_connector = ProxyConnector::new(https).map_err(|error| {
-                DownloadError::InvalidConfig(format!("failed to configure proxy connector: {error}"))
+                DownloadError::InvalidConfig(format!(
+                    "failed to configure proxy connector: {error}"
+                ))
             })?;
             if let Some(proxy) = effective_proxies.http_proxy {
                 proxy_connector.add_proxy(Proxy::new(Intercept::Http, proxy));
@@ -190,7 +194,10 @@ impl ClientNetworkConfig {
             }))
         } else {
             let client = builder.build(https);
-            Ok(BytehaulClient::Direct(BytehaulDirectClient { client, resolver }))
+            Ok(BytehaulClient::Direct(BytehaulDirectClient {
+                client,
+                resolver,
+            }))
         }
     }
 
@@ -216,13 +223,14 @@ impl ClientNetworkConfig {
             Err(error) => {
                 #[cfg(not(tarpaulin))]
                 tracing::debug!(error = %error, "platform verifier unavailable, falling back to native roots");
-                let builder = HttpsConnectorBuilder::new()
-                    .with_native_roots()
-                    .map_err(|fallback_error| {
-                        DownloadError::Internal(format!(
-                            "failed to initialize native TLS roots: {fallback_error}"
-                        ))
-                    })?;
+                let builder =
+                    HttpsConnectorBuilder::new()
+                        .with_native_roots()
+                        .map_err(|fallback_error| {
+                            DownloadError::Internal(format!(
+                                "failed to initialize native TLS roots: {fallback_error}"
+                            ))
+                        })?;
                 Ok(builder
                     .https_or_http()
                     .enable_http1()
@@ -242,9 +250,21 @@ impl ClientNetworkConfig {
 
     fn effective_proxies(&self) -> Result<EffectiveProxyConfig, DownloadError> {
         Ok(EffectiveProxyConfig {
-            all_proxy: proxy_uri(self.all_proxy.as_deref(), &["ALL_PROXY", "all_proxy"], "all_proxy")?,
-            http_proxy: proxy_uri(self.http_proxy.as_deref(), &["HTTP_PROXY", "http_proxy"], "http_proxy")?,
-            https_proxy: proxy_uri(self.https_proxy.as_deref(), &["HTTPS_PROXY", "https_proxy"], "https_proxy")?,
+            all_proxy: proxy_uri(
+                self.all_proxy.as_deref(),
+                &["ALL_PROXY", "all_proxy"],
+                "all_proxy",
+            )?,
+            http_proxy: proxy_uri(
+                self.http_proxy.as_deref(),
+                &["HTTP_PROXY", "http_proxy"],
+                "http_proxy",
+            )?,
+            https_proxy: proxy_uri(
+                self.https_proxy.as_deref(),
+                &["HTTPS_PROXY", "https_proxy"],
+                "https_proxy",
+            )?,
         })
     }
 }
@@ -310,9 +330,8 @@ struct BytehaulDnsResolver {
     cache: SharedDnsCache,
 }
 
-type ResolverFuture = Pin<
-    Box<dyn Future<Output = Result<std::vec::IntoIter<SocketAddr>, BoxError>> + Send>,
->;
+type ResolverFuture =
+    Pin<Box<dyn Future<Output = Result<std::vec::IntoIter<SocketAddr>, BoxError>> + Send>>;
 
 impl BytehaulDnsResolver {
     fn new(
@@ -414,7 +433,12 @@ impl Service<DnsName> for BytehaulDnsResolver {
     fn call(&mut self, name: DnsName) -> Self::Future {
         let resolver = self.clone();
         let host = name.as_str().to_string();
-        Box::pin(async move { resolver.lookup_host(host).await.map(|addrs| addrs.into_iter()) })
+        Box::pin(async move {
+            resolver
+                .lookup_host(host)
+                .await
+                .map(|addrs| addrs.into_iter())
+        })
     }
 }
 
@@ -435,7 +459,9 @@ fn store_cached_lookup(
     addrs: Vec<SocketAddr>,
     valid_until: Instant,
 ) {
-    cache.lock().insert(host, CachedDnsLookup { valid_until, addrs });
+    cache
+        .lock()
+        .insert(host, CachedDnsLookup { valid_until, addrs });
 }
 
 fn duration_to_u64_millis(duration: Duration) -> u64 {
@@ -556,9 +582,7 @@ where
     })?;
     let host_display = host.to_string();
     let port = url.port_or_known_default().ok_or_else(|| {
-        DownloadError::InvalidConfig(format!(
-            "DoH server URL '{server}' is missing a valid port"
-        ))
+        DownloadError::InvalidConfig(format!("DoH server URL '{server}' is missing a valid port"))
     })?;
 
     let host_for_resolution = host_display
@@ -627,7 +651,11 @@ mod tests {
     use http_body_util::BodyExt;
     use std::str::FromStr;
     use std::sync::Mutex as StdMutex;
-    use std::{io::{Read, Write}, net::TcpListener, thread};
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        thread,
+    };
 
     fn env_lock() -> &'static StdMutex<()> {
         static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
@@ -706,8 +734,8 @@ mod tests {
 
     #[test]
     fn test_build_name_server_group_adds_doh_servers() {
-        let group = build_name_server_group(&[], &["https://127.0.0.1/dns-query".into()], false)
-            .unwrap();
+        let group =
+            build_name_server_group(&[], &["https://127.0.0.1/dns-query".into()], false).unwrap();
 
         assert_eq!(group.len(), 1);
         let config = group.iter().next().unwrap();
@@ -719,9 +747,11 @@ mod tests {
 
     #[test]
     fn test_parse_doh_server_resolves_hostnames_and_custom_paths() {
-        let config =
-            parse_doh_server("https://localhost/custom-dns?ct=application/dns-message", false)
-                .unwrap();
+        let config = parse_doh_server(
+            "https://localhost/custom-dns?ct=application/dns-message",
+            false,
+        )
+        .unwrap();
 
         assert!(!config.socket_addrs.is_empty());
         assert!(config.socket_addrs.iter().all(SocketAddr::is_ipv4));
@@ -769,7 +799,10 @@ mod tests {
     fn test_parse_doh_server_rejects_empty_query_and_fragment_authorities() {
         for server in ["https://", "https://?dns=1", "https://#fragment"] {
             let err = parse_doh_server(server, true).unwrap_err().to_string();
-            assert!(err.contains("missing a host"), "unexpected error for {server}: {err}");
+            assert!(
+                err.contains("missing a host"),
+                "unexpected error for {server}: {err}"
+            );
         }
     }
 
@@ -786,17 +819,23 @@ mod tests {
     fn test_parse_doh_server_accepts_ipv6_literal_when_enabled() {
         let config = parse_doh_server("https://[::1]/dns-query", true).unwrap();
 
-        assert_eq!(config.socket_addrs, vec![SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 443))]);
+        assert_eq!(
+            config.socket_addrs,
+            vec![SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 443))]
+        );
         assert_eq!(config.tls_dns_name, "[::1]");
         assert!(config.http_endpoint.is_none());
     }
 
     #[test]
     fn test_parse_doh_server_preserves_root_query_endpoint() {
-        let config = parse_doh_server("https://127.0.0.1?ct=application/dns-message", true)
-            .unwrap();
+        let config =
+            parse_doh_server("https://127.0.0.1?ct=application/dns-message", true).unwrap();
 
-        assert_eq!(config.socket_addrs, vec![SocketAddr::from(([127, 0, 0, 1], 443))]);
+        assert_eq!(
+            config.socket_addrs,
+            vec![SocketAddr::from(([127, 0, 0, 1], 443))]
+        );
         assert_eq!(config.tls_dns_name, "127.0.0.1");
         assert_eq!(
             config.http_endpoint.as_deref(),
@@ -806,16 +845,13 @@ mod tests {
 
     #[test]
     fn test_parse_doh_server_reports_resolution_failures() {
-        let err = parse_doh_server_uncached(
-            "https://resolver-test.invalid/dns-query",
-            true,
-            |_, _| {
+        let err =
+            parse_doh_server_uncached("https://resolver-test.invalid/dns-query", true, |_, _| {
                 Err(std::io::Error::new(
                     std::io::ErrorKind::NotFound,
                     "simulated resolution failure",
                 ))
-            },
-        )
+            })
             .unwrap_err()
             .to_string();
 
@@ -901,12 +937,12 @@ mod tests {
         };
         drop(ipv4_only.build_dns_resolver().unwrap());
 
-        let custom = BytehaulDnsResolver::new(&[SocketAddr::from(([1, 1, 1, 1], 53))], &[], true)
-            .unwrap();
+        let custom =
+            BytehaulDnsResolver::new(&[SocketAddr::from(([1, 1, 1, 1], 53))], &[], true).unwrap();
         drop(custom);
 
-        let doh = BytehaulDnsResolver::new(&[], &["https://127.0.0.1/dns-query".into()], false)
-            .unwrap();
+        let doh =
+            BytehaulDnsResolver::new(&[], &["https://127.0.0.1/dns-query".into()], false).unwrap();
         drop(doh);
     }
 
@@ -984,7 +1020,10 @@ mod tests {
         };
         let proxies = config.effective_proxies().unwrap();
 
-        assert_eq!(proxies.http_proxy.unwrap().authority().unwrap().as_str(), "127.0.0.1:8080");
+        assert_eq!(
+            proxies.http_proxy.unwrap().authority().unwrap().as_str(),
+            "127.0.0.1:8080"
+        );
         clear_proxy_env();
     }
 
@@ -1039,7 +1078,10 @@ mod tests {
             .await
             .unwrap();
 
-        direct_client.warm_resolution_for_url("not a url").await.unwrap();
+        direct_client
+            .warm_resolution_for_url("not a url")
+            .await
+            .unwrap();
         direct_client
             .warm_resolution_for_url("file:///tmp/no-host")
             .await
@@ -1124,7 +1166,11 @@ mod tests {
     fn spawn_connection_pool_test_server(
         close_after_response: bool,
         expected_requests: usize,
-    ) -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>, thread::JoinHandle<()>) {
+    ) -> (
+        SocketAddr,
+        Arc<std::sync::atomic::AtomicUsize>,
+        thread::JoinHandle<()>,
+    ) {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();

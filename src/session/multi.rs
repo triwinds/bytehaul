@@ -12,9 +12,8 @@ use super::range_validate::{
 };
 use super::{
     begin_lease_and_wait, discard_lease_and_wait, flush_all_and_wait, flush_lease_and_wait,
-    stop_signal_error, stop_signal_label, stop_signal_state, ControlSaveReason,
-    ControlSaveTracker, StopSignal, MIN_SPEED_SAMPLE_SPAN, MULTI_PROGRESS_INTERVAL,
-    SPEED_ESTIMATE_WINDOW,
+    stop_signal_error, stop_signal_label, stop_signal_state, ControlSaveReason, ControlSaveTracker,
+    StopSignal, MIN_SPEED_SAMPLE_SPAN, MULTI_PROGRESS_INTERVAL, SPEED_ESTIMATE_WINDOW,
 };
 use crate::config::{DownloadSpec, LogLevel};
 use crate::error::DownloadError;
@@ -92,8 +91,12 @@ pub(super) async fn run_multi_worker(
     let received_bytes = Arc::new(AtomicU64::new(initial_completed_bytes));
     let start_time = Instant::now();
     let mut eta_estimator = EtaEstimator::new(SPEED_ESTIMATE_WINDOW, MIN_SPEED_SAMPLE_SPAN);
-    let mut progress_reporter =
-        ProgressReporter::new(initial_completed_bytes, MULTI_PROGRESS_INTERVAL, 0, start_time);
+    let mut progress_reporter = ProgressReporter::new(
+        initial_completed_bytes,
+        MULTI_PROGRESS_INTERVAL,
+        0,
+        start_time,
+    );
     eta_estimator.record(initial_completed_bytes, start_time);
 
     progress_tx.send_modify(|p| {
@@ -1000,39 +1003,38 @@ mod coverage_tests {
         let route = warp::path(path_segment)
             .and(warp::header::optional::<String>("range"))
             .and_then(move |range_header: Option<String>| async move {
-                    let (start, end) = match range_header {
-                        Some(range) => {
-                            let range = range.trim_start_matches("bytes=");
-                            let parts: Vec<&str> = range.split('-').collect();
-                            let start = parts[0].parse::<u64>().unwrap_or(0);
-                            let end = parts[1].parse::<u64>().unwrap_or(total - 1);
-                            (start, end)
-                        }
-                        None => (0, total - 1),
-                    };
+                let (start, end) = match range_header {
+                    Some(range) => {
+                        let range = range.trim_start_matches("bytes=");
+                        let parts: Vec<&str> = range.split('-').collect();
+                        let start = parts[0].parse::<u64>().unwrap_or(0);
+                        let end = parts[1].parse::<u64>().unwrap_or(total - 1);
+                        (start, end)
+                    }
+                    None => (0, total - 1),
+                };
 
-                    let len = end - start + 1;
-                    let delay = if len > 256 {
-                        Duration::from_millis(450)
-                    } else {
-                        Duration::from_millis(120)
-                    };
-                    tokio::time::sleep(delay).await;
+                let len = end - start + 1;
+                let delay = if len > 256 {
+                    Duration::from_millis(450)
+                } else {
+                    Duration::from_millis(120)
+                };
+                tokio::time::sleep(delay).await;
 
-                    let body = vec![0xEE; len as usize];
-                    Ok::<_, std::convert::Infallible>(
-                        warp::http::Response::builder()
-                            .status(206)
-                            .header("content-length", body.len().to_string())
-                            .header(
-                                "content-range",
-                                format!("bytes {}-{}/{}", start, end, total),
-                            )
-                            .body(body)
-                            .unwrap(),
-                    )
-                }
-            );
+                let body = vec![0xEE; len as usize];
+                Ok::<_, std::convert::Infallible>(
+                    warp::http::Response::builder()
+                        .status(206)
+                        .header("content-length", body.len().to_string())
+                        .header(
+                            "content-range",
+                            format!("bytes {}-{}/{}", start, end, total),
+                        )
+                        .body(body)
+                        .unwrap(),
+                )
+            });
 
         warp::serve(route).bind_ephemeral(([127, 0, 0, 1], 0))
     }
@@ -1231,7 +1233,9 @@ mod coverage_tests {
 
         persist_multi_control_snapshot(ControlSaveReason::Terminal, None, &mut tracker, &ctx).await;
 
-        let (loaded, hints) = ControlSnapshot::load_with_hints(&control_path).await.unwrap();
+        let (loaded, hints) = ControlSnapshot::load_with_hints(&control_path)
+            .await
+            .unwrap();
         assert_eq!(loaded.downloaded_bytes, 0);
         assert_eq!(hints.dirty_piece_ids, vec![0]);
         assert_eq!(hints.inflight_piece_ids, vec![0]);
@@ -1473,4 +1477,3 @@ mod coverage_tests {
         );
     }
 }
-

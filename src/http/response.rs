@@ -22,7 +22,6 @@ impl ResponseMeta {
         headers: &HeaderMap,
         content_length_override: Option<u64>,
     ) -> Self {
-
         let accept_ranges = headers
             .get("accept-ranges")
             .and_then(|v| v.to_str().ok())
@@ -104,12 +103,12 @@ mod tests {
     #[test]
     fn test_parse_content_range_metadata() {
         let response = Response::builder()
-                .status(206)
-                .header("content-range", "bytes 100-199/1000")
-                .header("content-length", "100")
-                .header("content-encoding", "identity")
-                .body(Empty::<Bytes>::new())
-                .unwrap();
+            .status(206)
+            .header("content-range", "bytes 100-199/1000")
+            .header("content-length", "100")
+            .header("content-encoding", "identity")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
 
         let meta = meta_from_response(response);
         assert_eq!(meta.content_range_start, Some(100));
@@ -122,10 +121,10 @@ mod tests {
     #[test]
     fn test_missing_content_range_metadata() {
         let response = Response::builder()
-                .status(200)
-                .header("content-length", "4")
-                .body(Empty::<Bytes>::new())
-                .unwrap();
+            .status(200)
+            .header("content-length", "4")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
 
         let meta = meta_from_response(response);
         assert_eq!(meta.content_range_start, None);
@@ -136,10 +135,10 @@ mod tests {
     #[test]
     fn test_accept_ranges_bytes() {
         let response = Response::builder()
-                .status(200)
-                .header("accept-ranges", "bytes")
-                .body(Empty::<Bytes>::new())
-                .unwrap();
+            .status(200)
+            .header("accept-ranges", "bytes")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
         let meta = meta_from_response(response);
         assert!(meta.accept_ranges);
     }
@@ -147,10 +146,10 @@ mod tests {
     #[test]
     fn test_accept_ranges_none() {
         let response = Response::builder()
-                .status(200)
-                .header("accept-ranges", "none")
-                .body(Empty::<Bytes>::new())
-                .unwrap();
+            .status(200)
+            .header("accept-ranges", "none")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
         let meta = meta_from_response(response);
         assert!(!meta.accept_ranges);
     }
@@ -158,11 +157,11 @@ mod tests {
     #[test]
     fn test_etag_and_last_modified() {
         let response = Response::builder()
-                .status(200)
-                .header("etag", "\"abc123\"")
-                .header("last-modified", "Thu, 01 Jan 2026 00:00:00 GMT")
-                .body(Empty::<Bytes>::new())
-                .unwrap();
+            .status(200)
+            .header("etag", "\"abc123\"")
+            .header("last-modified", "Thu, 01 Jan 2026 00:00:00 GMT")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
         let meta = meta_from_response(response);
         assert_eq!(meta.etag.as_deref(), Some("\"abc123\""));
         assert_eq!(
@@ -174,10 +173,10 @@ mod tests {
     #[test]
     fn test_content_range_unknown_total() {
         let response = Response::builder()
-                .status(206)
-                .header("content-range", "bytes 0-99/*")
-                .body(Empty::<Bytes>::new())
-                .unwrap();
+            .status(206)
+            .header("content-range", "bytes 0-99/*")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
         let meta = meta_from_response(response);
         assert_eq!(meta.content_range_start, Some(0));
         assert_eq!(meta.content_range_end, Some(99));
@@ -187,10 +186,10 @@ mod tests {
     #[test]
     fn test_content_disposition() {
         let response = Response::builder()
-                .status(200)
-                .header("content-disposition", "attachment; filename=test.bin")
-                .body(Empty::<Bytes>::new())
-                .unwrap();
+            .status(200)
+            .header("content-disposition", "attachment; filename=test.bin")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
         let meta = meta_from_response(response);
         assert_eq!(
             meta.content_disposition.as_deref(),

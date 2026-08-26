@@ -1,7 +1,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytehaul::{DownloadError, DownloadHandle, DownloadSpec, DownloadState, Downloader, FileAllocation};
+use bytehaul::{
+    DownloadError, DownloadHandle, DownloadSpec, DownloadState, Downloader, FileAllocation,
+};
 use futures::StreamExt;
 use warp::Filter;
 
@@ -80,8 +82,10 @@ fn slow_multi_server(
             };
 
             let slice = data[start as usize..=end as usize].to_vec();
-            let chunks: Vec<Result<Vec<u8>, std::convert::Infallible>> =
-                slice.chunks(32 * 1024).map(|chunk| Ok(chunk.to_vec())).collect();
+            let chunks: Vec<Result<Vec<u8>, std::convert::Infallible>> = slice
+                .chunks(32 * 1024)
+                .map(|chunk| Ok(chunk.to_vec()))
+                .collect();
             let stream = futures::stream::iter(chunks).then(
                 |chunk: Result<Vec<u8>, std::convert::Infallible>| async move {
                     tokio::time::sleep(Duration::from_millis(5)).await;
@@ -163,7 +167,10 @@ async fn test_pause_resume_single_connection() {
 
     let downloaded = std::fs::read(&output_path).unwrap();
     assert_eq!(downloaded, expected);
-    assert!(!ctrl_path.exists(), "control file should be deleted on success");
+    assert!(
+        !ctrl_path.exists(),
+        "control file should be deleted on success"
+    );
 }
 
 #[tokio::test]
@@ -200,5 +207,8 @@ async fn test_pause_resume_multi_connection() {
 
     let downloaded = std::fs::read(&output_path).unwrap();
     assert_eq!(downloaded, expected);
-    assert!(!ctrl_path.exists(), "control file should be deleted on success");
+    assert!(
+        !ctrl_path.exists(),
+        "control file should be deleted on success"
+    );
 }

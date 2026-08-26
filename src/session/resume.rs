@@ -2,12 +2,12 @@ use std::path::{Path, PathBuf};
 
 use tokio::sync::watch;
 
-use super::retry::retry_with_backoff;
-use super::single::run_single_connection;
 use super::multi::run_multi_worker;
 use super::range_validate::{
     validate_range_response, ExpectedRange, RangeValidationDecision, RangeValidationMode,
 };
+use super::retry::retry_with_backoff;
+use super::single::run_single_connection;
 use super::{validate_metadata, StopSignal};
 use crate::config::{DownloadSpec, LogLevel};
 use crate::error::DownloadError;
@@ -35,7 +35,10 @@ pub(crate) async fn validate_local_resume_state(
 
     let actual_len = metadata.len();
     let is_multi = ctrl.piece_count > 1 && spec.max_connections > 1;
-    let preallocated = matches!(spec.file_allocation, crate::config::FileAllocation::Prealloc);
+    let preallocated = matches!(
+        spec.file_allocation,
+        crate::config::FileAllocation::Prealloc
+    );
 
     if is_multi {
         let piece_map = PieceMap::from_bitset(
@@ -290,7 +293,11 @@ pub(super) async fn try_resume_download(
             }
         }
 
-        log_warn!(log_level, download_id, "control file discarded, restarting download");
+        log_warn!(
+            log_level,
+            download_id,
+            "control file discarded, restarting download"
+        );
         let _ = ControlSnapshot::delete(&control_path).await;
     }
 
@@ -374,7 +381,9 @@ mod tests {
         let err = validate_local_resume_state(&path, &ctrl, &spec)
             .await
             .unwrap_err();
-        assert!(matches!(err, DownloadError::ResumeMismatch(msg) if msg.contains("resume file size mismatch")));
+        assert!(
+            matches!(err, DownloadError::ResumeMismatch(msg) if msg.contains("resume file size mismatch"))
+        );
     }
 
     #[tokio::test]
@@ -399,7 +408,9 @@ mod tests {
         let err = validate_local_resume_state(&path, &ctrl, &spec)
             .await
             .unwrap_err();
-        assert!(matches!(err, DownloadError::ResumeMismatch(msg) if msg.contains("resume file size mismatch")));
+        assert!(
+            matches!(err, DownloadError::ResumeMismatch(msg) if msg.contains("resume file size mismatch"))
+        );
     }
 
     #[tokio::test]
@@ -478,7 +489,9 @@ mod tests {
         let err = validate_local_resume_state(&path, &ctrl, &spec)
             .await
             .unwrap_err();
-        assert!(matches!(err, DownloadError::ResumeMismatch(msg) if msg.contains("downloaded bytes")));
+        assert!(
+            matches!(err, DownloadError::ResumeMismatch(msg) if msg.contains("downloaded bytes"))
+        );
     }
 
     #[tokio::test]
@@ -492,7 +505,9 @@ mod tests {
         let err = validate_local_resume_state(&path, &ctrl, &spec)
             .await
             .unwrap_err();
-        assert!(matches!(err, DownloadError::ResumeMismatch(msg) if msg.contains("completed bytes")));
+        assert!(
+            matches!(err, DownloadError::ResumeMismatch(msg) if msg.contains("completed bytes"))
+        );
     }
 
     #[tokio::test]

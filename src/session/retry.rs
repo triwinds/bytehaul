@@ -44,9 +44,9 @@ where
                     // Equal jitter: half deterministic + half random to avoid
                     // thundering herd while keeping a minimum delay floor.
                     let half = raw / 2;
-                    let jitter = Duration::from_nanos(
-                        fastrand::u64(0..=half.as_nanos().min(u64::MAX as u128) as u64),
-                    );
+                    let jitter = Duration::from_nanos(fastrand::u64(
+                        0..=half.as_nanos().min(u64::MAX as u128) as u64,
+                    ));
                     half + jitter
                 };
 

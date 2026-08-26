@@ -1,12 +1,12 @@
-use std::net::SocketAddr;
 use std::hint::black_box;
+use std::net::SocketAddr;
 use std::time::Duration;
 
-use bytehaul::Downloader;
 use bytehaul::bench::{
     bench_cache_drain_lease_len, bench_cache_insert, bench_cache_new, bench_cache_total_bytes,
     ControlSnapshot, PieceMap,
 };
+use bytehaul::Downloader;
 use bytes::Bytes;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use tempfile::tempdir;
@@ -101,7 +101,9 @@ fn bench_piece_map_serde(c: &mut Criterion) {
         }
         let bitset = pm.to_bitset_bytes();
         b.iter(|| {
-            black_box(PieceMap::from_bitset(total_size, piece_size, &bitset, count));
+            black_box(PieceMap::from_bitset(
+                total_size, piece_size, &bitset, count,
+            ));
         });
     });
 }
@@ -112,11 +114,15 @@ fn bench_scheduler_snapshot(c: &mut Criterion) {
 
     for piece_count in [10_000usize, 100_000usize] {
         let total_size = piece_count as u64 * piece_size;
-        group.bench_with_input(BenchmarkId::from_parameter(piece_count), &total_size, |b, &size| {
-            b.iter(|| {
-                black_box(bytehaul::bench::bench_scheduler_snapshot(size, piece_size));
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::from_parameter(piece_count),
+            &total_size,
+            |b, &size| {
+                b.iter(|| {
+                    black_box(bytehaul::bench::bench_scheduler_snapshot(size, piece_size));
+                });
+            },
+        );
     }
 
     group.finish();
@@ -184,7 +190,11 @@ fn bench_control_save_only(c: &mut Criterion) {
 fn bench_single_progress_reporting(c: &mut Criterion) {
     c.bench_function("single_progress_reporting_throttled", |b| {
         b.iter(|| {
-            black_box(bytehaul::bench::bench_progress_reporting(1024, 8 * 1024, 10));
+            black_box(bytehaul::bench::bench_progress_reporting(
+                1024,
+                8 * 1024,
+                10,
+            ));
         });
     });
 }

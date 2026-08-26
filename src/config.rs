@@ -27,8 +27,6 @@ pub enum LogLevel {
     Trace = 5,
 }
 
-
-
 impl std::fmt::Display for LogLevel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
@@ -547,7 +545,9 @@ impl DownloadSpec {
             ));
         }
         if self.piece_size == 0 {
-            return Err(DownloadError::InvalidConfig("piece_size must be >= 1".into()));
+            return Err(DownloadError::InvalidConfig(
+                "piece_size must be >= 1".into(),
+            ));
         }
         if self.min_split_size == 0 {
             return Err(DownloadError::InvalidConfig(
@@ -571,7 +571,10 @@ impl DownloadSpec {
         }
         if let Some(ref checksum) = self.checksum {
             let value = match checksum {
-                Checksum::Sha256(v) | Checksum::Sha1(v) | Checksum::Md5(v) | Checksum::Sha512(v) => v,
+                Checksum::Sha256(v)
+                | Checksum::Sha1(v)
+                | Checksum::Md5(v)
+                | Checksum::Sha512(v) => v,
             };
             if value.trim().is_empty() {
                 return Err(DownloadError::InvalidConfig(

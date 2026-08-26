@@ -7,8 +7,7 @@ use tokio::sync::{mpsc, watch, Semaphore};
 
 use super::{
     flush_all_and_wait, stop_signal_error, stop_signal_state, ControlSaveReason,
-    ControlSaveTracker,
-    MIN_SPEED_SAMPLE_SPAN, SPEED_ESTIMATE_WINDOW, StopSignal,
+    ControlSaveTracker, StopSignal, MIN_SPEED_SAMPLE_SPAN, SPEED_ESTIMATE_WINDOW,
 };
 use crate::config::{DownloadSpec, LogLevel};
 use crate::error::DownloadError;
@@ -55,11 +54,14 @@ pub(super) async fn run_single_connection(
     download_id: u64,
 ) -> Result<(), DownloadError> {
     let use_control = spec.resume && total_size.is_some();
-    log_debug!(log_level, download_id = download_id,
+    log_debug!(
+        log_level,
+        download_id = download_id,
         start_offset = start_offset,
         total_size = total_size.unwrap_or(0),
         resume_control = use_control,
-        "single-connection download started");
+        "single-connection download started"
+    );
 
     let file = if start_offset > 0 {
         open_existing_file(output_path).await?
@@ -171,7 +173,11 @@ pub(super) async fn run_single_connection(
     if use_control {
         let _ = ControlSnapshot::delete(control_path).await;
     }
-    log_debug!(log_level, download_id = download_id, "single-connection download completed");
+    log_debug!(
+        log_level,
+        download_id = download_id,
+        "single-connection download completed"
+    );
     progress_tx.send_modify(|p| {
         p.downloaded = summary.downloaded;
         p.speed_bytes_per_sec = summary.speed_bytes_per_sec;
@@ -357,11 +363,15 @@ async fn persist_single_control_snapshot(
         if matches!(reason, ControlSaveReason::Autosave)
             && current_downloaded > control_save_tracker.last_saved_downloaded_bytes()
         {
-            log_debug!(ctx.log_level, download_id = ctx.download_id,
-                checkpoint = reason.label(), pending_prefix_bytes = current_downloaded,
+            log_debug!(
+                ctx.log_level,
+                download_id = ctx.download_id,
+                checkpoint = reason.label(),
+                pending_prefix_bytes = current_downloaded,
                 pending_autosaves = control_save_tracker.pending_autosaves(),
                 autosave_sync_every = ctx.autosave_sync_every,
-                "control snapshot deferred");
+                "control snapshot deferred"
+            );
         }
         return;
     }
@@ -389,12 +399,20 @@ async fn persist_single_control_snapshot(
     match snapshot.save(ctx.control_path).await {
         Ok(()) => {
             control_save_tracker.mark_saved(persisted_prefix_bytes);
-            log_debug!(ctx.log_level, download_id = ctx.download_id,
-                checkpoint = reason.label(), persisted_prefix_bytes = persisted_prefix_bytes,
-                flush_all_ms = flush_stats.map(|stats| stats.flush_elapsed.as_millis() as u64).unwrap_or(0),
-                sync_data_ms = flush_stats.and_then(|stats| stats.sync_elapsed.map(|elapsed| elapsed.as_millis() as u64)).unwrap_or(0),
+            log_debug!(
+                ctx.log_level,
+                download_id = ctx.download_id,
+                checkpoint = reason.label(),
+                persisted_prefix_bytes = persisted_prefix_bytes,
+                flush_all_ms = flush_stats
+                    .map(|stats| stats.flush_elapsed.as_millis() as u64)
+                    .unwrap_or(0),
+                sync_data_ms = flush_stats
+                    .and_then(|stats| stats.sync_elapsed.map(|elapsed| elapsed.as_millis() as u64))
+                    .unwrap_or(0),
                 control_save_ms = save_started.elapsed().as_millis() as u64,
-                "control snapshot saved");
+                "control snapshot saved"
+            );
         }
         Err(error) => {
             log_warn!(ctx.log_level, download_id = ctx.download_id, checkpoint = reason.label(),
@@ -473,10 +491,7 @@ mod tests {
         let client = crate::network::ClientNetworkConfig::default()
             .build_client()
             .unwrap();
-        let req = crate::http::request::build_get_request(
-            url,
-            &std::collections::HashMap::new(),
-        );
+        let req = crate::http::request::build_get_request(url, &std::collections::HashMap::new());
         tokio::time::timeout(Duration::from_secs(5), client.request(req))
             .await
             .unwrap()
@@ -578,7 +593,7 @@ mod tests {
 
         join_server(server).await;
 
-    assert!(matches!(err, DownloadError::Transport(_)));
+        assert!(matches!(err, DownloadError::Transport(_)));
         let loaded = ControlSnapshot::load(&control_path).await.unwrap();
         assert_eq!(loaded.downloaded_bytes, 4);
         assert_eq!(progress_tx.borrow().state, DownloadState::Failed);
@@ -593,7 +608,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let output_path = dir.path().join("single-success.bin");
         let control_path = dir.path().join("single-success.bytehaul");
-        snapshot_template_with(4, 1).save(&control_path).await.unwrap();
+        snapshot_template_with(4, 1)
+            .save(&control_path)
+            .await
+            .unwrap();
         let (progress_tx, _) = watch::channel(ProgressSnapshot::default());
         let (_cancel_tx, cancel_rx) = watch::channel(StopSignal::Running);
 
@@ -785,27 +803,15 @@ mod tests {
             download_id: 1,
         };
 
-        persist_single_control_snapshot(
-            ControlSaveReason::Autosave,
-            256,
-            None,
-            &mut tracker,
-            &ctx,
-        )
-        .await;
+        persist_single_control_snapshot(ControlSaveReason::Autosave, 256, None, &mut tracker, &ctx)
+            .await;
 
         assert!(!control_path.exists());
         assert_eq!(tracker.last_saved_downloaded_bytes(), 0);
         assert_eq!(tracker.pending_autosaves(), 1);
 
-        persist_single_control_snapshot(
-            ControlSaveReason::Autosave,
-            512,
-            None,
-            &mut tracker,
-            &ctx,
-        )
-        .await;
+        persist_single_control_snapshot(ControlSaveReason::Autosave, 512, None, &mut tracker, &ctx)
+            .await;
 
         let loaded = ControlSnapshot::load(&control_path).await.unwrap();
         assert_eq!(loaded.downloaded_bytes, 512);
@@ -856,22 +862,10 @@ mod tests {
             download_id: 3,
         };
 
-        persist_single_control_snapshot(
-            ControlSaveReason::Terminal,
-            256,
-            None,
-            &mut tracker,
-            &ctx,
-        )
-        .await;
-        persist_single_control_snapshot(
-            ControlSaveReason::Terminal,
-            256,
-            None,
-            &mut tracker,
-            &ctx,
-        )
-        .await;
+        persist_single_control_snapshot(ControlSaveReason::Terminal, 256, None, &mut tracker, &ctx)
+            .await;
+        persist_single_control_snapshot(ControlSaveReason::Terminal, 256, None, &mut tracker, &ctx)
+            .await;
 
         let loaded = ControlSnapshot::load(&control_path).await.unwrap();
         assert_eq!(loaded.downloaded_bytes, 256);
@@ -892,14 +886,8 @@ mod tests {
             download_id: 4,
         };
 
-        persist_single_control_snapshot(
-            ControlSaveReason::Terminal,
-            256,
-            None,
-            &mut tracker,
-            &ctx,
-        )
-        .await;
+        persist_single_control_snapshot(ControlSaveReason::Terminal, 256, None, &mut tracker, &ctx)
+            .await;
 
         assert!(!control_path.exists());
         assert_eq!(tracker.last_saved_downloaded_bytes(), 0);
@@ -919,14 +907,8 @@ mod tests {
             download_id: 5,
         };
 
-        persist_single_control_snapshot(
-            ControlSaveReason::Terminal,
-            256,
-            None,
-            &mut tracker,
-            &ctx,
-        )
-        .await;
+        persist_single_control_snapshot(ControlSaveReason::Terminal, 256, None, &mut tracker, &ctx)
+            .await;
 
         assert!(!control_path.exists());
         assert_eq!(tracker.last_saved_downloaded_bytes(), 256);
@@ -938,7 +920,9 @@ mod tests {
         let (url, server) = spawn_single_response_server(4, b"done".to_vec(), Duration::ZERO);
         let response = get_response(&url).await;
         let meta = single_response_meta(4);
-        let spec = test_spec(&url).resume(true).file_allocation(crate::config::FileAllocation::None);
+        let spec = test_spec(&url)
+            .resume(true)
+            .file_allocation(crate::config::FileAllocation::None);
         let dir = tempfile::tempdir().unwrap();
         let control_path = dir.path().join("single-writer-failure.bytehaul");
         let (progress_tx, _) = watch::channel(ProgressSnapshot::default());

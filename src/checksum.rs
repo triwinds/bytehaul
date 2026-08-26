@@ -20,18 +20,12 @@ pub(crate) async fn verify_checksum(
         .map_err(DownloadError::Io)?;
 
     match expected {
-        Checksum::Sha256(expected_hex) => {
-            hash_and_compare::<Sha256>(&mut file, expected_hex).await
-        }
-        Checksum::Sha512(expected_hex) => {
-            hash_and_compare::<Sha512>(&mut file, expected_hex).await
-        }
+        Checksum::Sha256(expected_hex) => hash_and_compare::<Sha256>(&mut file, expected_hex).await,
+        Checksum::Sha512(expected_hex) => hash_and_compare::<Sha512>(&mut file, expected_hex).await,
         Checksum::Sha1(expected_hex) => {
             hash_and_compare::<sha1::Sha1>(&mut file, expected_hex).await
         }
-        Checksum::Md5(expected_hex) => {
-            hash_and_compare::<md5::Md5>(&mut file, expected_hex).await
-        }
+        Checksum::Md5(expected_hex) => hash_and_compare::<md5::Md5>(&mut file, expected_hex).await,
     }
 }
 
@@ -137,9 +131,7 @@ mod tests {
         let path = dir.path().join("test_sha1.bin");
         tokio::fs::write(&path, b"hello world").await.unwrap();
         // SHA-1 of "hello world"
-        let expected = Checksum::Sha1(
-            "2aae6c35c94fcfb415dbe95f408b9ce91ee846ed".into(),
-        );
+        let expected = Checksum::Sha1("2aae6c35c94fcfb415dbe95f408b9ce91ee846ed".into());
         verify_checksum(&path, &expected).await.unwrap();
     }
 
@@ -149,9 +141,7 @@ mod tests {
         let path = dir.path().join("test_md5.bin");
         tokio::fs::write(&path, b"hello world").await.unwrap();
         // MD5 of "hello world"
-        let expected = Checksum::Md5(
-            "5eb63bbbe01eeed093cb22bb8f5acdc3".into(),
-        );
+        let expected = Checksum::Md5("5eb63bbbe01eeed093cb22bb8f5acdc3".into());
         verify_checksum(&path, &expected).await.unwrap();
     }
 

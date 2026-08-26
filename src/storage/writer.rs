@@ -1,7 +1,7 @@
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use std::collections::HashSet;
 
 use bytes::Bytes;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
@@ -258,7 +258,9 @@ mod tests {
             lease_id: 1,
         };
 
-        tx.send(WriterCommand::BeginLease { lease_key }).await.unwrap();
+        tx.send(WriterCommand::BeginLease { lease_key })
+            .await
+            .unwrap();
 
         // Send data with piece_id (cached write)
         tx.send(WriterCommand::Data {
@@ -308,7 +310,9 @@ mod tests {
             piece_id: 0,
             lease_id: 1,
         };
-        tx.send(WriterCommand::BeginLease { lease_key }).await.unwrap();
+        tx.send(WriterCommand::BeginLease { lease_key })
+            .await
+            .unwrap();
 
         tx.send(WriterCommand::Data {
             offset: 0,
@@ -356,7 +360,9 @@ mod tests {
             piece_id: 0,
             lease_id: 1,
         };
-        tx.send(WriterCommand::BeginLease { lease_key }).await.unwrap();
+        tx.send(WriterCommand::BeginLease { lease_key })
+            .await
+            .unwrap();
 
         tx.send(WriterCommand::Data {
             offset: 0,
@@ -414,12 +420,17 @@ mod tests {
             piece_id: 0,
             lease_id: 1,
         };
-        tx.send(WriterCommand::BeginLease { lease_key }).await.unwrap();
-
-        let (ack_tx, ack_rx) = oneshot::channel();
-        tx.send(WriterCommand::DiscardLease { lease_key, ack: ack_tx })
+        tx.send(WriterCommand::BeginLease { lease_key })
             .await
             .unwrap();
+
+        let (ack_tx, ack_rx) = oneshot::channel();
+        tx.send(WriterCommand::DiscardLease {
+            lease_key,
+            ack: ack_tx,
+        })
+        .await
+        .unwrap();
         assert_eq!(ack_rx.await.unwrap(), 0);
 
         tx.send(WriterCommand::Data {
@@ -541,7 +552,9 @@ mod tests {
             piece_id: 0,
             lease_id: 1,
         };
-        tx.send(WriterCommand::BeginLease { lease_key }).await.unwrap();
+        tx.send(WriterCommand::BeginLease { lease_key })
+            .await
+            .unwrap();
 
         tx.send(WriterCommand::Data {
             offset: 0,
@@ -590,7 +603,9 @@ mod tests {
             piece_id: 0,
             lease_id: 1,
         };
-        tx.send(WriterCommand::BeginLease { lease_key }).await.unwrap();
+        tx.send(WriterCommand::BeginLease { lease_key })
+            .await
+            .unwrap();
 
         // Send data that exceeds the high watermark
         tx.send(WriterCommand::Data {

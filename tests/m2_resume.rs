@@ -220,8 +220,14 @@ async fn test_single_resume_control_file_saves_periodically() {
     handle.cancel();
     let _ = handle.wait().await;
 
-    assert!(served.load(Ordering::Relaxed) > 0, "download should make progress before cancel");
-    assert!(saw_periodic_save, "control file should be saved before cancellation");
+    assert!(
+        served.load(Ordering::Relaxed) > 0,
+        "download should make progress before cancel"
+    );
+    assert!(
+        saw_periodic_save,
+        "control file should be saved before cancellation"
+    );
 }
 
 #[tokio::test]
@@ -268,8 +274,14 @@ async fn test_single_resume_autosave_sync_every_defers_first_save() {
     handle.cancel();
     let _ = handle.wait().await;
 
-    assert!(served.load(Ordering::Relaxed) > 0, "download should make progress before cancel");
-    assert!(saw_deferred_save, "durable autosave should happen on the second autosave tick");
+    assert!(
+        served.load(Ordering::Relaxed) > 0,
+        "download should make progress before cancel"
+    );
+    assert!(
+        saw_deferred_save,
+        "durable autosave should happen on the second autosave tick"
+    );
 }
 
 #[tokio::test]

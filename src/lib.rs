@@ -100,31 +100,31 @@ pub mod bench {
         downloader.bench_cached_client_count()
     }
 
-            pub fn bench_cache_new() -> WriteBackCache {
-                WriteBackCache::new()
-            }
+    pub fn bench_cache_new() -> WriteBackCache {
+        WriteBackCache::new()
+    }
 
-            pub fn bench_cache_insert(
-                cache: &mut WriteBackCache,
-                piece_id: usize,
-                lease_id: u64,
-                offset: u64,
-                data: bytes::Bytes,
-            ) {
-                cache.insert(LeaseKey { piece_id, lease_id }, offset, data);
-            }
+    pub fn bench_cache_insert(
+        cache: &mut WriteBackCache,
+        piece_id: usize,
+        lease_id: u64,
+        offset: u64,
+        data: bytes::Bytes,
+    ) {
+        cache.insert(LeaseKey { piece_id, lease_id }, offset, data);
+    }
 
-            pub fn bench_cache_total_bytes(cache: &WriteBackCache) -> usize {
-                cache.total_bytes()
-            }
+    pub fn bench_cache_total_bytes(cache: &WriteBackCache) -> usize {
+        cache.total_bytes()
+    }
 
-            pub fn bench_cache_drain_lease_len(
-                cache: &mut WriteBackCache,
-                piece_id: usize,
-                lease_id: u64,
-            ) -> usize {
-                cache.drain_lease(LeaseKey { piece_id, lease_id }).len()
-            }
+    pub fn bench_cache_drain_lease_len(
+        cache: &mut WriteBackCache,
+        piece_id: usize,
+        lease_id: u64,
+    ) -> usize {
+        cache.drain_lease(LeaseKey { piece_id, lease_id }).len()
+    }
 }
 
 #[cfg(test)]
