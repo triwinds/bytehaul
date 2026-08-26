@@ -7,7 +7,7 @@ use super::range_validate::{
     validate_range_response, ExpectedRange, RangeValidationDecision, RangeValidationMode,
 };
 use super::retry::retry_with_backoff;
-use super::single::run_single_connection;
+use super::single::run_single_with_retry;
 use super::{validate_metadata, StopSignal};
 use crate::config::{DownloadSpec, LogLevel};
 use crate::error::DownloadError;
@@ -272,9 +272,10 @@ pub(super) async fn try_resume_download(
                         "download strategy selected"
                     );
                     let request_url = worker.final_url().await?;
-                    run_single_connection(
+                    run_single_with_retry(
+                        worker.clone(),
                         resp,
-                        &meta,
+                        meta.clone(),
                         &request_url,
                         spec,
                         output_path,

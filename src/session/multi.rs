@@ -10,6 +10,7 @@ use tokio::sync::{mpsc, watch, Semaphore};
 use super::range_validate::{
     validate_range_response, ExpectedRange, RangeValidationDecision, RangeValidationMode,
 };
+use super::retry::{sleep_with_backoff, RetryDecision, RetryState};
 use super::{
     begin_lease_and_wait, discard_lease_and_wait, flush_all_and_wait, flush_lease_and_wait,
     stop_signal_error, stop_signal_label, stop_signal_state, ControlSaveReason, ControlSaveTracker,
@@ -566,8 +567,12 @@ async fn worker_loop(
             "assigned piece"
         );
 
-        let mut attempt = 0u32;
-        let retry_started_at = Instant::now();
+        let mut retry_state = RetryState::new(
+            cfg.max_retries,
+            cfg.retry_base_delay,
+            cfg.retry_max_delay,
+            cfg.max_retry_elapsed,
+        );
         let mut segment = segment;
 
         loop {
@@ -648,66 +653,42 @@ async fn worker_loop(
                         return Err(error);
                     }
 
-                    if !e.is_retryable() || attempt >= cfg.max_retries {
-                        log_warn!(log_level, download_id = download_id, worker_id = worker_id,
-                            piece_id = segment.piece_id, error = %e,
-                            "segment failed, reclaiming (non-retryable or max retries exceeded)");
-                        let _ = scheduler.lock().reclaim(segment.lease_key());
-                        return Err(e);
-                    }
-
-                    if let Some(limit) = cfg.max_retry_elapsed {
-                        let elapsed = retry_started_at.elapsed();
-                        if elapsed >= limit {
+                    match retry_state.decide(e) {
+                        RetryDecision::Stop(error) => {
+                            log_warn!(log_level, download_id = download_id, worker_id = worker_id,
+                                piece_id = segment.piece_id, error = %error,
+                                "segment failed, reclaiming (non-retryable or retry budget exhausted)");
                             let _ = scheduler.lock().reclaim(segment.lease_key());
-                            return Err(DownloadError::RetryBudgetExceeded { elapsed, limit });
+                            return Err(error);
                         }
-                    }
+                        RetryDecision::Retry {
+                            error,
+                            retry_count,
+                            backoff,
+                            elapsed,
+                        } => {
+                            segment = scheduler
+                                .lock()
+                                .renew(segment.lease_key(), worker_id)
+                                .ok_or_else(|| {
+                                    DownloadError::Internal(
+                                        "failed to renew segment lease for retry".into(),
+                                    )
+                                })?;
 
-                    attempt += 1;
-                    segment = scheduler
-                        .lock()
-                        .renew(segment.lease_key(), worker_id)
-                        .ok_or_else(|| {
-                            DownloadError::Internal(
-                                "failed to renew segment lease for retry".into(),
-                            )
-                        })?;
+                            log_warn!(log_level, download_id = download_id, worker_id = worker_id,
+                                piece_id = segment.piece_id, attempt = retry_count, error = %error,
+                                backoff_ms = backoff.as_millis() as u64,
+                                elapsed_ms = elapsed.as_millis() as u64,
+                                "segment failed, retrying after backoff");
 
-                    // Compute backoff delay
-                    let backoff = if let Some(retry_secs) = e.retry_after_secs() {
-                        Duration::from_secs(retry_secs)
-                    } else {
-                        let exp = cfg.retry_base_delay.saturating_mul(1u32 << attempt.min(10));
-                        exp.min(cfg.retry_max_delay)
-                    };
-
-                    if let Some(limit) = cfg.max_retry_elapsed {
-                        let elapsed = retry_started_at.elapsed();
-                        if elapsed.saturating_add(backoff) > limit {
-                            let _ = scheduler.lock().reclaim(segment.lease_key());
-                            return Err(DownloadError::RetryBudgetExceeded { elapsed, limit });
-                        }
-                    }
-
-                    log_warn!(log_level, download_id = download_id, worker_id = worker_id,
-                        piece_id = segment.piece_id, attempt = attempt, error = %e,
-                        backoff_ms = backoff.as_millis() as u64,
-                        "segment failed, retrying after backoff");
-
-                    // Wait with cancellation awareness
-                    tokio::select! {
-                        biased;
-                        result = cancel_rx.changed() => {
-                            if result.is_ok() {
-                                let signal = *cancel_rx.borrow_and_update();
+                            if let Err(stop_error) =
+                                sleep_with_backoff(backoff, &mut cancel_rx).await
+                            {
                                 let _ = scheduler.lock().reclaim(segment.lease_key());
-                                if let Some(error) = stop_signal_error(signal) {
-                                    return Err(error);
-                                }
+                                return Err(stop_error);
                             }
                         }
-                        _ = tokio::time::sleep(backoff) => {}
                     }
                 }
             }

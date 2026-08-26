@@ -30,7 +30,7 @@ use self::range_validate::{
 };
 use self::resume::try_resume_download;
 use self::retry::retry_with_backoff;
-use self::single::run_single_connection;
+use self::single::run_single_with_retry;
 
 const SPEED_ESTIMATE_WINDOW: Duration = Duration::from_secs(5);
 const MIN_SPEED_SAMPLE_SPAN: Duration = Duration::from_secs(1);
@@ -244,6 +244,7 @@ fn resolve_auto_output_path(
 #[allow(clippy::too_many_arguments)]
 async fn run_fresh_from_response(
     client: BytehaulClient,
+    worker: &HttpWorker,
     spec: &DownloadSpec,
     request_url: &str,
     output_path: &Path,
@@ -335,9 +336,10 @@ async fn run_fresh_from_response(
                 }
 
                 let total = single_response_total_size(response.status().as_u16(), &meta);
-                run_single_connection(
+                run_single_with_retry(
+                    worker.clone(),
                     response,
-                    &meta,
+                    meta.clone(),
                     request_url,
                     spec,
                     output_path,
@@ -374,9 +376,10 @@ async fn run_fresh_from_response(
                 );
 
                 let total = single_response_total_size(response.status().as_u16(), &meta);
-                run_single_connection(
+                run_single_with_retry(
+                    worker.clone(),
                     response,
-                    &meta,
+                    meta.clone(),
                     request_url,
                     spec,
                     output_path,
@@ -412,9 +415,10 @@ async fn run_fresh_from_response(
         "download strategy selected"
     );
     let total = single_response_total_size(response.status().as_u16(), &meta);
-    run_single_connection(
+    run_single_with_retry(
+        worker.clone(),
         response,
-        &meta,
+        meta.clone(),
         request_url,
         spec,
         output_path,
@@ -524,6 +528,7 @@ async fn run_download_inner(
             let request_url = worker.final_url().await?;
             run_fresh_from_response(
                 client,
+                &worker,
                 &spec,
                 &request_url,
                 &output_path,
@@ -563,6 +568,7 @@ async fn run_download_inner(
 
     run_fresh_from_response(
         client,
+        &worker,
         &spec,
         &request_url,
         &output_path,
