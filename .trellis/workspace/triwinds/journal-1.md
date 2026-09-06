@@ -50,3 +50,25 @@ Initialized Trellis tooling and project-specific Rust/Python guidelines, formatt
 ### Status
 
 [OK] **Completed**
+
+
+## Session 3: Simplify download internals and preserve checkpoint durability
+
+**Date**: 2026-09-06
+**Task**: Simplify download internals and preserve checkpoint durability
+**Package**: bytehaul-python
+**Branch**: `fix/retry-body-transport-errors`
+
+### Summary
+
+Committed aria2 review fixes: bounded cancellable forwarding, frozen pre-sync checkpoints, sparse scheduler, sequential lease cache, shared clients and Hickory DNS cache. 411 Rust tests, 42 Python tests, Clippy and docs passed; pooling remains opt-in.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `f483f37` | (see git log) |
+
+### Status
+
+[OK] **Completed**

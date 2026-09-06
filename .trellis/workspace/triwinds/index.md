@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 2
-- **Last Active**: 2026-08-26
+- **Total Sessions**: 3
+- **Last Active**: 2026-09-06
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~52 | Active |
+| `journal-1.md` | ~74 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 3 | 2026-09-06 | Simplify download internals and preserve checkpoint durability | `f483f37` | `fix/retry-body-transport-errors` |
 | 2 | 2026-08-26 | Single-connection retry | `4517569`, `b1e2901` | `fix/retry-body-transport-errors` |
 | 1 | 2026-08-26 | Bootstrap Trellis project guidelines | `7d78e6a`, `8455075` | `fix/retry-body-transport-errors` |
 <!-- @@@/auto:session-history -->
