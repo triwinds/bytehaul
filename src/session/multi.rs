@@ -957,45 +957,37 @@ mod coverage_tests {
         warp::serve(route).bind_ephemeral(([127, 0, 0, 1], 0))
     }
 
-    fn spawn_split_benefit_range_server(
+    fn spawn_gated_range_server(
         path_segment: &'static str,
+        arrivals: mpsc::UnboundedSender<(u64, u64, tokio::sync::oneshot::Sender<()>)>,
     ) -> (std::net::SocketAddr, impl std::future::Future<Output = ()>) {
-        let total = 1024u64;
-
         let route = warp::path(path_segment)
-            .and(warp::header::optional::<String>("range"))
-            .and_then(move |range_header: Option<String>| async move {
-                let (start, end) = match range_header {
-                    Some(range) => {
-                        let range = range.trim_start_matches("bytes=");
-                        let parts: Vec<&str> = range.split('-').collect();
-                        let start = parts[0].parse::<u64>().unwrap_or(0);
-                        let end = parts[1].parse::<u64>().unwrap_or(total - 1);
-                        (start, end)
-                    }
-                    None => (0, total - 1),
-                };
-
-                let len = end - start + 1;
-                let delay = if len > 256 {
-                    Duration::from_millis(450)
-                } else {
-                    Duration::from_millis(120)
-                };
-                tokio::time::sleep(delay).await;
-
-                let body = vec![0xEE; len as usize];
-                Ok::<_, std::convert::Infallible>(
-                    warp::http::Response::builder()
-                        .status(206)
-                        .header("content-length", body.len().to_string())
-                        .header(
-                            "content-range",
-                            format!("bytes {}-{}/{}", start, end, total),
-                        )
-                        .body(body)
-                        .unwrap(),
-                )
+            .and(warp::header::<String>("range"))
+            .and_then(move |range_header: String| {
+                let arrivals = arrivals.clone();
+                async move {
+                    let (start, end) = range_header
+                        .strip_prefix("bytes=")
+                        .unwrap()
+                        .split_once('-')
+                        .unwrap();
+                    let (start, end) = (start.parse::<u64>().unwrap(), end.parse::<u64>().unwrap());
+                    assert!(start <= end && end < 1024);
+                    let (release, released) = tokio::sync::oneshot::channel();
+                    arrivals.send((start, end, release)).unwrap();
+                    // No response headers or body can leave before the test has
+                    // observed every expected request in flight concurrently.
+                    released.await.unwrap();
+                    let body: Vec<u8> = (start..=end).map(|offset| (offset % 251) as u8).collect();
+                    Ok::<_, std::convert::Infallible>(
+                        warp::http::Response::builder()
+                            .status(206)
+                            .header("content-length", body.len().to_string())
+                            .header("content-range", format!("bytes {start}-{end}/1024"))
+                            .body(body)
+                            .unwrap(),
+                    )
+                }
             });
 
         warp::serve(route).bind_ephemeral(([127, 0, 0, 1], 0))
@@ -1853,23 +1845,26 @@ mod coverage_tests {
     }
 
     #[tokio::test]
-    async fn test_run_multi_worker_dynamic_split_reduces_tail_latency() {
+    async fn test_run_multi_worker_dynamic_split_requests_are_concurrent() {
         async fn run_case(
             path_segment: &'static str,
             min_segment_size: u64,
-        ) -> std::time::Duration {
-            let (addr, server) = spawn_split_benefit_range_server(path_segment);
-            tokio::spawn(server);
+            expected_ranges: &[(u64, u64)],
+        ) {
+            let (arrivals_tx, mut arrivals_rx) = mpsc::unbounded_channel();
+            let (addr, server) = spawn_gated_range_server(path_segment, arrivals_tx);
+            let server = tokio::spawn(server);
 
             let dir = tempfile::tempdir().unwrap();
             let output_path = dir.path().join(format!("{path_segment}.bin"));
+            let control_path = ControlSnapshot::control_path(&output_path);
             let meta = ResponseMeta {
                 content_length: Some(1024),
                 content_range_start: Some(0),
                 content_range_end: Some(1023),
                 content_range_total: Some(1024),
                 accept_ranges: true,
-                etag: Some("\"split-benefit\"".into()),
+                etag: Some("\"split-concurrency\"".into()),
                 last_modified: Some("Thu, 01 Jan 2026 00:00:00 GMT".into()),
                 content_disposition: None,
                 content_encoding: None,
@@ -1879,6 +1874,7 @@ mod coverage_tests {
                 .min_segment_size(min_segment_size)
                 .min_split_size(1)
                 .max_connections(4)
+                .max_retries(0)
                 .file_allocation(crate::config::FileAllocation::None)
                 .output_path(output_path.clone());
             let piece_map = PieceMap::new(1024, 1024);
@@ -1888,11 +1884,10 @@ mod coverage_tests {
                 .build_client()
                 .unwrap();
 
-            let started = Instant::now();
-            run_multi_worker(
+            let download = run_multi_worker(
                 client,
                 &spec,
-                &format!("http://{addr}/{path_segment}"),
+                &spec.url,
                 &output_path,
                 &meta,
                 1024,
@@ -1900,26 +1895,53 @@ mod coverage_tests {
                 None,
                 &progress_tx,
                 cancel_rx,
-                &ControlSnapshot::control_path(&output_path),
+                &control_path,
                 SpeedLimit::new(0),
                 LogLevel::Off,
                 10,
-            )
-            .await
-            .unwrap();
-            let elapsed = started.elapsed();
+            );
+            let release_responses = async {
+                let mut ranges = Vec::new();
+                let mut releases = Vec::new();
+                for _ in expected_ranges {
+                    let (start, end, release) = arrivals_rx.recv().await.unwrap();
+                    ranges.push((start, end));
+                    releases.push(release);
+                }
+                ranges.sort_unstable();
+                assert_eq!(ranges, expected_ranges);
+                for release in releases {
+                    release.send(()).unwrap();
+                }
+            };
+            // This only bounds a broken scheduler/serial request deadlock. It is
+            // not a speed comparison between machines or transfer strategies.
+            let completed = tokio::time::timeout(Duration::from_secs(30), async {
+                tokio::join!(download, release_responses).0.unwrap();
+            })
+            .await;
+            server.abort();
+            completed.expect("all expected ranges must arrive before any response is released");
 
+            assert!(
+                arrivals_rx.try_recv().is_err(),
+                "unexpected extra range request"
+            );
             let downloaded = std::fs::read(&output_path).unwrap();
-            assert_eq!(downloaded, vec![0xEE; 1024]);
-            elapsed
+            let expected: Vec<u8> = (0..1024).map(|offset| (offset % 251) as u8).collect();
+            assert_eq!(downloaded, expected);
+            let progress = progress_tx.borrow();
+            assert_eq!(progress.state, DownloadState::Completed);
+            assert_eq!(progress.downloaded, 1024);
+            assert_eq!(progress.total_size, Some(1024));
         }
 
-        let unsplit = run_case("split-benefit-unsplit", 1024).await;
-        let split = run_case("split-benefit-split", 256).await;
-
-        assert!(
-            split + Duration::from_millis(150) < unsplit,
-            "expected dynamic split to reduce tail latency, unsplit={unsplit:?}, split={split:?}"
-        );
+        run_case("unsplit", 1024, &[(0, 1023)]).await;
+        run_case(
+            "split",
+            256,
+            &[(0, 255), (256, 511), (512, 767), (768, 1023)],
+        )
+        .await;
     }
 }

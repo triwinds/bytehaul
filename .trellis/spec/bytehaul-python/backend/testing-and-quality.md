@@ -14,6 +14,12 @@
 - Assert exact public variants/statuses for branch-sensitive behavior. `tests/m5_retry.rs` distinguishes 503 from 403; `tests/m8_pause_resume.rs` checks both `DownloadError::Paused` and progress state.
 - Test single and multi paths when changing shared transfer semantics.
 - Keep timing checks behavior-based with deadlines/coarse bounds.
+- Verify concurrent transfers with response gates/barriers and exact requested ranges: require all
+  expected requests to arrive before releasing responses, then check output bytes and terminal state.
+  Do not gate CI on a fixed wall-clock speedup between sequential runs (for example, split must save
+  150 ms). Runner load, timer resolution and filesystem latency can change that delta despite correct
+  parallel behavior. Use a generous timeout only to catch deadlocks; keep performance comparisons in
+  benchmarks.
 - Network fixtures must not assume one socket write becomes one body frame. Aggregate chunks and
   assert exact offsets/bytes, or choose boundaries whose expected outcome is independent of framing.
 - Client configuration/cache tests use ephemeral local nonretryable responses and exact error/cache
