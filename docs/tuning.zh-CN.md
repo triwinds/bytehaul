@@ -27,7 +27,7 @@
 **默认值：** 64 MiB  
 **取值范围：** 必须大于 0
 
-控制回写缓存中最多允许缓冲多少数据，超过后会对 Worker 施加背压。也就是说，当缓存达到阈值时，Worker 会暂停继续读取网络数据，直到 Writer 把缓存刷到磁盘。
+限制为 writer 队列和回写缓存预留的数据字节数。较大的响应数据块会先拆小，刷盘水位为后续块保留空间，因此预算很小或不能整除块大小时也能继续下载。极小预算会增加 channel 和磁盘 I/O 开销。HTTP/TLS 接收缓冲区以及其他进程内存不计入这个数据预算。
 
 | 系统内存 | 建议预算 |
 |----------|----------|
@@ -104,3 +104,15 @@ HTTP 流读取层和回写缓存之间内部 Tokio channel 的缓冲区大小。
 | `max_retry_elapsed` | None | 总重试时间预算（`None` 表示不限时） |
 
 请求和响应体重试共用指数退避，并叠加等抖动（equal jitter），以降低多个客户端下载同一服务端时同时重试造成的冲击。单连接 body 失败会从已 flush 的连续前缀续传；若 Range 或对象 metadata 不匹配，会安全地清空后从零开始。
+
+## HTTP 空闲连接池对比
+
+连接池继续显式开启：使用 `DownloadSpec::http_idle_pool(4, Duration::from_secs(30))` 或 `DownloaderBuilder::http_idle_pool(...)`，默认保持关闭。
+
+本地对比命令：
+
+```bash
+env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy cargo run --release --example pool_compare -- 3 2
+```
+
+2026-09-06 的三轮交替测试使用 32 MiB 数据、4 个 worker、1 MiB piece，服务端对每次请求延迟 2 ms。关闭／开启连接池的中位耗时为 101.1／68.5 ms，接受的 TCP 连接数从 33 降到 5；每轮均为 33 次请求，输出逐字节一致。这是本机 HTTP 对比，没有覆盖公网、TLS 握手或代理可靠性，因此继续保留显式开关。

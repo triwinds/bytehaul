@@ -39,18 +39,14 @@ graph TD
     Probe -->|"不支持 Range 或文件过小"| Single
 
     Single --> HTTP
-    HTTP -->|"字节流"| Cache
-    Cache -->|"flush"| Writer
-    Writer --> Disk
-
     Multi --> Scheduler
-    Scheduler -->|"分配区段"| Worker
+    Scheduler -->|"分配 lease"| Worker
     Worker --> HTTP
-    Worker -->|"字节流"| Cache
-    Cache -->|"冲刷完整分片"| Writer
+    HTTP -->|"有界 channel"| Writer
+    Writer -->|"带 lease 的数据"| Cache
+    Cache -->|"flush blocks"| Writer
     Writer --> Disk
-    Worker -->|"分片完成"| Scheduler
-    Scheduler -->|"下一个区段"| Worker
+    Worker -->|"flush 确认后完成 lease"| Scheduler
 
     Session -->|"周期保存"| Control
     Session -->|"更新"| Progress
@@ -61,6 +57,9 @@ graph TD
 ### Downloader / DownloaderBuilder
 
 入口对象。它维护 downloader 级别的默认网络配置，以及一组按“生效网络配置”缓存的 `BytehaulClient`（内部基于 hyper client stack，并包含代理、DNS、TLS、超时等设置）。每次调用 `download()` 时，都会把默认值与任务级覆盖项（目前包括超时和代理）合并，复用或派生出匹配的 client，并返回一个 `DownloadHandle`。可选的 `Semaphore` 用于限制并发下载数。
+
+
+DNS 查询和有容量限制的 TTL 响应缓存由 HTTP connector 内的 Hickory 负责，下载前不再额外执行一次预解析。
 
 ### DownloadHandle
 
@@ -77,7 +76,7 @@ graph TD
 
 ### SchedulerState
 
-负责跟踪多 Worker 下载时的分片分配状态。它内部包装了一个 `PieceMap`（位图）以及一个 in-flight 排除集合。Worker 通过 `assign()` 获取下一个缺失区段，并通过 `complete()` / `reclaim()` 回写状态。
+通过完成位图、紧凑的可分配索引，以及仅为已触及且未完成的分片建立的稀疏状态跟踪任务。活动 lease 和缺失区间数量采用增量计数。Worker 领取完整分片或缺失子区间，携带 lease 身份调用 `complete()` / `reclaim()`。完整分片完成后释放详细状态；checkpoint 提示只遍历稀疏状态。
 
 ### Worker
 
@@ -85,15 +84,15 @@ graph TD
 
 ### WriteBackCache
 
-按分片 ID 组织的内存写缓冲区。它会合并相邻或重叠的字节区间，以减少磁盘 I/O 次数。分片完成时按分片冲刷；当内存预算达到高水位时，也会触发批量冲刷。
+按 lease 身份组织的内存写缓冲区。每个 lease 只接受连续追加的数据，间隙或重叠属于内部错误。重试使用新身份，避免旧 attempt 的迟到数据污染新数据。lease 完成或缓存达到刷盘水位时写盘；全量排出数据时按文件 offset 排序。
 
 ### Writer
 
-将 `FlushBlock` 条目转换成带位置的文件写入（`pwrite` 或 `seek+write`）。同时负责输出文件的预分配，例如零填充或平台原生 `fallocate`。
+通过有界 channel 接收数据，使用 `seek + write_all` 写入输出文件。单连接数据直接写盘，带 lease 的数据经过缓存。flush 确认允许 worker 标记 lease 完成，sync 确认则用于建立 checkpoint 持久化边界。文件创建与预分配位于 `storage/file.rs`。
 
 ### ControlSnapshot
 
-用于续传的二进制控制文件（`.bytehaul`）。格式为：4 字节 magic + 4 字节 version + 4 字节 payload length + 4 字节 CRC32 + bincode payload。该文件会按周期保存（默认 5 秒，可配置），并通过原子写入流程落盘（tmp → fsync → rename）。
+用于续传的二进制控制文件（`.bytehaul`）。格式为：4 字节 magic + 4 字节 version + 4 字节 payload length + 4 字节 CRC32 + bincode payload。该文件按周期检查保存条件（默认 5 秒，并受 `autosave_sync_every` 控制），通过原子写入流程落盘（tmp → fsync → rename）。多 Worker 先截取完成位图，再等待 writer flush/sync，最后保存截取的快照；期间新增的完成状态留到下一次 checkpoint。保留 V1/V2 读取兼容，dirty/inflight 提示仅用于诊断，不算可续传进度。
 
 ### PieceMap
 
@@ -101,7 +100,7 @@ graph TD
 
 ## 内存预算与背压
 
-`DownloadSpec` 中的 `memory_budget` 设置控制一个 Tokio `Semaphore`，限制缓存区最多可持有多少字节。当缓存超过高水位时，Worker 会被阻塞，直到 Writer 将数据冲刷到磁盘，从而让磁盘 I/O 速度自然反向约束网络读取速度。
+`memory_budget` 通过 Tokio semaphore 限制为 writer 队列和缓存预留的数据字节数。响应数据分成有上限的小块转发，刷盘水位为后续数据块留出空间，避免 worker 等待预算、writer 等待更多数据的循环等待。单连接和多连接在限速、预算、channel 等待期间都响应暂停或取消。这是数据预算，不是进程总内存或 HTTP/TLS 接收缓冲区的上限。
 
 ## 重试与韧性
 

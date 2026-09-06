@@ -1,11 +1,12 @@
 use std::path::Path;
 use std::sync::atomic::AtomicU64;
-#[cfg(test)]
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::{mpsc, watch, Semaphore};
+use tokio::sync::{mpsc, watch};
+
+use super::flow::MemoryBudget;
 
 use super::{
     flush_all_and_wait, stop_signal_error, stop_signal_state, ControlSaveReason,
@@ -100,7 +101,7 @@ struct SingleWriterRuntime {
     write_tx: Option<mpsc::Sender<WriterCommand>>,
     writer_handle: Option<tokio::task::JoinHandle<Result<(), DownloadError>>>,
     written_bytes: Arc<AtomicU64>,
-    budget: Arc<Semaphore>,
+    budget: Arc<MemoryBudget>,
     file_total_size: Option<u64>,
 }
 
@@ -115,7 +116,7 @@ impl SingleWriterRuntime {
             write_tx: None,
             writer_handle: None,
             written_bytes: Arc::new(AtomicU64::new(start_offset)),
-            budget: Arc::new(Semaphore::new(spec.memory_budget)),
+            budget: Arc::new(MemoryBudget::new(spec.memory_budget)),
             file_total_size: total_size,
         };
         runtime
@@ -137,14 +138,21 @@ impl SingleWriterRuntime {
             create_output_file(output_path, total_size, spec.file_allocation).await?
         };
 
-        self.budget = Arc::new(Semaphore::new(spec.memory_budget));
+        self.budget = Arc::new(MemoryBudget::new(spec.memory_budget));
         self.written_bytes = Arc::new(AtomicU64::new(start_offset));
         self.file_total_size = total_size;
         let (write_tx, write_rx) = mpsc::channel::<WriterCommand>(spec.channel_buffer);
         let written_bytes = self.written_bytes.clone();
         let budget = self.budget.clone();
         self.writer_handle = Some(tokio::spawn(
-            WriterTask::new(write_rx, file, written_bytes, budget, spec.memory_budget).run(),
+            WriterTask::new(
+                write_rx,
+                file,
+                written_bytes,
+                budget.semaphore.clone(),
+                budget.watermark,
+            )
+            .run(),
         ));
         self.write_tx = Some(write_tx);
         Ok(())
@@ -487,6 +495,16 @@ pub(super) async fn run_single_with_retry(
                     };
                     mark_single_terminal_progress(progress_tx, state);
                     writer.close().await?;
+                    if use_control {
+                        persist_single_control_snapshot(
+                            ControlSaveReason::Terminal,
+                            writer.written_bytes.load(Ordering::Acquire),
+                            None,
+                            &mut control_save_tracker,
+                            &control_ctx,
+                        )
+                        .await;
+                    }
                     return Err(error);
                 }
 
@@ -671,7 +689,7 @@ async fn stream_single(
     total_size: Option<u64>,
     start_offset: u64,
     control: Option<(&Path, &ControlSnapshot)>,
-    budget: Arc<Semaphore>,
+    budget: Arc<MemoryBudget>,
     speed_limit: &SpeedLimit,
     control_save_interval: Duration,
     control_save_tracker: &mut ControlSaveTracker,
@@ -720,7 +738,7 @@ async fn stream_single_attempt(
     total_size: Option<u64>,
     start_offset: u64,
     control: Option<(&Path, &ControlSnapshot)>,
-    budget: Arc<Semaphore>,
+    budget: Arc<MemoryBudget>,
     speed_limit: &SpeedLimit,
     control_save_interval: Duration,
     control_save_tracker: &mut ControlSaveTracker,
@@ -818,22 +836,6 @@ async fn stream_single_attempt(
                 match chunk {
                     Ok(Some(data)) => {
                         let len = data.len();
-                        // Rate limiting
-                        speed_limit.acquire(len).await;
-                        // Acquire budget permits before buffering data
-                        let permit = match budget.acquire_many(len as u32).await {
-                            Ok(permit) => permit,
-                            Err(_) => {
-                                return SingleAttemptOutcome::Failed {
-                                    error: DownloadError::Internal(
-                                        "budget semaphore closed".into(),
-                                    ),
-                                    received_in_attempt,
-                                };
-                            }
-                        };
-
-                        let offset = downloaded;
                         if expected_len.is_some_and(|expected| {
                             received_in_attempt.saturating_add(len as u64) > expected
                         }) {
@@ -855,23 +857,25 @@ async fn stream_single_attempt(
                                 received_in_attempt,
                             };
                         }
-                        downloaded += len as u64;
-                        if write_tx
-                            .send(WriterCommand::Data {
-                                offset,
-                                data,
-                                lease_key: None,
-                            })
-                            .await
-                            .is_err()
-                        {
-                            return SingleAttemptOutcome::Failed {
-                                error: DownloadError::ChannelClosed,
-                                received_in_attempt,
-                            };
+                        if let Err(error) = budget.forward(
+                            data, downloaded, None, write_tx, &mut cancel_rx, speed_limit,
+                            |sent| {
+                                downloaded += sent;
+                                received_in_attempt += sent;
+                            },
+                        ).await {
+                            progress_reporter.force_report(
+                                progress_tx,
+                                ProgressUpdate::new(downloaded, last_speed, last_eta_secs)
+                                    .with_state(match error {
+                                        DownloadError::Cancelled => DownloadState::Cancelled,
+                                        DownloadError::Paused => DownloadState::Paused,
+                                        _ => DownloadState::Failed,
+                                    }),
+                                Instant::now(),
+                            );
+                            return SingleAttemptOutcome::Failed { error, received_in_attempt };
                         }
-                        permit.forget(); // permits returned by writer after flush
-                        received_in_attempt += len as u64;
                         let now = Instant::now();
                         eta_estimator.record(downloaded, now);
                         let speed = eta_estimator.speed_bytes_per_sec().unwrap_or(0.0);
@@ -1287,7 +1291,7 @@ mod tests {
                 Some(4),
                 0,
                 None,
-                Arc::new(Semaphore::new(16)),
+                Arc::new(MemoryBudget::new(16)),
                 &SpeedLimit::new(0),
                 Duration::from_secs(60),
                 &mut tracker,
@@ -1336,7 +1340,7 @@ mod tests {
                 Some(5),
                 1,
                 Some((&control_path, &snapshot)),
-                Arc::new(Semaphore::new(16)),
+                Arc::new(MemoryBudget::new(16)),
                 &SpeedLimit::new(0),
                 Duration::from_secs(60),
                 &mut tracker,
@@ -1385,7 +1389,7 @@ mod tests {
                 Some(5),
                 1,
                 Some((&control_path, &snapshot)),
-                Arc::new(Semaphore::new(16)),
+                Arc::new(MemoryBudget::new(16)),
                 &SpeedLimit::new(0),
                 Duration::from_millis(5),
                 &mut tracker,

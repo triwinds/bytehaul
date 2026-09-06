@@ -1,0 +1,7 @@
+{"file": ".trellis/spec/bytehaul-python/backend/index.md", "reason": "Preserve engine, API, error and test contracts"}
+{"file": ".trellis/spec/bytehaul-python/backend/architecture.md", "reason": "Preserve engine, API, error and test contracts"}
+{"file": ".trellis/spec/bytehaul-python/backend/errors-and-observability.md", "reason": "Preserve engine, API, error and test contracts"}
+{"file": ".trellis/spec/bytehaul-python/backend/configuration-and-api.md", "reason": "Preserve engine, API, error and test contracts"}
+{"file": ".trellis/spec/bytehaul-python/backend/testing-and-quality.md", "reason": "Preserve engine, API, error and test contracts"}
+{"file": ".trellis/tasks/09-06-aria2-simplification/research/review.md", "reason": "Approved review findings and baseline evidence"}
+{"file": ".trellis/spec/bytehaul-python/backend/transfer-storage.md", "reason": "New executable contracts for flow and persistence"}

@@ -119,7 +119,7 @@ impl PieceMap {
 
     /// Returns `true` if every piece has been completed.
     pub fn all_done(&self) -> bool {
-        self.completed.all()
+        self.completed_pieces == self.piece_count
     }
 
     /// Returns the number of completed pieces.
@@ -140,6 +140,11 @@ impl PieceMap {
     /// Serialize the bitset for storage in the control file.
     pub fn to_bitset_bytes(&self) -> Vec<u8> {
         self.completed.as_raw_slice().to_vec()
+    }
+
+    /// Availability starts with one range for each incomplete piece.
+    pub(crate) fn missing_bitset(&self) -> BitVec<u8, Lsb0> {
+        !self.completed.clone()
     }
 
     fn advance_next_candidate(&mut self) {
@@ -218,6 +223,21 @@ mod tests {
         assert!(!pm.all_done());
         pm.mark_complete(1);
         assert!(pm.all_done());
+    }
+
+    #[test]
+    fn test_all_done_uses_restored_count_and_ignores_duplicate_completions() {
+        let mut pm = PieceMap::from_bitset(1_500, 1_000, &[0b1111_1101], 2);
+        assert!(!pm.all_done());
+        pm.mark_complete(0);
+        assert!(!pm.all_done());
+        assert_eq!(pm.completed_count(), 1);
+        pm.mark_complete(1);
+        pm.mark_complete(1);
+        assert!(pm.all_done());
+        assert_eq!(pm.completed_count(), 2);
+        assert_eq!(pm.completed_bytes(), 1_500);
+        assert!(PieceMap::new(0, 1_000).all_done());
     }
 
     #[test]

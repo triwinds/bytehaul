@@ -15,6 +15,7 @@ Primary evidence:
 | Guide | Use it when |
 | --- | --- |
 | [Architecture and Module Boundaries](./architecture.md) | Placing engine, HTTP, session, storage, or workspace changes |
+| [Transfer Storage Contracts](./transfer-storage.md) | Changing backpressure, leased cache, scheduler or checkpoint durability |
 | [Configuration and Public API](./configuration-and-api.md) | Adding options, builders, exported types, defaults, or docs |
 | [Errors and Observability](./errors-and-observability.md) | Changing failures, retries, Python exceptions, or logs |
 | [Python Bindings](./python-bindings.md) | Editing PyO3 classes/functions, runtime/GIL behavior, exports, or packaging |
@@ -23,7 +24,7 @@ Primary evidence:
 ## Pre-Development Checklist
 
 1. Read [Architecture and Module Boundaries](./architecture.md) for every implementation task.
-2. Read each affected contract guide. Configuration reaching Python requires both the configuration and binding guides.
+2. Read [Transfer Storage Contracts](./transfer-storage.md) for data-flow or persistence changes. Read each affected contract guide. Configuration reaching Python requires both the configuration and binding guides.
 3. Search every option, enum variant, exception, public symbol, or persisted field before changing it; public concepts commonly have Rust, Python, test, and documentation mirrors.
 4. Read the closest `#[cfg(test)]` module and a matching integration test under `tests/` or `bindings/python/tests/`.
 5. Keep the root crate independent of PyO3. Translation belongs in `bindings/python/src/lib.rs`.

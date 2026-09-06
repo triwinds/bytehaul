@@ -26,7 +26,7 @@ The piece size determines the granularity of multi-connection downloading and re
 **Default:** 64 MiB  
 **Range:** Must be > 0
 
-Controls the maximum amount of data buffered in the write-back cache before back-pressure is applied to workers. Workers pause when the cache exceeds this threshold, creating natural flow control between network speed and disk I/O speed.
+Limits payload bytes reserved for the writer queue and write-back cache. Bytehaul splits large response chunks before forwarding them and flushes the cache with enough headroom for further chunks, so small or non-divisible budgets still make progress. Very small budgets increase channel and disk I/O overhead. HTTP/TLS receive buffers and other process memory are outside this payload budget.
 
 | System Memory | Recommended Budget |
 |---------------|-------------------|
@@ -141,6 +141,17 @@ Treat these as directional local baselines, not portable capacity claims. The sh
 | `client_cache_custom_doh_timeout` | `2.7134 ms – 3.8286 ms` |
 | `cache_seq_append_single_piece` | `1.2518 ms – 1.3304 ms` |
 | `cache_seq_append_multi_piece` | `3.2731 ms – 3.7718 ms` |
-| `cache_overlap_fallback` | `616.36 µs – 715.28 µs` |
 
 If you need stable comparisons across commits, rerun the same command on an idle machine and compare Criterion's generated history rather than treating a single short local run as definitive.
+
+## HTTP idle pool comparison
+
+Idle pooling remains opt-in: `DownloadSpec::http_idle_pool(4, Duration::from_secs(30))` or `DownloaderBuilder::http_idle_pool(...)`. The default remains disabled.
+
+Reproduce the local diagnostic with:
+
+```bash
+env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy cargo run --release --example pool_compare -- 3 2
+```
+
+On 2026-09-06, three alternating runs downloading 32 MiB with four workers and 1 MiB pieces gave median times of 101.1 ms with pooling disabled and 68.5 ms with pooling enabled. Accepted TCP connections fell from 33 to 5; all runs made 33 requests and verified every output byte. The server delays each request by 2 ms. This localhost HTTP comparison measures neither WAN/TLS handshakes nor proxy reliability, so it does not justify changing the default.

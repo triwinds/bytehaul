@@ -42,23 +42,21 @@ fn bench_cache_insert_coalesce(c: &mut Criterion) {
         });
     });
 
-    c.bench_function("cache_overlap_fallback", |b| {
+    c.bench_function("cache_sequential_leases", |b| {
         b.iter(|| {
             let mut cache = bench_cache_new();
-            for i in 0u64..512 {
-                let offset = i * 4096;
-                bench_cache_insert(&mut cache, 0, 1, offset, Bytes::from(vec![0xCDu8; 4096]));
-                if i % 16 == 0 {
+            for lease_id in 1..=16 {
+                for chunk_id in 0..32 {
                     bench_cache_insert(
                         &mut cache,
                         0,
-                        1,
-                        offset + 2048,
+                        lease_id,
+                        chunk_id * 4096,
                         Bytes::from(vec![0xEFu8; 4096]),
                     );
                 }
+                black_box(bench_cache_drain_lease_len(&mut cache, 0, lease_id));
             }
-            black_box(bench_cache_total_bytes(&cache));
         });
     });
 
@@ -106,6 +104,28 @@ fn bench_piece_map_serde(c: &mut Criterion) {
             ));
         });
     });
+}
+
+fn bench_scheduler_assignment(c: &mut Criterion) {
+    let mut group = c.benchmark_group("scheduler_assign_split");
+    for piece_count in [1_000u64, 10_000, 100_000] {
+        group.bench_with_input(
+            BenchmarkId::from_parameter(piece_count),
+            &piece_count,
+            |b, &count| {
+                b.iter_batched_ref(
+                    || bytehaul::bench::bench_scheduler_new(count * 1_048_576, 1_048_576),
+                    |scheduler| {
+                        black_box(bytehaul::bench::bench_scheduler_assign_complete(
+                            scheduler, 1_000, 4, 262_144,
+                        ));
+                    },
+                    criterion::BatchSize::SmallInput,
+                );
+            },
+        );
+    }
+    group.finish();
 }
 
 fn bench_scheduler_snapshot(c: &mut Criterion) {
@@ -258,6 +278,7 @@ criterion_group!(
     bench_cache_insert_coalesce,
     bench_piece_map_serde,
     bench_scheduler_snapshot,
+    bench_scheduler_assignment,
     bench_control_save_only,
     bench_control_roundtrip,
     bench_single_progress_reporting,

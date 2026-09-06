@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::{cmp, collections::BTreeMap};
 
+use bitvec::prelude::*;
 use parking_lot::Mutex;
 
 use crate::storage::control::ControlHints;
@@ -95,12 +96,6 @@ impl RangeSet {
         }
         true
     }
-
-    fn covers(&self, range: ByteRange) -> bool {
-        self.ranges
-            .iter()
-            .any(|current| current.start <= range.start && current.end >= range.end)
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -110,30 +105,17 @@ struct ActiveLeaseState {
 
 #[derive(Debug, Clone)]
 struct PieceRuntimeState {
-    full_range: ByteRange,
     missing_ranges: RangeSet,
-    completed_ranges: RangeSet,
+    has_completed_ranges: bool,
     active_leases: BTreeMap<u64, ActiveLeaseState>,
     attempt_counter: u32,
 }
 
 impl PieceRuntimeState {
-    fn new(full_range: ByteRange, completed: bool) -> Self {
-        let completed_ranges = if completed {
-            RangeSet::new_full(full_range.start, full_range.end)
-        } else {
-            RangeSet::default()
-        };
-        let missing_ranges = if completed {
-            RangeSet::default()
-        } else {
-            RangeSet::new_full(full_range.start, full_range.end)
-        };
-
+    fn new(full_range: ByteRange) -> Self {
         Self {
-            full_range,
-            missing_ranges,
-            completed_ranges,
+            missing_ranges: RangeSet::new_full(full_range.start, full_range.end),
+            has_completed_ranges: false,
             active_leases: BTreeMap::new(),
             attempt_counter: 0,
         }
@@ -145,10 +127,6 @@ impl PieceRuntimeState {
 
     fn missing_range_count(&self) -> usize {
         self.missing_ranges.len()
-    }
-
-    fn active_lease_count(&self) -> usize {
-        self.active_leases.len()
     }
 
     fn issue_lease(
@@ -209,9 +187,11 @@ impl PieceRuntimeState {
     }
 
     fn complete(&mut self, lease_key: LeaseKey) -> Option<bool> {
-        let lease = self.active_leases.remove(&lease_key.lease_id)?;
-        self.completed_ranges.insert(lease.range);
-        Some(self.completed_ranges.covers(self.full_range))
+        self.active_leases.remove(&lease_key.lease_id)?;
+        self.has_completed_ranges = true;
+        // Issuing removes missing bytes and reclaiming puts them back. Once both
+        // sets are empty, every byte has been acknowledged exactly once.
+        Some(self.missing_ranges.ranges.is_empty() && self.active_leases.is_empty())
     }
 
     fn reclaim(&mut self, lease_key: LeaseKey) -> bool {
@@ -226,7 +206,12 @@ impl PieceRuntimeState {
 /// Manages piece assignment, completion, and reclamation.
 pub(crate) struct SchedulerState {
     piece_map: PieceMap,
-    pieces: Vec<PieceRuntimeState>,
+    // Untouched pieces need only their completion/availability bits. Retain
+    // detailed state after reclaim to preserve the per-piece attempt counter.
+    pieces: BTreeMap<usize, PieceRuntimeState>,
+    available_pieces: BitVec<u8, Lsb0>,
+    active_lease_count: usize,
+    available_range_count: usize,
     next_candidate: usize,
     next_lease_id: u64,
     snapshot_seq: u64,
@@ -234,17 +219,15 @@ pub(crate) struct SchedulerState {
 
 impl SchedulerState {
     pub fn new(piece_map: PieceMap) -> Self {
-        let piece_count = piece_map.piece_count();
         let next_candidate = piece_map.first_missing().unwrap_or(0);
-        let pieces = (0..piece_count)
-            .map(|piece_id| {
-                let (start, end) = piece_map.piece_range(piece_id);
-                PieceRuntimeState::new(ByteRange { start, end }, piece_map.is_complete(piece_id))
-            })
-            .collect();
+        let available_pieces = piece_map.missing_bitset();
+        let available_range_count = piece_map.remaining_count();
         Self {
             piece_map,
-            pieces,
+            pieces: BTreeMap::new(),
+            available_pieces,
+            active_lease_count: 0,
+            available_range_count,
             next_candidate,
             next_lease_id: 1,
             snapshot_seq: 0,
@@ -267,30 +250,46 @@ impl SchedulerState {
         max_active_leases: usize,
         min_segment_size: u64,
     ) -> Option<Segment> {
-        let piece_count = self.piece_map.piece_count();
-        if piece_count == 0 || self.piece_map.all_done() {
+        if self.available_range_count == 0 {
             return None;
         }
 
-        for step in 0..piece_count {
-            let piece_id = (self.next_candidate + step) % piece_count;
-            if self.piece_map.is_complete(piece_id) {
-                continue;
+        let piece_id = self.available_pieces[self.next_candidate..]
+            .first_one()
+            .map(|offset| self.next_candidate + offset)
+            .or_else(|| self.available_pieces[..self.next_candidate].first_one())?;
+        let range = match self.pieces.get(&piece_id) {
+            Some(piece) => piece.next_assignable_range()?,
+            None => {
+                let (start, end) = self.piece_map.piece_range(piece_id);
+                ByteRange { start, end }
             }
-            let Some(range) = self.pieces[piece_id].next_assignable_range() else {
-                continue;
-            };
-            let range = self.assignment_range_for(range, max_active_leases, min_segment_size);
-            self.next_candidate = (piece_id + 1) % piece_count;
-            return self.pieces[piece_id].issue_lease(
-                range,
-                worker_id,
-                &mut self.next_lease_id,
-                piece_id,
-            );
-        }
+        };
+        let range = self.assignment_range_for(range, max_active_leases, min_segment_size);
+        let segment = self.issue_lease(piece_id, range, worker_id)?;
+        self.next_candidate = (piece_id + 1) % self.piece_map.piece_count();
+        Some(segment)
+    }
 
-        None
+    fn issue_lease(
+        &mut self,
+        piece_id: usize,
+        range: ByteRange,
+        worker_id: usize,
+    ) -> Option<Segment> {
+        let (start, end) = self.piece_map.piece_range(piece_id);
+        let piece = self
+            .pieces
+            .entry(piece_id)
+            .or_insert_with(|| PieceRuntimeState::new(ByteRange { start, end }));
+        let previous_ranges = piece.missing_range_count();
+        let segment = piece.issue_lease(range, worker_id, &mut self.next_lease_id, piece_id)?;
+        self.available_range_count =
+            self.available_range_count - previous_ranges + piece.missing_range_count();
+        self.active_lease_count += 1;
+        self.available_pieces
+            .set(piece_id, piece.missing_range_count() != 0);
+        Some(segment)
     }
 
     #[allow(dead_code)]
@@ -301,16 +300,15 @@ impl SchedulerState {
         end: u64,
         worker_id: usize,
     ) -> Option<Segment> {
-        if self.piece_map.is_complete(piece_id) {
+        if piece_id >= self.piece_map.piece_count() || self.piece_map.is_complete(piece_id) {
             return None;
         }
         let range = ByteRange::new(start, end)?;
-        self.pieces.get_mut(piece_id)?.issue_lease(
-            range,
-            worker_id,
-            &mut self.next_lease_id,
-            piece_id,
-        )
+        let (piece_start, piece_end) = self.piece_map.piece_range(piece_id);
+        if start < piece_start || end > piece_end {
+            return None;
+        }
+        self.issue_lease(piece_id, range, worker_id)
     }
 
     /// Replace an active lease with a fresh lease identity for the same piece.
@@ -319,7 +317,7 @@ impl SchedulerState {
             return None;
         }
 
-        self.pieces.get_mut(lease_key.piece_id)?.renew(
+        self.pieces.get_mut(&lease_key.piece_id)?.renew(
             lease_key,
             worker_id,
             &mut self.next_lease_id,
@@ -329,27 +327,34 @@ impl SchedulerState {
 
     /// Mark a piece as completed and remove it from inflight.
     pub fn complete(&mut self, lease_key: LeaseKey) -> bool {
-        let Some(piece_state) = self.pieces.get_mut(lease_key.piece_id) else {
+        let Some(piece_state) = self.pieces.get_mut(&lease_key.piece_id) else {
             return false;
         };
 
         let Some(piece_complete) = piece_state.complete(lease_key) else {
             return false;
         };
+        self.active_lease_count -= 1;
         if piece_complete {
             self.piece_map.mark_complete(lease_key.piece_id);
+            self.pieces.remove(&lease_key.piece_id);
         }
         true
     }
 
     /// Reclaim a piece (worker failed); it becomes available for reassignment.
     pub fn reclaim(&mut self, lease_key: LeaseKey) -> bool {
-        let Some(piece_state) = self.pieces.get_mut(lease_key.piece_id) else {
+        let Some(piece_state) = self.pieces.get_mut(&lease_key.piece_id) else {
             return false;
         };
+        let previous_ranges = piece_state.missing_range_count();
         if !piece_state.reclaim(lease_key) {
             return false;
         }
+        self.active_lease_count -= 1;
+        self.available_range_count =
+            self.available_range_count - previous_ranges + piece_state.missing_range_count();
+        self.available_pieces.set(lease_key.piece_id, true);
         if lease_key.piece_id < self.next_candidate {
             self.next_candidate = lease_key.piece_id;
         }
@@ -388,42 +393,19 @@ impl SchedulerState {
 
     pub fn control_hints(&mut self) -> ControlHints {
         self.snapshot_seq = self.snapshot_seq.saturating_add(1);
-        ControlHints {
-            dirty_piece_ids: self
-                .pieces
-                .iter()
-                .enumerate()
-                .filter_map(|(piece_id, piece)| {
-                    (!self.piece_map.is_complete(piece_id)
-                        && (!piece.active_leases.is_empty()
-                            || !piece.completed_ranges.ranges.is_empty()))
-                    .then_some(piece_id)
-                })
-                .collect(),
-            inflight_piece_ids: self
-                .pieces
-                .iter()
-                .enumerate()
-                .filter_map(|(piece_id, piece)| {
-                    (!piece.active_leases.is_empty()).then_some(piece_id)
-                })
-                .collect(),
+        let mut hints = ControlHints {
             snapshot_seq: self.snapshot_seq,
+            ..ControlHints::default()
+        };
+        for (&piece_id, piece) in &self.pieces {
+            if !piece.active_leases.is_empty() {
+                hints.inflight_piece_ids.push(piece_id);
+            }
+            if !piece.active_leases.is_empty() || piece.has_completed_ranges {
+                hints.dirty_piece_ids.push(piece_id);
+            }
         }
-    }
-
-    fn active_lease_count(&self) -> usize {
-        self.pieces
-            .iter()
-            .map(PieceRuntimeState::active_lease_count)
-            .sum()
-    }
-
-    fn available_range_count(&self) -> usize {
-        self.pieces
-            .iter()
-            .map(PieceRuntimeState::missing_range_count)
-            .sum()
+        hints
     }
 
     fn assignment_range_for(
@@ -436,7 +418,7 @@ impl SchedulerState {
             return range;
         }
 
-        let total_work_units = self.active_lease_count() + self.available_range_count();
+        let total_work_units = self.active_lease_count + self.available_range_count;
         if total_work_units >= max_active_leases {
             return range;
         }
@@ -470,6 +452,120 @@ impl SchedulerState {
 mod tests {
     use super::*;
     use crate::storage::piece_map::PieceMap;
+
+    #[test]
+    fn test_runtime_state_is_sparse_and_released_on_completion() {
+        let mut sched = SchedulerState::new(PieceMap::new(100_000_000, 1_000));
+        assert!(sched.pieces.is_empty());
+        assert_eq!(sched.available_range_count, 100_000);
+
+        let segment = sched.assign_to_with_split(0, 4, 250).unwrap();
+        assert_eq!(sched.pieces.len(), 1);
+        assert_eq!(sched.active_lease_count, 1);
+        assert_eq!(sched.available_range_count, 99_999);
+        assert!(sched.complete(segment.lease_key()));
+        assert!(sched.pieces.is_empty());
+        assert_eq!(sched.active_lease_count, 0);
+        assert!(sched.control_hints().dirty_piece_ids.is_empty());
+    }
+
+    #[test]
+    fn test_restored_pieces_need_no_runtime_state_and_skip_completed_bits() {
+        // Only pieces 1 and 8 are missing; ignore padding bits beyond piece 8.
+        let pm = PieceMap::from_bitset(8_500, 1_000, &[0b1111_1101, 0b1111_1110], 9);
+        let mut sched = SchedulerState::new(pm);
+        assert!(sched.pieces.is_empty());
+        assert_eq!(sched.available_range_count, 2);
+        assert!(sched.control_hints().dirty_piece_ids.is_empty());
+
+        let first = sched.assign().unwrap();
+        let last = sched.assign().unwrap();
+        assert_eq!(first.piece_id, 1);
+        assert_eq!((last.piece_id, last.start, last.end), (8, 8_000, 8_500));
+        assert!(sched.assign().is_none());
+        assert!(sched.complete(last.lease_key()));
+        assert!(sched.complete(first.lease_key()));
+        assert!(sched.all_done());
+        assert_eq!(sched.completed_bytes(), 8_500);
+        assert!(sched.pieces.is_empty());
+    }
+
+    #[test]
+    fn test_fragmentation_reclaim_renewal_and_split_preserve_work_counts() {
+        let mut sched = SchedulerState::new(PieceMap::new(1_200, 1_000));
+        let middle = sched.assign_subrange(0, 250, 750, 0).unwrap();
+        assert_eq!(sched.available_range_count, 3);
+        let tail = sched.assign_subrange(1, 1_000, 1_200, 1).unwrap();
+        assert_eq!(
+            (sched.active_lease_count, sched.available_range_count),
+            (2, 2)
+        );
+
+        // Reclaim joins both missing sides into a single range.
+        assert!(sched.reclaim(middle.lease_key()));
+        assert_eq!(
+            (sched.active_lease_count, sched.available_range_count),
+            (1, 1)
+        );
+        let tail = sched.renew(tail.lease_key(), 2).unwrap();
+        assert_eq!(tail.attempt, 2);
+        assert!(!sched.reclaim(middle.lease_key()));
+        assert!(!sched.complete(middle.lease_key()));
+        assert!(sched.renew(middle.lease_key(), 0).is_none());
+        assert!(sched.assign_subrange(1, 1_050, 1_150, 0).is_none());
+
+        // The current work counts leave room for three pieces of the 1,000-byte range.
+        let first = sched.assign_to_with_split(0, 4, 250).unwrap();
+        let second = sched.assign_to_with_split(1, 4, 250).unwrap();
+        let third = sched.assign_to_with_split(2, 4, 250).unwrap();
+        assert_eq!((first.start, first.end, first.attempt), (0, 334, 2));
+        assert_eq!((second.start, second.end, second.attempt), (334, 667, 3));
+        assert_eq!((third.start, third.end, third.attempt), (667, 1_000, 4));
+        assert_eq!(
+            (sched.active_lease_count, sched.available_range_count),
+            (4, 0)
+        );
+        assert!(sched.assign_to_with_split(4, 8, 100).is_none());
+
+        assert!(sched.complete(tail.lease_key()));
+        assert!(sched.complete(second.lease_key()));
+        assert!(sched.complete(third.lease_key()));
+        assert_eq!(sched.completed_bytes(), 200);
+        assert_eq!(sched.control_hints().dirty_piece_ids, vec![0]);
+        assert!(sched.complete(first.lease_key()));
+        assert_eq!(sched.completed_bytes(), 1_200);
+        assert!(sched.all_done());
+        assert!(sched.pieces.is_empty());
+        assert_eq!(
+            (sched.active_lease_count, sched.available_range_count),
+            (0, 0)
+        );
+    }
+
+    #[test]
+    fn test_invalid_subranges_do_not_create_runtime_state() {
+        let mut sched = SchedulerState::new(PieceMap::new(2_000, 1_000));
+        assert!(sched.assign_subrange(1, 900, 1_100, 0).is_none());
+        assert!(sched.assign_subrange(0, 900, 1_100, 0).is_none());
+        assert!(sched.assign_subrange(0, 100, 100, 0).is_none());
+        assert!(sched.assign_subrange(99, 0, 100, 0).is_none());
+        assert!(sched.pieces.is_empty());
+        assert_eq!(sched.available_range_count, 2);
+    }
+
+    #[test]
+    fn test_empty_and_restored_complete_schedulers_have_no_work() {
+        for pm in [
+            PieceMap::new(0, 1_000),
+            PieceMap::from_bitset(1_500, 1_000, &[0b0000_0011], 2),
+        ] {
+            let mut sched = SchedulerState::new(pm);
+            assert!(sched.all_done());
+            assert!(sched.assign_to_with_split(0, 4, 100).is_none());
+            assert!(sched.pieces.is_empty());
+            assert_eq!(sched.available_range_count, 0);
+        }
+    }
 
     #[test]
     fn test_scheduler_assign_and_complete() {
@@ -610,12 +706,11 @@ mod tests {
     }
 
     #[test]
-    fn test_range_set_merges_overlapping_completed_ranges_without_double_counting() {
+    fn test_range_set_merges_overlapping_ranges() {
         let mut ranges = RangeSet::default();
         ranges.insert(ByteRange::new(0, 600).unwrap());
         ranges.insert(ByteRange::new(400, 1_000).unwrap());
 
-        assert!(ranges.covers(ByteRange::new(0, 1_000).unwrap()));
         assert_eq!(ranges.ranges.len(), 1);
         assert_eq!(ranges.ranges[0], ByteRange::new(0, 1_000).unwrap());
     }

@@ -1,3 +1,4 @@
+mod flow;
 mod multi;
 mod range_validate;
 mod resume;
@@ -502,8 +503,6 @@ async fn run_download_inner(
     let worker = HttpWorker::new(client.clone(), &spec);
     let mut cancel_rx = cancel_rx;
     let speed_limit = SpeedLimit::new(spec.max_download_speed);
-
-    client.warm_resolution_for_url(&spec.url).await?;
 
     if let Some(output_path) = resolve_static_output_path(&spec)? {
         if let Some(resumed_path) = try_resume_download(

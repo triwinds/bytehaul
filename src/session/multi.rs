@@ -5,7 +5,9 @@ use std::time::{Duration, Instant};
 
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
-use tokio::sync::{mpsc, watch, Semaphore};
+use tokio::sync::{mpsc, watch};
+
+use super::flow::MemoryBudget;
 
 use super::range_validate::{
     validate_range_response, ExpectedRange, RangeValidationDecision, RangeValidationMode,
@@ -68,7 +70,7 @@ pub(super) async fn run_multi_worker(
     };
 
     // Memory budget semaphore
-    let budget = Arc::new(Semaphore::new(spec.memory_budget));
+    let budget = Arc::new(MemoryBudget::new(spec.memory_budget));
 
     // Writer with cache
     let (write_tx, write_rx) = mpsc::channel::<WriterCommand>(spec.channel_buffer);
@@ -78,8 +80,8 @@ pub(super) async fn run_multi_worker(
             write_rx,
             file,
             written_bytes.clone(),
-            budget.clone(),
-            spec.memory_budget,
+            budget.semaphore.clone(),
+            budget.watermark,
         )
         .run(),
     );
@@ -288,8 +290,14 @@ pub(super) async fn run_multi_worker(
         .await
         .map_err(|e| DownloadError::TaskFailed(format!("writer panicked: {e}")))?;
 
+    let writer_succeeded = writer_result.is_ok();
+    if let Err(error) = writer_result {
+        download_error = Some(error);
+    }
+
     if let Some(e) = download_error {
-        if spec.resume {
+        // A closed writer is a durability barrier only when its final sync succeeded.
+        if spec.resume && writer_succeeded {
             persist_multi_control_snapshot(
                 ControlSaveReason::Terminal,
                 None,
@@ -312,20 +320,6 @@ pub(super) async fn run_multi_worker(
         log_error!(log_level, download_id = download_id, error = %e,
             "multi-worker download failed");
         return Err(e);
-    }
-    if let Err(error) = writer_result {
-        let now = Instant::now();
-        let update = sampled_progress_update(
-            &mut eta_estimator,
-            received_bytes.load(Ordering::Relaxed),
-            total_size,
-            now,
-        )
-        .with_state(DownloadState::Failed);
-        progress_reporter.force_report(progress_tx, update, now);
-        log_error!(log_level, download_id = download_id, error = %error,
-            "multi-worker writer failed");
-        return Err(error);
     }
 
     if !scheduler.lock().all_done() {
@@ -416,18 +410,8 @@ async fn persist_multi_control_snapshot(
         return;
     }
 
-    let flush_stats = match write_tx {
-        Some(write_tx) => match flush_all_and_wait(write_tx, true).await {
-            Ok(stats) => Some(stats),
-            Err(error) => {
-                log_warn!(ctx.log_level, download_id = ctx.download_id, checkpoint = reason.label(),
-                    error = %error, "control snapshot flush failed");
-                return;
-            }
-        },
-        None => None,
-    };
-
+    // Freeze both completed bits and advisory hints before the writer barrier.
+    // Workers may complete more pieces as soon as the sync acknowledges.
     let (snap, hints) = {
         let mut sched = ctx.scheduler.lock();
         let snap = ControlSnapshot {
@@ -448,6 +432,18 @@ async fn persist_multi_control_snapshot(
     {
         return;
     }
+
+    let flush_stats = match write_tx {
+        Some(write_tx) => match flush_all_and_wait(write_tx, true).await {
+            Ok(stats) => Some(stats),
+            Err(error) => {
+                log_warn!(ctx.log_level, download_id = ctx.download_id, checkpoint = reason.label(),
+                    error = %error, "control snapshot flush failed");
+                return;
+            }
+        },
+        None => None,
+    };
 
     let save_started = Instant::now();
     let dirty_piece_count = hints.dirty_piece_ids.len();
@@ -507,7 +503,7 @@ async fn worker_loop(
     write_tx: mpsc::Sender<WriterCommand>,
     received_bytes: Arc<AtomicU64>,
     cancel_rx: watch::Receiver<StopSignal>,
-    budget: Arc<Semaphore>,
+    budget: Arc<MemoryBudget>,
     speed_limit: SpeedLimit,
     first_response: Option<(HttpResponse, ResponseMeta, usize)>,
     total_size: u64,
@@ -736,7 +732,7 @@ async fn download_segment(
     write_tx: &mpsc::Sender<WriterCommand>,
     received_bytes: &Arc<AtomicU64>,
     cancel_rx: &mut watch::Receiver<StopSignal>,
-    budget: &Arc<Semaphore>,
+    budget: &Arc<MemoryBudget>,
     speed_limit: &SpeedLimit,
 ) -> Result<u64, (DownloadError, u64)> {
     let (response, meta) = worker
@@ -776,7 +772,7 @@ async fn stream_segment(
     write_tx: &mpsc::Sender<WriterCommand>,
     received_bytes: &Arc<AtomicU64>,
     cancel_rx: &mut watch::Receiver<StopSignal>,
-    budget: &Arc<Semaphore>,
+    budget: &Arc<MemoryBudget>,
     speed_limit: &SpeedLimit,
 ) -> Result<u64, (DownloadError, u64)> {
     let mut body = response.into_body();
@@ -810,30 +806,15 @@ async fn stream_segment(
                                 bytes_read,
                             ));
                         }
-                        // Rate limiting
-                        speed_limit.acquire(len).await;
-                        // Acquire budget permits before buffering
-                        let permit = budget
-                            .acquire_many(len as u32)
-                            .await
-                            .map_err(|_| {
-                                (
-                                    DownloadError::Internal("budget semaphore closed".into()),
-                                    bytes_read,
-                                )
-                            })?;
-
-                        if write_tx.send(WriterCommand::Data {
-                            offset,
-                            data,
-                            lease_key: Some(segment.lease_key()),
-                        }).await.is_err() {
-                            return Err((DownloadError::ChannelClosed, bytes_read));
-                        }
-                        permit.forget(); // permits returned by writer after flush
-                        offset += len_u64;
-                        bytes_read += len_u64;
-                        received_bytes.fetch_add(len_u64, Ordering::Relaxed);
+                        budget.forward(
+                            data, offset, Some(segment.lease_key()), write_tx,
+                            cancel_rx, speed_limit,
+                            |sent| {
+                                offset += sent;
+                                bytes_read += sent;
+                                received_bytes.fetch_add(sent, Ordering::Relaxed);
+                            },
+                        ).await.map_err(|error| (error, bytes_read))?;
                     }
                     Ok(None) => break,
                     Err(error) => return Err((error, bytes_read)),
@@ -1046,6 +1027,59 @@ mod coverage_tests {
     }
 
     #[tokio::test]
+    async fn checkpoint_freezes_completed_bits_and_hints_before_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("frozen.bytehaul");
+        let scheduler = build_scheduler(1024, 256);
+        complete_one_piece(&scheduler);
+        let pending = scheduler.lock().assign().unwrap();
+        let meta = response_meta();
+        let spec = DownloadSpec::new("https://example.com/multi.bin").autosave_sync_every(1);
+        let ctx = MultiControlSaveContext {
+            spec: &spec,
+            meta: &meta,
+            request_url: &spec.url,
+            scheduler: &scheduler,
+            total_size: 1024,
+            control_path: &path,
+            log_level: LogLevel::Off,
+            download_id: 0,
+        };
+        let (tx, mut rx) = mpsc::channel(1);
+        let mut tracker = ControlSaveTracker::new(0);
+        let barrier = async {
+            let WriterCommand::FlushAll { sync_data, ack } = rx.recv().await.unwrap() else {
+                panic!()
+            };
+            assert!(sync_data);
+            ack.send(crate::storage::writer::FlushAllStats {
+                written_bytes: 256,
+                flush_elapsed: Duration::ZERO,
+                sync_elapsed: Some(Duration::ZERO),
+            })
+            .unwrap();
+            // The sync has acknowledged. Before the save future resumes,
+            // a worker completes a lease written after that barrier.
+            assert!(scheduler.lock().complete(pending.lease_key()));
+        };
+        tokio::join!(
+            persist_multi_control_snapshot(
+                ControlSaveReason::Autosave,
+                Some(&tx),
+                &mut tracker,
+                &ctx
+            ),
+            barrier,
+        );
+        let (snapshot, hints) = ControlSnapshot::load_with_hints(&path).await.unwrap();
+        assert_eq!(snapshot.downloaded_bytes, 256);
+        assert_eq!(snapshot.completed_bitset, vec![1]);
+        assert_eq!(hints.inflight_piece_ids, vec![pending.piece_id]);
+        assert_eq!(scheduler.lock().completed_bytes(), 512);
+        assert_eq!(tracker.last_saved_downloaded_bytes(), 256);
+    }
+
+    #[tokio::test]
     async fn test_persist_multi_control_snapshot_defers_then_saves_autosave() {
         let dir = tempfile::tempdir().unwrap();
         let control_path = dir.path().join("multi.bytehaul");
@@ -1105,6 +1139,11 @@ mod coverage_tests {
             download_id: 4,
         };
         let mut tracker = ControlSaveTracker::new(0);
+        complete_one_piece(&scheduler);
+        persist_multi_control_snapshot(ControlSaveReason::Terminal, None, &mut tracker, &ctx).await;
+        let previous_file = tokio::fs::read(&control_path).await.unwrap();
+        assert_eq!(tracker.last_saved_downloaded_bytes(), 256);
+
         let (write_tx, write_rx) = mpsc::channel(1);
         drop(write_rx);
 
@@ -1117,8 +1156,34 @@ mod coverage_tests {
         )
         .await;
 
-        assert!(!control_path.exists());
-        assert_eq!(tracker.last_saved_downloaded_bytes(), 0);
+        assert_eq!(tokio::fs::read(&control_path).await.unwrap(), previous_file);
+        assert_eq!(tracker.last_saved_downloaded_bytes(), 256);
+
+        // A writer that accepts the barrier but fails during flush/sync drops
+        // its acknowledgement. That failure must preserve the same checkpoint.
+        let (write_tx, mut write_rx) = mpsc::channel(1);
+        tokio::join!(
+            persist_multi_control_snapshot(
+                ControlSaveReason::Terminal,
+                Some(&write_tx),
+                &mut tracker,
+                &ctx,
+            ),
+            async {
+                let WriterCommand::FlushAll { sync_data, ack } = write_rx.recv().await.unwrap()
+                else {
+                    panic!("expected a checkpoint durability barrier")
+                };
+                assert!(sync_data);
+                drop(ack);
+            },
+        );
+        assert_eq!(tokio::fs::read(&control_path).await.unwrap(), previous_file);
+        let snapshot = ControlSnapshot::load(&control_path).await.unwrap();
+        assert_eq!(snapshot.downloaded_bytes, 256);
+        assert_eq!(snapshot.completed_bitset, vec![1]);
+        assert_eq!(scheduler.lock().completed_bytes(), 512);
+        assert_eq!(tracker.last_saved_downloaded_bytes(), 256);
     }
 
     #[tokio::test]
@@ -1264,7 +1329,7 @@ mod coverage_tests {
             write_tx,
             downloaded.clone(),
             cancel_rx,
-            Arc::new(Semaphore::new(1024)),
+            Arc::new(MemoryBudget::new(1024)),
             SpeedLimit::new(0),
             None,
             256,
@@ -1312,7 +1377,7 @@ mod coverage_tests {
             write_tx,
             downloaded,
             cancel_rx,
-            Arc::new(Semaphore::new(1024)),
+            Arc::new(MemoryBudget::new(1024)),
             SpeedLimit::new(0),
             None,
             256,
