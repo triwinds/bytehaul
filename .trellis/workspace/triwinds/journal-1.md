@@ -72,3 +72,25 @@ Committed aria2 review fixes: bounded cancellable forwarding, frozen pre-sync ch
 ### Status
 
 [OK] **Completed**
+
+
+## Session 4: Diagnose local and CI coverage mismatch
+
+**Date**: 2026-09-06
+**Task**: Diagnose local and CI coverage mismatch
+**Package**: bytehaul-python
+**Branch**: `fix/retry-body-transport-errors`
+
+### Summary
+
+Committed aria2 simplification. Verified August Actions coverage 94.75% (2975/3140; 8 lines short); September coverage aborted on Linux-only /dev/full progress-state assertion, also failing ordinary Ubuntu tests. Windows helper has no coverage threshold; local macOS verification did not measure coverage. Recorded exact evidence and scoped follow-up in archived coverage-parity research. No push.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `f483f37` | (see git log) |
+
+### Status
+
+[OK] **Completed**
