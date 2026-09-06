@@ -1,0 +1,35 @@
+{
+  "version": "0.2.1",
+  "files": [
+    {
+      "name": "bytehaul-0.2.1-cp39-abi3-macosx_10_12_x86_64.whl",
+      "type": "bdist_wheel",
+      "yanked": false,
+      "sha256": "710433296dc53e19ea2630f947b46225335649a8c67d3b8bd4c74387cbcade30"
+    },
+    {
+      "name": "bytehaul-0.2.1-cp39-abi3-macosx_11_0_arm64.whl",
+      "type": "bdist_wheel",
+      "yanked": false,
+      "sha256": "3f7eb327a8ba775d8526c9b2e255311470c88222a4d4d96c2c3ce67c7f4a6349"
+    },
+    {
+      "name": "bytehaul-0.2.1-cp39-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+      "type": "bdist_wheel",
+      "yanked": false,
+      "sha256": "71c5d6d9e1250b62c44e06ec73eecbdb800a87c5f08d8d2dd869c24c7c0a33da"
+    },
+    {
+      "name": "bytehaul-0.2.1-cp39-abi3-win_amd64.whl",
+      "type": "bdist_wheel",
+      "yanked": false,
+      "sha256": "86a5179c188b64934983f29eb40946b2d052bf9883fc98544d9e6f33c7678472"
+    },
+    {
+      "name": "bytehaul-0.2.1.tar.gz",
+      "type": "sdist",
+      "yanked": false,
+      "sha256": "b9ce9d4b7f8ade4f090eea2ca0433bf783c8fae9b46e23cfb28d4c6712750673"
+    }
+  ]
+}
