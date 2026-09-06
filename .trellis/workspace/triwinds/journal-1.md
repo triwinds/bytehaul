@@ -138,3 +138,26 @@ Windows CI failed a 150ms speedup assertion despite a 146ms improvement. Replace
 ### Status
 
 [OK] **Completed**
+
+
+## Session 7: Merge repair branch and publish 0.2.1
+
+**Date**: 2026-09-07
+**Task**: Merge repair branch and publish 0.2.1
+**Package**: bytehaul-python
+**Branch**: `master`
+
+### Summary
+
+Reviewed five dependency PRs: closed incompatible bincode/warp/PyO3 bumps and superseded libc; incorporated rand 0.9.4. Prepared shared 0.2.1 versions and excluded internal workflow files from package. Native 429 Rust and 42 Python tests plus Clippy/docs/package audits passed. PR20 merged to existing master after both CI runs passed, coverage 96.59% (3404/3524). Tagged merge commit and created GitHub release; crates.io and PyPI workflows succeeded and registry APIs verified version 0.2.1 with four wheels and one sdist.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `654f783` | (see git log) |
+| `5ebda09` | (see git log) |
+
+### Status
+
+[OK] **Completed**
