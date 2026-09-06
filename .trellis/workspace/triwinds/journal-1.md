@@ -94,3 +94,25 @@ Committed aria2 simplification. Verified August Actions coverage 94.75% (2975/31
 ### Status
 
 [OK] **Completed**
+
+
+## Session 5: Fix storage failures and reproducible Linux coverage
+
+**Date**: 2026-09-06
+**Task**: Fix storage failures and reproducible Linux coverage
+**Package**: bytehaul-python
+**Branch**: `fix/retry-body-transport-errors`
+
+### Summary
+
+Fixed terminal storage error progress while preserving durable checkpoints. Unified pinned Linux coverage entry, added meaningful measured-gap regressions, isolated profiles and retained CI diagnostics. Fresh Linux gate passed 96.59% (3404/3524), 434 tests; native 429 tests and quality checks passed. Documented platform limits and prevention contracts; cleaned task-owned Docker/Colima resources. No push.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `3d21ed0` | (see git log) |
+
+### Status
+
+[OK] **Completed**
