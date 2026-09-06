@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 7
+- **Total Sessions**: 8
 - **Last Active**: 2026-09-07
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~163 | Active |
+| `journal-1.md` | ~185 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 8 | 2026-09-07 | Synchronize public guides for 0.2.1 | HEAD~1 | `master` |
 | 7 | 2026-09-07 | Merge repair branch and publish 0.2.1 | `654f783`, `5ebda09` | `master` |
 | 6 | 2026-09-06 | Replace flaky dynamic split timing assertion | `d25f8f3` | `fix/retry-body-transport-errors` |
 | 5 | 2026-09-06 | Fix storage failures and reproducible Linux coverage | `3d21ed0` | `fix/retry-body-transport-errors` |

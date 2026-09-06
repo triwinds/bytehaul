@@ -161,3 +161,25 @@ Reviewed five dependency PRs: closed incompatible bincode/warp/PyO3 bumps and su
 ### Status
 
 [OK] **Completed**
+
+
+## Session 8: Synchronize public guides for 0.2.1
+
+**Date**: 2026-09-07
+**Task**: Synchronize public guides for 0.2.1
+**Package**: bytehaul-python
+**Branch**: `master`
+
+### Summary
+
+Updated README and English/Chinese guides for 0.2.1 installation, master badges and release links. Corrected received vs durable progress, storage/cleanup, pause/cancel, Python lifecycle, fresh split strategy and Windows coverage descriptions; marked historical design/benchmarks. Independent docs checks passed: 40 local links, 2 anchors, 25 Python/21 Rust/2 TOML/30 shell snippets. No runtime change; no full runtime test rerun.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `HEAD~1` | (see git log) |
+
+### Status
+
+[OK] **Completed**
