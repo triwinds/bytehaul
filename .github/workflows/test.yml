@@ -59,7 +59,7 @@ jobs:
 
   coverage:
     name: Coverage gate (≥95%)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Check out source
@@ -67,24 +67,28 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Cargo registry & build
+      - name: Cache Cargo registry
         uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-tarpaulin-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-tarpaulin-
+          key: ${{ runner.os }}-coverage-${{ hashFiles('scripts/coverage-config.json', '**/Cargo.lock') }}
 
-      - name: Install cargo-tarpaulin
-        run: cargo install cargo-tarpaulin
+      - name: Test coverage entry
+        run: python3 -m unittest discover -s scripts/tests -p 'test_coverage.py'
 
-      - name: Run coverage
-        run: cargo tarpaulin --engine llvm -p bytehaul --all-targets --out Stdout --fail-under 95
+      - name: Run Linux coverage gate with pinned tools
+        run: python3 scripts/coverage.py --install
+
+      - name: Upload coverage diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-coverage-${{ github.sha }}
+          path: target/coverage/reports/
+          if-no-files-found: warn
+          retention-days: 14
 
   python-tests:
     name: Python binding tests

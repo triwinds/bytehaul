@@ -559,4 +559,99 @@ mod tests {
         let resolved = resolve_redirect_target("https://example.com/file", "%zz").unwrap();
         assert_eq!(resolved, "https://example.com/%zz");
     }
+
+    #[tokio::test]
+    async fn final_url_resolves_relative_redirect_once_and_caches_it() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let count = requests.clone();
+        let route = warp::path::full().map(move |path: warp::path::FullPath| {
+            count.fetch_add(1, Ordering::SeqCst);
+            let response = warp::http::Response::builder();
+            if path.as_str() == "/release" {
+                response.status(302).header("location", "asset")
+            } else {
+                assert_eq!(path.as_str(), "/asset");
+                response.status(200)
+            }
+            .body("done")
+            .unwrap()
+        });
+        let (addr, server) = warp::serve(route).bind_ephemeral(([127, 0, 0, 1], 0));
+        tokio::spawn(server);
+        let worker = worker_for(format!("http://{addr}/release"));
+        assert_eq!(
+            worker.final_url().await.unwrap(),
+            format!("http://{addr}/asset")
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            worker.final_url().await.unwrap(),
+            format!("http://{addr}/asset")
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn final_url_rejects_redirect_loops_without_caching_them() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let count = requests.clone();
+        let route = warp::any().map(move || {
+            count.fetch_add(1, Ordering::SeqCst);
+            warp::http::Response::builder()
+                .status(302)
+                .header("location", "/loop")
+                .body("")
+                .unwrap()
+        });
+        let (addr, server) = warp::serve(route).bind_ephemeral(([127, 0, 0, 1], 0));
+        tokio::spawn(server);
+        let worker = worker_for(format!("http://{addr}/loop"));
+        let err = worker.final_url().await.unwrap_err();
+        assert!(matches!(err, DownloadError::HttpStatus { status: 508, .. }));
+        assert_eq!(requests.load(Ordering::SeqCst), 10);
+        assert!(worker.final_url.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn send_get_refreshes_expired_redirects() {
+        for expired_status in [403, 404] {
+            let active = Arc::new(AtomicUsize::new(1));
+            let release_count = Arc::new(AtomicUsize::new(0));
+            let active_release = active.clone();
+            let count = release_count.clone();
+            let release = warp::path("release").map(move || {
+                count.fetch_add(1, Ordering::SeqCst);
+                warp::http::Response::builder()
+                    .status(302)
+                    .header(
+                        "location",
+                        format!("/asset/{}", active_release.load(Ordering::SeqCst)),
+                    )
+                    .body("")
+                    .unwrap()
+            });
+            let asset = warp::path!("asset" / usize).map(move |id| {
+                let status = if id == active.load(Ordering::SeqCst) {
+                    active.fetch_add(1, Ordering::SeqCst);
+                    200
+                } else {
+                    expired_status
+                };
+                warp::http::Response::builder()
+                    .status(status)
+                    .body("done")
+                    .unwrap()
+            });
+            let (addr, server) = warp::serve(release.or(asset)).bind_ephemeral(([127, 0, 0, 1], 0));
+            tokio::spawn(server);
+            let worker = worker_for(format!("http://{addr}/release"));
+            worker.send_get().await.unwrap();
+            worker.send_get().await.unwrap();
+            assert_eq!(release_count.load(Ordering::SeqCst), 2);
+            assert_eq!(
+                worker.final_url().await.unwrap(),
+                format!("http://{addr}/asset/2")
+            );
+        }
+    }
 }

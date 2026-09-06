@@ -1453,6 +1453,406 @@ mod coverage_tests {
     }
 
     #[tokio::test]
+    async fn nonretryable_worker_failure_preserves_completed_prefix() {
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = requests.clone();
+        let route = warp::any().map(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            warp::http::Response::builder()
+                .status(403)
+                .body("forbidden")
+        });
+        let (addr, server) = warp::serve(route).bind_ephemeral(([127, 0, 0, 1], 0));
+        let server = tokio::spawn(server);
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("partial.bin");
+        let control = ControlSnapshot::control_path(&output);
+        tokio::fs::write(&output, vec![0xAC; 256]).await.unwrap();
+        let spec = DownloadSpec::new(format!("http://{addr}/piece"))
+            .resume(true)
+            .piece_size(256)
+            .min_segment_size(256)
+            .max_connections(1);
+        let mut pieces = PieceMap::new(512, 256);
+        pieces.mark_complete(0);
+        let (progress, _) = watch::channel(ProgressSnapshot::default());
+        let (_stop, stop_rx) = watch::channel(StopSignal::Running);
+        let client = crate::network::ClientNetworkConfig::default()
+            .build_client()
+            .unwrap();
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_multi_worker(
+                client,
+                &spec,
+                &spec.url,
+                &output,
+                &response_meta(),
+                512,
+                pieces,
+                None,
+                &progress,
+                stop_rx,
+                &control,
+                SpeedLimit::new(0),
+                LogLevel::Off,
+                0,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        server.abort();
+
+        assert!(
+            matches!(error, DownloadError::HttpStatus { status: 403, .. }),
+            "{error:?}"
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 1, "403 must not retry");
+        assert_eq!(progress.borrow().state, DownloadState::Failed);
+        assert_eq!(progress.borrow().downloaded, 256);
+        assert_eq!(tokio::fs::read(output).await.unwrap(), vec![0xAC; 256]);
+        let (saved, hints) = ControlSnapshot::load_with_hints(&control).await.unwrap();
+        assert_eq!(saved.downloaded_bytes, 256);
+        assert_eq!(saved.completed_bitset, vec![1]);
+        assert!(
+            hints.inflight_piece_ids.is_empty(),
+            "failed lease must be reclaimed"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_segment_rejects_short_and_oversized_bodies_without_false_completion() {
+        for body_len in [2, 5] {
+            let route = warp::any().map(move || vec![0xAC; body_len]);
+            let (addr, server) = warp::serve(route).bind_ephemeral(([127, 0, 0, 1], 0));
+            let server = tokio::spawn(server);
+            let response = worker_for(format!("http://{addr}/piece"))
+                .send_get()
+                .await
+                .unwrap()
+                .0;
+            let scheduler = build_scheduler(4, 4);
+            let segment = scheduler.lock().assign().unwrap();
+            let (tx, mut rx) = mpsc::channel(4);
+            let (_stop, mut stop_rx) = watch::channel(StopSignal::Running);
+            let downloaded = Arc::new(AtomicU64::new(0));
+            let (error, accepted) = stream_segment(
+                response,
+                Duration::from_secs(2),
+                4,
+                &segment,
+                &tx,
+                &downloaded,
+                &mut stop_rx,
+                &Arc::new(MemoryBudget::new(64)),
+                &SpeedLimit::new(0),
+            )
+            .await
+            .unwrap_err();
+            server.abort();
+            if body_len == 2 {
+                assert!(
+                    matches!(error, DownloadError::Transport(ref e)
+                    if e.kind() == crate::error::TransportErrorKind::Body),
+                    "{error:?}"
+                );
+                assert_eq!(accepted, 2);
+            } else {
+                assert!(
+                    matches!(error, DownloadError::ResumeMismatch(_)),
+                    "{error:?}"
+                );
+                assert!(
+                    accepted <= 4,
+                    "must not forward bytes past the requested range"
+                );
+            }
+            let mut forwarded = Vec::new();
+            while let Ok(command) = rx.try_recv() {
+                let WriterCommand::Data {
+                    data,
+                    offset,
+                    lease_key,
+                    ..
+                } = command
+                else {
+                    panic!("incomplete segment must not flush its lease");
+                };
+                assert_eq!(offset, forwarded.len() as u64);
+                assert_eq!(lease_key, Some(segment.lease_key()));
+                forwarded.extend_from_slice(&data);
+            }
+            assert_eq!(forwarded, vec![0xAC; accepted as usize]);
+            assert_eq!(downloaded.load(Ordering::Relaxed), accepted);
+            assert!(!scheduler.lock().all_done());
+        }
+    }
+
+    fn failure_test_worker_config(worker: HttpWorker) -> Arc<WorkerConfig> {
+        Arc::new(WorkerConfig {
+            worker,
+            read_timeout: Duration::from_secs(2),
+            max_retries: 0,
+            retry_base_delay: Duration::ZERO,
+            retry_max_delay: Duration::ZERO,
+            max_retry_elapsed: None,
+            max_active_leases: 1,
+            min_segment_size: 4,
+        })
+    }
+
+    #[tokio::test]
+    async fn worker_preexisting_stop_leaves_piece_unleased() {
+        for signal in [StopSignal::Pause, StopSignal::Cancel] {
+            let scheduler = build_scheduler(4, 4);
+            let (tx, mut rx) = mpsc::channel(1);
+            let (_stop, stop_rx) = watch::channel(signal);
+            let error = worker_loop(
+                0,
+                failure_test_worker_config(worker_for("http://example.invalid/unused".into())),
+                scheduler.clone(),
+                tx,
+                Arc::new(AtomicU64::new(0)),
+                stop_rx,
+                Arc::new(MemoryBudget::new(64)),
+                SpeedLimit::new(0),
+                None,
+                4,
+                LogLevel::Off,
+                0,
+            )
+            .await
+            .unwrap_err();
+            match signal {
+                StopSignal::Pause => assert!(matches!(error, DownloadError::Paused)),
+                StopSignal::Cancel => assert!(matches!(error, DownloadError::Cancelled)),
+                StopSignal::Running => unreachable!(),
+            }
+            assert!(
+                rx.recv().await.is_none(),
+                "stopped worker must not begin a lease"
+            );
+            let mut scheduler = scheduler.lock();
+            assert_eq!(scheduler.remaining_count(), 1);
+            assert!(scheduler.control_hints().inflight_piece_ids.is_empty());
+            assert_eq!(scheduler.assign().unwrap().start, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_probe_total_reclaims_lease_without_forwarding_data() {
+        let route = warp::any().map(|| vec![0xAC; 4]);
+        let (addr, server) = warp::serve(route).bind_ephemeral(([127, 0, 0, 1], 0));
+        let server = tokio::spawn(server);
+        let worker = worker_for(format!("http://{addr}/piece"));
+        let (response, mut meta) = worker.send_get().await.unwrap();
+        meta.content_range_start = Some(0);
+        meta.content_range_end = Some(3);
+        meta.content_range_total = Some(5);
+        let scheduler = build_scheduler(4, 4);
+        let (tx, rx) = mpsc::channel(4);
+        let writer = spawn_writer_ack(rx);
+        let downloaded = Arc::new(AtomicU64::new(0));
+        let (_stop, stop_rx) = watch::channel(StopSignal::Running);
+        let error = worker_loop(
+            0,
+            failure_test_worker_config(worker),
+            scheduler.clone(),
+            tx,
+            downloaded.clone(),
+            stop_rx,
+            Arc::new(MemoryBudget::new(64)),
+            SpeedLimit::new(0),
+            Some((response, meta, 0)),
+            4,
+            LogLevel::Off,
+            0,
+        )
+        .await
+        .unwrap_err();
+        writer.await.unwrap();
+        server.abort();
+        assert!(
+            matches!(error, DownloadError::ResumeMismatch(_)),
+            "{error:?}"
+        );
+        assert_eq!(downloaded.load(Ordering::Relaxed), 0);
+        let mut scheduler = scheduler.lock();
+        assert_eq!(scheduler.remaining_count(), 1);
+        assert!(scheduler.control_hints().inflight_piece_ids.is_empty());
+        assert_eq!(scheduler.assign().unwrap().start, 0);
+    }
+
+    #[tokio::test]
+    async fn writer_discard_failure_rolls_back_received_bytes_and_reclaims_piece() {
+        let route = warp::any().map(|| vec![0xAC; 2]);
+        let (addr, server) = warp::serve(route).bind_ephemeral(([127, 0, 0, 1], 0));
+        let server = tokio::spawn(server);
+        let worker = worker_for(format!("http://{addr}/piece"));
+        let (response, mut meta) = worker.send_get().await.unwrap();
+        meta.content_length = Some(4);
+        meta.content_range_start = Some(0);
+        meta.content_range_end = Some(3);
+        meta.content_range_total = Some(4);
+        let scheduler = build_scheduler(4, 4);
+        let (tx, mut rx) = mpsc::channel(4);
+        let writer = tokio::spawn(async move {
+            assert!(matches!(
+                rx.recv().await,
+                Some(WriterCommand::BeginLease { .. })
+            ));
+            let mut received = Vec::new();
+            loop {
+                match rx.recv().await {
+                    Some(WriterCommand::Data { data, offset, .. }) => {
+                        assert_eq!(offset, received.len() as u64);
+                        received.extend_from_slice(&data);
+                    }
+                    Some(WriterCommand::DiscardLease { ack, .. }) => {
+                        assert_eq!(received, vec![0xAC; 2]);
+                        // Model a writer failing after receiving the discard command.
+                        drop(ack);
+                        break;
+                    }
+                    _ => panic!("expected prefix data then discard"),
+                }
+            }
+        });
+        let downloaded = Arc::new(AtomicU64::new(0));
+        let (_stop, stop_rx) = watch::channel(StopSignal::Running);
+        let error = worker_loop(
+            0,
+            failure_test_worker_config(worker),
+            scheduler.clone(),
+            tx,
+            downloaded.clone(),
+            stop_rx,
+            Arc::new(MemoryBudget::new(64)),
+            SpeedLimit::new(0),
+            Some((response, meta, 0)),
+            4,
+            LogLevel::Off,
+            0,
+        )
+        .await
+        .unwrap_err();
+        writer.await.unwrap();
+        server.abort();
+        assert!(matches!(error, DownloadError::ChannelClosed), "{error:?}");
+        assert_eq!(
+            downloaded.load(Ordering::Relaxed),
+            0,
+            "failed prefix must be rolled back"
+        );
+        let mut scheduler = scheduler.lock();
+        assert_eq!(scheduler.remaining_count(), 1);
+        assert!(scheduler.control_hints().inflight_piece_ids.is_empty());
+        assert_eq!(scheduler.assign().unwrap().start, 0);
+    }
+
+    #[tokio::test]
+    async fn failed_checkpoint_save_keeps_tracker_pending_for_next_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("not-a-directory");
+        tokio::fs::write(&blocker, b"preserve").await.unwrap();
+        let control = blocker.join("state.bytehaul");
+        let scheduler = build_scheduler(512, 256);
+        complete_one_piece(&scheduler);
+        let spec = DownloadSpec::new("http://example.invalid/piece").autosave_sync_every(1);
+        let meta = response_meta();
+        let ctx = MultiControlSaveContext {
+            spec: &spec,
+            meta: &meta,
+            request_url: &spec.url,
+            scheduler: &scheduler,
+            total_size: 512,
+            control_path: &control,
+            log_level: LogLevel::Off,
+            download_id: 0,
+        };
+        let mut tracker = ControlSaveTracker::new(0);
+        persist_multi_control_snapshot(ControlSaveReason::Autosave, None, &mut tracker, &ctx).await;
+        assert_eq!(tracker.last_saved_downloaded_bytes(), 0);
+        assert_eq!(tokio::fs::read(&blocker).await.unwrap(), b"preserve");
+        tokio::fs::remove_file(&blocker).await.unwrap();
+        tokio::fs::create_dir(&blocker).await.unwrap();
+        persist_multi_control_snapshot(ControlSaveReason::Autosave, None, &mut tracker, &ctx).await;
+        assert_eq!(tracker.last_saved_downloaded_bytes(), 256);
+        assert_eq!(
+            ControlSnapshot::load(&control)
+                .await
+                .unwrap()
+                .completed_bitset,
+            vec![1]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn multi_writer_failure_does_not_replace_existing_checkpoint() {
+        let (addr, server) = spawn_flaky_range_server(0, None);
+        let server = tokio::spawn(server);
+        let dir = tempfile::tempdir().unwrap();
+        let control = dir.path().join("previous.bytehaul");
+        let spec = DownloadSpec::new(format!("http://{addr}/piece"))
+            .resume(true)
+            .piece_size(256)
+            .max_connections(1)
+            .file_allocation(crate::config::FileAllocation::None);
+        let previous = ControlSnapshot {
+            url: spec.url.clone(),
+            total_size: 256,
+            piece_size: 256,
+            piece_count: 1,
+            completed_bitset: vec![0],
+            downloaded_bytes: 0,
+            etag: None,
+            last_modified: None,
+        };
+        previous.save(&control).await.unwrap();
+        let original = tokio::fs::read(&control).await.unwrap();
+        let (progress, _) = watch::channel(ProgressSnapshot::default());
+        let (_stop, stop_rx) = watch::channel(StopSignal::Running);
+        let client = crate::network::ClientNetworkConfig::default()
+            .build_client()
+            .unwrap();
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_multi_worker(
+                client,
+                &spec,
+                &spec.url,
+                Path::new("/dev/full"),
+                &response_meta(),
+                256,
+                PieceMap::new(256, 256),
+                None,
+                &progress,
+                stop_rx,
+                &control,
+                SpeedLimit::new(0),
+                LogLevel::Off,
+                0,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        server.abort();
+        assert!(matches!(error, DownloadError::Io(_)), "{error:?}");
+        assert_eq!(progress.borrow().state, DownloadState::Failed);
+        assert_eq!(tokio::fs::read(&control).await.unwrap(), original);
+        assert_eq!(
+            ControlSnapshot::load(&control)
+                .await
+                .unwrap()
+                .downloaded_bytes,
+            0
+        );
+    }
+
+    #[tokio::test]
     async fn test_run_multi_worker_dynamic_split_reduces_tail_latency() {
         async fn run_case(
             path_segment: &'static str,

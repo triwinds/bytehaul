@@ -222,6 +222,7 @@ pub(super) async fn run_single_with_retry(
     log_level: LogLevel,
     download_id: u64,
 ) -> Result<(), DownloadError> {
+    let mark_error = |error: &DownloadError| mark_single_error_progress(progress_tx, error);
     let mut offset = start_offset;
     let mut total_size = initial_total_size;
     let mut baseline = meta.clone();
@@ -233,7 +234,9 @@ pub(super) async fn run_single_with_retry(
         spec.retry_max_delay,
         spec.max_retry_elapsed,
     );
-    let mut writer = SingleWriterRuntime::start(output_path, offset, spec, total_size).await?;
+    let mut writer = SingleWriterRuntime::start(output_path, offset, spec, total_size)
+        .await
+        .inspect_err(mark_error)?;
     let mut use_control = spec.resume && total_size.is_some();
     let mut control_save_tracker = ControlSaveTracker::new(offset);
     let mut snap_template = single_snapshot_template(request_url, total_size, offset, &baseline);
@@ -257,7 +260,7 @@ pub(super) async fn run_single_with_retry(
                 Err(error) => match retry_state.decide(error) {
                     RetryDecision::Stop(error) => {
                         mark_single_terminal_progress(progress_tx, DownloadState::Failed);
-                        writer.close().await?;
+                        writer.close().await.inspect_err(mark_error)?;
                         return Err(error);
                     }
                     RetryDecision::Retry {
@@ -281,7 +284,7 @@ pub(super) async fn run_single_with_retry(
                         );
                         if let Err(stop_error) = sleep_with_backoff(backoff, &mut cancel_rx).await {
                             mark_single_error_progress(progress_tx, &stop_error);
-                            writer.close().await?;
+                            writer.close().await.inspect_err(mark_error)?;
                             return Err(stop_error);
                         }
                         continue;
@@ -343,7 +346,7 @@ pub(super) async fn run_single_with_retry(
                 match retry_state.decide_restart(error) {
                     RetryDecision::Stop(error) => {
                         mark_single_terminal_progress(progress_tx, DownloadState::Failed);
-                        writer.close().await?;
+                        writer.close().await.inspect_err(mark_error)?;
                         return Err(error);
                     }
                     RetryDecision::Retry {
@@ -367,15 +370,20 @@ pub(super) async fn run_single_with_retry(
                         );
                         if let Err(stop_error) = sleep_with_backoff(backoff, &mut cancel_rx).await {
                             mark_single_error_progress(progress_tx, &stop_error);
-                            writer.close().await?;
+                            writer.close().await.inspect_err(mark_error)?;
                             return Err(stop_error);
                         }
                         // The replacement object's size is not known until a
                         // fresh GET arrives; do not preallocate using the old
                         // object's size or a smaller replacement could leave
                         // stale trailing bytes in the output file.
-                        writer.reset(output_path, spec, None).await?;
-                        ControlSnapshot::delete(control_path).await?;
+                        writer
+                            .reset(output_path, spec, None)
+                            .await
+                            .inspect_err(mark_error)?;
+                        ControlSnapshot::delete(control_path)
+                            .await
+                            .inspect_err(mark_error)?;
                         offset = 0;
                         total_size = None;
                         use_control = false;
@@ -412,7 +420,10 @@ pub(super) async fn run_single_with_retry(
                 // A restart may have had to recreate the file before the new
                 // response revealed its size. Recreate once more with the
                 // discovered size so pre-allocation remains effective.
-                writer.reset(output_path, spec, total_size).await?;
+                writer
+                    .reset(output_path, spec, total_size)
+                    .await
+                    .inspect_err(mark_error)?;
             }
         }
 
@@ -452,28 +463,15 @@ pub(super) async fn run_single_with_retry(
                 final_offset,
                 speed_bytes_per_sec,
             } => {
-                let stats = writer.flush().await?;
-                if stats.written_bytes != final_offset
-                    || total_size.is_some_and(|total| final_offset != total)
-                {
-                    let error = DownloadError::Internal(format!(
-                        "single writer persisted {} bytes but attempt completed at {}",
-                        stats.written_bytes, final_offset
-                    ));
-                    mark_single_terminal_progress(progress_tx, DownloadState::Failed);
-                    writer.close().await?;
-                    return Err(error);
-                }
-                writer.close().await?;
-                if use_control {
-                    ControlSnapshot::delete(control_path).await?;
-                }
-                progress_tx.send_modify(|progress| {
-                    progress.downloaded = final_offset;
-                    progress.speed_bytes_per_sec = speed_bytes_per_sec;
-                    progress.state = DownloadState::Completed;
-                    progress.eta_secs = Some(0.0);
-                });
+                complete_single_transfer(
+                    &mut writer,
+                    final_offset,
+                    total_size,
+                    speed_bytes_per_sec,
+                    progress_tx,
+                    use_control.then_some(control_path),
+                )
+                .await?;
                 log_debug!(
                     log_level,
                     download_id = download_id,
@@ -494,7 +492,7 @@ pub(super) async fn run_single_with_retry(
                         _ => DownloadState::Failed,
                     };
                     mark_single_terminal_progress(progress_tx, state);
-                    writer.close().await?;
+                    writer.close().await.inspect_err(mark_error)?;
                     if use_control {
                         persist_single_control_snapshot(
                             ControlSaveReason::Terminal,
@@ -508,7 +506,7 @@ pub(super) async fn run_single_with_retry(
                     return Err(error);
                 }
 
-                let stats = writer.flush().await?;
+                let stats = writer.flush().await.inspect_err(mark_error)?;
                 offset = stats.written_bytes;
                 progress_tx.send_modify(|progress| {
                     progress.downloaded = offset;
@@ -528,7 +526,7 @@ pub(super) async fn run_single_with_retry(
                 match retry_state.decide(error) {
                     RetryDecision::Stop(error) => {
                         mark_single_terminal_progress(progress_tx, DownloadState::Failed);
-                        writer.close().await?;
+                        writer.close().await.inspect_err(mark_error)?;
                         return Err(error);
                     }
                     RetryDecision::Retry {
@@ -563,12 +561,17 @@ pub(super) async fn run_single_with_retry(
                         );
                         if let Err(stop_error) = sleep_with_backoff(backoff, &mut cancel_rx).await {
                             mark_single_error_progress(progress_tx, &stop_error);
-                            writer.close().await?;
+                            writer.close().await.inspect_err(mark_error)?;
                             return Err(stop_error);
                         }
                         if restart_from_zero {
-                            writer.reset(output_path, spec, None).await?;
-                            ControlSnapshot::delete(control_path).await?;
+                            writer
+                                .reset(output_path, spec, None)
+                                .await
+                                .inspect_err(mark_error)?;
+                            ControlSnapshot::delete(control_path)
+                                .await
+                                .inspect_err(mark_error)?;
                             offset = 0;
                             total_size = None;
                             use_control = false;
@@ -586,6 +589,49 @@ pub(super) async fn run_single_with_retry(
             }
         }
     }
+}
+
+/// Publish completion only after both the flush barrier and writer shutdown
+/// succeed. A storage error must leave any previous durable checkpoint intact.
+async fn complete_single_transfer(
+    writer: &mut SingleWriterRuntime,
+    final_offset: u64,
+    total_size: Option<u64>,
+    speed_bytes_per_sec: f64,
+    progress_tx: &watch::Sender<ProgressSnapshot>,
+    control_path: Option<&Path>,
+) -> Result<(), DownloadError> {
+    // Body progress may still be throttled when EOF arrives. Report the known
+    // received prefix even if final sync fails; it is not a durable checkpoint.
+    progress_tx.send_modify(|progress| {
+        progress.downloaded = final_offset;
+        progress.speed_bytes_per_sec = speed_bytes_per_sec;
+    });
+    let mark_error = |error: &DownloadError| mark_single_error_progress(progress_tx, error);
+    let stats = writer.flush().await.inspect_err(mark_error)?;
+    if stats.written_bytes != final_offset || total_size.is_some_and(|total| final_offset != total)
+    {
+        let error = DownloadError::Internal(format!(
+            "single writer persisted {} bytes but attempt completed at {}",
+            stats.written_bytes, final_offset
+        ));
+        mark_error(&error);
+        writer.close().await.inspect_err(mark_error)?;
+        return Err(error);
+    }
+    writer.close().await.inspect_err(mark_error)?;
+    if let Some(control_path) = control_path {
+        ControlSnapshot::delete(control_path)
+            .await
+            .inspect_err(mark_error)?;
+    }
+    progress_tx.send_modify(|progress| {
+        progress.downloaded = final_offset;
+        progress.speed_bytes_per_sec = speed_bytes_per_sec;
+        progress.state = DownloadState::Completed;
+        progress.eta_secs = Some(0.0);
+    });
+    Ok(())
 }
 
 fn single_snapshot_template(
@@ -1050,6 +1096,7 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::{Shutdown, TcpListener};
     use std::thread;
+    use warp::Filter;
 
     fn snapshot_template_with(total_size: u64, downloaded_bytes: u64) -> ControlSnapshot {
         let mut snapshot = snapshot_template();
@@ -1537,6 +1584,338 @@ mod tests {
         assert_eq!(tracker.last_saved_downloaded_bytes(), 256);
     }
 
+    async fn assert_continuation_request_failure(stop: Option<StopSignal>) {
+        let (initial_url, initial_server) =
+            spawn_single_response_server(8, b"data".to_vec(), Duration::ZERO);
+        let response = get_response(&initial_url).await;
+        let (cancel_tx, cancel_rx) = watch::channel(StopSignal::Running);
+        let requests = Arc::new(AtomicU64::new(0));
+        let observed = requests.clone();
+        let route = warp::header::<String>("range").map(move |range: String| {
+            assert_eq!(
+                range, "bytes=4-7",
+                "continuations must use the synced prefix"
+            );
+            let request = observed.fetch_add(1, Ordering::SeqCst);
+            if let Some(signal) = stop {
+                cancel_tx.send(signal).unwrap();
+            }
+            warp::http::Response::builder()
+                .status(if request == 0 { 503 } else { 403 })
+                .header("retry-after", "0")
+                .body("")
+                .unwrap()
+        });
+        let (addr, server) = warp::serve(route).bind_ephemeral(([127, 0, 0, 1], 0));
+        let server = tokio::spawn(server);
+        let url = format!("http://{addr}/continuation");
+        let mut spec = test_spec(&url)
+            .max_retries(2)
+            .retry_base_delay(Duration::ZERO)
+            .retry_max_delay(Duration::ZERO)
+            .file_allocation(crate::config::FileAllocation::None);
+        spec.control_save_interval = Duration::from_secs(60);
+        let dir = tempfile::tempdir().unwrap();
+        let output_path = dir.path().join("continuation.bin");
+        let control_path = dir.path().join("continuation.bytehaul");
+        let (progress_tx, _) = watch::channel(ProgressSnapshot::default());
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_single_connection(
+                response,
+                &single_response_meta(8),
+                &url,
+                &spec,
+                &output_path,
+                0,
+                &progress_tx,
+                cancel_rx,
+                &control_path,
+                Some(8),
+                SpeedLimit::new(0),
+                LogLevel::Debug,
+                16,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        join_server(initial_server).await;
+        server.abort();
+
+        match stop {
+            Some(StopSignal::Pause) => {
+                assert!(matches!(error, DownloadError::Paused), "got {error:?}");
+                assert_eq!(progress_tx.borrow().state, DownloadState::Paused);
+            }
+            Some(StopSignal::Cancel) => {
+                assert!(matches!(error, DownloadError::Cancelled), "got {error:?}");
+                assert_eq!(progress_tx.borrow().state, DownloadState::Cancelled);
+            }
+            None => {
+                assert!(
+                    matches!(error, DownloadError::HttpStatus { status: 403, .. }),
+                    "got {error:?}"
+                );
+                assert_eq!(progress_tx.borrow().state, DownloadState::Failed);
+            }
+            Some(StopSignal::Running) => unreachable!(),
+        }
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            if stop.is_some() { 1 } else { 2 }
+        );
+        assert_eq!(tokio::fs::read(&output_path).await.unwrap(), b"data");
+        let checkpoint = ControlSnapshot::load(&control_path).await.unwrap();
+        assert_eq!(checkpoint.downloaded_bytes, 4);
+        assert_eq!(checkpoint.total_size, 8);
+        assert_eq!(checkpoint.completed_bitset, vec![0]);
+        assert_eq!(progress_tx.borrow().downloaded, 4);
+    }
+
+    #[tokio::test]
+    async fn test_continuation_request_retries_503_then_returns_403_with_durable_prefix() {
+        assert_continuation_request_failure(None).await;
+    }
+
+    #[tokio::test]
+    async fn test_continuation_request_backoff_observes_pause_and_cancel() {
+        assert_continuation_request_failure(Some(StopSignal::Pause)).await;
+        assert_continuation_request_failure(Some(StopSignal::Cancel)).await;
+    }
+
+    #[tokio::test]
+    async fn test_stream_rejects_clean_short_and_overlong_bodies() {
+        // The wire body is internally valid; expected transfer size differs.
+        // This isolates the session's validation from hyper's framing checks.
+        // An expected zero-byte body rejects every nonempty frame, independent
+        // of how TCP divides the body into chunks.
+        for (body, total, expected_written, expected_error) in [
+            (
+                b"data".as_slice(),
+                8,
+                b"data".as_slice(),
+                std::io::ErrorKind::UnexpectedEof,
+            ),
+            (
+                b"data".as_slice(),
+                0,
+                b"".as_slice(),
+                std::io::ErrorKind::InvalidData,
+            ),
+        ] {
+            let (url, server) =
+                spawn_single_response_server(body.len(), body.to_vec(), Duration::ZERO);
+            let response = get_response(&url).await;
+            let spec = test_spec(&url).file_allocation(crate::config::FileAllocation::None);
+            let dir = tempfile::tempdir().unwrap();
+            let output_path = dir.path().join("length-check.bin");
+            let mut writer = SingleWriterRuntime::start(&output_path, 0, &spec, Some(total))
+                .await
+                .unwrap();
+            let (progress_tx, _) = watch::channel(ProgressSnapshot::default());
+            let (_cancel_tx, cancel_rx) = watch::channel(StopSignal::Running);
+            let mut tracker = ControlSaveTracker::new(0);
+            let outcome = stream_single_attempt(
+                response,
+                Duration::from_secs(5),
+                writer.write_tx().unwrap(),
+                &progress_tx,
+                cancel_rx,
+                Some(total),
+                0,
+                None,
+                writer.budget.clone(),
+                &SpeedLimit::new(0),
+                Duration::from_secs(60),
+                &mut tracker,
+                1,
+                LogLevel::Off,
+                17,
+            )
+            .await;
+            writer.close().await.unwrap();
+            join_server(server).await;
+            let SingleAttemptOutcome::Failed {
+                error,
+                received_in_attempt,
+            } = outcome
+            else {
+                panic!("invalid body length must not complete");
+            };
+            assert_eq!(received_in_attempt, expected_written.len() as u64);
+            let DownloadError::Transport(error) = error else {
+                panic!("expected body transport error");
+            };
+            assert_eq!(error.kind(), TransportErrorKind::Body);
+            let source = std::error::Error::source(&error)
+                .unwrap()
+                .downcast_ref::<std::io::Error>()
+                .unwrap();
+            assert_eq!(source.kind(), expected_error);
+            assert_eq!(
+                tokio::fs::read(&output_path).await.unwrap(),
+                expected_written
+            );
+            assert_eq!(progress_tx.borrow().state, DownloadState::Failed);
+            assert_eq!(
+                progress_tx.borrow().downloaded,
+                expected_written.len() as u64
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_completion_rejects_durable_and_advertised_size_mismatches() {
+        for (final_offset, total_size) in [(4, Some(4)), (0, Some(4))] {
+            let dir = tempfile::tempdir().unwrap();
+            let output_path = dir.path().join("mismatch.bin");
+            let control_path = dir.path().join("mismatch.bytehaul");
+            snapshot_template_with(4, 0)
+                .save(&control_path)
+                .await
+                .unwrap();
+            let previous_control = tokio::fs::read(&control_path).await.unwrap();
+            let spec = test_spec("http://unused.invalid")
+                .file_allocation(crate::config::FileAllocation::None);
+            let mut writer = SingleWriterRuntime::start(&output_path, 0, &spec, total_size)
+                .await
+                .unwrap();
+            let (progress_tx, _) = watch::channel(ProgressSnapshot::default());
+            let error = complete_single_transfer(
+                &mut writer,
+                final_offset,
+                total_size,
+                0.0,
+                &progress_tx,
+                Some(&control_path),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(error, DownloadError::Internal(ref message) if message.contains("single writer persisted 0 bytes")),
+                "got {error:?}"
+            );
+            assert_eq!(progress_tx.borrow().state, DownloadState::Failed);
+            assert_eq!(
+                tokio::fs::read(&control_path).await.unwrap(),
+                previous_control
+            );
+            assert_eq!(tokio::fs::read(&output_path).await.unwrap(), b"");
+            assert!(writer.writer_handle.is_none());
+        }
+    }
+
+    async fn assert_completion_storage_failure_preserves_checkpoint(fail_on_flush: bool) {
+        for existing_checkpoint in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let control_path = dir.path().join("single-finalization.bytehaul");
+            let previous_control = if existing_checkpoint {
+                snapshot_template_with(4, 1)
+                    .save(&control_path)
+                    .await
+                    .unwrap();
+                Some(tokio::fs::read(&control_path).await.unwrap())
+            } else {
+                None
+            };
+            let (write_tx, mut write_rx) = mpsc::channel(1);
+            let writer_handle = tokio::spawn(async move {
+                let Some(WriterCommand::FlushAll { sync_data, ack }) = write_rx.recv().await else {
+                    panic!("completion must request a flush barrier");
+                };
+                assert!(sync_data);
+                if fail_on_flush {
+                    drop(ack);
+                } else {
+                    ack.send(FlushAllStats {
+                        written_bytes: 4,
+                        flush_elapsed: Duration::ZERO,
+                        sync_elapsed: Some(Duration::ZERO),
+                    })
+                    .unwrap();
+                    assert!(write_rx.recv().await.is_none());
+                }
+                Err(DownloadError::Io(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected final writer failure",
+                )))
+            });
+            let mut writer = SingleWriterRuntime {
+                write_tx: Some(write_tx),
+                writer_handle: Some(writer_handle),
+                // Even written bytes are not durable when the sync fails.
+                written_bytes: Arc::new(AtomicU64::new(4)),
+                budget: Arc::new(MemoryBudget::new(1024)),
+                file_total_size: Some(4),
+            };
+            let (progress_tx, _) = watch::channel(ProgressSnapshot {
+                state: DownloadState::Downloading,
+                // Simulate a small body whose progress update was throttled.
+                downloaded: 0,
+                eta_secs: Some(1.0),
+                ..ProgressSnapshot::default()
+            });
+
+            let error = tokio::time::timeout(
+                Duration::from_secs(5),
+                complete_single_transfer(
+                    &mut writer,
+                    4,
+                    Some(4),
+                    1.0,
+                    &progress_tx,
+                    Some(&control_path),
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap_err();
+
+            match error {
+                DownloadError::Io(error) => {
+                    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+                    assert_eq!(error.to_string(), "injected final writer failure");
+                }
+                other => panic!("expected original storage error, got {other:?}"),
+            }
+            let progress = progress_tx.borrow();
+            assert_eq!(progress.state, DownloadState::Failed);
+            assert_eq!(progress.downloaded, 4);
+            assert_eq!(progress.eta_secs, None);
+            assert!(writer.writer_handle.is_none(), "writer must be joined");
+            assert!(writer.write_tx.is_none(), "writer channel must be closed");
+            if let Some(previous_control) = previous_control {
+                assert_eq!(
+                    tokio::fs::read(&control_path).await.unwrap(),
+                    previous_control
+                );
+                assert_eq!(
+                    ControlSnapshot::load(&control_path)
+                        .await
+                        .unwrap()
+                        .downloaded_bytes,
+                    1
+                );
+            } else {
+                assert!(
+                    !control_path.exists(),
+                    "failed writes must not create a checkpoint"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_single_completion_flush_error_preserves_checkpoint() {
+        assert_completion_storage_failure_preserves_checkpoint(true).await;
+    }
+
+    #[tokio::test]
+    async fn test_single_completion_close_error_preserves_checkpoint() {
+        assert_completion_storage_failure_preserves_checkpoint(false).await;
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn test_run_single_connection_reports_writer_failure() {
@@ -1575,7 +1954,9 @@ mod tests {
         let snapshot = progress_tx.borrow().clone();
         assert_eq!(snapshot.state, DownloadState::Failed);
         assert_eq!(snapshot.downloaded, 4);
-        let loaded = ControlSnapshot::load(&control_path).await.unwrap();
-        assert_eq!(loaded.downloaded_bytes, 4);
+        assert!(
+            !control_path.exists(),
+            "failed writes must not create a checkpoint from received bytes"
+        );
     }
 }

@@ -14,6 +14,11 @@
 - Assert exact public variants/statuses for branch-sensitive behavior. `tests/m5_retry.rs` distinguishes 503 from 403; `tests/m8_pause_resume.rs` checks both `DownloadError::Paused` and progress state.
 - Test single and multi paths when changing shared transfer semantics.
 - Keep timing checks behavior-based with deadlines/coarse bounds.
+- Network fixtures must not assume one socket write becomes one body frame. Aggregate chunks and
+  assert exact offsets/bytes, or choose boundaries whose expected outcome is independent of framing.
+- Client configuration/cache tests use ephemeral local nonretryable responses and exact error/cache
+  assertions. Do not wait through default retries against fixed unavailable ports when retry behavior
+  is not the subject of the test. Keep retry/backoff verification in its dedicated tests.
 - Use `pytest.raises` with public exception classes and retain GIL/thread progress coverage for runtime changes.
 
 A regression must fail if production behavior is reverted:
@@ -68,13 +73,66 @@ Apply the same isolation to `uv run pytest`. Do not change product proxy handlin
 assertions to compensate for a developer-machine proxy. Tests that explicitly exercise environment
 proxy behavior must continue to set and restore their own variables.
 
-Ubuntu coverage uses:
+## Coverage gate contract
+
+### 1. Scope / Trigger
+
+Apply this whenever reporting coverage or changing engine code, coverage tooling, scripts, or CI.
+Functional tests, Clippy and docs are separate checks; passing them is never evidence of >=95% coverage.
+
+### 2. Signatures
 
 ```bash
-cargo tarpaulin --engine llvm -p bytehaul --all-targets --out Stdout --fail-under 95
+python3 scripts/coverage.py --install
+python3 scripts/coverage.py
+python3 -m unittest discover -s scripts/tests -v
 ```
 
-Use the Windows coverage helper documented in `README.md`. Focused checks come first; full relevant checks run before completion. Documentation-only specs still require template-marker, link, and index validation.
+The Linux entry reads `scripts/coverage-config.json` for Rust, Tarpaulin and the minimum line
+percentage. `.github/workflows/test.yml` calls this entry on Ubuntu 24.04. The Windows PowerShell
+helper checks llvm-cov line coverage using the same numeric threshold, but remains platform-specific.
+
+### 3. Contracts
+
+- Keep the root `bytehaul` package, all targets, LLVM engine and 95% line gate together in one Linux
+  entry. No custom excludes or platform skips may be added merely to make the gate green.
+- Preserve the underlying nonzero exit code through log capture and report export. Each run has
+  fresh profiles/report paths; a previous report must never certify the current run.
+- Record revision/dirty state, OS/architecture, actual tool versions, command, exit status and measured
+  totals. A local report is comparable only when revision, tools, platform, scope and metric match.
+- CI uploads log/metadata/available JSON/HTML reports even on failure. Classify failed tests separately
+  from a completed coverage measurement below the threshold; partial coverage cannot pass the gate.
+- Isolate shell proxy variables for localhost fixtures; do not change product proxy behavior.
+- Tool upgrades require an explicit config update plus fresh measurement. Do not infer the cause of
+  historical percentage changes from a badge when logs/tool metadata are unavailable.
+
+### 4. Validation & Error Matrix
+
+| Condition | Required outcome |
+| --- | --- |
+| Any test fails | Nonzero, coverage incomplete, retained log |
+| Tests pass, measured lines <95% | Nonzero, reports retained, measured shortfall identified |
+| Wrong tool version / missing report | Nonzero setup/report error |
+| Windows report passes | Windows line gate passed; no claim of Linux equivalence |
+| Linux-only storage path changes | Run Linux test; also use portable failure injection where feasible |
+
+### 5. Good / Base / Bad Cases
+
+- Good: the same Linux entry produces a fresh report and passes the pinned 95% gate.
+- Base: a developer uses a focused Windows or macOS report to choose new tests, then verifies Linux.
+- Bad: `cargo test` passes on macOS while a Linux-only `/dev/full` test fails; describing this as a
+  coverage percentage difference hides the functional defect.
+
+### 6. Tests Required
+
+Gate script tests must assert actual failing exit propagation, preserved reports, fresh-run isolation,
+and distinct diagnostics for failed tests, insufficient measured coverage and tooling failure. Run
+the real Linux gate after script changes; stubs alone cannot verify tool output format or final totals.
+
+### 7. Wrong vs Correct
+
+Wrong: report “coverage meets 95%” after only functional tests or a successful report-export command.
+Correct: cite the measured covered/total lines and gate exit code, with version/revision/platform.
 
 ## Review Checklist
 

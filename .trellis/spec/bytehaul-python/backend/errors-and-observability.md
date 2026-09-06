@@ -39,6 +39,14 @@ independent request scope.
 
 ### 3. Contracts
 
+- Every storage failure during writer start, flush, reset or close must publish
+  `Failed` before returning the original typed error. A body that reached EOF
+  is not complete until the writer flush and final close both succeed.
+- Finalization publishes the known received prefix before awaiting storage. A
+  throttled progress update must not leave downloaded bytes stale on failure;
+  this received counter still must not be used as a durable checkpoint offset.
+- Failed flush/sync must leave the previous durable control file unchanged;
+  never create a terminal checkpoint at the received-byte offset.
 - A body failure first drops the response and awaits `FlushAll(sync_data =
   true)`; only the acknowledgement's `written_bytes` is a durable resume
   offset.
@@ -76,6 +84,10 @@ independent request scope.
   bytes, and reset behavior for truncation, Range ignored, and metadata change.
 - Retry unit tests must cover zero retries, count exhaustion, Retry-After,
   elapsed limits, and pause/cancel during backoff.
+- Portable writer-failure regressions must drive production finalization and
+  assert the typed error, `Failed` progress, and unchanged previous checkpoint.
+  Retain the Linux `/dev/full` integration with the same durability semantics;
+  macOS/Windows success cannot replace exercising Linux-only code.
 - Existing multi-worker short-body, lease, pause/cancel, and resume tests must
   remain green because each segment retains its own `RetryState`.
 

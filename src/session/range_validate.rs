@@ -452,4 +452,111 @@ mod tests {
             _ => panic!("expected HttpStatus"),
         }
     }
+
+    #[test]
+    fn existing_ranges_require_identity_encoding_and_a_matching_known_total() {
+        for mode in [
+            RangeValidationMode::ResumeProbe,
+            RangeValidationMode::Segment,
+        ] {
+            for (encoding, expected_total, actual_total) in [
+                (Some("gzip"), Some(5000), Some(5000)),
+                (None, None, Some(5000)),
+                (None, Some(5000), None),
+                (None, Some(5000), Some(5001)),
+            ] {
+                let mut meta = test_meta();
+                meta.content_encoding = encoding.map(str::to_owned);
+                meta.content_range_total = actual_total;
+                let err = validate_range_response(
+                    206,
+                    None,
+                    &meta,
+                    mode,
+                    ExpectedRange {
+                        start: 0,
+                        end_inclusive: 999,
+                        total_size: expected_total,
+                    },
+                )
+                .unwrap_err();
+                assert!(matches!(err, DownloadError::ResumeMismatch(_)), "{err:?}");
+                assert!(!err.is_retryable());
+            }
+        }
+    }
+
+    #[test]
+    fn fresh_probe_rejects_an_empty_or_out_of_bounds_representation() {
+        for (total, start) in [(0, 0), (5000, 5000)] {
+            let mut meta = test_meta();
+            meta.content_range_total = Some(total);
+            let err = validate_range_response(
+                206,
+                None,
+                &meta,
+                RangeValidationMode::FreshProbe,
+                ExpectedRange {
+                    start,
+                    end_inclusive: start + 999,
+                    total_size: None,
+                },
+            )
+            .unwrap_err();
+            assert!(matches!(err, DownloadError::ResumeMismatch(_)));
+        }
+    }
+
+    #[test]
+    fn range_errors_keep_status_and_only_accept_numeric_retry_after() {
+        for mode in [
+            RangeValidationMode::FreshProbe,
+            RangeValidationMode::ResumeProbe,
+            RangeValidationMode::Segment,
+        ] {
+            for (status, header, expected_message) in [
+                (429, Some(" 7 "), "retry-after:7"),
+                (429, None, "HTTP 429"),
+                (503, Some("invalid"), "HTTP 503"),
+            ] {
+                let err = validate_range_response(
+                    status,
+                    header,
+                    &test_meta(),
+                    mode,
+                    ExpectedRange {
+                        start: 0,
+                        end_inclusive: 999,
+                        total_size: Some(5000),
+                    },
+                )
+                .unwrap_err();
+                assert!(err.is_retryable());
+                assert!(
+                    matches!(err, DownloadError::HttpStatus { status: actual, message } if actual == status && message == expected_message)
+                );
+            }
+            let err = validate_range_response(
+                404,
+                None,
+                &test_meta(),
+                mode,
+                ExpectedRange {
+                    start: 0,
+                    end_inclusive: 999,
+                    total_size: Some(5000),
+                },
+            )
+            .unwrap_err();
+            assert!(!err.is_retryable());
+            let expected_message = if matches!(mode, RangeValidationMode::FreshProbe) {
+                "expected 206 or 200, got 404"
+            } else {
+                "expected 206, got 404"
+            };
+            assert!(
+                matches!(err, DownloadError::HttpStatus { status: 404, message } if message == expected_message)
+            );
+        }
+    }
 }

@@ -365,6 +365,30 @@ impl DownloadHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use warp::Filter;
+
+    fn spawn_forbidden_server() -> String {
+        let route = warp::any().map(|| {
+            warp::http::Response::builder()
+                .status(403)
+                .body("Forbidden")
+                .unwrap()
+        });
+        let (addr, server) = warp::serve(route).bind_ephemeral(([127, 0, 0, 1], 0));
+        tokio::spawn(server);
+        format!("http://{addr}")
+    }
+
+    async fn assert_forbidden(handle: DownloadHandle) {
+        let error = tokio::time::timeout(Duration::from_secs(5), handle.wait())
+            .await
+            .expect("configuration test must not wait for network retry backoff")
+            .unwrap_err();
+        assert!(
+            matches!(error, DownloadError::HttpStatus { status: 403, .. }),
+            "expected HTTP 403 from the local fixture, got {error:?}"
+        );
+    }
 
     #[test]
     fn test_downloader_builder_default() {
@@ -514,80 +538,93 @@ mod tests {
 
     #[tokio::test]
     async fn test_download_rebuilds_client_for_spec_timeout_override() {
+        let server = spawn_forbidden_server();
+        let dir = tempfile::tempdir().unwrap();
         let downloader = Downloader::builder().build().unwrap();
-        let spec = crate::config::DownloadSpec::new("http://127.0.0.1:1/nonexistent")
-            .output_path(std::env::temp_dir().join("bytehaul_test_timeout_override"))
+        let spec = crate::config::DownloadSpec::new(format!("{server}/timeout"))
+            .output_path(dir.path().join("timeout-override.bin"))
             .connect_timeout(Duration::from_secs(1));
 
         assert_eq!(downloader.client_cache.lock().len(), 1);
-        let handle = downloader.download(spec);
-        let result = handle.wait().await;
-        assert!(result.is_err());
+        assert_forbidden(downloader.download(spec)).await;
         assert_eq!(downloader.client_cache.lock().len(), 2);
     }
 
     #[tokio::test]
     async fn test_download_reuses_cached_timeout_override_client() {
+        let server = spawn_forbidden_server();
+        let dir = tempfile::tempdir().unwrap();
         let downloader = Downloader::builder().build().unwrap();
-        let spec = crate::config::DownloadSpec::new("http://127.0.0.1:1/nonexistent")
-            .output_path(std::env::temp_dir().join("bytehaul_test_timeout_override_reuse"))
+        let spec = crate::config::DownloadSpec::new(format!("{server}/timeout-reuse"))
+            .output_path(dir.path().join("timeout-reuse.bin"))
             .connect_timeout(Duration::from_secs(1));
 
-        let _ = downloader.download(spec.clone()).wait().await;
+        assert_eq!(downloader.client_cache.lock().len(), 1);
+        assert_forbidden(downloader.download(spec.clone())).await;
         assert_eq!(downloader.client_cache.lock().len(), 2);
 
-        let _ = downloader.download(spec).wait().await;
+        assert_forbidden(downloader.download(spec)).await;
         assert_eq!(downloader.client_cache.lock().len(), 2);
     }
 
     #[tokio::test]
     async fn test_download_uses_builder_timeout_when_spec_has_no_override() {
+        let server = spawn_forbidden_server();
+        let dir = tempfile::tempdir().unwrap();
         let downloader = Downloader::builder()
             .connect_timeout(Duration::from_secs(3))
             .build()
             .unwrap();
-        let spec = crate::config::DownloadSpec::new("http://127.0.0.1:1/nonexistent")
-            .output_path(std::env::temp_dir().join("bytehaul_test_builder_timeout_default"));
+        let spec = crate::config::DownloadSpec::new(format!("{server}/builder-timeout"))
+            .output_path(dir.path().join("builder-timeout.bin"));
 
-        let _ = downloader.download(spec).wait().await;
+        assert_eq!(downloader.client_cache.lock().len(), 1);
+        assert_forbidden(downloader.download(spec)).await;
         assert_eq!(downloader.client_cache.lock().len(), 1);
     }
 
     #[tokio::test]
     async fn test_download_rebuilds_client_for_spec_proxy_override() {
+        let proxy = spawn_forbidden_server();
+        let dir = tempfile::tempdir().unwrap();
         let downloader = Downloader::builder().build().unwrap();
-        let spec = crate::config::DownloadSpec::new("http://127.0.0.1:1/nonexistent")
-            .output_path(std::env::temp_dir().join("bytehaul_test_proxy_override"))
-            .all_proxy("http://127.0.0.1:7890");
+        let spec = crate::config::DownloadSpec::new("http://proxy-target.invalid/nonexistent")
+            .output_path(dir.path().join("proxy-override.bin"))
+            .all_proxy(proxy);
 
         assert_eq!(downloader.client_cache.lock().len(), 1);
-        let _ = downloader.download(spec).wait().await;
+        assert_forbidden(downloader.download(spec)).await;
         assert_eq!(downloader.client_cache.lock().len(), 2);
     }
 
     #[tokio::test]
     async fn test_download_rebuilds_client_for_spec_idle_pool_override() {
+        let server = spawn_forbidden_server();
+        let dir = tempfile::tempdir().unwrap();
         let downloader = Downloader::builder().build().unwrap();
-        let spec = crate::config::DownloadSpec::new("http://127.0.0.1:1/nonexistent")
-            .output_path(std::env::temp_dir().join("bytehaul_test_idle_pool_override"))
+        let spec = crate::config::DownloadSpec::new(format!("{server}/idle-pool"))
+            .output_path(dir.path().join("idle-pool.bin"))
             .http_idle_pool(2, Duration::from_secs(5));
 
         assert_eq!(downloader.client_cache.lock().len(), 1);
-        let _ = downloader.download(spec).wait().await;
+        assert_forbidden(downloader.download(spec)).await;
         assert_eq!(downloader.client_cache.lock().len(), 2);
     }
 
     #[tokio::test]
     async fn test_download_proxy_override_reuses_cached_client() {
+        let proxy = spawn_forbidden_server();
+        let dir = tempfile::tempdir().unwrap();
         let downloader = Downloader::builder().build().unwrap();
-        let spec = crate::config::DownloadSpec::new("http://127.0.0.1:1/nonexistent")
-            .output_path(std::env::temp_dir().join("bytehaul_test_proxy_override_reuse"))
-            .all_proxy("http://127.0.0.1:7890");
+        let spec = crate::config::DownloadSpec::new("http://proxy-target.invalid/nonexistent")
+            .output_path(dir.path().join("proxy-reuse.bin"))
+            .all_proxy(proxy);
 
-        let _ = downloader.download(spec.clone()).wait().await;
+        assert_eq!(downloader.client_cache.lock().len(), 1);
+        assert_forbidden(downloader.download(spec.clone())).await;
         assert_eq!(downloader.client_cache.lock().len(), 2);
 
-        let _ = downloader.download(spec).wait().await;
+        assert_forbidden(downloader.download(spec)).await;
         assert_eq!(downloader.client_cache.lock().len(), 2);
     }
 
