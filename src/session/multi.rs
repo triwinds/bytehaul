@@ -5,16 +5,18 @@ use std::time::{Duration, Instant};
 
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
-use tokio::sync::{mpsc, watch, Semaphore};
+use tokio::sync::{mpsc, watch};
+
+use super::flow::MemoryBudget;
 
 use super::range_validate::{
     validate_range_response, ExpectedRange, RangeValidationDecision, RangeValidationMode,
 };
+use super::retry::{sleep_with_backoff, RetryDecision, RetryState};
 use super::{
     begin_lease_and_wait, discard_lease_and_wait, flush_all_and_wait, flush_lease_and_wait,
-    stop_signal_error, stop_signal_label, stop_signal_state, ControlSaveReason,
-    ControlSaveTracker, StopSignal, MIN_SPEED_SAMPLE_SPAN, MULTI_PROGRESS_INTERVAL,
-    SPEED_ESTIMATE_WINDOW,
+    stop_signal_error, stop_signal_label, stop_signal_state, ControlSaveReason, ControlSaveTracker,
+    StopSignal, MIN_SPEED_SAMPLE_SPAN, MULTI_PROGRESS_INTERVAL, SPEED_ESTIMATE_WINDOW,
 };
 use crate::config::{DownloadSpec, LogLevel};
 use crate::error::DownloadError;
@@ -68,7 +70,7 @@ pub(super) async fn run_multi_worker(
     };
 
     // Memory budget semaphore
-    let budget = Arc::new(Semaphore::new(spec.memory_budget));
+    let budget = Arc::new(MemoryBudget::new(spec.memory_budget));
 
     // Writer with cache
     let (write_tx, write_rx) = mpsc::channel::<WriterCommand>(spec.channel_buffer);
@@ -78,8 +80,8 @@ pub(super) async fn run_multi_worker(
             write_rx,
             file,
             written_bytes.clone(),
-            budget.clone(),
-            spec.memory_budget,
+            budget.semaphore.clone(),
+            budget.watermark,
         )
         .run(),
     );
@@ -92,8 +94,12 @@ pub(super) async fn run_multi_worker(
     let received_bytes = Arc::new(AtomicU64::new(initial_completed_bytes));
     let start_time = Instant::now();
     let mut eta_estimator = EtaEstimator::new(SPEED_ESTIMATE_WINDOW, MIN_SPEED_SAMPLE_SPAN);
-    let mut progress_reporter =
-        ProgressReporter::new(initial_completed_bytes, MULTI_PROGRESS_INTERVAL, 0, start_time);
+    let mut progress_reporter = ProgressReporter::new(
+        initial_completed_bytes,
+        MULTI_PROGRESS_INTERVAL,
+        0,
+        start_time,
+    );
     eta_estimator.record(initial_completed_bytes, start_time);
 
     progress_tx.send_modify(|p| {
@@ -284,8 +290,14 @@ pub(super) async fn run_multi_worker(
         .await
         .map_err(|e| DownloadError::TaskFailed(format!("writer panicked: {e}")))?;
 
+    let writer_succeeded = writer_result.is_ok();
+    if let Err(error) = writer_result {
+        download_error = Some(error);
+    }
+
     if let Some(e) = download_error {
-        if spec.resume {
+        // A closed writer is a durability barrier only when its final sync succeeded.
+        if spec.resume && writer_succeeded {
             persist_multi_control_snapshot(
                 ControlSaveReason::Terminal,
                 None,
@@ -308,20 +320,6 @@ pub(super) async fn run_multi_worker(
         log_error!(log_level, download_id = download_id, error = %e,
             "multi-worker download failed");
         return Err(e);
-    }
-    if let Err(error) = writer_result {
-        let now = Instant::now();
-        let update = sampled_progress_update(
-            &mut eta_estimator,
-            received_bytes.load(Ordering::Relaxed),
-            total_size,
-            now,
-        )
-        .with_state(DownloadState::Failed);
-        progress_reporter.force_report(progress_tx, update, now);
-        log_error!(log_level, download_id = download_id, error = %error,
-            "multi-worker writer failed");
-        return Err(error);
     }
 
     if !scheduler.lock().all_done() {
@@ -412,18 +410,8 @@ async fn persist_multi_control_snapshot(
         return;
     }
 
-    let flush_stats = match write_tx {
-        Some(write_tx) => match flush_all_and_wait(write_tx, true).await {
-            Ok(stats) => Some(stats),
-            Err(error) => {
-                log_warn!(ctx.log_level, download_id = ctx.download_id, checkpoint = reason.label(),
-                    error = %error, "control snapshot flush failed");
-                return;
-            }
-        },
-        None => None,
-    };
-
+    // Freeze both completed bits and advisory hints before the writer barrier.
+    // Workers may complete more pieces as soon as the sync acknowledges.
     let (snap, hints) = {
         let mut sched = ctx.scheduler.lock();
         let snap = ControlSnapshot {
@@ -444,6 +432,18 @@ async fn persist_multi_control_snapshot(
     {
         return;
     }
+
+    let flush_stats = match write_tx {
+        Some(write_tx) => match flush_all_and_wait(write_tx, true).await {
+            Ok(stats) => Some(stats),
+            Err(error) => {
+                log_warn!(ctx.log_level, download_id = ctx.download_id, checkpoint = reason.label(),
+                    error = %error, "control snapshot flush failed");
+                return;
+            }
+        },
+        None => None,
+    };
 
     let save_started = Instant::now();
     let dirty_piece_count = hints.dirty_piece_ids.len();
@@ -503,7 +503,7 @@ async fn worker_loop(
     write_tx: mpsc::Sender<WriterCommand>,
     received_bytes: Arc<AtomicU64>,
     cancel_rx: watch::Receiver<StopSignal>,
-    budget: Arc<Semaphore>,
+    budget: Arc<MemoryBudget>,
     speed_limit: SpeedLimit,
     first_response: Option<(HttpResponse, ResponseMeta, usize)>,
     total_size: u64,
@@ -563,8 +563,12 @@ async fn worker_loop(
             "assigned piece"
         );
 
-        let mut attempt = 0u32;
-        let retry_started_at = Instant::now();
+        let mut retry_state = RetryState::new(
+            cfg.max_retries,
+            cfg.retry_base_delay,
+            cfg.retry_max_delay,
+            cfg.max_retry_elapsed,
+        );
         let mut segment = segment;
 
         loop {
@@ -645,66 +649,42 @@ async fn worker_loop(
                         return Err(error);
                     }
 
-                    if !e.is_retryable() || attempt >= cfg.max_retries {
-                        log_warn!(log_level, download_id = download_id, worker_id = worker_id,
-                            piece_id = segment.piece_id, error = %e,
-                            "segment failed, reclaiming (non-retryable or max retries exceeded)");
-                        let _ = scheduler.lock().reclaim(segment.lease_key());
-                        return Err(e);
-                    }
-
-                    if let Some(limit) = cfg.max_retry_elapsed {
-                        let elapsed = retry_started_at.elapsed();
-                        if elapsed >= limit {
+                    match retry_state.decide(e) {
+                        RetryDecision::Stop(error) => {
+                            log_warn!(log_level, download_id = download_id, worker_id = worker_id,
+                                piece_id = segment.piece_id, error = %error,
+                                "segment failed, reclaiming (non-retryable or retry budget exhausted)");
                             let _ = scheduler.lock().reclaim(segment.lease_key());
-                            return Err(DownloadError::RetryBudgetExceeded { elapsed, limit });
+                            return Err(error);
                         }
-                    }
+                        RetryDecision::Retry {
+                            error,
+                            retry_count,
+                            backoff,
+                            elapsed,
+                        } => {
+                            segment = scheduler
+                                .lock()
+                                .renew(segment.lease_key(), worker_id)
+                                .ok_or_else(|| {
+                                    DownloadError::Internal(
+                                        "failed to renew segment lease for retry".into(),
+                                    )
+                                })?;
 
-                    attempt += 1;
-                    segment = scheduler
-                        .lock()
-                        .renew(segment.lease_key(), worker_id)
-                        .ok_or_else(|| {
-                            DownloadError::Internal(
-                                "failed to renew segment lease for retry".into(),
-                            )
-                        })?;
+                            log_warn!(log_level, download_id = download_id, worker_id = worker_id,
+                                piece_id = segment.piece_id, attempt = retry_count, error = %error,
+                                backoff_ms = backoff.as_millis() as u64,
+                                elapsed_ms = elapsed.as_millis() as u64,
+                                "segment failed, retrying after backoff");
 
-                    // Compute backoff delay
-                    let backoff = if let Some(retry_secs) = e.retry_after_secs() {
-                        Duration::from_secs(retry_secs)
-                    } else {
-                        let exp = cfg.retry_base_delay.saturating_mul(1u32 << attempt.min(10));
-                        exp.min(cfg.retry_max_delay)
-                    };
-
-                    if let Some(limit) = cfg.max_retry_elapsed {
-                        let elapsed = retry_started_at.elapsed();
-                        if elapsed.saturating_add(backoff) > limit {
-                            let _ = scheduler.lock().reclaim(segment.lease_key());
-                            return Err(DownloadError::RetryBudgetExceeded { elapsed, limit });
-                        }
-                    }
-
-                    log_warn!(log_level, download_id = download_id, worker_id = worker_id,
-                        piece_id = segment.piece_id, attempt = attempt, error = %e,
-                        backoff_ms = backoff.as_millis() as u64,
-                        "segment failed, retrying after backoff");
-
-                    // Wait with cancellation awareness
-                    tokio::select! {
-                        biased;
-                        result = cancel_rx.changed() => {
-                            if result.is_ok() {
-                                let signal = *cancel_rx.borrow_and_update();
+                            if let Err(stop_error) =
+                                sleep_with_backoff(backoff, &mut cancel_rx).await
+                            {
                                 let _ = scheduler.lock().reclaim(segment.lease_key());
-                                if let Some(error) = stop_signal_error(signal) {
-                                    return Err(error);
-                                }
+                                return Err(stop_error);
                             }
                         }
-                        _ = tokio::time::sleep(backoff) => {}
                     }
                 }
             }
@@ -752,7 +732,7 @@ async fn download_segment(
     write_tx: &mpsc::Sender<WriterCommand>,
     received_bytes: &Arc<AtomicU64>,
     cancel_rx: &mut watch::Receiver<StopSignal>,
-    budget: &Arc<Semaphore>,
+    budget: &Arc<MemoryBudget>,
     speed_limit: &SpeedLimit,
 ) -> Result<u64, (DownloadError, u64)> {
     let (response, meta) = worker
@@ -792,7 +772,7 @@ async fn stream_segment(
     write_tx: &mpsc::Sender<WriterCommand>,
     received_bytes: &Arc<AtomicU64>,
     cancel_rx: &mut watch::Receiver<StopSignal>,
-    budget: &Arc<Semaphore>,
+    budget: &Arc<MemoryBudget>,
     speed_limit: &SpeedLimit,
 ) -> Result<u64, (DownloadError, u64)> {
     let mut body = response.into_body();
@@ -826,30 +806,15 @@ async fn stream_segment(
                                 bytes_read,
                             ));
                         }
-                        // Rate limiting
-                        speed_limit.acquire(len).await;
-                        // Acquire budget permits before buffering
-                        let permit = budget
-                            .acquire_many(len as u32)
-                            .await
-                            .map_err(|_| {
-                                (
-                                    DownloadError::Internal("budget semaphore closed".into()),
-                                    bytes_read,
-                                )
-                            })?;
-
-                        if write_tx.send(WriterCommand::Data {
-                            offset,
-                            data,
-                            lease_key: Some(segment.lease_key()),
-                        }).await.is_err() {
-                            return Err((DownloadError::ChannelClosed, bytes_read));
-                        }
-                        permit.forget(); // permits returned by writer after flush
-                        offset += len_u64;
-                        bytes_read += len_u64;
-                        received_bytes.fetch_add(len_u64, Ordering::Relaxed);
+                        budget.forward(
+                            data, offset, Some(segment.lease_key()), write_tx,
+                            cancel_rx, speed_limit,
+                            |sent| {
+                                offset += sent;
+                                bytes_read += sent;
+                                received_bytes.fetch_add(sent, Ordering::Relaxed);
+                            },
+                        ).await.map_err(|error| (error, bytes_read))?;
                     }
                     Ok(None) => break,
                     Err(error) => return Err((error, bytes_read)),
@@ -992,47 +957,38 @@ mod coverage_tests {
         warp::serve(route).bind_ephemeral(([127, 0, 0, 1], 0))
     }
 
-    fn spawn_split_benefit_range_server(
+    fn spawn_gated_range_server(
         path_segment: &'static str,
+        arrivals: mpsc::UnboundedSender<(u64, u64, tokio::sync::oneshot::Sender<()>)>,
     ) -> (std::net::SocketAddr, impl std::future::Future<Output = ()>) {
-        let total = 1024u64;
-
         let route = warp::path(path_segment)
-            .and(warp::header::optional::<String>("range"))
-            .and_then(move |range_header: Option<String>| async move {
-                    let (start, end) = match range_header {
-                        Some(range) => {
-                            let range = range.trim_start_matches("bytes=");
-                            let parts: Vec<&str> = range.split('-').collect();
-                            let start = parts[0].parse::<u64>().unwrap_or(0);
-                            let end = parts[1].parse::<u64>().unwrap_or(total - 1);
-                            (start, end)
-                        }
-                        None => (0, total - 1),
-                    };
-
-                    let len = end - start + 1;
-                    let delay = if len > 256 {
-                        Duration::from_millis(450)
-                    } else {
-                        Duration::from_millis(120)
-                    };
-                    tokio::time::sleep(delay).await;
-
-                    let body = vec![0xEE; len as usize];
+            .and(warp::header::<String>("range"))
+            .and_then(move |range_header: String| {
+                let arrivals = arrivals.clone();
+                async move {
+                    let (start, end) = range_header
+                        .strip_prefix("bytes=")
+                        .unwrap()
+                        .split_once('-')
+                        .unwrap();
+                    let (start, end) = (start.parse::<u64>().unwrap(), end.parse::<u64>().unwrap());
+                    assert!(start <= end && end < 1024);
+                    let (release, released) = tokio::sync::oneshot::channel();
+                    arrivals.send((start, end, release)).unwrap();
+                    // No response headers or body can leave before the test has
+                    // observed every expected request in flight concurrently.
+                    released.await.unwrap();
+                    let body: Vec<u8> = (start..=end).map(|offset| (offset % 251) as u8).collect();
                     Ok::<_, std::convert::Infallible>(
                         warp::http::Response::builder()
                             .status(206)
                             .header("content-length", body.len().to_string())
-                            .header(
-                                "content-range",
-                                format!("bytes {}-{}/{}", start, end, total),
-                            )
+                            .header("content-range", format!("bytes {start}-{end}/1024"))
                             .body(body)
                             .unwrap(),
                     )
                 }
-            );
+            });
 
         warp::serve(route).bind_ephemeral(([127, 0, 0, 1], 0))
     }
@@ -1060,6 +1016,59 @@ mod coverage_tests {
     fn complete_one_piece(scheduler: &Scheduler) {
         let segment = scheduler.lock().assign().unwrap();
         assert!(scheduler.lock().complete(segment.lease_key()));
+    }
+
+    #[tokio::test]
+    async fn checkpoint_freezes_completed_bits_and_hints_before_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("frozen.bytehaul");
+        let scheduler = build_scheduler(1024, 256);
+        complete_one_piece(&scheduler);
+        let pending = scheduler.lock().assign().unwrap();
+        let meta = response_meta();
+        let spec = DownloadSpec::new("https://example.com/multi.bin").autosave_sync_every(1);
+        let ctx = MultiControlSaveContext {
+            spec: &spec,
+            meta: &meta,
+            request_url: &spec.url,
+            scheduler: &scheduler,
+            total_size: 1024,
+            control_path: &path,
+            log_level: LogLevel::Off,
+            download_id: 0,
+        };
+        let (tx, mut rx) = mpsc::channel(1);
+        let mut tracker = ControlSaveTracker::new(0);
+        let barrier = async {
+            let WriterCommand::FlushAll { sync_data, ack } = rx.recv().await.unwrap() else {
+                panic!()
+            };
+            assert!(sync_data);
+            ack.send(crate::storage::writer::FlushAllStats {
+                written_bytes: 256,
+                flush_elapsed: Duration::ZERO,
+                sync_elapsed: Some(Duration::ZERO),
+            })
+            .unwrap();
+            // The sync has acknowledged. Before the save future resumes,
+            // a worker completes a lease written after that barrier.
+            assert!(scheduler.lock().complete(pending.lease_key()));
+        };
+        tokio::join!(
+            persist_multi_control_snapshot(
+                ControlSaveReason::Autosave,
+                Some(&tx),
+                &mut tracker,
+                &ctx
+            ),
+            barrier,
+        );
+        let (snapshot, hints) = ControlSnapshot::load_with_hints(&path).await.unwrap();
+        assert_eq!(snapshot.downloaded_bytes, 256);
+        assert_eq!(snapshot.completed_bitset, vec![1]);
+        assert_eq!(hints.inflight_piece_ids, vec![pending.piece_id]);
+        assert_eq!(scheduler.lock().completed_bytes(), 512);
+        assert_eq!(tracker.last_saved_downloaded_bytes(), 256);
     }
 
     #[tokio::test]
@@ -1122,6 +1131,11 @@ mod coverage_tests {
             download_id: 4,
         };
         let mut tracker = ControlSaveTracker::new(0);
+        complete_one_piece(&scheduler);
+        persist_multi_control_snapshot(ControlSaveReason::Terminal, None, &mut tracker, &ctx).await;
+        let previous_file = tokio::fs::read(&control_path).await.unwrap();
+        assert_eq!(tracker.last_saved_downloaded_bytes(), 256);
+
         let (write_tx, write_rx) = mpsc::channel(1);
         drop(write_rx);
 
@@ -1134,8 +1148,34 @@ mod coverage_tests {
         )
         .await;
 
-        assert!(!control_path.exists());
-        assert_eq!(tracker.last_saved_downloaded_bytes(), 0);
+        assert_eq!(tokio::fs::read(&control_path).await.unwrap(), previous_file);
+        assert_eq!(tracker.last_saved_downloaded_bytes(), 256);
+
+        // A writer that accepts the barrier but fails during flush/sync drops
+        // its acknowledgement. That failure must preserve the same checkpoint.
+        let (write_tx, mut write_rx) = mpsc::channel(1);
+        tokio::join!(
+            persist_multi_control_snapshot(
+                ControlSaveReason::Terminal,
+                Some(&write_tx),
+                &mut tracker,
+                &ctx,
+            ),
+            async {
+                let WriterCommand::FlushAll { sync_data, ack } = write_rx.recv().await.unwrap()
+                else {
+                    panic!("expected a checkpoint durability barrier")
+                };
+                assert!(sync_data);
+                drop(ack);
+            },
+        );
+        assert_eq!(tokio::fs::read(&control_path).await.unwrap(), previous_file);
+        let snapshot = ControlSnapshot::load(&control_path).await.unwrap();
+        assert_eq!(snapshot.downloaded_bytes, 256);
+        assert_eq!(snapshot.completed_bitset, vec![1]);
+        assert_eq!(scheduler.lock().completed_bytes(), 512);
+        assert_eq!(tracker.last_saved_downloaded_bytes(), 256);
     }
 
     #[tokio::test]
@@ -1231,7 +1271,9 @@ mod coverage_tests {
 
         persist_multi_control_snapshot(ControlSaveReason::Terminal, None, &mut tracker, &ctx).await;
 
-        let (loaded, hints) = ControlSnapshot::load_with_hints(&control_path).await.unwrap();
+        let (loaded, hints) = ControlSnapshot::load_with_hints(&control_path)
+            .await
+            .unwrap();
         assert_eq!(loaded.downloaded_bytes, 0);
         assert_eq!(hints.dirty_piece_ids, vec![0]);
         assert_eq!(hints.inflight_piece_ids, vec![0]);
@@ -1279,7 +1321,7 @@ mod coverage_tests {
             write_tx,
             downloaded.clone(),
             cancel_rx,
-            Arc::new(Semaphore::new(1024)),
+            Arc::new(MemoryBudget::new(1024)),
             SpeedLimit::new(0),
             None,
             256,
@@ -1327,7 +1369,7 @@ mod coverage_tests {
             write_tx,
             downloaded,
             cancel_rx,
-            Arc::new(Semaphore::new(1024)),
+            Arc::new(MemoryBudget::new(1024)),
             SpeedLimit::new(0),
             None,
             256,
@@ -1403,23 +1445,426 @@ mod coverage_tests {
     }
 
     #[tokio::test]
-    async fn test_run_multi_worker_dynamic_split_reduces_tail_latency() {
+    async fn nonretryable_worker_failure_preserves_completed_prefix() {
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = requests.clone();
+        let route = warp::any().map(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            warp::http::Response::builder()
+                .status(403)
+                .body("forbidden")
+        });
+        let (addr, server) = warp::serve(route).bind_ephemeral(([127, 0, 0, 1], 0));
+        let server = tokio::spawn(server);
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("partial.bin");
+        let control = ControlSnapshot::control_path(&output);
+        tokio::fs::write(&output, vec![0xAC; 256]).await.unwrap();
+        let spec = DownloadSpec::new(format!("http://{addr}/piece"))
+            .resume(true)
+            .piece_size(256)
+            .min_segment_size(256)
+            .max_connections(1);
+        let mut pieces = PieceMap::new(512, 256);
+        pieces.mark_complete(0);
+        let (progress, _) = watch::channel(ProgressSnapshot::default());
+        let (_stop, stop_rx) = watch::channel(StopSignal::Running);
+        let client = crate::network::ClientNetworkConfig::default()
+            .build_client()
+            .unwrap();
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_multi_worker(
+                client,
+                &spec,
+                &spec.url,
+                &output,
+                &response_meta(),
+                512,
+                pieces,
+                None,
+                &progress,
+                stop_rx,
+                &control,
+                SpeedLimit::new(0),
+                LogLevel::Off,
+                0,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        server.abort();
+
+        assert!(
+            matches!(error, DownloadError::HttpStatus { status: 403, .. }),
+            "{error:?}"
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 1, "403 must not retry");
+        assert_eq!(progress.borrow().state, DownloadState::Failed);
+        assert_eq!(progress.borrow().downloaded, 256);
+        assert_eq!(tokio::fs::read(output).await.unwrap(), vec![0xAC; 256]);
+        let (saved, hints) = ControlSnapshot::load_with_hints(&control).await.unwrap();
+        assert_eq!(saved.downloaded_bytes, 256);
+        assert_eq!(saved.completed_bitset, vec![1]);
+        assert!(
+            hints.inflight_piece_ids.is_empty(),
+            "failed lease must be reclaimed"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_segment_rejects_short_and_oversized_bodies_without_false_completion() {
+        for body_len in [2, 5] {
+            let route = warp::any().map(move || vec![0xAC; body_len]);
+            let (addr, server) = warp::serve(route).bind_ephemeral(([127, 0, 0, 1], 0));
+            let server = tokio::spawn(server);
+            let response = worker_for(format!("http://{addr}/piece"))
+                .send_get()
+                .await
+                .unwrap()
+                .0;
+            let scheduler = build_scheduler(4, 4);
+            let segment = scheduler.lock().assign().unwrap();
+            let (tx, mut rx) = mpsc::channel(4);
+            let (_stop, mut stop_rx) = watch::channel(StopSignal::Running);
+            let downloaded = Arc::new(AtomicU64::new(0));
+            let (error, accepted) = stream_segment(
+                response,
+                Duration::from_secs(2),
+                4,
+                &segment,
+                &tx,
+                &downloaded,
+                &mut stop_rx,
+                &Arc::new(MemoryBudget::new(64)),
+                &SpeedLimit::new(0),
+            )
+            .await
+            .unwrap_err();
+            server.abort();
+            if body_len == 2 {
+                assert!(
+                    matches!(error, DownloadError::Transport(ref e)
+                    if e.kind() == crate::error::TransportErrorKind::Body),
+                    "{error:?}"
+                );
+                assert_eq!(accepted, 2);
+            } else {
+                assert!(
+                    matches!(error, DownloadError::ResumeMismatch(_)),
+                    "{error:?}"
+                );
+                assert!(
+                    accepted <= 4,
+                    "must not forward bytes past the requested range"
+                );
+            }
+            let mut forwarded = Vec::new();
+            while let Ok(command) = rx.try_recv() {
+                let WriterCommand::Data {
+                    data,
+                    offset,
+                    lease_key,
+                    ..
+                } = command
+                else {
+                    panic!("incomplete segment must not flush its lease");
+                };
+                assert_eq!(offset, forwarded.len() as u64);
+                assert_eq!(lease_key, Some(segment.lease_key()));
+                forwarded.extend_from_slice(&data);
+            }
+            assert_eq!(forwarded, vec![0xAC; accepted as usize]);
+            assert_eq!(downloaded.load(Ordering::Relaxed), accepted);
+            assert!(!scheduler.lock().all_done());
+        }
+    }
+
+    fn failure_test_worker_config(worker: HttpWorker) -> Arc<WorkerConfig> {
+        Arc::new(WorkerConfig {
+            worker,
+            read_timeout: Duration::from_secs(2),
+            max_retries: 0,
+            retry_base_delay: Duration::ZERO,
+            retry_max_delay: Duration::ZERO,
+            max_retry_elapsed: None,
+            max_active_leases: 1,
+            min_segment_size: 4,
+        })
+    }
+
+    #[tokio::test]
+    async fn worker_preexisting_stop_leaves_piece_unleased() {
+        for signal in [StopSignal::Pause, StopSignal::Cancel] {
+            let scheduler = build_scheduler(4, 4);
+            let (tx, mut rx) = mpsc::channel(1);
+            let (_stop, stop_rx) = watch::channel(signal);
+            let error = worker_loop(
+                0,
+                failure_test_worker_config(worker_for("http://example.invalid/unused".into())),
+                scheduler.clone(),
+                tx,
+                Arc::new(AtomicU64::new(0)),
+                stop_rx,
+                Arc::new(MemoryBudget::new(64)),
+                SpeedLimit::new(0),
+                None,
+                4,
+                LogLevel::Off,
+                0,
+            )
+            .await
+            .unwrap_err();
+            match signal {
+                StopSignal::Pause => assert!(matches!(error, DownloadError::Paused)),
+                StopSignal::Cancel => assert!(matches!(error, DownloadError::Cancelled)),
+                StopSignal::Running => unreachable!(),
+            }
+            assert!(
+                rx.recv().await.is_none(),
+                "stopped worker must not begin a lease"
+            );
+            let mut scheduler = scheduler.lock();
+            assert_eq!(scheduler.remaining_count(), 1);
+            assert!(scheduler.control_hints().inflight_piece_ids.is_empty());
+            assert_eq!(scheduler.assign().unwrap().start, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_probe_total_reclaims_lease_without_forwarding_data() {
+        let route = warp::any().map(|| vec![0xAC; 4]);
+        let (addr, server) = warp::serve(route).bind_ephemeral(([127, 0, 0, 1], 0));
+        let server = tokio::spawn(server);
+        let worker = worker_for(format!("http://{addr}/piece"));
+        let (response, mut meta) = worker.send_get().await.unwrap();
+        meta.content_range_start = Some(0);
+        meta.content_range_end = Some(3);
+        meta.content_range_total = Some(5);
+        let scheduler = build_scheduler(4, 4);
+        let (tx, rx) = mpsc::channel(4);
+        let writer = spawn_writer_ack(rx);
+        let downloaded = Arc::new(AtomicU64::new(0));
+        let (_stop, stop_rx) = watch::channel(StopSignal::Running);
+        let error = worker_loop(
+            0,
+            failure_test_worker_config(worker),
+            scheduler.clone(),
+            tx,
+            downloaded.clone(),
+            stop_rx,
+            Arc::new(MemoryBudget::new(64)),
+            SpeedLimit::new(0),
+            Some((response, meta, 0)),
+            4,
+            LogLevel::Off,
+            0,
+        )
+        .await
+        .unwrap_err();
+        writer.await.unwrap();
+        server.abort();
+        assert!(
+            matches!(error, DownloadError::ResumeMismatch(_)),
+            "{error:?}"
+        );
+        assert_eq!(downloaded.load(Ordering::Relaxed), 0);
+        let mut scheduler = scheduler.lock();
+        assert_eq!(scheduler.remaining_count(), 1);
+        assert!(scheduler.control_hints().inflight_piece_ids.is_empty());
+        assert_eq!(scheduler.assign().unwrap().start, 0);
+    }
+
+    #[tokio::test]
+    async fn writer_discard_failure_rolls_back_received_bytes_and_reclaims_piece() {
+        let route = warp::any().map(|| vec![0xAC; 2]);
+        let (addr, server) = warp::serve(route).bind_ephemeral(([127, 0, 0, 1], 0));
+        let server = tokio::spawn(server);
+        let worker = worker_for(format!("http://{addr}/piece"));
+        let (response, mut meta) = worker.send_get().await.unwrap();
+        meta.content_length = Some(4);
+        meta.content_range_start = Some(0);
+        meta.content_range_end = Some(3);
+        meta.content_range_total = Some(4);
+        let scheduler = build_scheduler(4, 4);
+        let (tx, mut rx) = mpsc::channel(4);
+        let writer = tokio::spawn(async move {
+            assert!(matches!(
+                rx.recv().await,
+                Some(WriterCommand::BeginLease { .. })
+            ));
+            let mut received = Vec::new();
+            loop {
+                match rx.recv().await {
+                    Some(WriterCommand::Data { data, offset, .. }) => {
+                        assert_eq!(offset, received.len() as u64);
+                        received.extend_from_slice(&data);
+                    }
+                    Some(WriterCommand::DiscardLease { ack, .. }) => {
+                        assert_eq!(received, vec![0xAC; 2]);
+                        // Model a writer failing after receiving the discard command.
+                        drop(ack);
+                        break;
+                    }
+                    _ => panic!("expected prefix data then discard"),
+                }
+            }
+        });
+        let downloaded = Arc::new(AtomicU64::new(0));
+        let (_stop, stop_rx) = watch::channel(StopSignal::Running);
+        let error = worker_loop(
+            0,
+            failure_test_worker_config(worker),
+            scheduler.clone(),
+            tx,
+            downloaded.clone(),
+            stop_rx,
+            Arc::new(MemoryBudget::new(64)),
+            SpeedLimit::new(0),
+            Some((response, meta, 0)),
+            4,
+            LogLevel::Off,
+            0,
+        )
+        .await
+        .unwrap_err();
+        writer.await.unwrap();
+        server.abort();
+        assert!(matches!(error, DownloadError::ChannelClosed), "{error:?}");
+        assert_eq!(
+            downloaded.load(Ordering::Relaxed),
+            0,
+            "failed prefix must be rolled back"
+        );
+        let mut scheduler = scheduler.lock();
+        assert_eq!(scheduler.remaining_count(), 1);
+        assert!(scheduler.control_hints().inflight_piece_ids.is_empty());
+        assert_eq!(scheduler.assign().unwrap().start, 0);
+    }
+
+    #[tokio::test]
+    async fn failed_checkpoint_save_keeps_tracker_pending_for_next_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("not-a-directory");
+        tokio::fs::write(&blocker, b"preserve").await.unwrap();
+        let control = blocker.join("state.bytehaul");
+        let scheduler = build_scheduler(512, 256);
+        complete_one_piece(&scheduler);
+        let spec = DownloadSpec::new("http://example.invalid/piece").autosave_sync_every(1);
+        let meta = response_meta();
+        let ctx = MultiControlSaveContext {
+            spec: &spec,
+            meta: &meta,
+            request_url: &spec.url,
+            scheduler: &scheduler,
+            total_size: 512,
+            control_path: &control,
+            log_level: LogLevel::Off,
+            download_id: 0,
+        };
+        let mut tracker = ControlSaveTracker::new(0);
+        persist_multi_control_snapshot(ControlSaveReason::Autosave, None, &mut tracker, &ctx).await;
+        assert_eq!(tracker.last_saved_downloaded_bytes(), 0);
+        assert_eq!(tokio::fs::read(&blocker).await.unwrap(), b"preserve");
+        tokio::fs::remove_file(&blocker).await.unwrap();
+        tokio::fs::create_dir(&blocker).await.unwrap();
+        persist_multi_control_snapshot(ControlSaveReason::Autosave, None, &mut tracker, &ctx).await;
+        assert_eq!(tracker.last_saved_downloaded_bytes(), 256);
+        assert_eq!(
+            ControlSnapshot::load(&control)
+                .await
+                .unwrap()
+                .completed_bitset,
+            vec![1]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn multi_writer_failure_does_not_replace_existing_checkpoint() {
+        let (addr, server) = spawn_flaky_range_server(0, None);
+        let server = tokio::spawn(server);
+        let dir = tempfile::tempdir().unwrap();
+        let control = dir.path().join("previous.bytehaul");
+        let spec = DownloadSpec::new(format!("http://{addr}/piece"))
+            .resume(true)
+            .piece_size(256)
+            .max_connections(1)
+            .file_allocation(crate::config::FileAllocation::None);
+        let previous = ControlSnapshot {
+            url: spec.url.clone(),
+            total_size: 256,
+            piece_size: 256,
+            piece_count: 1,
+            completed_bitset: vec![0],
+            downloaded_bytes: 0,
+            etag: None,
+            last_modified: None,
+        };
+        previous.save(&control).await.unwrap();
+        let original = tokio::fs::read(&control).await.unwrap();
+        let (progress, _) = watch::channel(ProgressSnapshot::default());
+        let (_stop, stop_rx) = watch::channel(StopSignal::Running);
+        let client = crate::network::ClientNetworkConfig::default()
+            .build_client()
+            .unwrap();
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_multi_worker(
+                client,
+                &spec,
+                &spec.url,
+                Path::new("/dev/full"),
+                &response_meta(),
+                256,
+                PieceMap::new(256, 256),
+                None,
+                &progress,
+                stop_rx,
+                &control,
+                SpeedLimit::new(0),
+                LogLevel::Off,
+                0,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        server.abort();
+        assert!(matches!(error, DownloadError::Io(_)), "{error:?}");
+        assert_eq!(progress.borrow().state, DownloadState::Failed);
+        assert_eq!(tokio::fs::read(&control).await.unwrap(), original);
+        assert_eq!(
+            ControlSnapshot::load(&control)
+                .await
+                .unwrap()
+                .downloaded_bytes,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_multi_worker_dynamic_split_requests_are_concurrent() {
         async fn run_case(
             path_segment: &'static str,
             min_segment_size: u64,
-        ) -> std::time::Duration {
-            let (addr, server) = spawn_split_benefit_range_server(path_segment);
-            tokio::spawn(server);
+            expected_ranges: &[(u64, u64)],
+        ) {
+            let (arrivals_tx, mut arrivals_rx) = mpsc::unbounded_channel();
+            let (addr, server) = spawn_gated_range_server(path_segment, arrivals_tx);
+            let server = tokio::spawn(server);
 
             let dir = tempfile::tempdir().unwrap();
             let output_path = dir.path().join(format!("{path_segment}.bin"));
+            let control_path = ControlSnapshot::control_path(&output_path);
             let meta = ResponseMeta {
                 content_length: Some(1024),
                 content_range_start: Some(0),
                 content_range_end: Some(1023),
                 content_range_total: Some(1024),
                 accept_ranges: true,
-                etag: Some("\"split-benefit\"".into()),
+                etag: Some("\"split-concurrency\"".into()),
                 last_modified: Some("Thu, 01 Jan 2026 00:00:00 GMT".into()),
                 content_disposition: None,
                 content_encoding: None,
@@ -1429,6 +1874,7 @@ mod coverage_tests {
                 .min_segment_size(min_segment_size)
                 .min_split_size(1)
                 .max_connections(4)
+                .max_retries(0)
                 .file_allocation(crate::config::FileAllocation::None)
                 .output_path(output_path.clone());
             let piece_map = PieceMap::new(1024, 1024);
@@ -1438,11 +1884,10 @@ mod coverage_tests {
                 .build_client()
                 .unwrap();
 
-            let started = Instant::now();
-            run_multi_worker(
+            let download = run_multi_worker(
                 client,
                 &spec,
-                &format!("http://{addr}/{path_segment}"),
+                &spec.url,
                 &output_path,
                 &meta,
                 1024,
@@ -1450,27 +1895,53 @@ mod coverage_tests {
                 None,
                 &progress_tx,
                 cancel_rx,
-                &ControlSnapshot::control_path(&output_path),
+                &control_path,
                 SpeedLimit::new(0),
                 LogLevel::Off,
                 10,
-            )
-            .await
-            .unwrap();
-            let elapsed = started.elapsed();
+            );
+            let release_responses = async {
+                let mut ranges = Vec::new();
+                let mut releases = Vec::new();
+                for _ in expected_ranges {
+                    let (start, end, release) = arrivals_rx.recv().await.unwrap();
+                    ranges.push((start, end));
+                    releases.push(release);
+                }
+                ranges.sort_unstable();
+                assert_eq!(ranges, expected_ranges);
+                for release in releases {
+                    release.send(()).unwrap();
+                }
+            };
+            // This only bounds a broken scheduler/serial request deadlock. It is
+            // not a speed comparison between machines or transfer strategies.
+            let completed = tokio::time::timeout(Duration::from_secs(30), async {
+                tokio::join!(download, release_responses).0.unwrap();
+            })
+            .await;
+            server.abort();
+            completed.expect("all expected ranges must arrive before any response is released");
 
+            assert!(
+                arrivals_rx.try_recv().is_err(),
+                "unexpected extra range request"
+            );
             let downloaded = std::fs::read(&output_path).unwrap();
-            assert_eq!(downloaded, vec![0xEE; 1024]);
-            elapsed
+            let expected: Vec<u8> = (0..1024).map(|offset| (offset % 251) as u8).collect();
+            assert_eq!(downloaded, expected);
+            let progress = progress_tx.borrow();
+            assert_eq!(progress.state, DownloadState::Completed);
+            assert_eq!(progress.downloaded, 1024);
+            assert_eq!(progress.total_size, Some(1024));
         }
 
-        let unsplit = run_case("split-benefit-unsplit", 1024).await;
-        let split = run_case("split-benefit-split", 256).await;
-
-        assert!(
-            split + Duration::from_millis(150) < unsplit,
-            "expected dynamic split to reduce tail latency, unsplit={unsplit:?}, split={split:?}"
-        );
+        run_case("unsplit", 1024, &[(0, 1023)]).await;
+        run_case(
+            "split",
+            256,
+            &[(0, 255), (256, 511), (512, 767), (768, 1023)],
+        )
+        .await;
     }
 }
-

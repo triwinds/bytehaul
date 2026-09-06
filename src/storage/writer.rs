@@ -1,14 +1,14 @@
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use std::collections::HashSet;
 
 use bytes::Bytes;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::error::DownloadError;
-use crate::storage::cache::WriteBackCache;
+use crate::storage::cache::{NonContiguousWrite, WriteBackCache};
 use crate::storage::segment::LeaseKey;
 
 #[derive(Debug, Clone, Copy)]
@@ -52,7 +52,7 @@ pub(crate) struct WriterTask {
     file: tokio::fs::File,
     written_bytes: Arc<AtomicU64>,
     cache: WriteBackCache,
-    active_leases: HashSet<LeaseKey>,
+    active_leases: HashMap<LeaseKey, Option<u64>>,
     /// Budget permit sender 鈥?returned when data is flushed to disk.
     budget_return: Arc<tokio::sync::Semaphore>,
     /// Maximum bytes to buffer before forcing a flush.
@@ -72,7 +72,7 @@ impl WriterTask {
             file,
             written_bytes,
             cache: WriteBackCache::new(),
-            active_leases: HashSet::new(),
+            active_leases: HashMap::new(),
             budget_return,
             cache_high_watermark,
         }
@@ -82,7 +82,7 @@ impl WriterTask {
         while let Some(cmd) = self.rx.recv().await {
             match cmd {
                 WriterCommand::BeginLease { lease_key } => {
-                    self.active_leases.insert(lease_key);
+                    self.active_leases.insert(lease_key, None);
                 }
                 WriterCommand::Data {
                     offset,
@@ -91,8 +91,25 @@ impl WriterTask {
                 } => {
                     let data_len = data.len();
                     match lease_key {
-                        Some(lease_key) if self.active_leases.contains(&lease_key) => {
-                            self.cache.insert(lease_key, offset, data);
+                        Some(lease_key) if self.active_leases.contains_key(&lease_key) => {
+                            if !data.is_empty() {
+                                if let Some(Some(expected)) = self.active_leases.get(&lease_key) {
+                                    if offset != *expected {
+                                        return Err(DownloadError::Internal(
+                                            NonContiguousWrite {
+                                                expected: *expected,
+                                                actual: offset,
+                                            }
+                                            .to_string(),
+                                        ));
+                                    }
+                                }
+                                self.cache
+                                    .insert(lease_key, offset, data)
+                                    .map_err(|error| DownloadError::Internal(error.to_string()))?;
+                                self.active_leases
+                                    .insert(lease_key, Some(offset + data_len as u64));
+                            }
                         }
                         Some(_) => {
                             self.budget_return.add_permits(data_len);
@@ -195,6 +212,50 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn writer_rejects_gap_or_overlap_even_after_watermark_flush() {
+        for watermark in [1, 100] {
+            for next_offset in [1, 3] {
+                let dir = tempfile::tempdir().unwrap();
+                let file = tokio::fs::File::create(dir.path().join("data"))
+                    .await
+                    .unwrap();
+                let (tx, rx) = mpsc::channel(4);
+                let writer = tokio::spawn(
+                    WriterTask::new(
+                        rx,
+                        file,
+                        Arc::new(AtomicU64::new(0)),
+                        Arc::new(tokio::sync::Semaphore::new(0)),
+                        watermark,
+                    )
+                    .run(),
+                );
+                let key = LeaseKey {
+                    piece_id: 0,
+                    lease_id: 1,
+                };
+                tx.send(WriterCommand::BeginLease { lease_key: key })
+                    .await
+                    .unwrap();
+                for (offset, data) in [(0, b"ab".as_slice()), (next_offset, b"x".as_slice())] {
+                    tx.send(WriterCommand::Data {
+                        offset,
+                        data: Bytes::copy_from_slice(data),
+                        lease_key: Some(key),
+                    })
+                    .await
+                    .unwrap();
+                }
+                drop(tx);
+                assert!(
+                    matches!(writer.await.unwrap(), Err(DownloadError::Internal(message))
+                    if message == format!("noncontiguous lease write: expected offset 2, got {next_offset}"))
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn test_writer_direct_write() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.bin");
@@ -258,7 +319,9 @@ mod tests {
             lease_id: 1,
         };
 
-        tx.send(WriterCommand::BeginLease { lease_key }).await.unwrap();
+        tx.send(WriterCommand::BeginLease { lease_key })
+            .await
+            .unwrap();
 
         // Send data with piece_id (cached write)
         tx.send(WriterCommand::Data {
@@ -308,7 +371,9 @@ mod tests {
             piece_id: 0,
             lease_id: 1,
         };
-        tx.send(WriterCommand::BeginLease { lease_key }).await.unwrap();
+        tx.send(WriterCommand::BeginLease { lease_key })
+            .await
+            .unwrap();
 
         tx.send(WriterCommand::Data {
             offset: 0,
@@ -356,7 +421,9 @@ mod tests {
             piece_id: 0,
             lease_id: 1,
         };
-        tx.send(WriterCommand::BeginLease { lease_key }).await.unwrap();
+        tx.send(WriterCommand::BeginLease { lease_key })
+            .await
+            .unwrap();
 
         tx.send(WriterCommand::Data {
             offset: 0,
@@ -414,12 +481,17 @@ mod tests {
             piece_id: 0,
             lease_id: 1,
         };
-        tx.send(WriterCommand::BeginLease { lease_key }).await.unwrap();
-
-        let (ack_tx, ack_rx) = oneshot::channel();
-        tx.send(WriterCommand::DiscardLease { lease_key, ack: ack_tx })
+        tx.send(WriterCommand::BeginLease { lease_key })
             .await
             .unwrap();
+
+        let (ack_tx, ack_rx) = oneshot::channel();
+        tx.send(WriterCommand::DiscardLease {
+            lease_key,
+            ack: ack_tx,
+        })
+        .await
+        .unwrap();
         assert_eq!(ack_rx.await.unwrap(), 0);
 
         tx.send(WriterCommand::Data {
@@ -541,7 +613,9 @@ mod tests {
             piece_id: 0,
             lease_id: 1,
         };
-        tx.send(WriterCommand::BeginLease { lease_key }).await.unwrap();
+        tx.send(WriterCommand::BeginLease { lease_key })
+            .await
+            .unwrap();
 
         tx.send(WriterCommand::Data {
             offset: 0,
@@ -590,7 +664,9 @@ mod tests {
             piece_id: 0,
             lease_id: 1,
         };
-        tx.send(WriterCommand::BeginLease { lease_key }).await.unwrap();
+        tx.send(WriterCommand::BeginLease { lease_key })
+            .await
+            .unwrap();
 
         // Send data that exceeds the high watermark
         tx.send(WriterCommand::Data {

@@ -35,7 +35,10 @@ impl EtaEstimator {
             }
         }
 
-        self.samples.push_back(ProgressSample { at: now, downloaded });
+        self.samples.push_back(ProgressSample {
+            at: now,
+            downloaded,
+        });
         self.trim(now);
     }
 
@@ -92,7 +95,10 @@ impl EtaEstimator {
                     let total_span = sample.at.duration_since(before.at).as_secs_f64();
                     let elapsed = cutoff.duration_since(before.at).as_secs_f64();
                     let delta_bytes = sample.downloaded.saturating_sub(before.downloaded) as f64;
-                    Some((before.downloaded as f64 + delta_bytes * (elapsed / total_span), cutoff))
+                    Some((
+                        before.downloaded as f64 + delta_bytes * (elapsed / total_span),
+                        cutoff,
+                    ))
                 }
                 Some(before) => Some((before.downloaded as f64, before.at)),
                 None => Some((sample.downloaded as f64, sample.at)),

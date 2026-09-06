@@ -21,7 +21,7 @@ A Rust async HTTP download library with Python bindings (also available on PyPI)
 - **Pause / resume** — cooperative pause with persisted control files for later continuation
 - **Write-back cache** — piece-based aggregation to reduce random I/O
 - **Memory budget & backpressure** — semaphore-based flow control
-- **Retry with exponential backoff** — configurable max retries, respects `Retry-After`
+- **Retry with exponential backoff** — shared by single/multi transfers, resumes body failures safely, respects `Retry-After`
 - **Rate limiting** — shared token-bucket across all workers
 - **SHA-256 checksum verification** — post-download integrity check
 - **Cancellation** — cooperative cancel via stop signal
@@ -101,27 +101,37 @@ For the full Python API (object API, progress, cancellation, error handling, etc
 
 ## Coverage
 
-The CI coverage gate is still enforced on Ubuntu with Tarpaulin:
+CI and local Linux validation use one entry point. On Ubuntu 24.04 x86_64 (with Python 3, rustup, a C compiler, pkg-config and OpenSSL development headers installed), run:
 
 ```bash
-cargo tarpaulin --engine llvm --workspace --all-targets --out Stdout --fail-under 95
+python3 scripts/coverage.py --install
 ```
 
-On Windows, Tarpaulin can leave locked binaries or produce incomplete summaries after interrupted or parallel coverage runs. Use the PowerShell helper instead for a local report:
+`--install` installs the Rust and Tarpaulin versions pinned in [coverage-config.json](scripts/coverage-config.json). After setup, omit it to reuse those exact versions. The gate uses LLVM, `-p bytehaul --all-targets`, the locked dependencies and a **95% line threshold**, without extra source exclusions. It ignores ambient Tarpaulin config and isolates proxy environment variables for localhost tests.
+
+Use a writable source checkout: LLVM-instrumented build scripts can write profile files there even when the build directory is elsewhere. On a Linux VM with limited memory, reduce concurrent compiler processes. Linking can still exceed a 2 GB VM; use more memory if the linker is killed:
+
+```bash
+CARGO_BUILD_JOBS=1 python3 scripts/coverage.py --install
+```
+
+This changes build concurrency only; the target scope and threshold remain the same. Metadata includes the Linux distribution and the explicit `CARGO_BUILD_JOBS` value, if set.
+
+Every run gets separate build and report directories under `target/coverage/`. JSON, HTML, the raw log, tool versions, revision and dirty-worktree status are retained under `target/coverage/reports/<run>/`. A failed test is reported as incomplete coverage; a measured percentage below 95% is reported as a threshold failure. Both fail the command. Actions also publishes the summary and uploads diagnostics on failure.
+
+Run this gate before submitting Rust changes, using the same revision intended for CI. Passing `cargo test`, Clippy or a report generator without a threshold does **not** certify coverage. macOS/Windows compile different paths; a local report there does not replace the Linux gate. On those hosts, use an Ubuntu x86_64 VM/WSL environment or the GitHub coverage job for the reference measurement. Change the pins deliberately and rerun the full gate when upgrading tools.
+
+For additional Windows diagnostics:
 
 ```powershell
 rustup component add llvm-tools-preview
 cargo install cargo-llvm-cov
 powershell -ExecutionPolicy Bypass -File scripts/coverage-windows.ps1 -Scope all-targets -Format html
-```
-
-For a machine-readable summary on Windows:
-
-```powershell
+# Machine-readable alternative:
 powershell -ExecutionPolicy Bypass -File scripts/coverage-windows.ps1 -Scope all-targets -Format json
 ```
 
-The helper now defaults to the same `all-targets` scope as the CI gate, while still forcing `CARGO_BUILD_JOBS=1` and a fresh isolated `CARGO_TARGET_DIR` on each run to avoid the `os error 5`, `LNK1104`, and stale `cargo` / `rustc` handle conflicts that show up when multiple coverage builds overlap on Windows.
+The Windows helper uses cargo-llvm-cov, explicitly enforces the shared 95% **line** threshold, and defaults to `all-targets`. `tests` and `lib` measure narrower scopes. Its success certifies only the selected Windows scope, whose coverage denominator differs from Tarpaulin on Linux. Each run uses a fresh target and default report path with a single build job to avoid locked files and stale reports.
 
 ## Architecture
 

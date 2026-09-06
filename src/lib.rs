@@ -67,6 +67,33 @@ pub mod bench {
     pub use crate::storage::control::ControlSnapshot;
     pub use crate::storage::piece_map::PieceMap;
 
+    pub struct BenchScheduler(SchedulerState);
+
+    pub fn bench_scheduler_new(total_size: u64, piece_size: u64) -> BenchScheduler {
+        BenchScheduler(SchedulerState::new(PieceMap::new(total_size, piece_size)))
+    }
+
+    pub fn bench_scheduler_assign_complete(
+        scheduler: &mut BenchScheduler,
+        assignments: usize,
+        max_active_leases: usize,
+        min_segment_size: u64,
+    ) -> usize {
+        let mut completed = 0;
+        for _ in 0..assignments {
+            let Some(segment) =
+                scheduler
+                    .0
+                    .assign_to_with_split(0, max_active_leases, min_segment_size)
+            else {
+                break;
+            };
+            assert!(scheduler.0.complete(segment.lease_key()));
+            completed += 1;
+        }
+        completed
+    }
+
     pub fn bench_scheduler_snapshot(total_size: u64, piece_size: u64) -> (usize, u64) {
         let mut scheduler = SchedulerState::new(PieceMap::new(total_size, piece_size));
         while let Some(segment) = scheduler.assign() {
@@ -100,36 +127,41 @@ pub mod bench {
         downloader.bench_cached_client_count()
     }
 
-            pub fn bench_cache_new() -> WriteBackCache {
-                WriteBackCache::new()
-            }
+    pub fn bench_cache_new() -> WriteBackCache {
+        WriteBackCache::new()
+    }
 
-            pub fn bench_cache_insert(
-                cache: &mut WriteBackCache,
-                piece_id: usize,
-                lease_id: u64,
-                offset: u64,
-                data: bytes::Bytes,
-            ) {
-                cache.insert(LeaseKey { piece_id, lease_id }, offset, data);
-            }
+    pub fn bench_cache_insert(
+        cache: &mut WriteBackCache,
+        piece_id: usize,
+        lease_id: u64,
+        offset: u64,
+        data: bytes::Bytes,
+    ) {
+        cache
+            .insert(LeaseKey { piece_id, lease_id }, offset, data)
+            .expect("benchmark writes must be contiguous");
+    }
 
-            pub fn bench_cache_total_bytes(cache: &WriteBackCache) -> usize {
-                cache.total_bytes()
-            }
+    pub fn bench_cache_total_bytes(cache: &WriteBackCache) -> usize {
+        cache.total_bytes()
+    }
 
-            pub fn bench_cache_drain_lease_len(
-                cache: &mut WriteBackCache,
-                piece_id: usize,
-                lease_id: u64,
-            ) -> usize {
-                cache.drain_lease(LeaseKey { piece_id, lease_id }).len()
-            }
+    pub fn bench_cache_drain_lease_len(
+        cache: &mut WriteBackCache,
+        piece_id: usize,
+        lease_id: u64,
+    ) -> usize {
+        cache.drain_lease(LeaseKey { piece_id, lease_id }).len()
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::bench::{bench_cached_client_lookup, bench_scheduler_snapshot};
+    use super::bench::{
+        bench_cached_client_lookup, bench_scheduler_assign_complete, bench_scheduler_new,
+        bench_scheduler_snapshot,
+    };
     use super::Downloader;
     use std::time::Duration;
 
@@ -139,6 +171,23 @@ mod tests {
 
         assert_eq!(downloaded_bytes, 1024);
         assert!(bitset_len >= 1);
+    }
+
+    #[test]
+    fn test_bench_scheduler_assign_complete_drives_split_path() {
+        let mut scheduler = bench_scheduler_new(1_024, 1_024);
+        assert_eq!(
+            bench_scheduler_assign_complete(&mut scheduler, 2, 4, 256),
+            2
+        );
+        assert_eq!(
+            bench_scheduler_assign_complete(&mut scheduler, 4, 4, 256),
+            2
+        );
+        assert_eq!(
+            bench_scheduler_assign_complete(&mut scheduler, 1, 4, 256),
+            0
+        );
     }
 
     #[test]

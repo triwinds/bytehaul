@@ -1,5 +1,8 @@
+use std::io::{Read, Write};
+use std::net::{Shutdown, TcpListener};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::thread;
 
 use bytehaul::{DownloadSpec, Downloader, FileAllocation};
 use warp::Filter;
@@ -68,6 +71,203 @@ fn flaky_server(
         });
 
     warp::serve(route).bind_ephemeral(([127, 0, 0, 1], 0))
+}
+
+/// The first full response is truncated after a prefix. The next request must
+/// resume at that persisted prefix and receive a strict 206 response.
+fn truncated_body_then_range_server(
+    path_segment: &'static str,
+    data: Vec<u8>,
+) -> (String, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let handle = thread::spawn(move || {
+        for request_no in 0..2 {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 1024];
+            loop {
+                let read = stream.read(&mut buffer).unwrap();
+                assert!(read > 0, "client closed before sending request");
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let request = String::from_utf8_lossy(&request);
+            let total = data.len();
+            if request_no == 0 {
+                assert!(!request.to_ascii_lowercase().contains("range:"));
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nETag: \"retry-body\"\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
+                stream.write_all(&data[..4]).unwrap();
+            } else {
+                let range_line = request
+                    .lines()
+                    .find(|line| line.to_ascii_lowercase().starts_with("range:"))
+                    .expect("retry request must carry Range");
+                let range = range_line.split_once(':').unwrap().1.trim();
+                let range = range.trim_start_matches("bytes=");
+                let (start, end) = range.split_once('-').expect("valid Range header");
+                let start: usize = start.parse().unwrap();
+                let end: usize = end.parse().unwrap();
+                assert_eq!(start, 4, "retry must resume at persisted prefix");
+                assert_eq!(end, total - 1);
+                let body = &data[start..=end];
+                write!(
+                    stream,
+                    "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {start}-{end}/{total}\r\nETag: \"retry-body\"\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .unwrap();
+                stream.write_all(body).unwrap();
+            }
+            stream.shutdown(Shutdown::Both).unwrap();
+        }
+    });
+    (format!("http://{address}/{path_segment}"), handle)
+}
+
+/// The first chunked response ends before its terminating chunk. With no
+/// trustworthy total size, the client must restart with a plain full GET.
+fn truncated_chunked_then_full_server(
+    path_segment: &'static str,
+    data: Vec<u8>,
+) -> (String, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let handle = thread::spawn(move || {
+        for request_no in 0..2 {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 1024];
+            loop {
+                let read = stream.read(&mut buffer).unwrap();
+                assert!(read > 0, "client closed before sending request");
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let request = String::from_utf8_lossy(&request);
+            assert!(!request.to_ascii_lowercase().contains("range:"));
+            if request_no == 0 {
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n4\r\n{}\r\n",
+                    String::from_utf8_lossy(&data[..4])
+                )
+                .unwrap();
+            } else {
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{}\r\n0\r\n\r\n",
+                    data.len(),
+                    String::from_utf8_lossy(&data)
+                )
+                .unwrap();
+            }
+            stream.shutdown(Shutdown::Both).unwrap();
+        }
+    });
+    (format!("http://{address}/{path_segment}"), handle)
+}
+
+/// The first response is truncated, then a retry either ignores Range or
+/// changes validators. The client must reset before the final full GET.
+fn truncated_then_restart_server(
+    path_segment: &'static str,
+    data: Vec<u8>,
+    range_returns_206_with_changed_etag: bool,
+) -> (String, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let handle = thread::spawn(move || {
+        let request_count = if range_returns_206_with_changed_etag {
+            3
+        } else {
+            2
+        };
+        for request_no in 0..request_count {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 1024];
+            loop {
+                let read = stream.read(&mut buffer).unwrap();
+                assert!(read > 0, "client closed before sending request");
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let request = String::from_utf8_lossy(&request);
+            let total = data.len();
+            match request_no {
+                0 => {
+                    assert!(!request.to_ascii_lowercase().contains("range:"));
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nETag: \"old\"\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n"
+                    )
+                    .unwrap();
+                    stream.write_all(&data[..4]).unwrap();
+                }
+                1 if range_returns_206_with_changed_etag => {
+                    let range_line = request
+                        .lines()
+                        .find(|line| line.to_ascii_lowercase().starts_with("range:"))
+                        .expect("retry request must carry Range");
+                    assert_eq!(range_line.split_once(':').unwrap().1.trim(), "bytes=4-9");
+                    let body = &data[4..];
+                    write!(
+                        stream,
+                        "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes 4-9/{total}\r\nETag: \"new\"\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .unwrap();
+                    stream.write_all(body).unwrap();
+                }
+                1 => {
+                    let range_line = request
+                        .lines()
+                        .find(|line| line.to_ascii_lowercase().starts_with("range:"))
+                        .expect("retry request must carry Range");
+                    assert_eq!(range_line.split_once(':').unwrap().1.trim(), "bytes=4-9");
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nETag: \"old\"\r\nConnection: close\r\n\r\n"
+                    )
+                    .unwrap();
+                    stream.write_all(&data).unwrap();
+                }
+                2 => {
+                    assert!(!request.to_ascii_lowercase().contains("range:"));
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nETag: \"{}\"\r\nConnection: close\r\n\r\n",
+                        if range_returns_206_with_changed_etag { "new" } else { "old" }
+                    )
+                    .unwrap();
+                    stream.write_all(&data).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            stream.shutdown(Shutdown::Both).unwrap();
+        }
+    });
+    (format!("http://{address}/{path_segment}"), handle)
 }
 
 /// Server that rate-limits only the initial Range probe but would allow a plain GET.
@@ -207,6 +407,102 @@ async fn test_retry_on_503_single_connection() {
 
     let downloaded = std::fs::read(&output_path).unwrap();
     assert_eq!(downloaded, expected);
+}
+
+#[tokio::test]
+async fn test_retry_on_truncated_body_single_connection_resumes_range() {
+    let content = b"0123456789".to_vec();
+    let (url, server) = truncated_body_then_range_server("retry-body", content.clone());
+
+    let dir = tempfile::tempdir().unwrap();
+    let output_path = dir.path().join("retry-body.bin");
+
+    let downloader = Downloader::builder().build().unwrap();
+    let spec = DownloadSpec::new(url)
+        .output_path(output_path.clone())
+        .file_allocation(FileAllocation::None)
+        .max_connections(1)
+        .retry_policy(
+            2,
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_millis(5),
+        );
+
+    downloader.download(spec).wait().await.unwrap();
+    assert_eq!(std::fs::read(output_path).unwrap(), content);
+    server.join().unwrap();
+}
+
+#[tokio::test]
+async fn test_retry_unknown_length_single_connection_restarts_from_zero() {
+    let content = b"0123456789".to_vec();
+    let (url, server) = truncated_chunked_then_full_server("retry-chunked", content.clone());
+    let dir = tempfile::tempdir().unwrap();
+    let output_path = dir.path().join("retry-chunked.bin");
+
+    let downloader = Downloader::builder().build().unwrap();
+    let spec = DownloadSpec::new(url)
+        .output_path(output_path.clone())
+        .file_allocation(FileAllocation::None)
+        .max_connections(1)
+        .retry_policy(
+            2,
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_millis(5),
+        );
+
+    downloader.download(spec).wait().await.unwrap();
+    assert_eq!(std::fs::read(&output_path).unwrap(), content);
+    let control_path = std::path::PathBuf::from(format!("{}.bytehaul", output_path.display()));
+    assert!(!control_path.exists());
+    server.join().unwrap();
+}
+
+#[tokio::test]
+async fn test_retry_range_ignored_resets_before_full_get() {
+    let content = b"0123456789".to_vec();
+    let (url, server) =
+        truncated_then_restart_server("retry-range-ignored", content.clone(), false);
+    let dir = tempfile::tempdir().unwrap();
+    let output_path = dir.path().join("retry-range-ignored.bin");
+
+    let downloader = Downloader::builder().build().unwrap();
+    let spec = DownloadSpec::new(url)
+        .output_path(output_path.clone())
+        .file_allocation(FileAllocation::None)
+        .max_connections(1)
+        .retry_policy(
+            3,
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_millis(5),
+        );
+
+    downloader.download(spec).wait().await.unwrap();
+    assert_eq!(std::fs::read(output_path).unwrap(), content);
+    server.join().unwrap();
+}
+
+#[tokio::test]
+async fn test_retry_metadata_change_resets_before_full_get() {
+    let content = b"0123456789".to_vec();
+    let (url, server) = truncated_then_restart_server("retry-metadata", content.clone(), true);
+    let dir = tempfile::tempdir().unwrap();
+    let output_path = dir.path().join("retry-metadata.bin");
+
+    let downloader = Downloader::builder().build().unwrap();
+    let spec = DownloadSpec::new(url)
+        .output_path(output_path.clone())
+        .file_allocation(FileAllocation::None)
+        .max_connections(1)
+        .retry_policy(
+            3,
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_millis(5),
+        );
+
+    downloader.download(spec).wait().await.unwrap();
+    assert_eq!(std::fs::read(output_path).unwrap(), content);
+    server.join().unwrap();
 }
 
 #[tokio::test]

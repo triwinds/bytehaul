@@ -3,9 +3,8 @@ use std::path::{Component, Path, PathBuf};
 use url::Url;
 
 const WINDOWS_RESERVED_NAMES: &[&str] = &[
-    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6",
-    "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7",
-    "LPT8", "LPT9",
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
 ];
 
 pub(crate) fn sanitize_relative_path(path: &Path) -> Option<PathBuf> {
@@ -93,7 +92,11 @@ fn decode_rfc5987_value(value: &str) -> Option<String> {
 fn split_rfc5987_parts(value: &str) -> Option<(&str, &str, &str)> {
     let first = value.find('\'')?;
     let second = value[first + 1..].find('\'')? + first + 1;
-    Some((&value[..first], &value[first + 1..second], &value[second + 1..]))
+    Some((
+        &value[..first],
+        &value[first + 1..second],
+        &value[second + 1..],
+    ))
 }
 
 fn sanitize_filename_component(value: &str) -> String {
@@ -173,7 +176,9 @@ fn percent_decode_bytes(value: &str) -> Option<Vec<u8>> {
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use super::{detect_filename, filename_from_url, parse_content_disposition, sanitize_relative_path};
+    use super::{
+        detect_filename, filename_from_url, parse_content_disposition, sanitize_relative_path,
+    };
 
     #[test]
     fn test_parse_content_disposition_prefers_filename_star() {
@@ -187,19 +192,28 @@ mod tests {
     #[test]
     fn test_parse_content_disposition_sanitizes_filename() {
         let header = "attachment; filename=..\\bad:name?.txt";
-        assert_eq!(parse_content_disposition(header).as_deref(), Some(".._bad_name_.txt"));
+        assert_eq!(
+            parse_content_disposition(header).as_deref(),
+            Some(".._bad_name_.txt")
+        );
     }
 
     #[test]
     fn test_parse_content_disposition_supports_latin1_filename_star() {
         let header = "attachment; filename*=ISO-8859-1''caf%E9.txt";
-        assert_eq!(parse_content_disposition(header).as_deref(), Some("café.txt"));
+        assert_eq!(
+            parse_content_disposition(header).as_deref(),
+            Some("café.txt")
+        );
     }
 
     #[test]
     fn test_parse_content_disposition_falls_back_when_filename_star_is_invalid() {
         let header = "attachment; filename*=UTF-8''bad%ZZname.txt; filename=fallback.txt";
-        assert_eq!(parse_content_disposition(header).as_deref(), Some("fallback.txt"));
+        assert_eq!(
+            parse_content_disposition(header).as_deref(),
+            Some("fallback.txt")
+        );
     }
 
     #[test]
@@ -231,7 +245,10 @@ mod tests {
     #[test]
     fn test_filename_from_url_rejects_invalid_inputs() {
         assert_eq!(filename_from_url("not a url"), None);
-        assert_eq!(filename_from_url("https://example.com/files/bad%ZZname.zip"), None);
+        assert_eq!(
+            filename_from_url("https://example.com/files/bad%ZZname.zip"),
+            None
+        );
     }
 
     #[test]
@@ -294,7 +311,10 @@ mod tests {
     fn test_unsupported_charset_in_filename_star() {
         // Triggers the `else { None }` branch in decode_rfc5987_value
         let header = "attachment; filename*=WINDOWS-1252''caf%E9.txt; filename=fallback.txt";
-        assert_eq!(parse_content_disposition(header).as_deref(), Some("fallback.txt"));
+        assert_eq!(
+            parse_content_disposition(header).as_deref(),
+            Some("fallback.txt")
+        );
     }
 
     #[test]

@@ -258,7 +258,10 @@ fn test_apply_client_options_and_build_download_spec() {
     assert_eq!(spec.get_max_retries(), 7);
     assert_eq!(spec.get_retry_base_delay(), Duration::from_secs_f64(0.5));
     assert_eq!(spec.get_retry_max_delay(), Duration::from_secs_f64(2.0));
-    assert_eq!(spec.get_max_retry_elapsed(), Some(Duration::from_secs_f64(4.0)));
+    assert_eq!(
+        spec.get_max_retry_elapsed(),
+        Some(Duration::from_secs_f64(4.0))
+    );
     assert_eq!(spec.get_max_download_speed(), 12345);
     assert!(matches!(
         spec.get_checksum(),
@@ -330,9 +333,11 @@ fn test_checksum_parsing_and_invalid_config_mapping() {
         .to_string()
         .contains("unsupported checksum algorithm"));
 
-    assert!(map_download_error(DownloadError::InvalidConfig("bad config".into()))
-        .to_string()
-        .contains("ConfigError"));
+    assert!(
+        map_download_error(DownloadError::InvalidConfig("bad config".into()))
+            .to_string()
+            .contains("ConfigError")
+    );
 }
 
 #[test]
@@ -390,15 +395,17 @@ fn test_error_mapping_snapshot_conversion_and_repr() {
     assert!(map_download_error(DownloadError::Internal("boom".into()))
         .to_string()
         .contains("InternalError"));
-    assert!(map_download_error(DownloadError::ResumeMismatch("resume mismatch".into()))
-        .to_string()
-        .contains("ResumeError"));
+    assert!(
+        map_download_error(DownloadError::ResumeMismatch("resume mismatch".into()))
+            .to_string()
+            .contains("ResumeError")
+    );
     assert!(map_download_error(DownloadError::RetryBudgetExceeded {
         elapsed: Duration::from_secs(3),
         limit: Duration::from_secs(2),
     })
-        .to_string()
-        .contains("DownloadFailedError"));
+    .to_string()
+    .contains("DownloadFailedError"));
 
     let cases = [
         (bytehaul::DownloadState::Pending, "pending"),
@@ -560,13 +567,29 @@ fn test_download_task_pause_maps_to_paused_error() {
 fn test_py_downloader_with_log_level() {
     init_python();
     // Test with explicit log_level
-    let d =
-        PyDownloader::new(None, None, None, None, None, None, None, Some("debug".into()))
-            .unwrap();
+    let d = PyDownloader::new(
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some("debug".into()),
+    )
+    .unwrap();
     drop(d);
     // Test invalid log_level
-    let result =
-        PyDownloader::new(None, None, None, None, None, None, None, Some("invalid".into()));
+    let result = PyDownloader::new(
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some("invalid".into()),
+    );
     assert!(result.is_err());
     assert!(result.err().unwrap().to_string().contains("log_level"));
 }

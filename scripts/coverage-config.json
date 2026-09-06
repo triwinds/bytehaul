@@ -1,0 +1,5 @@
+{
+  "rust": "1.98.1",
+  "tarpaulin": "0.37.2",
+  "minimum_lines": 95
+}

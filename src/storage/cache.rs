@@ -4,31 +4,28 @@ use bytes::{Bytes, BytesMut};
 
 use crate::storage::segment::LeaseKey;
 
-/// A write-back cache that aggregates small data chunks by offset before flushing.
-///
-/// Data is stored per piece, and within each piece by contiguous byte ranges.
-/// Adjacent or overlapping writes are merged to reduce the number of disk I/O operations.
+/// Sequential HTTP body buffers, isolated by lease identity.
 #[derive(Default)]
 pub struct WriteBackCache {
-    /// Cached entries keyed by lease identity.
     pieces: BTreeMap<LeaseKey, PieceCacheEntry>,
-    /// Total bytes currently held in the cache.
     total_bytes: usize,
 }
 
-/// Cached data for a single piece, stored as a set of contiguous byte ranges.
 struct PieceCacheEntry {
-    /// Sorted, non-overlapping ranges: (offset, data).
-    ranges: Vec<(u64, BytesMut)>,
-    /// Total resident bytes currently held for this piece.
-    resident_bytes: usize,
+    offset: u64,
+    data: BytesMut,
+}
+
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+#[error("noncontiguous lease write: expected offset {expected}, got {actual}")]
+pub(crate) struct NonContiguousWrite {
+    pub expected: u64,
+    pub actual: u64,
 }
 
 /// A contiguous block of data ready to be flushed to disk.
 pub struct FlushBlock {
-    /// File offset where this block should be written.
     pub offset: u64,
-    /// The data payload.
     pub data: Bytes,
 }
 
@@ -37,169 +34,74 @@ impl WriteBackCache {
         Self::default()
     }
 
-    /// Total bytes currently buffered in the cache.
     pub(crate) fn total_bytes(&self) -> usize {
         self.total_bytes
     }
 
-    /// Insert data for a specific lease at the given file offset.
-    pub(crate) fn insert(&mut self, lease_key: LeaseKey, offset: u64, data: Bytes) {
-        let len = data.len();
-        if len == 0 {
-            return;
+    /// Append a body chunk. A lease must never overlap or skip buffered bytes.
+    pub(crate) fn insert(
+        &mut self,
+        lease_key: LeaseKey,
+        offset: u64,
+        data: Bytes,
+    ) -> Result<(), NonContiguousWrite> {
+        if data.is_empty() {
+            return Ok(());
         }
         let entry = self
             .pieces
             .entry(lease_key)
             .or_insert_with(|| PieceCacheEntry {
-                ranges: Vec::new(),
-                resident_bytes: 0,
+                offset,
+                data: BytesMut::new(),
             });
-        self.total_bytes += entry.merge(offset, data);
+        let expected = entry.offset + entry.data.len() as u64;
+        if offset != expected {
+            return Err(NonContiguousWrite {
+                expected,
+                actual: offset,
+            });
+        }
+        entry.data.extend_from_slice(&data);
+        self.total_bytes += data.len();
+        Ok(())
     }
 
-    /// Drain all cached data for the given lease, returning flush blocks sorted by offset.
     pub(crate) fn drain_lease(&mut self, lease_key: LeaseKey) -> Vec<FlushBlock> {
         match self.pieces.remove(&lease_key) {
             Some(entry) => {
-                self.total_bytes = self.total_bytes.saturating_sub(entry.resident_bytes);
-                let blocks: Vec<FlushBlock> = entry
-                    .ranges
-                    .into_iter()
-                    .map(|(offset, data)| FlushBlock {
-                        offset,
-                        data: data.freeze(),
-                    })
-                    .collect();
-                blocks
+                self.total_bytes -= entry.data.len();
+                vec![FlushBlock {
+                    offset: entry.offset,
+                    data: entry.data.freeze(),
+                }]
             }
             None => Vec::new(),
         }
     }
 
-    /// Discard all cached data for a failed lease attempt.
     pub(crate) fn discard_lease(&mut self, lease_key: LeaseKey) -> usize {
         match self.pieces.remove(&lease_key) {
             Some(entry) => {
-                self.total_bytes = self.total_bytes.saturating_sub(entry.resident_bytes);
-                entry.resident_bytes
+                self.total_bytes -= entry.data.len();
+                entry.data.len()
             }
             None => 0,
         }
     }
 
-    /// Drain ALL cached data across all pieces, returning flush blocks sorted by offset.
+    /// Lease order differs from file order after retries and subrange splitting.
     pub(crate) fn drain_all(&mut self) -> Vec<FlushBlock> {
-        let mut blocks = Vec::new();
-        let pieces = std::mem::take(&mut self.pieces);
-        for (_lease_key, entry) in pieces {
-            self.total_bytes = self.total_bytes.saturating_sub(entry.resident_bytes);
-            for (offset, data) in entry.ranges {
-                blocks.push(FlushBlock {
-                    offset,
-                    data: data.freeze(),
-                });
-            }
-        }
+        let mut blocks: Vec<_> = std::mem::take(&mut self.pieces)
+            .into_values()
+            .map(|entry| FlushBlock {
+                offset: entry.offset,
+                data: entry.data.freeze(),
+            })
+            .collect();
+        self.total_bytes = 0;
+        blocks.sort_unstable_by_key(|block| block.offset);
         blocks
-    }
-}
-
-impl PieceCacheEntry {
-    /// Merge new data at `offset` into the existing ranges, coalescing adjacent/overlapping ranges.
-    fn merge(&mut self, offset: u64, data: Bytes) -> usize {
-        if let Some(delta) = self.try_append(offset, &data) {
-            self.resident_bytes += delta;
-            return delta;
-        }
-
-        let before = self.resident_bytes;
-        let end = offset + data.len() as u64;
-
-        // Find the insertion point
-        let pos = self.ranges.partition_point(|(o, _)| *o < offset);
-
-        // Check if we can extend the previous range
-        if pos > 0 {
-            let prev = &self.ranges[pos - 1];
-            let prev_end = prev.0 + prev.1.len() as u64;
-            if prev_end >= offset {
-                // The new data overlaps or is contiguous with the previous range.
-                // Extend the previous range.
-                let idx = pos - 1;
-                if end > prev_end {
-                    let skip = (prev_end - offset) as usize;
-                    if skip < data.len() {
-                        self.ranges[idx].1.extend_from_slice(&data[skip..]);
-                    }
-                }
-                // Now coalesce with subsequent ranges if they overlap
-                self.coalesce_from(idx);
-                self.recompute_resident_bytes();
-                return self.resident_bytes - before;
-            }
-        }
-
-        // Check if we overlap with the next range
-        if pos < self.ranges.len() {
-            let next = &self.ranges[pos];
-            if end >= next.0 {
-                // Overlaps with next range — insert and coalesce
-                let mut buf = BytesMut::with_capacity(data.len());
-                buf.extend_from_slice(&data);
-                self.ranges.insert(pos, (offset, buf));
-                self.coalesce_from(pos);
-                self.recompute_resident_bytes();
-                return self.resident_bytes - before;
-            }
-        }
-
-        // No overlap — insert a new range
-        let mut buf = BytesMut::with_capacity(data.len());
-        buf.extend_from_slice(&data);
-        self.ranges.insert(pos, (offset, buf));
-        self.resident_bytes = before + data.len();
-        data.len()
-    }
-
-    fn try_append(&mut self, offset: u64, data: &Bytes) -> Option<usize> {
-        let (last_offset, last_data) = self.ranges.last_mut()?;
-        let last_end = *last_offset + last_data.len() as u64;
-        if offset < *last_offset || offset > last_end {
-            return None;
-        }
-
-        let overlap = last_end.saturating_sub(offset) as usize;
-        if overlap >= data.len() {
-            return Some(0);
-        }
-
-        last_data.extend_from_slice(&data[overlap..]);
-        Some(data.len() - overlap)
-    }
-
-    /// Starting from index `idx`, merge all subsequent ranges that are now contiguous/overlapping.
-    fn coalesce_from(&mut self, idx: usize) {
-        while idx + 1 < self.ranges.len() {
-            let cur_end = self.ranges[idx].0 + self.ranges[idx].1.len() as u64;
-            let next_start = self.ranges[idx + 1].0;
-            if cur_end >= next_start {
-                let next = self.ranges.remove(idx + 1);
-                let next_end = next.0 + next.1.len() as u64;
-                if next_end > cur_end {
-                    let skip = (cur_end - next.0) as usize;
-                    if skip < next.1.len() {
-                        self.ranges[idx].1.extend_from_slice(&next.1[skip..]);
-                    }
-                }
-            } else {
-                break;
-            }
-        }
-    }
-
-    fn recompute_resident_bytes(&mut self) {
-        self.resident_bytes = self.ranges.iter().map(|(_, data)| data.len()).sum();
     }
 }
 
@@ -207,325 +109,73 @@ impl PieceCacheEntry {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_basic_insert_and_drain() {
-        let mut cache = WriteBackCache::new();
-        let lease = LeaseKey {
+    fn lease(lease_id: u64) -> LeaseKey {
+        LeaseKey {
             piece_id: 0,
-            lease_id: 1,
-        };
-        cache.insert(lease, 0, Bytes::from(vec![1u8; 100]));
-        cache.insert(lease, 100, Bytes::from(vec![2u8; 100]));
-        assert_eq!(cache.total_bytes(), 200);
+            lease_id,
+        }
+    }
 
-        let blocks = cache.drain_lease(lease);
-        // Should merge into one contiguous block
+    #[test]
+    fn sequential_append_preserves_bytes() {
+        let mut cache = WriteBackCache::new();
+        cache
+            .insert(lease(1), 10, Bytes::from_static(b"abc"))
+            .unwrap();
+        cache
+            .insert(lease(1), 13, Bytes::from_static(b"def"))
+            .unwrap();
+        assert_eq!(cache.total_bytes(), 6);
+        let blocks = cache.drain_lease(lease(1));
         assert_eq!(blocks.len(), 1);
-        assert_eq!(blocks[0].offset, 0);
-        assert_eq!(blocks[0].data.len(), 200);
+        assert_eq!(blocks[0].offset, 10);
+        assert_eq!(blocks[0].data, &b"abcdef"[..]);
         assert_eq!(cache.total_bytes(), 0);
+        assert!(cache.drain_lease(lease(1)).is_empty());
     }
 
     #[test]
-    fn test_non_contiguous_ranges() {
+    fn gap_and_overlap_are_rejected_without_mutation() {
         let mut cache = WriteBackCache::new();
-        let lease = LeaseKey {
-            piece_id: 0,
-            lease_id: 1,
-        };
-        cache.insert(lease, 0, Bytes::from(vec![1u8; 100]));
-        cache.insert(lease, 200, Bytes::from(vec![2u8; 100]));
-        assert_eq!(cache.total_bytes(), 200);
-
-        let blocks = cache.drain_lease(lease);
-        assert_eq!(blocks.len(), 2);
-        assert_eq!(blocks[0].offset, 0);
-        assert_eq!(blocks[0].data.len(), 100);
-        assert_eq!(blocks[1].offset, 200);
-        assert_eq!(blocks[1].data.len(), 100);
+        cache
+            .insert(lease(1), 10, Bytes::from_static(b"abc"))
+            .unwrap();
+        for offset in [9, 10, 12, 14] {
+            assert_eq!(
+                cache.insert(lease(1), offset, Bytes::from_static(b"x")),
+                Err(NonContiguousWrite {
+                    expected: 13,
+                    actual: offset
+                })
+            );
+            assert_eq!(cache.total_bytes(), 3);
+        }
+        assert_eq!(cache.drain_lease(lease(1))[0].data, &b"abc"[..]);
     }
 
     #[test]
-    fn test_overlapping_merge() {
+    fn renewed_leases_drain_in_file_order_and_discard_independently() {
         let mut cache = WriteBackCache::new();
-        let lease = LeaseKey {
-            piece_id: 0,
-            lease_id: 1,
-        };
-        cache.insert(lease, 0, Bytes::from(vec![1u8; 100]));
-        cache.insert(lease, 50, Bytes::from(vec![2u8; 100]));
-        assert_eq!(cache.total_bytes(), 150);
-
-        let blocks = cache.drain_lease(lease);
-        assert_eq!(blocks.len(), 1);
-        assert_eq!(blocks[0].offset, 0);
-        assert_eq!(blocks[0].data.len(), 150);
-    }
-
-    #[test]
-    fn test_drain_all() {
-        let mut cache = WriteBackCache::new();
-        cache.insert(
-            LeaseKey {
-                piece_id: 0,
-                lease_id: 1,
-            },
-            0,
-            Bytes::from(vec![1u8; 100]),
-        );
-        cache.insert(
-            LeaseKey {
-                piece_id: 1,
-                lease_id: 2,
-            },
-            1000,
-            Bytes::from(vec![2u8; 100]),
-        );
-
+        cache
+            .insert(lease(1), 100, Bytes::from_static(b"tail"))
+            .unwrap();
+        cache
+            .insert(lease(2), 0, Bytes::from_static(b"old"))
+            .unwrap();
+        assert_eq!(cache.discard_lease(lease(2)), 3);
+        assert_eq!(cache.discard_lease(lease(2)), 0);
+        cache
+            .insert(lease(3), 0, Bytes::from_static(b"head"))
+            .unwrap();
+        cache.insert(lease(3), 999, Bytes::new()).unwrap();
+        assert_eq!(cache.total_bytes(), 8);
         let blocks = cache.drain_all();
-        assert_eq!(blocks.len(), 2);
-        assert_eq!(blocks[0].offset, 0);
-        assert_eq!(blocks[1].offset, 1000);
+        assert_eq!(
+            blocks.iter().map(|b| b.offset).collect::<Vec<_>>(),
+            vec![0, 100]
+        );
+        assert_eq!(blocks[0].data, &b"head"[..]);
+        assert_eq!(blocks[1].data, &b"tail"[..]);
         assert_eq!(cache.total_bytes(), 0);
-    }
-
-    #[test]
-    fn test_append_fast_path_tracks_resident_bytes() {
-        let mut cache = WriteBackCache::new();
-        let lease = LeaseKey {
-            piece_id: 0,
-            lease_id: 1,
-        };
-        cache.insert(lease, 0, Bytes::from(vec![1u8; 100]));
-        cache.insert(lease, 100, Bytes::from(vec![2u8; 50]));
-        cache.insert(lease, 125, Bytes::from(vec![3u8; 50]));
-
-        assert_eq!(cache.total_bytes(), 175);
-        let blocks = cache.drain_lease(lease);
-        assert_eq!(blocks.len(), 1);
-        assert_eq!(blocks[0].data.len(), 175);
-    }
-
-    #[test]
-    fn test_multiple_pieces() {
-        let mut cache = WriteBackCache::new();
-        let lease0 = LeaseKey {
-            piece_id: 0,
-            lease_id: 1,
-        };
-        let lease1 = LeaseKey {
-            piece_id: 1,
-            lease_id: 2,
-        };
-        cache.insert(lease0, 0, Bytes::from(vec![1u8; 100]));
-        cache.insert(lease1, 1000, Bytes::from(vec![2u8; 200]));
-        cache.insert(lease0, 100, Bytes::from(vec![3u8; 50]));
-
-        assert_eq!(cache.total_bytes(), 350);
-
-        let blocks = cache.drain_lease(lease0);
-        assert_eq!(blocks.len(), 1);
-        assert_eq!(blocks[0].data.len(), 150);
-
-        let blocks = cache.drain_lease(lease1);
-        assert_eq!(blocks.len(), 1);
-        assert_eq!(blocks[0].data.len(), 200);
-    }
-
-    #[test]
-    fn test_drain_piece_empty() {
-        let mut cache = WriteBackCache::new();
-        let blocks = cache.drain_lease(LeaseKey {
-            piece_id: 99,
-            lease_id: 1,
-        });
-        assert!(blocks.is_empty());
-    }
-
-    #[test]
-    fn test_discard_piece_removes_cached_data_without_flushing() {
-        let mut cache = WriteBackCache::new();
-        let lease0 = LeaseKey {
-            piece_id: 0,
-            lease_id: 1,
-        };
-        let lease1 = LeaseKey {
-            piece_id: 1,
-            lease_id: 2,
-        };
-        cache.insert(lease0, 0, Bytes::from(vec![1u8; 100]));
-        cache.insert(lease1, 1000, Bytes::from(vec![2u8; 50]));
-
-        assert_eq!(cache.discard_lease(lease0), 100);
-        assert_eq!(cache.total_bytes(), 50);
-        assert!(cache.drain_lease(lease0).is_empty());
-        assert_eq!(cache.drain_lease(lease1).len(), 1);
-    }
-
-    #[test]
-    fn test_insert_empty_data() {
-        let mut cache = WriteBackCache::new();
-        cache.insert(
-            LeaseKey {
-                piece_id: 0,
-                lease_id: 1,
-            },
-            0,
-            Bytes::new(),
-        );
-        assert_eq!(cache.total_bytes(), 0);
-        let blocks = cache.drain_lease(LeaseKey {
-            piece_id: 0,
-            lease_id: 1,
-        });
-        assert!(blocks.is_empty());
-    }
-
-    #[test]
-    fn test_overlap_with_next_range() {
-        let mut cache = WriteBackCache::new();
-        let lease = LeaseKey {
-            piece_id: 0,
-            lease_id: 1,
-        };
-        // Insert a range at offset 100
-        cache.insert(lease, 100, Bytes::from(vec![2u8; 50]));
-        // Insert a range at offset 0 that overlaps with the one at 100
-        cache.insert(lease, 0, Bytes::from(vec![1u8; 120]));
-
-        let blocks = cache.drain_lease(lease);
-        assert_eq!(blocks.len(), 1);
-        assert_eq!(blocks[0].offset, 0);
-        assert_eq!(blocks[0].data.len(), 150); // 0..120 merged with 100..150
-    }
-
-    #[test]
-    fn test_coalesce_multiple_ranges() {
-        let mut cache = WriteBackCache::new();
-        let lease = LeaseKey {
-            piece_id: 0,
-            lease_id: 1,
-        };
-        // Create three separate ranges
-        cache.insert(lease, 0, Bytes::from(vec![1u8; 50]));
-        cache.insert(lease, 100, Bytes::from(vec![2u8; 50]));
-        cache.insert(lease, 200, Bytes::from(vec![3u8; 50]));
-        // Now insert something that bridges all three
-        cache.insert(lease, 40, Bytes::from(vec![4u8; 170]));
-
-        let blocks = cache.drain_lease(lease);
-        assert_eq!(blocks.len(), 1);
-        assert_eq!(blocks[0].offset, 0);
-        assert_eq!(blocks[0].data.len(), 250);
-    }
-
-    #[test]
-    fn test_insert_contiguous_extends_previous() {
-        let mut cache = WriteBackCache::new();
-        let lease = LeaseKey {
-            piece_id: 0,
-            lease_id: 1,
-        };
-        cache.insert(lease, 0, Bytes::from(vec![1u8; 100]));
-        // Exactly contiguous
-        cache.insert(lease, 100, Bytes::from(vec![2u8; 100]));
-        let blocks = cache.drain_lease(lease);
-        assert_eq!(blocks.len(), 1);
-        assert_eq!(blocks[0].data.len(), 200);
-    }
-
-    #[test]
-    fn test_fully_overlapping_insert() {
-        let mut cache = WriteBackCache::new();
-        let lease = LeaseKey {
-            piece_id: 0,
-            lease_id: 1,
-        };
-        cache.insert(lease, 0, Bytes::from(vec![1u8; 200]));
-        // Insert completely within existing range
-        cache.insert(lease, 50, Bytes::from(vec![2u8; 50]));
-        let blocks = cache.drain_lease(lease);
-        assert_eq!(blocks.len(), 1);
-        assert_eq!(blocks[0].offset, 0);
-        assert_eq!(blocks[0].data.len(), 200);
-    }
-
-    #[test]
-    fn test_drain_all_sorts_by_offset() {
-        let mut cache = WriteBackCache::new();
-        cache.insert(
-            LeaseKey {
-                piece_id: 5,
-                lease_id: 1,
-            },
-            5000,
-            Bytes::from(vec![1u8; 10]),
-        );
-        cache.insert(
-            LeaseKey {
-                piece_id: 0,
-                lease_id: 2,
-            },
-            0,
-            Bytes::from(vec![2u8; 10]),
-        );
-        cache.insert(
-            LeaseKey {
-                piece_id: 3,
-                lease_id: 3,
-            },
-            3000,
-            Bytes::from(vec![3u8; 10]),
-        );
-
-        let blocks = cache.drain_all();
-        assert_eq!(blocks.len(), 3);
-        assert_eq!(blocks[0].offset, 0);
-        assert_eq!(blocks[1].offset, 3000);
-        assert_eq!(blocks[2].offset, 5000);
-        assert_eq!(cache.total_bytes(), 0);
-    }
-
-    #[test]
-    fn test_coalesce_stops_at_gap() {
-        let mut cache = WriteBackCache::new();
-        let lease = LeaseKey {
-            piece_id: 0,
-            lease_id: 1,
-        };
-        // Three ranges with a gap between second and third
-        cache.insert(lease, 0, Bytes::from(vec![1u8; 50]));
-        cache.insert(lease, 50, Bytes::from(vec![2u8; 50]));
-        cache.insert(lease, 200, Bytes::from(vec![3u8; 50]));
-
-        let blocks = cache.drain_lease(lease);
-        // First two should merge, third should be separate
-        assert_eq!(blocks.len(), 2);
-        assert_eq!(blocks[0].offset, 0);
-        assert_eq!(blocks[0].data.len(), 100);
-        assert_eq!(blocks[1].offset, 200);
-        assert_eq!(blocks[1].data.len(), 50);
-    }
-
-    #[test]
-    fn test_coalesce_breaks_when_next_range_is_still_gapped() {
-        let mut cache = WriteBackCache::new();
-        let lease = LeaseKey {
-            piece_id: 0,
-            lease_id: 1,
-        };
-        cache.insert(lease, 0, Bytes::from(vec![1u8; 50]));
-        cache.insert(lease, 100, Bytes::from(vec![2u8; 50]));
-        cache.insert(lease, 200, Bytes::from(vec![3u8; 50]));
-
-        // This extends the first range, but still leaves a gap before the second.
-        cache.insert(lease, 40, Bytes::from(vec![4u8; 40]));
-
-        let blocks = cache.drain_lease(lease);
-        assert_eq!(blocks.len(), 3);
-        assert_eq!(blocks[0].offset, 0);
-        assert_eq!(blocks[0].data.len(), 80);
-        assert_eq!(blocks[1].offset, 100);
-        assert_eq!(blocks[2].offset, 200);
     }
 }

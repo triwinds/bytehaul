@@ -30,7 +30,10 @@ async fn test_empty_file_download() {
 
     // No control file should exist for a 0-byte download
     let ctrl = out.with_extension("bin.bytehaul");
-    assert!(!ctrl.exists(), "control file should not exist for empty download");
+    assert!(
+        !ctrl.exists(),
+        "control file should not exist for empty download"
+    );
 }
 
 #[tokio::test]
@@ -65,7 +68,10 @@ async fn test_cancel_and_pause_race() {
     handle.cancel();
 
     let result = handle.wait().await;
-    assert!(result.is_err(), "download should fail after cancel+pause race");
+    assert!(
+        result.is_err(),
+        "download should fail after cancel+pause race"
+    );
     // Either Cancelled or Paused is acceptable — no panic or hang is the key assertion
     let err = result.unwrap_err();
     let msg = err.to_string();

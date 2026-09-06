@@ -1,12 +1,12 @@
-use std::net::SocketAddr;
 use std::hint::black_box;
+use std::net::SocketAddr;
 use std::time::Duration;
 
-use bytehaul::Downloader;
 use bytehaul::bench::{
     bench_cache_drain_lease_len, bench_cache_insert, bench_cache_new, bench_cache_total_bytes,
     ControlSnapshot, PieceMap,
 };
+use bytehaul::Downloader;
 use bytes::Bytes;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use tempfile::tempdir;
@@ -42,23 +42,21 @@ fn bench_cache_insert_coalesce(c: &mut Criterion) {
         });
     });
 
-    c.bench_function("cache_overlap_fallback", |b| {
+    c.bench_function("cache_sequential_leases", |b| {
         b.iter(|| {
             let mut cache = bench_cache_new();
-            for i in 0u64..512 {
-                let offset = i * 4096;
-                bench_cache_insert(&mut cache, 0, 1, offset, Bytes::from(vec![0xCDu8; 4096]));
-                if i % 16 == 0 {
+            for lease_id in 1..=16 {
+                for chunk_id in 0..32 {
                     bench_cache_insert(
                         &mut cache,
                         0,
-                        1,
-                        offset + 2048,
+                        lease_id,
+                        chunk_id * 4096,
                         Bytes::from(vec![0xEFu8; 4096]),
                     );
                 }
+                black_box(bench_cache_drain_lease_len(&mut cache, 0, lease_id));
             }
-            black_box(bench_cache_total_bytes(&cache));
         });
     });
 
@@ -101,9 +99,33 @@ fn bench_piece_map_serde(c: &mut Criterion) {
         }
         let bitset = pm.to_bitset_bytes();
         b.iter(|| {
-            black_box(PieceMap::from_bitset(total_size, piece_size, &bitset, count));
+            black_box(PieceMap::from_bitset(
+                total_size, piece_size, &bitset, count,
+            ));
         });
     });
+}
+
+fn bench_scheduler_assignment(c: &mut Criterion) {
+    let mut group = c.benchmark_group("scheduler_assign_split");
+    for piece_count in [1_000u64, 10_000, 100_000] {
+        group.bench_with_input(
+            BenchmarkId::from_parameter(piece_count),
+            &piece_count,
+            |b, &count| {
+                b.iter_batched_ref(
+                    || bytehaul::bench::bench_scheduler_new(count * 1_048_576, 1_048_576),
+                    |scheduler| {
+                        black_box(bytehaul::bench::bench_scheduler_assign_complete(
+                            scheduler, 1_000, 4, 262_144,
+                        ));
+                    },
+                    criterion::BatchSize::SmallInput,
+                );
+            },
+        );
+    }
+    group.finish();
 }
 
 fn bench_scheduler_snapshot(c: &mut Criterion) {
@@ -112,11 +134,15 @@ fn bench_scheduler_snapshot(c: &mut Criterion) {
 
     for piece_count in [10_000usize, 100_000usize] {
         let total_size = piece_count as u64 * piece_size;
-        group.bench_with_input(BenchmarkId::from_parameter(piece_count), &total_size, |b, &size| {
-            b.iter(|| {
-                black_box(bytehaul::bench::bench_scheduler_snapshot(size, piece_size));
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::from_parameter(piece_count),
+            &total_size,
+            |b, &size| {
+                b.iter(|| {
+                    black_box(bytehaul::bench::bench_scheduler_snapshot(size, piece_size));
+                });
+            },
+        );
     }
 
     group.finish();
@@ -184,7 +210,11 @@ fn bench_control_save_only(c: &mut Criterion) {
 fn bench_single_progress_reporting(c: &mut Criterion) {
     c.bench_function("single_progress_reporting_throttled", |b| {
         b.iter(|| {
-            black_box(bytehaul::bench::bench_progress_reporting(1024, 8 * 1024, 10));
+            black_box(bytehaul::bench::bench_progress_reporting(
+                1024,
+                8 * 1024,
+                10,
+            ));
         });
     });
 }
@@ -248,6 +278,7 @@ criterion_group!(
     bench_cache_insert_coalesce,
     bench_piece_map_serde,
     bench_scheduler_snapshot,
+    bench_scheduler_assignment,
     bench_control_save_only,
     bench_control_roundtrip,
     bench_single_progress_reporting,

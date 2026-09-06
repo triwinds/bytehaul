@@ -29,7 +29,10 @@ async fn test_auto_filename_uses_content_disposition() {
     handle.wait().await.unwrap();
 
     let output_path = dir.path().join("server-name.bin");
-    assert_eq!(std::fs::read(&output_path).unwrap(), b"content disposition body");
+    assert_eq!(
+        std::fs::read(&output_path).unwrap(),
+        b"content disposition body"
+    );
 }
 
 #[tokio::test]
@@ -82,7 +85,10 @@ async fn test_output_dir_and_relative_output_path_are_combined() {
     let handle = downloader.download(spec);
     handle.wait().await.unwrap();
 
-    assert_eq!(std::fs::read(&output_path).unwrap(), b"nested output path body");
+    assert_eq!(
+        std::fs::read(&output_path).unwrap(),
+        b"nested output path body"
+    );
 }
 
 #[tokio::test]
@@ -114,7 +120,10 @@ async fn test_auto_filename_resume_after_pause() {
                     warp::http::Response::builder()
                         .status(206)
                         .header("content-length", slice.len().to_string())
-                        .header("content-range", format!("bytes {}-{}/{}", start, end, total))
+                        .header(
+                            "content-range",
+                            format!("bytes {}-{}/{}", start, end, total),
+                        )
                         .header("accept-ranges", "bytes")
                         .header(
                             "content-disposition",
@@ -165,14 +174,23 @@ async fn test_auto_filename_resume_after_pause() {
     handle.pause();
 
     assert!(matches!(handle.wait().await, Err(DownloadError::Paused)));
-    assert!(output_path.exists(), "resolved output file should exist after pause");
-    assert!(control_path.exists(), "control file should use the resolved filename");
+    assert!(
+        output_path.exists(),
+        "resolved output file should exist after pause"
+    );
+    assert!(
+        control_path.exists(),
+        "control file should use the resolved filename"
+    );
 
     let resumed = downloader.download(spec);
     resumed.wait().await.unwrap();
 
     assert_eq!(std::fs::read(&output_path).unwrap(), expected);
-    assert!(!control_path.exists(), "control file should be removed after success");
+    assert!(
+        !control_path.exists(),
+        "control file should be removed after success"
+    );
 }
 
 #[tokio::test]
@@ -198,5 +216,8 @@ async fn test_auto_filename_defaults_to_download() {
     handle.wait().await.unwrap();
 
     let output_path = dir.path().join("download");
-    assert_eq!(std::fs::read(&output_path).unwrap(), b"default filename body");
+    assert_eq!(
+        std::fs::read(&output_path).unwrap(),
+        b"default filename body"
+    );
 }

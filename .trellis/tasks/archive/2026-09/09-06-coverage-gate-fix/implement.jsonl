@@ -1,0 +1,5 @@
+{"file": ".trellis/spec/bytehaul-python/backend/architecture.md", "reason": "Module ownership"}
+{"file": ".trellis/spec/bytehaul-python/backend/testing-and-quality.md", "reason": "Validation"}
+{"file": ".trellis/spec/bytehaul-python/backend/transfer-storage.md", "reason": "Durability"}
+{"file": ".trellis/spec/bytehaul-python/backend/errors-and-observability.md", "reason": "Error states"}
+{"file": ".trellis/tasks/archive/2026-09/09-06-coverage-parity/research/ci-findings.md", "reason": "Verified diagnosis"}

@@ -27,8 +27,6 @@ pub enum LogLevel {
     Trace = 5,
 }
 
-
-
 impl std::fmt::Display for LogLevel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
@@ -133,13 +131,13 @@ pub struct DownloadSpec {
     pub(crate) piece_size: u64,
     pub(crate) min_split_size: u64,
     pub(crate) min_segment_size: u64,
-    /// Maximum retry attempts per segment (0 = no retries).
+    /// Maximum additional retries per request/transfer scope (0 = no retries).
     pub(crate) max_retries: u32,
     /// Base delay for exponential backoff between retries.
     pub(crate) retry_base_delay: Duration,
     /// Maximum delay cap for exponential backoff.
     pub(crate) retry_max_delay: Duration,
-    /// Optional total elapsed retry budget across retries for a single request.
+    /// Optional total elapsed retry budget across retries for one request/transfer scope.
     pub(crate) max_retry_elapsed: Option<Duration>,
     /// Maximum download speed in bytes/sec. 0 = unlimited.
     pub(crate) max_download_speed: u64,
@@ -299,7 +297,7 @@ impl DownloadSpec {
         self.min_segment_size
     }
 
-    /// Returns the maximum number of retry attempts per segment.
+    /// Returns the maximum number of additional retries per request/transfer scope.
     pub fn get_max_retries(&self) -> u32 {
         self.max_retries
     }
@@ -452,7 +450,7 @@ impl DownloadSpec {
         self
     }
 
-    /// Set the maximum retry attempts per segment (default: 5).
+    /// Set the maximum additional retries per request/transfer scope (default: 5).
     pub fn max_retries(mut self, max_retries: u32) -> Self {
         self.max_retries = max_retries;
         self
@@ -547,7 +545,9 @@ impl DownloadSpec {
             ));
         }
         if self.piece_size == 0 {
-            return Err(DownloadError::InvalidConfig("piece_size must be >= 1".into()));
+            return Err(DownloadError::InvalidConfig(
+                "piece_size must be >= 1".into(),
+            ));
         }
         if self.min_split_size == 0 {
             return Err(DownloadError::InvalidConfig(
@@ -571,7 +571,10 @@ impl DownloadSpec {
         }
         if let Some(ref checksum) = self.checksum {
             let value = match checksum {
-                Checksum::Sha256(v) | Checksum::Sha1(v) | Checksum::Md5(v) | Checksum::Sha512(v) => v,
+                Checksum::Sha256(v)
+                | Checksum::Sha1(v)
+                | Checksum::Md5(v)
+                | Checksum::Sha512(v) => v,
             };
             if value.trim().is_empty() {
                 return Err(DownloadError::InvalidConfig(

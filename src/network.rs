@@ -26,7 +26,6 @@ use url::Url;
 use crate::error::{BoxError, DownloadError, TransportError};
 use crate::http::{HttpRequestBody, HttpResponse};
 
-type SharedDnsCache = Arc<Mutex<HashMap<String, CachedDnsLookup>>>;
 type DirectHttpConnector = HttpConnector<BytehaulDnsResolver>;
 type DirectRustlsConnector = HttpsConnector<DirectHttpConnector>;
 type DirectRustlsClient = Client<DirectRustlsConnector, HttpRequestBody>;
@@ -48,14 +47,8 @@ pub(crate) struct ClientNetworkConfig {
 
 #[derive(Clone)]
 pub(crate) enum BytehaulClient {
-    Direct(BytehaulDirectClient),
-    Proxy(BytehaulProxyClient),
-}
-
-#[derive(Clone)]
-pub(crate) struct BytehaulDirectClient {
-    client: DirectRustlsClient,
-    resolver: BytehaulDnsResolver,
+    Direct(Arc<DirectRustlsClient>),
+    Proxy(Arc<BytehaulProxyClient>),
 }
 
 #[derive(Clone)]
@@ -84,7 +77,6 @@ impl BytehaulClient {
     ) -> Result<HttpResponse, DownloadError> {
         match self {
             Self::Direct(client) => client
-                .client
                 .request(req)
                 .await
                 .map_err(|error| TransportError::from(error).into()),
@@ -112,25 +104,6 @@ impl BytehaulClient {
             .await
             .map_err(|_| DownloadError::timeout("request timed out"))?
     }
-
-    pub(crate) async fn warm_resolution_for_url(&self, url: &str) -> Result<(), DownloadError> {
-        let Self::Direct(client) = self else {
-            return Ok(());
-        };
-
-        let Ok(parsed) = Url::parse(url) else {
-            return Ok(());
-        };
-        let Some(host) = parsed.host_str() else {
-            return Ok(());
-        };
-
-        if let Err(error) = client.resolver.warm_lookup(host).await {
-            #[cfg(not(tarpaulin))]
-            tracing::debug!(host, error = %error, "DNS warmup skipped after lookup failure");
-        }
-        Ok(())
-    }
 }
 
 impl Default for ClientNetworkConfig {
@@ -153,17 +126,19 @@ impl ClientNetworkConfig {
     pub(crate) fn build_client(&self) -> Result<BytehaulClient, DownloadError> {
         let effective_proxies = self.effective_proxies()?;
         #[cfg(not(tarpaulin))]
-        tracing::debug!(connect_timeout_ms = self.connect_timeout.as_millis() as u64,
+        tracing::debug!(
+            connect_timeout_ms = self.connect_timeout.as_millis() as u64,
             pool_max_idle_per_host = self.pool_max_idle_per_host,
             pool_idle_timeout_ms = self.pool_idle_timeout.as_millis() as u64,
             has_proxy = effective_proxies.has_proxy(),
             custom_dns = !self.dns_servers.is_empty(),
             custom_doh = !self.doh_servers.is_empty(),
             enable_ipv6 = self.enable_ipv6,
-            "building HTTP client");
+            "building HTTP client"
+        );
 
         let resolver = self.build_dns_resolver()?;
-        let https = self.build_https_connector(resolver.clone())?;
+        let https = self.build_https_connector(resolver)?;
         let mut builder = Client::builder(TokioExecutor::new());
         builder.pool_max_idle_per_host(self.pool_max_idle_per_host);
         if self.pool_max_idle_per_host > 0 {
@@ -172,7 +147,9 @@ impl ClientNetworkConfig {
 
         if effective_proxies.has_proxy() {
             let mut proxy_connector = ProxyConnector::new(https).map_err(|error| {
-                DownloadError::InvalidConfig(format!("failed to configure proxy connector: {error}"))
+                DownloadError::InvalidConfig(format!(
+                    "failed to configure proxy connector: {error}"
+                ))
             })?;
             if let Some(proxy) = effective_proxies.http_proxy {
                 proxy_connector.add_proxy(Proxy::new(Intercept::Http, proxy));
@@ -184,13 +161,13 @@ impl ClientNetworkConfig {
                 proxy_connector.add_proxy(Proxy::new(Intercept::All, proxy));
             }
             let client = builder.build(proxy_connector.clone());
-            Ok(BytehaulClient::Proxy(BytehaulProxyClient {
+            Ok(BytehaulClient::Proxy(Arc::new(BytehaulProxyClient {
                 client,
                 connector: proxy_connector,
-            }))
+            })))
         } else {
             let client = builder.build(https);
-            Ok(BytehaulClient::Direct(BytehaulDirectClient { client, resolver }))
+            Ok(BytehaulClient::Direct(Arc::new(client)))
         }
     }
 
@@ -216,13 +193,14 @@ impl ClientNetworkConfig {
             Err(error) => {
                 #[cfg(not(tarpaulin))]
                 tracing::debug!(error = %error, "platform verifier unavailable, falling back to native roots");
-                let builder = HttpsConnectorBuilder::new()
-                    .with_native_roots()
-                    .map_err(|fallback_error| {
-                        DownloadError::Internal(format!(
-                            "failed to initialize native TLS roots: {fallback_error}"
-                        ))
-                    })?;
+                let builder =
+                    HttpsConnectorBuilder::new()
+                        .with_native_roots()
+                        .map_err(|fallback_error| {
+                            DownloadError::Internal(format!(
+                                "failed to initialize native TLS roots: {fallback_error}"
+                            ))
+                        })?;
                 Ok(builder
                     .https_or_http()
                     .enable_http1()
@@ -242,9 +220,21 @@ impl ClientNetworkConfig {
 
     fn effective_proxies(&self) -> Result<EffectiveProxyConfig, DownloadError> {
         Ok(EffectiveProxyConfig {
-            all_proxy: proxy_uri(self.all_proxy.as_deref(), &["ALL_PROXY", "all_proxy"], "all_proxy")?,
-            http_proxy: proxy_uri(self.http_proxy.as_deref(), &["HTTP_PROXY", "http_proxy"], "http_proxy")?,
-            https_proxy: proxy_uri(self.https_proxy.as_deref(), &["HTTPS_PROXY", "https_proxy"], "https_proxy")?,
+            all_proxy: proxy_uri(
+                self.all_proxy.as_deref(),
+                &["ALL_PROXY", "all_proxy"],
+                "all_proxy",
+            )?,
+            http_proxy: proxy_uri(
+                self.http_proxy.as_deref(),
+                &["HTTP_PROXY", "http_proxy"],
+                "http_proxy",
+            )?,
+            https_proxy: proxy_uri(
+                self.https_proxy.as_deref(),
+                &["HTTPS_PROXY", "https_proxy"],
+                "https_proxy",
+            )?,
         })
     }
 }
@@ -298,21 +288,13 @@ struct DohServerConfig {
     http_endpoint: Option<String>,
 }
 
-#[derive(Debug, Clone)]
-struct CachedDnsLookup {
-    valid_until: Instant,
-    addrs: Vec<SocketAddr>,
-}
-
 #[derive(Clone)]
-struct BytehaulDnsResolver {
+pub(crate) struct BytehaulDnsResolver {
     resolver: TokioResolver,
-    cache: SharedDnsCache,
 }
 
-type ResolverFuture = Pin<
-    Box<dyn Future<Output = Result<std::vec::IntoIter<SocketAddr>, BoxError>> + Send>,
->;
+type ResolverFuture =
+    Pin<Box<dyn Future<Output = Result<std::vec::IntoIter<SocketAddr>, BoxError>> + Send>>;
 
 impl BytehaulDnsResolver {
     fn new(
@@ -343,41 +325,27 @@ impl BytehaulDnsResolver {
 
         Ok(Self {
             resolver: builder.build(),
-            cache: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
-    async fn warm_lookup(&self, host: &str) -> Result<(), BoxError> {
-        self.lookup_host(host.to_string()).await.map(|_| ())
-    }
-
     async fn lookup_host(&self, host: String) -> Result<Vec<SocketAddr>, BoxError> {
-        if let Some(cached) = load_cached_lookup(&self.cache, &host) {
-            #[cfg(not(tarpaulin))]
-            tracing::debug!(
-                host = %host,
-                addrs = ?cached.addrs,
-                cache_hit = true,
-                ttl_remaining_ms = duration_to_u64_millis(
-                    cached.valid_until.saturating_duration_since(Instant::now())
-                ),
-                "resolved host via DNS cache"
-            );
-            return Ok(cached.addrs);
-        }
-
-        let lookup = self.resolver.lookup_ip(host.clone()).await.map_err(|error| {
-            #[cfg(not(tarpaulin))]
-            tracing::debug!(host = %host, cache_hit = false, error = %error, "DNS lookup failed");
-            let boxed: BoxError = Box::new(error);
-            boxed
-        })?;
+        // Hickory owns the bounded TTL cache shared by resolver clones.
+        let lookup = self
+            .resolver
+            .lookup_ip(host.clone())
+            .await
+            .map_err(|error| {
+                #[cfg(not(tarpaulin))]
+                tracing::debug!(host = %host, error = %error, "DNS lookup failed");
+                let boxed: BoxError = Box::new(error);
+                boxed
+            })?;
 
         let valid_until = lookup.valid_until();
         let addrs: Vec<SocketAddr> = lookup.iter().map(|ip| SocketAddr::new(ip, 0)).collect();
         if addrs.is_empty() {
             #[cfg(not(tarpaulin))]
-            tracing::debug!(host = %host, cache_hit = false, "DNS lookup returned no IP addresses");
+            tracing::debug!(host = %host, "DNS lookup returned no IP addresses");
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 format!("no DNS records found for {host}"),
@@ -385,13 +353,10 @@ impl BytehaulDnsResolver {
             .into());
         }
 
-        store_cached_lookup(&self.cache, host.clone(), addrs.clone(), valid_until);
-
         #[cfg(not(tarpaulin))]
         tracing::debug!(
             host = %host,
             addrs = ?addrs,
-            cache_hit = false,
             ttl_remaining_ms = duration_to_u64_millis(
                 valid_until.saturating_duration_since(Instant::now())
             ),
@@ -414,28 +379,13 @@ impl Service<DnsName> for BytehaulDnsResolver {
     fn call(&mut self, name: DnsName) -> Self::Future {
         let resolver = self.clone();
         let host = name.as_str().to_string();
-        Box::pin(async move { resolver.lookup_host(host).await.map(|addrs| addrs.into_iter()) })
+        Box::pin(async move {
+            resolver
+                .lookup_host(host)
+                .await
+                .map(|addrs| addrs.into_iter())
+        })
     }
-}
-
-fn load_cached_lookup(cache: &SharedDnsCache, host: &str) -> Option<CachedDnsLookup> {
-    let mut cache = cache.lock();
-    let cached = cache.get(host).cloned()?;
-    if cached.valid_until > Instant::now() {
-        Some(cached)
-    } else {
-        cache.remove(host);
-        None
-    }
-}
-
-fn store_cached_lookup(
-    cache: &SharedDnsCache,
-    host: String,
-    addrs: Vec<SocketAddr>,
-    valid_until: Instant,
-) {
-    cache.lock().insert(host, CachedDnsLookup { valid_until, addrs });
 }
 
 fn duration_to_u64_millis(duration: Duration) -> u64 {
@@ -556,9 +506,7 @@ where
     })?;
     let host_display = host.to_string();
     let port = url.port_or_known_default().ok_or_else(|| {
-        DownloadError::InvalidConfig(format!(
-            "DoH server URL '{server}' is missing a valid port"
-        ))
+        DownloadError::InvalidConfig(format!("DoH server URL '{server}' is missing a valid port"))
     })?;
 
     let host_for_resolution = host_display
@@ -627,7 +575,11 @@ mod tests {
     use http_body_util::BodyExt;
     use std::str::FromStr;
     use std::sync::Mutex as StdMutex;
-    use std::{io::{Read, Write}, net::TcpListener, thread};
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        thread,
+    };
 
     fn env_lock() -> &'static StdMutex<()> {
         static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
@@ -706,8 +658,8 @@ mod tests {
 
     #[test]
     fn test_build_name_server_group_adds_doh_servers() {
-        let group = build_name_server_group(&[], &["https://127.0.0.1/dns-query".into()], false)
-            .unwrap();
+        let group =
+            build_name_server_group(&[], &["https://127.0.0.1/dns-query".into()], false).unwrap();
 
         assert_eq!(group.len(), 1);
         let config = group.iter().next().unwrap();
@@ -719,9 +671,11 @@ mod tests {
 
     #[test]
     fn test_parse_doh_server_resolves_hostnames_and_custom_paths() {
-        let config =
-            parse_doh_server("https://localhost/custom-dns?ct=application/dns-message", false)
-                .unwrap();
+        let config = parse_doh_server(
+            "https://localhost/custom-dns?ct=application/dns-message",
+            false,
+        )
+        .unwrap();
 
         assert!(!config.socket_addrs.is_empty());
         assert!(config.socket_addrs.iter().all(SocketAddr::is_ipv4));
@@ -769,7 +723,10 @@ mod tests {
     fn test_parse_doh_server_rejects_empty_query_and_fragment_authorities() {
         for server in ["https://", "https://?dns=1", "https://#fragment"] {
             let err = parse_doh_server(server, true).unwrap_err().to_string();
-            assert!(err.contains("missing a host"), "unexpected error for {server}: {err}");
+            assert!(
+                err.contains("missing a host"),
+                "unexpected error for {server}: {err}"
+            );
         }
     }
 
@@ -786,17 +743,23 @@ mod tests {
     fn test_parse_doh_server_accepts_ipv6_literal_when_enabled() {
         let config = parse_doh_server("https://[::1]/dns-query", true).unwrap();
 
-        assert_eq!(config.socket_addrs, vec![SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 443))]);
+        assert_eq!(
+            config.socket_addrs,
+            vec![SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 443))]
+        );
         assert_eq!(config.tls_dns_name, "[::1]");
         assert!(config.http_endpoint.is_none());
     }
 
     #[test]
     fn test_parse_doh_server_preserves_root_query_endpoint() {
-        let config = parse_doh_server("https://127.0.0.1?ct=application/dns-message", true)
-            .unwrap();
+        let config =
+            parse_doh_server("https://127.0.0.1?ct=application/dns-message", true).unwrap();
 
-        assert_eq!(config.socket_addrs, vec![SocketAddr::from(([127, 0, 0, 1], 443))]);
+        assert_eq!(
+            config.socket_addrs,
+            vec![SocketAddr::from(([127, 0, 0, 1], 443))]
+        );
         assert_eq!(config.tls_dns_name, "127.0.0.1");
         assert_eq!(
             config.http_endpoint.as_deref(),
@@ -806,16 +769,13 @@ mod tests {
 
     #[test]
     fn test_parse_doh_server_reports_resolution_failures() {
-        let err = parse_doh_server_uncached(
-            "https://resolver-test.invalid/dns-query",
-            true,
-            |_, _| {
+        let err =
+            parse_doh_server_uncached("https://resolver-test.invalid/dns-query", true, |_, _| {
                 Err(std::io::Error::new(
                     std::io::ErrorKind::NotFound,
                     "simulated resolution failure",
                 ))
-            },
-        )
+            })
             .unwrap_err()
             .to_string();
 
@@ -823,45 +783,8 @@ mod tests {
     }
 
     #[test]
-    fn test_load_cached_lookup_returns_none_for_missing_host() {
-        let cache = Arc::new(Mutex::new(HashMap::new()));
-        assert!(load_cached_lookup(&cache, "missing.example.com").is_none());
-    }
-
-    #[test]
     fn test_duration_to_u64_millis_saturates() {
         assert_eq!(duration_to_u64_millis(Duration::MAX), u64::MAX);
-    }
-
-    #[test]
-    fn test_dns_lookup_cache_returns_fresh_entries() {
-        let cache = Arc::new(Mutex::new(HashMap::new()));
-        let addrs = vec![SocketAddr::from(([127, 0, 0, 1], 0))];
-
-        store_cached_lookup(
-            &cache,
-            "example.com".into(),
-            addrs.clone(),
-            Instant::now() + Duration::from_secs(5),
-        );
-
-        let cached = load_cached_lookup(&cache, "example.com").unwrap();
-        assert_eq!(cached.addrs, addrs);
-    }
-
-    #[test]
-    fn test_dns_lookup_cache_evicts_expired_entries() {
-        let cache = Arc::new(Mutex::new(HashMap::new()));
-
-        store_cached_lookup(
-            &cache,
-            "expired.example.com".into(),
-            vec![SocketAddr::from(([127, 0, 0, 1], 0))],
-            Instant::now() - Duration::from_secs(1),
-        );
-
-        assert!(load_cached_lookup(&cache, "expired.example.com").is_none());
-        assert!(!cache.lock().contains_key("expired.example.com"));
     }
 
     #[test]
@@ -901,12 +824,12 @@ mod tests {
         };
         drop(ipv4_only.build_dns_resolver().unwrap());
 
-        let custom = BytehaulDnsResolver::new(&[SocketAddr::from(([1, 1, 1, 1], 53))], &[], true)
-            .unwrap();
+        let custom =
+            BytehaulDnsResolver::new(&[SocketAddr::from(([1, 1, 1, 1], 53))], &[], true).unwrap();
         drop(custom);
 
-        let doh = BytehaulDnsResolver::new(&[], &["https://127.0.0.1/dns-query".into()], false)
-            .unwrap();
+        let doh =
+            BytehaulDnsResolver::new(&[], &["https://127.0.0.1/dns-query".into()], false).unwrap();
         drop(doh);
     }
 
@@ -923,27 +846,74 @@ mod tests {
         assert!(addrs.iter().all(|addr| addr.port() == 0));
     }
 
+    async fn spawn_dns_test_server(
+        ttl: u32,
+    ) -> (
+        SocketAddr,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use hickory_resolver::proto::{
+            op::{Message, MessageType},
+            rr::{rdata::A, RData, Record, RecordType},
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let socket = tokio::net::UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        let queries = Arc::new(AtomicUsize::new(0));
+        let server_queries = queries.clone();
+        let server = tokio::spawn(async move {
+            let mut buf = [0; 4096];
+            loop {
+                let (len, peer) = socket.recv_from(&mut buf).await.unwrap();
+                let request = Message::from_vec(&buf[..len]).unwrap();
+                let query = request.queries()[0].clone();
+                // IPv4-only configuration must never ask for an AAAA record.
+                assert_eq!(query.query_type(), RecordType::A);
+                let count = server_queries.fetch_add(1, Ordering::SeqCst) + 1;
+                let mut response = Message::new();
+                response
+                    .set_id(request.id())
+                    .set_message_type(MessageType::Response)
+                    .set_recursion_desired(true)
+                    .set_recursion_available(true)
+                    .add_query(query.clone())
+                    .add_answer(Record::from_rdata(
+                        query.name().clone(),
+                        ttl,
+                        RData::A(A::new(127, 0, 0, count as u8)),
+                    ));
+                socket
+                    .send_to(&response.to_vec().unwrap(), peer)
+                    .await
+                    .unwrap();
+            }
+        });
+        (addr, queries, server)
+    }
+
     #[tokio::test]
-    async fn test_dns_resolver_returns_cached_lookup_without_querying_dns() {
-        let mut resolver = BytehaulDnsResolver::new(&[], &[], false).unwrap();
-        let cached_addrs = vec![
-            SocketAddr::from(([127, 0, 0, 1], 0)),
-            SocketAddr::from(([127, 0, 0, 2], 0)),
-        ];
-        store_cached_lookup(
-            &resolver.cache,
-            "cached.example.com".into(),
-            cached_addrs.clone(),
-            Instant::now() + Duration::from_secs(5),
-        );
+    async fn test_dns_resolver_shares_hickory_cache_and_refreshes_expired_answers() {
+        use std::sync::atomic::Ordering;
 
-        let addrs: Vec<_> = resolver
-            .call(DnsName::from_str("cached.example.com").unwrap())
-            .await
-            .unwrap()
-            .collect();
+        let (addr, queries, server) = spawn_dns_test_server(1).await;
+        let mut resolver = BytehaulDnsResolver::new(&[addr], &[], false).unwrap();
+        let name = DnsName::from_str("cache-test.example.").unwrap();
+        let first: Vec<_> = resolver.call(name.clone()).await.unwrap().collect();
+        assert_eq!(first, vec![SocketAddr::from(([127, 0, 0, 1], 0))]);
 
-        assert_eq!(addrs, cached_addrs);
+        let cached: Vec<_> = resolver.clone().call(name.clone()).await.unwrap().collect();
+        assert_eq!(cached, first);
+        assert_eq!(queries.load(Ordering::SeqCst), 1);
+
+        // Hickory uses std::time::Instant for expiry, so advancing Tokio's
+        // paused clock would not exercise the real TTL contract.
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let refreshed: Vec<_> = resolver.call(name).await.unwrap().collect();
+        assert_eq!(refreshed, vec![SocketAddr::from(([127, 0, 0, 2], 0))]);
+        assert_eq!(queries.load(Ordering::SeqCst), 2);
+        server.abort();
     }
 
     #[tokio::test]
@@ -984,7 +954,10 @@ mod tests {
         };
         let proxies = config.effective_proxies().unwrap();
 
-        assert_eq!(proxies.http_proxy.unwrap().authority().unwrap().as_str(), "127.0.0.1:8080");
+        assert_eq!(
+            proxies.http_proxy.unwrap().authority().unwrap().as_str(),
+            "127.0.0.1:8080"
+        );
         clear_proxy_env();
     }
 
@@ -1016,38 +989,6 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(proxy.to_string(), "http://127.0.0.1:8080/");
-    }
-
-    #[tokio::test]
-    async fn test_warm_resolution_for_url_handles_proxy_invalid_and_hostless_urls() {
-        let (proxy_client, direct_client) = {
-            let _guard = env_lock().lock().unwrap();
-            clear_proxy_env();
-
-            let proxy_client = ClientNetworkConfig {
-                http_proxy: Some("http://127.0.0.1:8080".into()),
-                ..ClientNetworkConfig::default()
-            }
-            .build_client()
-            .unwrap();
-            let direct_client = ClientNetworkConfig::default().build_client().unwrap();
-
-            (proxy_client, direct_client)
-        };
-        proxy_client
-            .warm_resolution_for_url("http://example.com/file.bin")
-            .await
-            .unwrap();
-
-        direct_client.warm_resolution_for_url("not a url").await.unwrap();
-        direct_client
-            .warm_resolution_for_url("file:///tmp/no-host")
-            .await
-            .unwrap();
-        direct_client
-            .warm_resolution_for_url("http://coverage-check.invalid/file.bin")
-            .await
-            .unwrap();
     }
 
     #[tokio::test]
@@ -1124,7 +1065,11 @@ mod tests {
     fn spawn_connection_pool_test_server(
         close_after_response: bool,
         expected_requests: usize,
-    ) -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>, thread::JoinHandle<()>) {
+    ) -> (
+        SocketAddr,
+        Arc<std::sync::atomic::AtomicUsize>,
+        thread::JoinHandle<()>,
+    ) {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -1225,6 +1170,41 @@ mod tests {
 
         handle.join().unwrap();
         assert_eq!(accepted.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_connector_reconnects_using_hickory_cached_dns_answer() {
+        use std::sync::atomic::Ordering;
+
+        let (dns_addr, queries, dns_server) = spawn_dns_test_server(60).await;
+        let (http_addr, accepted, http_server) = spawn_connection_pool_test_server(true, 2);
+        let client = {
+            let _guard = env_lock().lock().unwrap();
+            clear_proxy_env();
+            ClientNetworkConfig {
+                dns_servers: vec![dns_addr],
+                enable_ipv6: false,
+                ..ClientNetworkConfig::default()
+            }
+            .build_client()
+            .unwrap()
+        };
+        for expected in [b"pong", b"more"] {
+            let req = hyper::Request::builder()
+                .uri(format!(
+                    "http://cache-test.example.:{}/range",
+                    http_addr.port()
+                ))
+                .body(HttpRequestBody::new())
+                .unwrap();
+            let response = client.request(req).await.unwrap();
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(bytes.as_ref(), expected);
+        }
+        http_server.join().unwrap();
+        assert_eq!(accepted.load(Ordering::SeqCst), 2);
+        assert_eq!(queries.load(Ordering::SeqCst), 1);
+        dns_server.abort();
     }
 
     #[tokio::test]

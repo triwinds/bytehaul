@@ -5,6 +5,159 @@ use tokio::sync::watch;
 use super::{stop_signal_error, StopSignal};
 use crate::error::DownloadError;
 
+/// A retry policy's state for one logical operation.
+///
+/// The state deliberately contains no I/O or sleeping.  Callers can therefore
+/// use the same accounting for response probes, segment transfers, and a
+/// complete single-connection transfer while keeping resource cleanup in the
+/// caller that owns it.
+#[derive(Debug)]
+pub(crate) struct RetryState {
+    retries_started: u32,
+    started_at: Instant,
+    max_retries: u32,
+    base_delay: Duration,
+    max_delay: Duration,
+    max_retry_elapsed: Option<Duration>,
+}
+
+/// The result of applying a retry policy to one failed operation.
+#[derive(Debug)]
+pub(crate) enum RetryDecision {
+    Stop(DownloadError),
+    Retry {
+        error: DownloadError,
+        retry_count: u32,
+        backoff: Duration,
+        elapsed: Duration,
+    },
+}
+
+impl RetryState {
+    pub(crate) fn new(
+        max_retries: u32,
+        base_delay: Duration,
+        max_delay: Duration,
+        max_retry_elapsed: Option<Duration>,
+    ) -> Self {
+        Self {
+            retries_started: 0,
+            started_at: Instant::now(),
+            max_retries,
+            base_delay,
+            max_delay,
+            max_retry_elapsed,
+        }
+    }
+
+    /// Apply the normal retry policy to an error.
+    pub(crate) fn decide(&mut self, error: DownloadError) -> RetryDecision {
+        self.decide_inner(error, false)
+    }
+
+    /// Apply retry count and elapsed-budget checks for a safe restart.
+    ///
+    /// A response with a mismatched validator or an ignored Range is not
+    /// globally retryable (`DownloadError::is_retryable` must remain strict),
+    /// but the single-transfer orchestrator still has to charge the restart
+    /// to its existing retry scope.  This method is that explicit, local
+    /// escape hatch; it does not alter error classification anywhere else.
+    pub(crate) fn decide_restart(&mut self, error: DownloadError) -> RetryDecision {
+        self.decide_inner(error, true)
+    }
+
+    pub(crate) fn max_retries(&self) -> u32 {
+        self.max_retries
+    }
+
+    fn decide_inner(&mut self, error: DownloadError, force_retry: bool) -> RetryDecision {
+        if (!force_retry && !error.is_retryable()) || self.retries_started >= self.max_retries {
+            return RetryDecision::Stop(error);
+        }
+
+        let elapsed = self.started_at.elapsed();
+        if let Some(limit) = self.max_retry_elapsed {
+            if elapsed >= limit {
+                return RetryDecision::Stop(DownloadError::RetryBudgetExceeded { elapsed, limit });
+            }
+        }
+
+        let retry_count = self.retries_started.saturating_add(1);
+        let backoff = retry_backoff(&error, retry_count, self.base_delay, self.max_delay);
+
+        let elapsed = self.started_at.elapsed();
+        if let Some(limit) = self.max_retry_elapsed {
+            if elapsed.saturating_add(backoff) > limit {
+                return RetryDecision::Stop(DownloadError::RetryBudgetExceeded { elapsed, limit });
+            }
+        }
+
+        self.retries_started = retry_count;
+        RetryDecision::Retry {
+            error,
+            retry_count,
+            backoff,
+            elapsed,
+        }
+    }
+}
+
+fn retry_backoff(
+    error: &DownloadError,
+    retry_count: u32,
+    base_delay: Duration,
+    max_delay: Duration,
+) -> Duration {
+    if let Some(retry_secs) = error.retry_after_secs() {
+        return Duration::from_secs(retry_secs);
+    }
+
+    let raw = base_delay
+        .saturating_mul(1u32 << retry_count.min(10))
+        .min(max_delay);
+    // Equal jitter: retain half the deterministic delay and randomize the
+    // remaining half.  This gives every retry a non-zero floor while avoiding
+    // a synchronized retry wave.
+    let half = raw / 2;
+    let max_jitter = half.as_nanos().min(u64::MAX as u128) as u64;
+    let jitter = Duration::from_nanos(fastrand::u64(0..=max_jitter));
+    half + jitter
+}
+
+/// Sleep for a retry delay while observing pause/cancel signals.
+pub(crate) async fn sleep_with_backoff(
+    backoff: Duration,
+    cancel_rx: &mut watch::Receiver<StopSignal>,
+) -> Result<(), DownloadError> {
+    if let Some(error) = stop_signal_error(*cancel_rx.borrow()) {
+        return Err(error);
+    }
+
+    let sleep = tokio::time::sleep(backoff);
+    tokio::pin!(sleep);
+    loop {
+        tokio::select! {
+            biased;
+            result = cancel_rx.changed() => {
+                match result {
+                    Ok(()) => {
+                        if let Some(error) = stop_signal_error(*cancel_rx.borrow_and_update()) {
+                            return Err(error);
+                        }
+                    }
+                    // A dropped signal sender means no future stop request;
+                    // finish the already selected backoff normally.
+                    Err(_) => {
+                        sleep.as_mut().await;
+                        return Ok(());
+                    }
+                }
+            }
+            _ = &mut sleep => return Ok(()),
+        }
+    }
+}
+
 /// Retry an async operation with exponential backoff.
 pub(crate) async fn retry_with_backoff<F, Fut, T>(
     max_retries: u32,
@@ -18,65 +171,99 @@ where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T, DownloadError>>,
 {
-    let started_at = Instant::now();
-    for attempt in 0u32.. {
+    let mut retry_state = RetryState::new(max_retries, base_delay, max_delay, max_retry_elapsed);
+    loop {
         match op().await {
             Ok(val) => return Ok(val),
-            Err(e) => {
-                if !e.is_retryable() || attempt >= max_retries {
-                    return Err(e);
+            Err(e) => match retry_state.decide(e) {
+                RetryDecision::Stop(error) => return Err(error),
+                RetryDecision::Retry { backoff, .. } => {
+                    sleep_with_backoff(backoff, cancel_rx).await?;
                 }
-
-                if let Some(limit) = max_retry_elapsed {
-                    let elapsed = started_at.elapsed();
-                    if elapsed >= limit {
-                        return Err(DownloadError::RetryBudgetExceeded { elapsed, limit });
-                    }
-                }
-
-                let retry_count = attempt.saturating_add(1);
-                let backoff = if let Some(retry_secs) = e.retry_after_secs() {
-                    Duration::from_secs(retry_secs)
-                } else {
-                    let raw = base_delay
-                        .saturating_mul(1u32 << retry_count.min(10))
-                        .min(max_delay);
-                    // Equal jitter: half deterministic + half random to avoid
-                    // thundering herd while keeping a minimum delay floor.
-                    let half = raw / 2;
-                    let jitter = Duration::from_nanos(
-                        fastrand::u64(0..=half.as_nanos().min(u64::MAX as u128) as u64),
-                    );
-                    half + jitter
-                };
-
-                if let Some(limit) = max_retry_elapsed {
-                    let elapsed = started_at.elapsed();
-                    if elapsed.saturating_add(backoff) > limit {
-                        return Err(DownloadError::RetryBudgetExceeded { elapsed, limit });
-                    }
-                }
-
-                tokio::select! {
-                    result = cancel_rx.changed() => {
-                        if result.is_ok() {
-                            if let Some(error) = stop_signal_error(*cancel_rx.borrow_and_update()) {
-                                return Err(error);
-                            }
-                        }
-                    }
-                    _ = tokio::time::sleep(backoff) => {}
-                }
-            }
+            },
         }
     }
-
-    unreachable!("infinite retry loop should always return from success or error branches")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn retryable_error() -> DownloadError {
+        DownloadError::HttpStatus {
+            status: 503,
+            message: "Service Unavailable".into(),
+        }
+    }
+
+    #[test]
+    fn test_retry_state_zero_retries_returns_original_error() {
+        let mut state =
+            RetryState::new(0, Duration::from_millis(1), Duration::from_millis(5), None);
+        assert!(matches!(
+            state.decide(retryable_error()),
+            RetryDecision::Stop(DownloadError::HttpStatus { status: 503, .. })
+        ));
+    }
+
+    #[test]
+    fn test_retry_state_counts_additional_retries() {
+        let mut state = RetryState::new(2, Duration::ZERO, Duration::ZERO, None);
+        assert!(matches!(
+            state.decide(retryable_error()),
+            RetryDecision::Retry { retry_count: 1, .. }
+        ));
+        assert!(matches!(
+            state.decide(retryable_error()),
+            RetryDecision::Retry { retry_count: 2, .. }
+        ));
+        assert!(matches!(
+            state.decide(retryable_error()),
+            RetryDecision::Stop(DownloadError::HttpStatus { status: 503, .. })
+        ));
+    }
+
+    #[test]
+    fn test_retry_state_restart_uses_same_budget() {
+        let mut state = RetryState::new(1, Duration::ZERO, Duration::ZERO, None);
+        let mismatch = || DownloadError::ResumeMismatch("changed object".into());
+        assert!(matches!(
+            state.decide_restart(mismatch()),
+            RetryDecision::Retry { retry_count: 1, .. }
+        ));
+        assert!(matches!(
+            state.decide_restart(mismatch()),
+            RetryDecision::Stop(DownloadError::ResumeMismatch(_))
+        ));
+    }
+
+    #[test]
+    fn test_retry_backoff_equal_jitter_is_within_bounds() {
+        let backoff = retry_backoff(
+            &retryable_error(),
+            1,
+            Duration::from_millis(10),
+            Duration::from_millis(100),
+        );
+        assert!((Duration::from_millis(10)..=Duration::from_millis(20)).contains(&backoff));
+    }
+
+    #[test]
+    fn test_retry_after_overrides_backoff() {
+        let error = DownloadError::HttpStatus {
+            status: 503,
+            message: "retry-after:7".into(),
+        };
+        assert_eq!(
+            retry_backoff(
+                &error,
+                1,
+                Duration::from_millis(1),
+                Duration::from_millis(2)
+            ),
+            Duration::from_secs(7)
+        );
+    }
 
     #[tokio::test]
     async fn test_retry_with_backoff_immediate_success() {

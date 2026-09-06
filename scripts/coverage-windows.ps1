@@ -14,6 +14,7 @@ param(
 $ErrorActionPreference = "Stop"
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
+$coverageConfig = Get-Content (Join-Path $PSScriptRoot "coverage-config.json") -Raw | ConvertFrom-Json
 Set-Location $repoRoot
 
 $cargoLlvmCov = Get-Command cargo-llvm-cov -ErrorAction SilentlyContinue
@@ -46,8 +47,8 @@ $targetDir = Join-Path $repoRoot "target\llvm-cov-windows-$Scope-$runId"
 
 if (-not $OutputPath) {
     $OutputPath = switch ($Format) {
-        "html" { Join-Path $reportRoot "$Scope-html" }
-        "json" { Join-Path $reportRoot "$Scope-summary.json" }
+        "html" { Join-Path $reportRoot "$Scope-$runId-html" }
+        "json" { Join-Path $reportRoot "$Scope-$runId-summary.json" }
     }
 }
 
@@ -76,8 +77,9 @@ $reportArgs = switch ($Format) {
 }
 
 $collectArgs = @("llvm-cov", "--no-report") + $scopeArgs
-$exportArgs = @("llvm-cov", "report", "-p", "bytehaul") + $reportArgs
+$exportArgs = @("llvm-cov", "report", "-p", "bytehaul", "--fail-under-lines", "$($coverageConfig.minimum_lines)") + $reportArgs
 
+Write-Host "Windows-only line coverage gate: $($coverageConfig.minimum_lines)%, scope=$Scope. This does not certify the Ubuntu CI gate."
 Write-Host "Collecting Windows coverage data with single-job build and isolated target dir..."
 Write-Host "$cargoLlvmCovPath $($collectArgs -join ' ')"
 

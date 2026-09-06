@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock, Once};
+use std::sync::{Arc, Mutex, Once, OnceLock};
 use std::time::Duration;
 
 use bytehaul::{Checksum, DownloadError, DownloadSpec, FileAllocation, LogLevel};
@@ -291,10 +291,7 @@ fn build_download_spec(
         spec = spec.retry_max_delay(duration_from_secs("retry_max_delay", retry_max_delay)?);
     }
     if let Some(max_retry_elapsed) = max_retry_elapsed {
-        spec = spec.max_retry_elapsed(duration_from_secs(
-            "max_retry_elapsed",
-            max_retry_elapsed,
-        )?);
+        spec = spec.max_retry_elapsed(duration_from_secs("max_retry_elapsed", max_retry_elapsed)?);
     }
     if let Some(max_download_speed) = max_download_speed {
         spec = spec.max_download_speed(max_download_speed);
@@ -311,19 +308,14 @@ fn build_download_spec(
         spec = spec.checksum(parse_checksum_string(&checksum)?);
     }
     if let Some(interval) = control_save_interval {
-        spec = spec.control_save_interval(duration_from_secs(
-            "control_save_interval",
-            interval,
-        )?);
+        spec = spec.control_save_interval(duration_from_secs("control_save_interval", interval)?);
     }
     if let Some(autosave_sync_every) = autosave_sync_every {
-        spec = spec.autosave_sync_every(non_zero_u32(
-            "autosave_sync_every",
-            autosave_sync_every,
-        )?);
+        spec = spec.autosave_sync_every(non_zero_u32("autosave_sync_every", autosave_sync_every)?);
     }
 
-    spec.validate().map_err(|err| config_error(err.to_string()))?;
+    spec.validate()
+        .map_err(|err| config_error(err.to_string()))?;
 
     Ok(spec)
 }
@@ -333,8 +325,9 @@ fn map_download_error(error: DownloadError) -> PyErr {
         DownloadError::Cancelled => CancelledError::new_err("download cancelled"),
         DownloadError::Paused => PausedError::new_err("download paused"),
         DownloadError::InvalidConfig(message) => ConfigError::new_err(message),
-        DownloadError::ResumeMismatch(message)
-        | DownloadError::ControlFileCorrupted(message) => ResumeError::new_err(message),
+        DownloadError::ResumeMismatch(message) | DownloadError::ControlFileCorrupted(message) => {
+            ResumeError::new_err(message)
+        }
         DownloadError::TaskFailed(message) | DownloadError::Internal(message) => {
             InternalError::new_err(message)
         }

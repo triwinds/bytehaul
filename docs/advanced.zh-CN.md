@@ -29,7 +29,7 @@ let spec = DownloadSpec::new("https://example.com/file.bin")
 
 现在 bytehaul 会在真正发起网络请求前通过 `DownloadSpec::validate()` 统一校验这些任务级配置，避免把约束分散到各个运行时分支里兜底。
 
-`max_retries` 仍然表示最多重试多少次；`max_retry_elapsed` 则补充了“总共最多重试多久”的时间预算。如果继续退避会超出这个预算，请求会以 `DownloadError::RetryBudgetExceeded` 结束，而不是只看次数上限。
+`max_retries` 表示初次请求/传输之后允许的额外重试次数；`max_retry_elapsed` 则补充了“总共最多重试多久”的时间预算。单连接 body 失败会在同一个 transfer retry scope 内从 flush barrier 的连续前缀续传，后续 Range 建连和响应校验不会重新计数。如果继续退避会超出这个预算，请求会以 `DownloadError::RetryBudgetExceeded` 结束，而不是只看次数上限。
 
 如果省略 `.output_path(...)`，bytehaul 会依次按 `Content-Disposition`、URL 路径最后一段、默认名 `download` 自动选择文件名。若未设置 `.output_dir(...)`，仍可继续直接传绝对输出路径。
 

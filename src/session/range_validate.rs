@@ -44,11 +44,11 @@ pub(super) fn validate_range_response(
             RangeValidationMode::FreshProbe => Ok(RangeValidationDecision::FallbackToSingle(
                 FreshRangeFallbackReason::EncodedResponse,
             )),
-            RangeValidationMode::ResumeProbe | RangeValidationMode::Segment => Err(
-                DownloadError::ResumeMismatch(
+            RangeValidationMode::ResumeProbe | RangeValidationMode::Segment => {
+                Err(DownloadError::ResumeMismatch(
                     "range responses with content-encoding are not supported".into(),
-                ),
-            ),
+                ))
+            }
         };
     }
 
@@ -66,22 +66,25 @@ pub(super) fn validate_range_response(
         .checked_sub(expected.start)
         .and_then(|len| len.checked_add(1))
         .ok_or_else(mismatched_content_range_error)?;
-    if meta.content_length.is_some_and(|length| length != expected_len) {
+    if meta
+        .content_length
+        .is_some_and(|length| length != expected_len)
+    {
         return match mode {
-            RangeValidationMode::Segment => Err(DownloadError::Transport(
-                crate::error::TransportError::new(
+            RangeValidationMode::Segment => {
+                Err(DownloadError::Transport(crate::error::TransportError::new(
                     crate::error::TransportErrorKind::Body,
                     std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         "server returned a mismatched Content-Length for range response",
                     ),
-                ),
-            )),
-            RangeValidationMode::FreshProbe | RangeValidationMode::ResumeProbe => Err(
-                DownloadError::ResumeMismatch(
+                )))
+            }
+            RangeValidationMode::FreshProbe | RangeValidationMode::ResumeProbe => {
+                Err(DownloadError::ResumeMismatch(
                     "server returned a mismatched Content-Length for range response".into(),
-                ),
-            ),
+                ))
+            }
         };
     }
 
@@ -105,12 +108,12 @@ fn validate_range_status(
             RangeValidationMode::FreshProbe => Ok(RangeValidationDecision::FallbackToSingle(
                 FreshRangeFallbackReason::RangeNotSupported,
             )),
-            RangeValidationMode::ResumeProbe | RangeValidationMode::Segment => Err(
-                DownloadError::HttpStatus {
+            RangeValidationMode::ResumeProbe | RangeValidationMode::Segment => {
+                Err(DownloadError::HttpStatus {
                     status: 200,
                     message: "server returned 200 instead of 206; Range not supported".into(),
-                },
-            ),
+                })
+            }
         };
     }
 
@@ -143,9 +146,7 @@ fn resolve_response_total(
 ) -> Result<u64, DownloadError> {
     match mode {
         RangeValidationMode::FreshProbe => meta.content_range_total.ok_or_else(|| {
-            DownloadError::ResumeMismatch(
-                "range probe response missing Content-Range total".into(),
-            )
+            DownloadError::ResumeMismatch("range probe response missing Content-Range total".into())
         }),
         RangeValidationMode::ResumeProbe | RangeValidationMode::Segment => {
             let Some(expected_total_size) = expected_total_size else {
@@ -259,9 +260,7 @@ mod tests {
 
         assert_eq!(
             decision,
-            RangeValidationDecision::FallbackToSingle(
-                FreshRangeFallbackReason::RangeNotSupported,
-            )
+            RangeValidationDecision::FallbackToSingle(FreshRangeFallbackReason::RangeNotSupported,)
         );
     }
 
@@ -285,9 +284,7 @@ mod tests {
 
         assert_eq!(
             decision,
-            RangeValidationDecision::FallbackToSingle(
-                FreshRangeFallbackReason::EncodedResponse,
-            )
+            RangeValidationDecision::FallbackToSingle(FreshRangeFallbackReason::EncodedResponse,)
         );
     }
 
@@ -384,7 +381,9 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(matches!(err, DownloadError::ResumeMismatch(message) if message.contains("Content-Length")));
+        assert!(
+            matches!(err, DownloadError::ResumeMismatch(message) if message.contains("Content-Length"))
+        );
     }
 
     #[test]
@@ -451,6 +450,113 @@ mod tests {
                 assert_eq!(message, "retry-after:5");
             }
             _ => panic!("expected HttpStatus"),
+        }
+    }
+
+    #[test]
+    fn existing_ranges_require_identity_encoding_and_a_matching_known_total() {
+        for mode in [
+            RangeValidationMode::ResumeProbe,
+            RangeValidationMode::Segment,
+        ] {
+            for (encoding, expected_total, actual_total) in [
+                (Some("gzip"), Some(5000), Some(5000)),
+                (None, None, Some(5000)),
+                (None, Some(5000), None),
+                (None, Some(5000), Some(5001)),
+            ] {
+                let mut meta = test_meta();
+                meta.content_encoding = encoding.map(str::to_owned);
+                meta.content_range_total = actual_total;
+                let err = validate_range_response(
+                    206,
+                    None,
+                    &meta,
+                    mode,
+                    ExpectedRange {
+                        start: 0,
+                        end_inclusive: 999,
+                        total_size: expected_total,
+                    },
+                )
+                .unwrap_err();
+                assert!(matches!(err, DownloadError::ResumeMismatch(_)), "{err:?}");
+                assert!(!err.is_retryable());
+            }
+        }
+    }
+
+    #[test]
+    fn fresh_probe_rejects_an_empty_or_out_of_bounds_representation() {
+        for (total, start) in [(0, 0), (5000, 5000)] {
+            let mut meta = test_meta();
+            meta.content_range_total = Some(total);
+            let err = validate_range_response(
+                206,
+                None,
+                &meta,
+                RangeValidationMode::FreshProbe,
+                ExpectedRange {
+                    start,
+                    end_inclusive: start + 999,
+                    total_size: None,
+                },
+            )
+            .unwrap_err();
+            assert!(matches!(err, DownloadError::ResumeMismatch(_)));
+        }
+    }
+
+    #[test]
+    fn range_errors_keep_status_and_only_accept_numeric_retry_after() {
+        for mode in [
+            RangeValidationMode::FreshProbe,
+            RangeValidationMode::ResumeProbe,
+            RangeValidationMode::Segment,
+        ] {
+            for (status, header, expected_message) in [
+                (429, Some(" 7 "), "retry-after:7"),
+                (429, None, "HTTP 429"),
+                (503, Some("invalid"), "HTTP 503"),
+            ] {
+                let err = validate_range_response(
+                    status,
+                    header,
+                    &test_meta(),
+                    mode,
+                    ExpectedRange {
+                        start: 0,
+                        end_inclusive: 999,
+                        total_size: Some(5000),
+                    },
+                )
+                .unwrap_err();
+                assert!(err.is_retryable());
+                assert!(
+                    matches!(err, DownloadError::HttpStatus { status: actual, message } if actual == status && message == expected_message)
+                );
+            }
+            let err = validate_range_response(
+                404,
+                None,
+                &test_meta(),
+                mode,
+                ExpectedRange {
+                    start: 0,
+                    end_inclusive: 999,
+                    total_size: Some(5000),
+                },
+            )
+            .unwrap_err();
+            assert!(!err.is_retryable());
+            let expected_message = if matches!(mode, RangeValidationMode::FreshProbe) {
+                "expected 206 or 200, got 404"
+            } else {
+                "expected 206, got 404"
+            };
+            assert!(
+                matches!(err, DownloadError::HttpStatus { status: 404, message } if message == expected_message)
+            );
         }
     }
 }

@@ -201,6 +201,8 @@ Frozen snapshot of download progress.
 | `checksum_sha256`   | `str \| None`    | `None`        |
 | `log_level`         | `str \| None`    | `None` (`"off"`) |
 
+`max_retries` counts additional retries after the initial request/transfer attempt; `0` disables retries. Single-connection body failures resume from the writer's flushed contiguous prefix, while Range or object-metadata mismatches reset the file before restarting.
+
 Valid `log_level` values: `"off"`, `"error"`, `"warn"`, `"info"`, `"debug"`, `"trace"` (case-insensitive).
 
 ### Network options
@@ -246,4 +248,3 @@ The project uses `abi3-py39`, so a single wheel per platform covers all Python 3
 ## License
 
 MIT. See the repository LICENSE file.
-

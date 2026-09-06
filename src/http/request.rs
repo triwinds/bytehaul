@@ -8,7 +8,7 @@ use crate::http::HttpRequestBody;
 pub(crate) fn build_get_request(
     url: &str,
     headers: &HashMap<String, String>,
-)-> Request<HttpRequestBody> {
+) -> Request<HttpRequestBody> {
     let mut req = Request::builder()
         .method("GET")
         .uri(url)
@@ -44,12 +44,7 @@ mod tests {
 
     #[test]
     fn test_range_request_forces_identity_encoding() {
-        let req = build_range_request(
-            "https://example.com/file.bin",
-            &HashMap::new(),
-            0,
-            99,
-        );
+        let req = build_range_request("https://example.com/file.bin", &HashMap::new(), 0, 99);
 
         assert_eq!(req.headers().get("range").unwrap(), "bytes=0-99");
         assert_eq!(req.headers().get("accept-encoding").unwrap(), "identity");

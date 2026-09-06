@@ -24,7 +24,7 @@ Rust 异步 HTTP 下载库，带有 Python 绑定（同时在 PyPI 发布），�
 - **断点续传**：通过原子化状态保存控制下载进度持久化
 - **回写缓存**：基于分片聚合写入，减少随机 I/O
 - **内存预算与背压控制**：基于信号量限制内存占用与生产速度
-- **指数退避重试**：支持配置最大重试次数，并尊重 `Retry-After`
+- **指数退避重试**：单/多连接共用重试策略，响应体失败可安全续传，并尊重 `Retry-After`
 - **下载限速**：所有工作线程共享令牌桶限速
 - **SHA-256 校验**：下载完成后进行完整性校验
 - **取消下载**：通过 watch channel 协作取消
@@ -103,27 +103,37 @@ bytehaul.download(
 
 ## 覆盖率
 
-CI 中的覆盖率门禁仍然在 Ubuntu 上通过 Tarpaulin 执行：
+CI 与本地 Linux 使用同一个入口。在 Ubuntu 24.04 x86_64 上安装 Python 3、rustup、C 编译器、pkg-config 和 OpenSSL 开发头文件后运行：
 
 ```bash
-cargo tarpaulin --engine llvm --workspace --all-targets --out Stdout --fail-under 95
+python3 scripts/coverage.py --install
 ```
 
-在 Windows 上，如果直接跑 Tarpaulin，常见问题是中断后残留句柄、二进制被锁住，或者终端拿不到完整总结。仓库里提供了专门的 PowerShell 脚本来生成本地报告：
+`--install` 安装 [coverage-config.json](../scripts/coverage-config.json) 中固定的 Rust 和 Tarpaulin 版本；安装后可省略，脚本会校验工具版本。门禁使用 LLVM、`-p bytehaul --all-targets`、锁定的依赖和 **95% 行覆盖率门槛**，不增加源码排除规则。脚本忽略额外的 Tarpaulin 配置，并隔离可能干扰 localhost 测试的代理环境变量。
+
+源码目录需要可写：即使构建目录位于其他位置，LLVM 插桩的构建脚本仍可能在源码目录写入 profile 文件。在内存较小的 Linux 虚拟机中，可减少同时运行的编译任务。链接仍可能超出 2 GB 虚拟机的内存；链接器被系统终止时需要更多内存：
+
+```bash
+CARGO_BUILD_JOBS=1 python3 scripts/coverage.py --install
+```
+
+这只调整构建并发，不改变测试范围和覆盖率门槛。报告元数据会记录 Linux 发行版，以及显式设置的 `CARGO_BUILD_JOBS` 值。
+
+每次运行的构建和报告目录均独立，位于 `target/coverage/`。`target/coverage/reports/<run>/` 保留 JSON、HTML、完整日志、工具版本、提交号及工作区是否有修改的信息。测试失败会标记为“覆盖率未完整收集”；测得的比例低于 95% 则标记为“未达到门槛”，两者都会返回失败。Actions 在失败时仍显示摘要并上传诊断文件。
+
+提交 Rust 改动前，在待提交的相同代码上运行此门禁。`cargo test`、Clippy 通过，或不带门槛的报告生成成功，都**不代表覆盖率达标**。macOS/Windows 编译的代码路径不同，本地平台报告不能代替 Linux 门禁；可使用 Ubuntu x86_64 虚拟机、WSL 环境或 GitHub 覆盖率任务进行基准验证。升级工具时统一修改配置，并重新运行完整门禁。
+
+Windows 的补充诊断仍使用独立脚本：
 
 ```powershell
 rustup component add llvm-tools-preview
 cargo install cargo-llvm-cov
 powershell -ExecutionPolicy Bypass -File scripts/coverage-windows.ps1 -Scope all-targets -Format html
-```
-
-如果你需要机器可读的摘要，可以使用：
-
-```powershell
+# 机器可读报告：
 powershell -ExecutionPolicy Bypass -File scripts/coverage-windows.ps1 -Scope all-targets -Format json
 ```
 
-该脚本现在默认按与 CI 一致的 `all-targets` 口径执行，并会强制 `CARGO_BUILD_JOBS=1`、为每次运行使用新的隔离 `CARGO_TARGET_DIR`，以减少 Windows 下 `os error 5`、`LNK1104` 以及残留 `cargo` / `rustc` 进程带来的冲突。
+Windows 脚本使用 cargo-llvm-cov，显式检查共享的 **95% 行覆盖率门槛**，默认范围是 `all-targets`；`tests`、`lib` 的统计范围更窄。成功仅证明所选 Windows 范围达标，其分母与 Linux Tarpaulin 不同。每次运行使用新的构建目录及默认报告路径，并限制单任务构建，减少文件锁和旧报告混淆。
 
 ## 架构概览
 

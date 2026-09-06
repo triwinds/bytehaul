@@ -39,18 +39,14 @@ graph TD
     Probe -->|"no Range or small file"| Single
 
     Single --> HTTP
-    HTTP -->|"byte stream"| Cache
-    Cache -->|"flush"| Writer
-    Writer --> Disk
-
     Multi --> Scheduler
-    Scheduler -->|"assign segment"| Worker
+    Scheduler -->|"assign lease"| Worker
     Worker --> HTTP
-    Worker -->|"byte stream"| Cache
-    Cache -->|"flush piece"| Writer
+    HTTP -->|"bounded channel"| Writer
+    Writer -->|"leased data"| Cache
+    Cache -->|"flush blocks"| Writer
     Writer --> Disk
-    Worker -->|"piece done"| Scheduler
-    Scheduler -->|"next segment"| Worker
+    Worker -->|"complete lease after flush ack"| Scheduler
 
     Session -->|"periodic save"| Control
     Session -->|"update"| Progress
@@ -61,6 +57,9 @@ graph TD
 ### Downloader / DownloaderBuilder
 
 Entry point. Holds downloader-wide default network settings plus a cache of `BytehaulClient` instances built from the hyper client stack (proxy, DNS, TLS, timeout). Each call to `download()` combines those defaults with task-level overrides (currently timeout and proxies), reuses or derives the matching client, and returns a `DownloadHandle`. An optional `Semaphore` limits concurrent downloads.
+
+
+DNS lookup and bounded TTL answer caching are provided by Hickory inside the HTTP connector; downloads do not run a separate preflight lookup.
 
 ### DownloadHandle
 
@@ -76,7 +75,7 @@ Orchestration layer. Decides between single-connection and multi-worker paths ba
 
 ### SchedulerState
 
-Tracks piece assignment for multi-worker downloads. Wraps a `PieceMap` (bitset) and an in-flight exclusion set. Workers call `assign()` to get the next missing segment and `complete()` / `reclaim()` to update state.
+Tracks piece assignment with a completion bitset, a compact availability index, and sparse runtime state for touched, incomplete pieces. Active lease and missing-range counts are maintained incrementally. Workers acquire complete pieces or missing subranges, then call `complete()` / `reclaim()` with a lease identity. Finishing a piece releases its detailed runtime state; checkpoint hints inspect only the sparse state.
 
 ### Worker
 
@@ -84,15 +83,15 @@ Each worker runs an HTTP Range GET for its assigned segment, streaming bytes int
 
 ### WriteBackCache
 
-In-memory write buffer keyed by piece ID. Merges adjacent or overlapping byte ranges (coalescing) to minimize disk I/O. Flushed per-piece when a piece completes, or bulk-flushed when the memory budget high-watermark is reached.
+In-memory write buffer keyed by lease identity. Each lease appends a contiguous byte stream; gaps and overlaps are internal errors. Retry attempts receive new identities so stale data cannot contaminate a new attempt. Data is flushed when the lease completes or the cache reaches its flush watermark. Bulk drains are sorted by file offset.
 
 ### Writer
 
-Translates `FlushBlock` entries into positioned writes (`pwrite` / `seek+write`) on the output file. Handles file pre-allocation (zero-fill or platform-native `fallocate`).
+Receives data through a bounded channel and writes the output with `seek + write_all`. Single-connection data is written directly; leased data passes through the cache. Flush acknowledgements let workers mark leases complete, and sync acknowledgements establish checkpoint durability. File creation and preallocation live in `storage/file.rs`.
 
 ### ControlSnapshot
 
-Binary control file (`.bytehaul`) for resume support. Format: 4-byte magic + 4-byte version + 4-byte payload length + 4-byte CRC32 + bincode payload. Saved periodically (configurable interval, default 5 s) via atomic write (tmp → fsync → rename).
+Binary control file (`.bytehaul`) for resume support. Format: 4-byte magic + 4-byte version + 4-byte payload length + 4-byte CRC32 + bincode payload. Saved periodically (configurable interval, default 5 s, gated by `autosave_sync_every`) via atomic write (tmp → fsync → rename). Multi-worker checkpoints freeze the completed bitset before awaiting the writer flush/sync barrier and save that frozen snapshot afterwards. Later completions wait for the next checkpoint. V1 and V2 reads remain supported; dirty/inflight hints are diagnostic, not resumable progress.
 
 ### PieceMap
 
@@ -100,8 +99,8 @@ Compact bitset (`BitVec<u8, Lsb0>`) tracking per-piece completion status. Serial
 
 ## Memory Budget & Back-Pressure
 
-The `memory_budget` setting (via `DownloadSpec`) controls a Tokio `Semaphore` that limits how many bytes the cache can hold before workers are blocked. When the cache exceeds the high-watermark, pending writes are suspended until the writer flushes data to disk, creating natural back-pressure from disk I/O speed.
+The `memory_budget` setting limits payload bytes reserved for the writer queue and cache through a Tokio semaphore. Response data is forwarded in bounded chunks, and the cache flush watermark leaves room for another chunk so budget acquisition cannot prevent the flush needed to release permits. Single and multi transfers observe pause/cancel while waiting for rate limits, budget, or the writer channel. This is a payload budget, not a bound on total process memory or HTTP/TLS receive buffers.
 
 ## Retry & Resilience
 
-Failed HTTP requests are retried with exponential back-off plus full jitter (`fastrand`). Configurable parameters: `max_retries`, `retry_base_delay`, `retry_max_delay`, `max_retry_elapsed`. On resume, the control file is validated (magic, version, CRC32) and corrupted files are discarded gracefully.
+Failed HTTP requests and response-body transport errors share exponential back-off with equal jitter (`fastrand`). In single-connection mode, a body failure resumes only from the contiguous prefix confirmed by the writer flush barrier; a Range/metadata mismatch or an unprovable non-zero offset truncates the output before restarting from zero. `max_retries` means additional retries after the initial attempt (`0` disables retries). Configurable parameters: `max_retries`, `retry_base_delay`, `retry_max_delay`, `max_retry_elapsed`. On resume, the control file is validated (magic, version, CRC32) and corrupted files are discarded gracefully.

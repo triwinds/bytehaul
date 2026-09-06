@@ -63,7 +63,8 @@ impl ControlSnapshot {
 
     /// Save the snapshot atomically: write to tmp → fsync → rename.
     pub async fn save(&self, control_path: &Path) -> Result<(), DownloadError> {
-        self.save_with_hints(control_path, ControlHints::default()).await
+        self.save_with_hints(control_path, ControlHints::default())
+            .await
     }
 
     pub(crate) async fn save_with_hints(
@@ -116,7 +117,7 @@ fn save_sync(
         snapshot: snapshot.clone(),
         hints,
     }))
-        .map_err(|e| DownloadError::Internal(format!("control file serialize failed: {e}")))?;
+    .map_err(|e| DownloadError::Internal(format!("control file serialize failed: {e}")))?;
     let checksum = crc32fast::hash(&payload);
 
     let tmp_path = path.with_extension("bytehaul.tmp");
