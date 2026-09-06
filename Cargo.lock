@@ -127,7 +127,7 @@ checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 
 [[package]]
 name = "bytehaul"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "bincode",
  "bitvec",
@@ -146,7 +146,7 @@ dependencies = [
  "libc",
  "md-5",
  "parking_lot",
- "rand 0.8.6",
+ "rand 0.9.4",
  "serde",
  "sha1 0.11.0",
  "sha2",
@@ -162,7 +162,7 @@ dependencies = [
 
 [[package]]
 name = "bytehaul-python"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "bytehaul",
  "pyo3",

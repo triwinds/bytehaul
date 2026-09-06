@@ -140,6 +140,18 @@ the real Linux gate after script changes; stubs alone cannot verify tool output 
 Wrong: report “coverage meets 95%” after only functional tests or a successful report-export command.
 Correct: cite the measured covered/total lines and gate exit code, with version/revision/platform.
 
+## Release packaging
+
+- Bump the shared workspace version and matching workspace lock entries together; Python metadata
+  derives its version from the binding crate. Verify both packages with `cargo metadata --locked`.
+- After `maturin develop`, run local release checks with `uv run --no-sync` and verify both
+  `bytehaul.__version__` and `importlib.metadata.version("bytehaul")`. A normal `uv run` can reinstall
+  cached editable metadata from the previous workspace version while retaining the rebuilt extension.
+- Run `cargo package -p bytehaul --allow-dirty --locked` while preparing a release, then inspect the
+  generated archive. Keep source, public documentation and tests; exclude internal workflow directories
+  such as `.agents/`, `.trellis/`, `.codex/` and `.cursor/` through the root package's `exclude` list.
+  A successful compile alone does not verify the publication file list.
+
 ## Review Checklist
 
 - Correct engine/binding layer and all option/state/error/export mirrors searched?
