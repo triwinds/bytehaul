@@ -178,7 +178,7 @@ Updated README and English/Chinese guides for 0.2.1 installation, master badges 
 
 | Hash | Message |
 |------|---------|
-| `HEAD~1` | (see git log) |
+| `c9e34a0` | (see git log) |
 
 ### Status
 

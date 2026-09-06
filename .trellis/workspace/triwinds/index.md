@@ -29,7 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
-| 8 | 2026-09-07 | Synchronize public guides for 0.2.1 | HEAD~1 | `master` |
+| 8 | 2026-09-07 | Synchronize public guides for 0.2.1 | c9e34a0 | `master` |
 | 7 | 2026-09-07 | Merge repair branch and publish 0.2.1 | `654f783`, `5ebda09` | `master` |
 | 6 | 2026-09-06 | Replace flaky dynamic split timing assertion | `d25f8f3` | `fix/retry-body-transport-errors` |
 | 5 | 2026-09-06 | Fix storage failures and reproducible Linux coverage | `3d21ed0` | `fix/retry-body-transport-errors` |
