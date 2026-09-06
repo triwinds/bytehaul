@@ -116,3 +116,25 @@ Fixed terminal storage error progress while preserving durable checkpoints. Unif
 ### Status
 
 [OK] **Completed**
+
+
+## Session 6: Replace flaky dynamic split timing assertion
+
+**Date**: 2026-09-06
+**Task**: Replace flaky dynamic split timing assertion
+**Package**: bytehaul-python
+**Branch**: `fix/retry-body-transport-errors`
+
+### Summary
+
+Windows CI failed a 150ms speedup assertion despite a 146ms improvement. Replaced elapsed-time comparison with gated exact subrange arrivals, patterned output and Completed progress. Ten focused repetitions passed; serial configuration mutation failed as expected; restored test, full429 native tests, benchmarks, Clippy and formatting passed. Captured deterministic concurrency testing rule. Push and remote Actions verification follow in the task conversation.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `d25f8f3` | (see git log) |
+
+### Status
+
+[OK] **Completed**
