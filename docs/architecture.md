@@ -56,7 +56,7 @@ graph TD
 
 ### Downloader / DownloaderBuilder
 
-Entry point. Holds downloader-wide default network settings plus a cache of `BytehaulClient` instances built from the hyper client stack (proxy, DNS, TLS, timeout). Each call to `download()` combines those defaults with task-level overrides (currently timeout and proxies), reuses or derives the matching client, and returns a `DownloadHandle`. An optional `Semaphore` limits concurrent downloads.
+Entry point. Holds downloader-wide default network settings plus a cache of `BytehaulClient` instances built from the hyper client stack (proxy, DNS, TLS, timeout). Each call to `download()` combines those defaults with task-level overrides (timeout, connection pooling and proxies), reuses or derives the matching client, and returns a `DownloadHandle`. An optional `Semaphore` limits concurrent downloads.
 
 
 DNS lookup and bounded TTL answer caching are provided by Hickory inside the HTTP connector; downloads do not run a separate preflight lookup.
@@ -64,7 +64,7 @@ DNS lookup and bounded TTL answer caching are provided by Hickory inside the HTT
 ### DownloadHandle
 
 Provides the user-facing control surface:
-- **`progress()`** — snapshot of current state via `watch::Receiver`
+- **`progress()`** — returns the current `ProgressSnapshot`; `subscribe_progress()` returns a `watch::Receiver` for updates
 - **`on_progress(callback)`** — push-based progress notifications
 - **`cancel()` / `pause()`** — cooperative cancellation via a shared `watch` channel
 - **`wait()`** — awaits task completion
@@ -79,7 +79,7 @@ Tracks piece assignment with a completion bitset, a compact availability index, 
 
 ### Worker
 
-Each worker runs an HTTP Range GET for its assigned segment, streaming bytes into the `WriteBackCache`. On completion, it notifies the scheduler and requests the next piece.
+Each worker runs an HTTP Range GET for its assigned segment and forwards bytes through a bounded channel to the writer’s lease cache. It marks the lease complete in the scheduler only after the lease flush acknowledgement, then requests the next segment.
 
 ### WriteBackCache
 
@@ -103,4 +103,10 @@ The `memory_budget` setting limits payload bytes reserved for the writer queue a
 
 ## Retry & Resilience
 
-Failed HTTP requests and response-body transport errors share exponential back-off with equal jitter (`fastrand`). In single-connection mode, a body failure resumes only from the contiguous prefix confirmed by the writer flush barrier; a Range/metadata mismatch or an unprovable non-zero offset truncates the output before restarting from zero. `max_retries` means additional retries after the initial attempt (`0` disables retries). Configurable parameters: `max_retries`, `retry_base_delay`, `retry_max_delay`, `max_retry_elapsed`. On resume, the control file is validated (magic, version, CRC32) and corrupted files are discarded gracefully.
+Retryable HTTP request failures and response-body transport errors share exponential back-off with equal jitter (`fastrand`). In single-connection mode, a body failure resumes only from the contiguous prefix confirmed by the writer flush barrier; a Range/metadata mismatch or an unprovable non-zero offset truncates the output before restarting from zero. `max_retries` means additional retries after the initial attempt (`0` disables retries). Configurable parameters: `max_retries`, `retry_base_delay`, `retry_max_delay`, `max_retry_elapsed`. On resume, the control file is validated (magic, version, CRC32) and corrupted files are discarded gracefully.
+
+## Progress and Storage Failures
+
+`ProgressSnapshot.downloaded` reports received bytes for the UI and may decrease during multi-worker retries. The control file records only the confirmed durable single-connection prefix or complete pieces. A final writer write or synchronization failure publishes `Failed` and preserves the previous durable checkpoint, even if the UI byte count has reached the total size.
+
+Single-connection completion publishes `Completed` only after flush, writer close and required control-file cleanup succeed. Multi-connection completion requires successful final writer synchronization and all pieces complete; control-file deletion is best effort. Callers should await the final `wait()` result, including any configured checksum verification.

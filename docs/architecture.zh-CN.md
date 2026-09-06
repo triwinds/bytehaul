@@ -65,7 +65,7 @@ DNS 查询和有容量限制的 TTL 响应缓存由 HTTP connector 内的 Hickor
 
 向用户暴露下载控制面：
 
-- `progress()`：通过 `watch::Receiver` 读取当前进度快照
+- `progress()`：返回当前 `ProgressSnapshot`；`subscribe_progress()` 返回用于订阅更新的 `watch::Receiver`
 - `on_progress(callback)`：注册推送式进度回调
 - `cancel()` / `pause()`：通过共享的 `watch` channel 协作取消或暂停
 - `wait()`：等待任务结束
@@ -80,7 +80,7 @@ DNS 查询和有容量限制的 TTL 响应缓存由 HTTP connector 内的 Hickor
 
 ### Worker
 
-每个 Worker 都会针对自己拿到的区段发起一次 HTTP Range GET，请求返回的字节流会写入 `WriteBackCache`。区段完成后，Worker 会通知调度器并继续请求下一块分片。
+每个 Worker 针对领取的区段发起 HTTP Range GET，并通过有界 channel 把数据交给 writer 的 lease 缓存。收到 lease flush 确认后，Worker 才通知调度器完成，并领取下一区段。
 
 ### WriteBackCache
 
@@ -104,4 +104,10 @@ DNS 查询和有容量限制的 TTL 响应缓存由 HTTP connector 内的 Hickor
 
 ## 重试与韧性
 
-失败的 HTTP 请求和响应体传输会采用统一的指数退避并叠加等抖动（equal jitter，`fastrand`）进行重试。单连接在 body 失败后只从 writer flush barrier 确认的连续前缀发起 Range 续传；Range/metadata 不匹配或无法证明非零偏移时会先清空输出再从零重启。`max_retries` 表示初次尝试之后允许的额外重试次数，`0` 表示不重试。可配置参数包括：`max_retries`、`retry_base_delay`、`retry_max_delay`、`max_retry_elapsed`。恢复下载时，控制文件会先做校验（magic、version、CRC32）；如果文件损坏，bytehaul 会安全地丢弃它并从头开始。
+可重试的 HTTP 请求和响应体传输错误会采用统一的指数退避并叠加等抖动（equal jitter，`fastrand`）进行重试。单连接在 body 失败后只从 writer flush barrier 确认的连续前缀发起 Range 续传；Range/metadata 不匹配或无法证明非零偏移时会先清空输出再从零重启。`max_retries` 表示初次尝试之后允许的额外重试次数，`0` 表示不重试。可配置参数包括：`max_retries`、`retry_base_delay`、`retry_max_delay`、`max_retry_elapsed`。恢复下载时，控制文件会先做校验（magic、version、CRC32）；如果文件损坏，bytehaul 会安全地丢弃它并从头开始。
+
+## 进度与存储失败
+
+`ProgressSnapshot.downloaded` 用于显示已接收字节，多 Worker 重试时可能回退；控制文件只声明已确认持久化的单连接前缀或完整分片。最终 writer 写入或同步失败时发布 `Failed`，保留此前的持久化断点，即使界面字节数已达到总大小。
+
+单连接在 flush、关闭 writer 和所需的控制文件清理全部成功后才发布 `Completed`；多连接在 writer 最终同步成功并确认所有分片完成后发布 `Completed`，控制文件删除是尽力而为。调用方应等待 `wait()` 的最终结果，包括后续配置的校验和检查。

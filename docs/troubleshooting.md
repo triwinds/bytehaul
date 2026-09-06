@@ -6,11 +6,11 @@ Common issues and how to resolve them.
 
 ## Control File Corrupted
 
-**Symptom:** Download fails on resume with `ControlFileCorrupted` error.
+**Symptom:** A control file fails validation and the download starts over instead of resuming saved progress.
 
 **Cause:** The `.bytehaul` control file was partially written (e.g., power loss during save) or modified externally.
 
-**Fix:** Delete the control file and restart the download. The control file is located next to the output file with a `.bytehaul` extension:
+**Fix:** Version 0.2.1 ignores control files that cannot be loaded or validated and starts a fresh download. If you need to remove one manually, it is located next to the output file with a `.bytehaul` extension:
 
 ```bash
 rm /path/to/your-file.zip.bytehaul
@@ -20,11 +20,17 @@ The download will restart from scratch.
 
 ## Response Body Interrupted
 
-**Symptom:** A single-connection download hits a timeout, connection reset, or early EOF while reading the response body.
+**Symptom:** A single-connection download hits a timeout, connection reset, or early EOF while reading a known-size response body.
 
 **Resolution:** These network errors are retried within the same retry budget. When the file size is known, bytehaul sends the next Range request only from the contiguous prefix confirmed by the writer flush barrier. If the server ignores Range, or the ETag, Last-Modified, or total size changes, bytehaul truncates the output and restarts from zero so two objects are never concatenated. `max_retries` counts additional retries after the initial attempt; set it to `0` to disable retries.
 
 If logs contain `restart_from_zero`, check whether the remote object is being replaced, the URL serves dynamic content, or the server consistently supports Range.
+
+## Full Byte Count but Failed Download
+
+A final write or synchronization failure can leave `downloaded` equal to `total_size` while the state is `Failed` (`failed` in Python). This is runtime received-byte progress; the control file records only confirmed durable data. Check disk space, quotas, permissions and the underlying I/O error before submitting another download. Do not advance a checkpoint manually from the displayed byte count.
+
+Single-connection downloads also report final control-file cleanup errors; multi-connection cleanup is best effort. Inspect the error from `wait()` rather than treating the byte count or ETA as proof of success. Storage failures do not replace the previous checkpoint with unconfirmed progress.
 
 ## Proxy Configuration
 
@@ -108,7 +114,7 @@ Available levels (from most to least verbose): `trace`, `debug`, `info`, `warn`,
 
 **Recommended levels:**
 - `debug` — shows HTTP request/response details, piece scheduling, control file operations
-- `trace` — includes per-chunk data flow (very verbose, for deep debugging only)
+- `trace` — selectable, but the current implementation adds no per-chunk trace events
 - `info` — high-level progress events
 
 ## Download Stalls or Slow Speed
@@ -156,7 +162,7 @@ uv run maturin develop
 
 For production use, install the wheel:
 ```bash
-pip install bytehaul
+pip install "bytehaul==0.2.1"
 ```
 
 ## Windows Coverage Reports
@@ -183,4 +189,4 @@ If you want a JSON summary instead of HTML:
 powershell -ExecutionPolicy Bypass -File scripts/coverage-windows.ps1 -Scope all-targets -Format json
 ```
 
-The helper defaults to the same `all-targets` scope as the Linux CI gate and uses a fresh isolated target directory per run, while Linux CI still uses Tarpaulin for the repository-wide threshold check.
+The helper uses cargo-llvm-cov, defaults to `all-targets`, and explicitly checks 95% line coverage with separate build and default report paths per run. Windows and Linux compile different paths and have different coverage denominators, so success certifies only the selected Windows scope. The reference Linux gate remains the [shared entry in the README](../README.md#coverage).

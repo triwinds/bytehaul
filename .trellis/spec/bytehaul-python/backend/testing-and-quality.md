@@ -142,6 +142,10 @@ Correct: cite the measured covered/total lines and gate exit code, with version/
 
 ## Release packaging
 
+- Before publishing, synchronize the version examples and release applicability in `README.md`,
+  `docs/README.zh-CN.md`, the Python README and translated guides. Check the actual default branch
+  for badges/links and compare behavior descriptions against the release source. Mark historical
+  design baselines explicitly; do not turn old implementation notes into current API claims.
 - Bump the shared workspace version and matching workspace lock entries together; Python metadata
   derives its version from the binding crate. Verify both packages with `cargo metadata --locked`.
 - After `maturin develop`, run local release checks with `uv run --no-sync` and verify both

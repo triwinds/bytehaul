@@ -1,18 +1,25 @@
 # bytehaul
 
-Python bindings for the [bytehaul](https://github.com/triwinds/bytehaul) Rust download library.
+Python bindings for the [bytehaul](https://github.com/triwinds/bytehaul) Rust download library. This guide targets the published **0.2.1** release.
 
 [中文使用文档](../../docs/python.zh-CN.md)
 
 ## Requirements
 
 - Python 3.9+
-- Rust toolchain (for building from source)
-- `uv`
+- Rust toolchain and `uv` only when building from source; neither is required to install an available wheel.
 
-Commands below assume you are running them from the repository root.
+Each source-build command block below assumes you start from the repository root.
 
 ## Installation
+
+### From PyPI
+
+```bash
+pip install "bytehaul==0.2.1"
+```
+
+See the [0.2.1 release notes](https://github.com/triwinds/bytehaul/releases/tag/v0.2.1).
 
 ### From source (development)
 
@@ -136,6 +143,8 @@ except DownloadFailedError as e:
     print(f"Download failed: {e}")
 ```
 
+Response-body timeouts, connection resets and early EOF for a known-size body are retried within `max_retries`, which counts additional attempts after the first (`0` disables retries). With a known total and matching object validators, continuation starts at the durable prefix confirmed by the writer; ignored Range requests or changed object metadata trigger a safe restart from zero. Disk write and synchronization errors are not retried as network failures.
+
 ## API Reference
 
 ### `download(url, output_path=None, output_dir=None, **options)`
@@ -147,7 +156,7 @@ Blocking convenience function. Downloads a file and returns when complete.
 - If `output_path` is omitted, bytehaul chooses `Content-Disposition` → URL path → `download`
 - Absolute `output_path` values are still accepted when `output_dir` is omitted
 
-### `Downloader(connect_timeout=None, proxy=None, http_proxy=None, https_proxy=None, dns_servers=None, doh_servers=None, enable_ipv6=None)`
+### `Downloader(connect_timeout=None, proxy=None, http_proxy=None, https_proxy=None, dns_servers=None, doh_servers=None, enable_ipv6=None, log_level=None)`
 
 Reusable downloader instance.
 
@@ -164,6 +173,8 @@ Handle to a running download.
 - `task.cancel()` — cancel the download
 - `task.wait()` — block until download completes (releases GIL)
 
+`wait()` consumes the task handle. It cannot be called twice, and `progress()` is unavailable after it returns or raises.
+
 ### `ProgressSnapshot`
 
 Frozen snapshot of download progress.
@@ -171,11 +182,13 @@ Frozen snapshot of download progress.
 | Attribute      | Type           | Description                     |
 |----------------|----------------|---------------------------------|
 | `total_size`   | `int \| None`  | Total file size (if known)      |
-| `downloaded`   | `int`          | Bytes downloaded so far         |
+| `downloaded`   | `int`          | UI-oriented received bytes, not a durable resume offset |
 | `state`        | `str`          | `"pending"`, `"downloading"`, `"completed"`, `"failed"`, `"cancelled"`, `"paused"` |
 | `speed`        | `float`        | Recent-window speed in bytes/second |
 | `eta_secs`     | `float \| None`| Estimated remaining seconds     |
 | `elapsed_secs` | `float \| None`| Elapsed time in seconds         |
+
+`downloaded` may decrease during retries or already equal `total_size` when final synchronization fails. Final write or synchronization failures produce `failed` state, and the control file retains only confirmed durable progress. Use the result or exception from `task.wait()` to determine success; do not use the displayed byte count as a resume offset.
 
 `speed` and `eta_secs` are computed from the same recent throughput window. `speed` is not a whole-download lifetime average, and `eta_secs` stays `None` until bytehaul has enough recent samples or a known total size.
 
@@ -197,11 +210,16 @@ Frozen snapshot of download progress.
 | `max_retries`       | `int`            | `5`           |
 | `retry_base_delay`  | `float` (secs)   | `1.0`         |
 | `retry_max_delay`   | `float` (secs)   | `30.0`        |
+| `max_retry_elapsed` | `float \| None` (secs) | `None` |
+| `control_save_interval` | `float` (secs) | `5.0` |
+| `autosave_sync_every` | `int` | `2` |
 | `max_download_speed`| `int`            | `0` (unlimited)|
 | `checksum_sha256`   | `str \| None`    | `None`        |
 | `log_level`         | `str \| None`    | `None` (`"off"`) |
 
 `max_retries` counts additional retries after the initial request/transfer attempt; `0` disables retries. Single-connection body failures resume from the writer's flushed contiguous prefix, while Range or object-metadata mismatches reset the file before restarting.
+
+`control_save_interval` checks whether a checkpoint is due; `autosave_sync_every` batches those checks when unsaved progress exists. Set `log_level` on the convenience `download(...)` function or the `Downloader(...)` constructor.
 
 Valid `log_level` values: `"off"`, `"error"`, `"warn"`, `"info"`, `"debug"`, `"trace"` (case-insensitive).
 
@@ -224,8 +242,10 @@ Use these on `Downloader(...)` to set defaults, or pass `proxy`, `http_proxy`, a
 uv sync --project bindings/python
 cd bindings/python
 uv run --project . maturin develop -m Cargo.toml
-uv run --project . pytest tests/ -v
+uv run --no-sync --project . pytest tests/ -v
 ```
+
+After `maturin develop`, use `--no-sync` for tests so uv does not replace the freshly built development extension during another environment sync.
 
 ## Building wheels for release
 

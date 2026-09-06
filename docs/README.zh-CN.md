@@ -1,13 +1,15 @@
 # bytehaul
 
-[![Tests](https://img.shields.io/github/actions/workflow/status/triwinds/bytehaul/test.yml?branch=main&logo=githubactions&label=tests)](https://github.com/triwinds/bytehaul/actions/workflows/test.yml)
+[![Tests](https://img.shields.io/github/actions/workflow/status/triwinds/bytehaul/test.yml?branch=master&logo=githubactions&label=tests)](https://github.com/triwinds/bytehaul/actions/workflows/test.yml)
 [![Crates.io](https://img.shields.io/crates/v/bytehaul?logo=rust)](https://crates.io/crates/bytehaul)
 [![Docs.rs](https://img.shields.io/docsrs/bytehaul?logo=docs.rs)](https://docs.rs/bytehaul)
 [![PyPI](https://img.shields.io/pypi/v/bytehaul?logo=pypi)](https://pypi.org/project/bytehaul/)
 [![Python](https://img.shields.io/pypi/pyversions/bytehaul?logo=python&logoColor=white)](https://pypi.org/project/bytehaul/)
-[![License](https://img.shields.io/github/license/triwinds/bytehaul)](LICENSE)
+[![License](https://img.shields.io/github/license/triwinds/bytehaul)](../LICENSE)
 
 Rust 异步 HTTP 下载库，带有 Python 绑定（同时在 PyPI 发布），支持断点续传、多连接并发、回写缓存、限速和校验。
+
+本文示例适用于 **0.2.1**，该版本修复响应体重试和存储失败状态，并保留已有断点文件格式兼容性。参阅 [0.2.1 发布说明](https://github.com/triwinds/bytehaul/releases/tag/v0.2.1)。
 
 ## 文档
 
@@ -37,20 +39,20 @@ Rust 异步 HTTP 下载库，带有 Python 绑定（同时在 PyPI 发布），�
 通过 Cargo 添加依赖：
 
 ```bash
-cargo add bytehaul
+cargo add bytehaul@0.2.1
 ```
 
 或手动添加到 `Cargo.toml`：
 
 ```toml
 [dependencies]
-bytehaul = "0.2.0"
+bytehaul = "0.2.1"
 ```
 
 ### Python
 
 ```bash
-pip install bytehaul
+pip install "bytehaul==0.2.1"
 ```
 
 需要 Python 3.9+。每个平台只需一个 wheel 即可覆盖所有支持的 Python 版本（abi3）。

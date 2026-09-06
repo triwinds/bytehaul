@@ -94,12 +94,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+`downloaded` is a UI-oriented count of received bytes, not the durable resume offset in the control file. Retries may move it backward; even when it equals the total size, a final write or synchronization failure can leave the task `Failed`. Use the result of `handle.wait().await` to determine success.
+
 `speed_bytes_per_sec` and `eta_secs` are derived from the same recent throughput window:
 
 - `speed_bytes_per_sec` is a recent-window rate, not a whole-download lifetime average.
 - `eta_secs` divides remaining bytes by that same recent-window rate, so it rises and falls with the displayed speed instead of using a different smoothing rule.
 - `eta_secs == None` means bytehaul does not have enough recent samples yet, or the total size is still unknown.
-- `eta_secs == Some(0.0)` means the task has reached the end of the stream and the progress state is transitioning to `Completed`.
+- `eta_secs == Some(0.0)` means the current byte count leaves no estimated transfer time; it does not independently prove that writing, synchronization or final verification succeeded.
 
 ## Pause And Resume
 
@@ -116,7 +118,7 @@ match handle.wait().await {
 }
 ```
 
-Pause is not an in-place suspension of the same handle. It ends the current task after flushing writer state and saving a control file. Resuming means starting a new `download(spec)` call against the same resolved output path.
+Pause is not an in-place suspension of the same handle. It ends the current task, flushing writer state and saving a control file when resume is enabled and storage succeeds. Resuming means starting a new `download(spec)` call against the same resolved output path.
 
 Resume safety has two checks before bytehaul trusts the saved state:
 
@@ -158,4 +160,4 @@ handle.cancel();
 let result = handle.wait().await; // returns Err(DownloadError::Cancelled)
 ```
 
-`Cancelled`, `Paused`, and `Completed` are distinct end states. `cancel()` abandons the task. `pause()` preserves resumable state. A normally completed download removes its control file and returns `Ok(())`.
+`Cancelled`, `Paused`, and `Completed` are distinct end states. Both `cancel()` and `pause()` end the current task and attempt to preserve resumable state when resume is enabled. A write or synchronization failure leaves the previous durable checkpoint in place. Normal completion attempts to remove the control file; single-connection cleanup failure is an error, while multi-connection cleanup is best effort.

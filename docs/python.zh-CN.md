@@ -1,16 +1,21 @@
 # bytehaul Python 使用文档
 
-本文介绍如何在当前仓库中构建、安装并使用 `bytehaul` 的 Python 绑定。
+本文介绍已发布的 **bytehaul 0.2.1** Python 绑定，以及从源码构建的方法。
 
 [English Python Guide](../bindings/python/README.md)
 
 ## 环境要求
 
 - Python 3.9+
-- Rust toolchain
-- `uv`
+- 从源码构建时另需 Rust toolchain 和 `uv`；安装已提供的 wheel 不需要这两项。
 
-下面的命令默认在仓库根目录执行。
+## 安装发布版本
+
+```bash
+pip install "bytehaul==0.2.1"
+```
+
+参阅 [0.2.1 发布说明](https://github.com/triwinds/bytehaul/releases/tag/v0.2.1)。下面的源码构建命令均假定从仓库根目录开始执行。
 
 ## 初始化开发环境
 
@@ -177,6 +182,8 @@ except DownloadFailedError as exc:
     print(f"下载失败: {exc}")
 ```
 
+响应体超时、连接重置或已知大小的响应体提前结束会受 `max_retries` 控制；该值表示初次尝试后的额外重试次数，`0` 表示禁用。已知总大小且对象校验信息匹配时，从 writer 确认的持久化前缀续传；服务端忽略 Range 或对象信息改变时先清空文件再重下。写盘或同步错误不会作为网络错误反复重试。
+
 ## API 概览
 
 ### `download(url, output_path=None, output_dir=None, **options)`
@@ -188,7 +195,7 @@ except DownloadFailedError as exc:
 - 省略 `output_path` 时，会按 `Content-Disposition` → URL 路径 → `download` 自动选择文件名
 - 若未设置 `output_dir`，仍可直接传绝对 `output_path`
 
-### `Downloader(connect_timeout=None, proxy=None, http_proxy=None, https_proxy=None, dns_servers=None, doh_servers=None, enable_ipv6=None)`
+### `Downloader(connect_timeout=None, proxy=None, http_proxy=None, https_proxy=None, dns_servers=None, doh_servers=None, enable_ipv6=None, log_level=None)`
 
 可复用的下载器实例。
 
@@ -212,11 +219,13 @@ except DownloadFailedError as exc:
 | 属性 | 类型 | 说明 |
 | --- | --- | --- |
 | `total_size` | `int \| None` | 文件总大小，未知时为 `None` |
-| `downloaded` | `int` | 已下载字节数 |
-| `state` | `str` | 当前状态，如 `pending`、`downloading`、`completed`、`cancelled`、`paused` |
+| `downloaded` | `int` | 面向界面的已接收字节数，不是持久化续传偏移 |
+| `state` | `str` | 当前状态，如 `pending`、`downloading`、`completed`、`failed`、`cancelled`、`paused` |
 | `speed` | `float` | 最近窗口内的下载速度，单位为字节/秒 |
 | `eta_secs` | `float \| None` | 预计剩余秒数 |
 | `elapsed_secs` | `float \| None` | 已耗时秒数 |
+
+`downloaded` 可能在重试时回退，也可能在最终同步失败时已经等于 `total_size`。最终写入或同步失败会显示为 `failed`，控制文件只保留已确认持久化的进度；请以 `task.wait()` 的返回或异常判断任务结果，不要把显示字节数当作可恢复偏移。
 
 `speed` 和 `eta_secs` 使用同一条最近吞吐窗口。`speed` 不是全程平均速度；在最近样本不足或总大小未知时，`eta_secs` 会保持为 `None`。
 
@@ -238,9 +247,14 @@ except DownloadFailedError as exc:
 | `max_retries` | `int` | `5` | 初次请求/传输失败后的额外重试次数；`0` 表示不重试 |
 | `retry_base_delay` | `float` | `1.0` | 重试基础退避时间，单位秒 |
 | `retry_max_delay` | `float` | `30.0` | 重试最大退避时间，单位秒 |
+| `max_retry_elapsed` | `float \| None` | `None` | 总重试时间预算，单位秒 |
+| `control_save_interval` | `float` | `5.0` | 检查断点保存条件的间隔，单位秒 |
+| `autosave_sync_every` | `int` | `2` | 存在未保存进度时，每 N 次检查尝试持久化 |
 | `max_download_speed` | `int` | `0` | 最大下载速度，`0` 表示不限速 |
 | `checksum_sha256` | `str \| None` | `None` | 下载完成后的 SHA-256 校验值 |
 | `log_level` | `str \| None` | `None`（`"off"`） | 日志级别 |
+
+`log_level` 用于便捷函数 `download(...)` 或 `Downloader(...)` 构造器。
 
 ## 网络层参数
 
@@ -259,7 +273,7 @@ except DownloadFailedError as exc:
 
 ```bash
 cd bindings/python
-uv run --project . pytest
+uv run --no-sync --project . pytest
 ```
 
 如果刚拉起环境，建议先执行一次：
@@ -268,5 +282,7 @@ uv run --project . pytest
 uv sync --project bindings/python
 cd bindings/python
 uv run --project . maturin develop -m Cargo.toml
-uv run --project . pytest
+uv run --no-sync --project . pytest
 ```
+
+在 `maturin develop` 之后运行测试时使用 `--no-sync`，避免 uv 再次同步时替换刚构建的开发扩展。

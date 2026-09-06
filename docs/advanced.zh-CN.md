@@ -91,12 +91,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+`downloaded` 是面向界面的已接收字节数，不是控制文件里的持久化续传偏移。重试可能使其回退；即使它已等于总大小，最终写入或同步失败仍会使任务进入 `Failed`。请以 `handle.wait().await` 的结果判断任务是否成功。
+
 `speed_bytes_per_sec` 和 `eta_secs` 现在共用同一条最近吞吐窗口：
 
 - `speed_bytes_per_sec` 表示最近窗口内的速度，而不是从下载开始到当前时刻的全程平均值。
 - `eta_secs` 直接使用同一窗口速度估算剩余时间，因此它和显示出来的速度会一起变化，而不是各走一套平滑规则。
 - `eta_secs == None`：当前最近样本还不足以给出稳定 ETA，或者总大小仍未知。
-- `eta_secs == Some(0.0)`：下载已经到达流末尾，状态即将或已经进入 `Completed`。
+- `eta_secs == Some(0.0)`：根据当前字节计数已无剩余时间；这不能单独证明写盘、同步或最终校验成功。
 
 ## 暂停与续传
 
@@ -113,7 +115,7 @@ match handle.wait().await {
 }
 ```
 
-pause 不是把同一个 handle 原地挂起后再继续，而是结束当前任务、刷盘并写出控制文件。真正的恢复动作是后续再发起一次新的 `download(spec)` 调用，并且解析出的输出路径必须保持一致。
+pause 不是把同一个 handle 原地挂起后再继续，而是结束当前任务，并在启用续传且存储正常时刷盘、保存控制文件。真正的恢复动作是后续再发起一次新的 `download(spec)` 调用，并且解析出的输出路径必须保持一致。
 
 在信任续传状态前，bytehaul 现在会同时检查：
 
@@ -155,4 +157,4 @@ handle.cancel();
 let result = handle.wait().await; // 返回 Err(DownloadError::Cancelled)
 ```
 
-`Cancelled`、`Paused`、`Completed` 是三个不同的结束语义：`cancel()` 放弃任务，`pause()` 保留可恢复状态，正常完成则删除控制文件并返回 `Ok(())`。
+`Cancelled`、`Paused`、`Completed` 是不同的结束状态。`cancel()` 和 `pause()` 都会结束当前任务；启用续传时，两者都会尝试保存可恢复状态。写盘或同步失败时保留此前的持久化断点。正常完成会尝试删除控制文件；单连接将清理失败视为错误，多连接的清理是尽力而为。

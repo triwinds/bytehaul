@@ -1,6 +1,6 @@
 # bytehaul
 
-[![Tests](https://img.shields.io/github/actions/workflow/status/triwinds/bytehaul/test.yml?branch=main&logo=githubactions&label=tests)](https://github.com/triwinds/bytehaul/actions/workflows/test.yml)
+[![Tests](https://img.shields.io/github/actions/workflow/status/triwinds/bytehaul/test.yml?branch=master&logo=githubactions&label=tests)](https://github.com/triwinds/bytehaul/actions/workflows/test.yml)
 [![Crates.io](https://img.shields.io/crates/v/bytehaul?logo=rust)](https://crates.io/crates/bytehaul)
 [![Docs.rs](https://img.shields.io/docsrs/bytehaul?logo=docs.rs)](https://docs.rs/bytehaul)
 [![PyPI](https://img.shields.io/pypi/v/bytehaul?logo=pypi)](https://pypi.org/project/bytehaul/)
@@ -8,6 +8,8 @@
 [![License](https://img.shields.io/github/license/triwinds/bytehaul)](LICENSE)
 
 A Rust async HTTP download library with Python bindings (also available on PyPI), supporting resume, multi-connection downloads, write-back cache, rate limiting, and checksum verification.
+
+These examples target **0.2.1**, which improves response-body retries and storage-failure handling while preserving existing resume-file compatibility. See the [0.2.1 release notes](https://github.com/triwinds/bytehaul/releases/tag/v0.2.1).
 
 ## Documentation
 
@@ -35,20 +37,20 @@ A Rust async HTTP download library with Python bindings (also available on PyPI)
 Add `bytehaul` to your project via Cargo:
 
 ```bash
-cargo add bytehaul
+cargo add bytehaul@0.2.1
 ```
 
 Or add it manually to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-bytehaul = "0.2.0"
+bytehaul = "0.2.1"
 ```
 
 ### Python
 
 ```bash
-pip install bytehaul
+pip install "bytehaul==0.2.1"
 ```
 
 Requires Python 3.9+. A single wheel per platform covers all supported Python versions (abi3).

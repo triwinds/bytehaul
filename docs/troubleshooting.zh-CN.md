@@ -6,11 +6,11 @@
 
 ## 控制文件损坏
 
-**现象：** 续传时下载失败，并报出 `ControlFileCorrupted` 错误。
+**现象：** 控制文件无法通过校验，下载从头开始而没有恢复已有进度。
 
 **原因：** `.bytehaul` 控制文件只写入了一部分（例如保存过程中断电），或者被外部程序修改过。
 
-**处理方法：** 删除控制文件后重新下载。控制文件默认位于输出文件旁边，扩展名为 `.bytehaul`：
+**处理方法：** 0.2.1 会忽略无法加载或校验失败的控制文件，并重新下载。如果需要手动清除该文件，它默认位于输出文件旁边，扩展名为 `.bytehaul`：
 
 ```bash
 rm /path/to/your-file.zip.bytehaul
@@ -20,11 +20,17 @@ rm /path/to/your-file.zip.bytehaul
 
 ## 响应体传输中断
 
-**现象：** 单连接下载在读取响应体时遇到超时、连接重置或提前 EOF。
+**现象：** 单连接下载在读取响应体时遇到超时、连接重置或已知大小的响应体提前 EOF。
 
 **处理方法：** 这些网络错误会在同一个重试预算内自动重试。已知文件大小时，bytehaul 只从 writer flush barrier 确认的连续前缀发送 Range 请求；如果服务端忽略 Range，或 ETag、Last-Modified、总大小发生变化，会先清空输出再从零开始，避免把两个对象拼接起来。`max_retries` 是初次尝试之后的额外重试次数，设为 `0` 可关闭重试。
 
 若日志中出现 `restart_from_zero`，请重点检查对象是否被覆盖、下载 URL 是否指向动态内容，以及服务端是否稳定支持 Range。
+
+## 字节数已到总大小，但任务失败
+
+最终写盘或同步失败时，界面的 `downloaded` 仍可能等于 `total_size`，而状态是 `Failed`（Python 为 `failed`）。该字节数表示运行时接收进度；控制文件只记录已确认持久化的部分。先检查磁盘空间、配额、权限和底层 I/O 错误，再重新发起下载；不要根据显示字节数手工推进断点。
+
+单连接还会把最终控制文件清理失败作为错误返回，多连接的清理是尽力而为。请检查 `wait()` 的错误，而不是只看字节数或 ETA。存储失败时不会用未经确认的新进度覆盖旧断点。
 
 ## 代理配置
 
@@ -116,7 +122,7 @@ let dl = Downloader::builder()
 **推荐选择：**
 
 - `debug`：可查看 HTTP 请求/响应细节、分片调度、控制文件操作
-- `trace`：会包含按 chunk 级别的数据流细节，日志非常多，只适合深度调试
+- `trace`：可选择的级别；当前实现没有额外的逐 chunk trace 事件
 - `info`：仅输出较高层级的进度事件
 
 ## 下载卡住或速度偏慢
@@ -166,7 +172,7 @@ uv run maturin develop
 如果是生产环境，请直接安装 wheel：
 
 ```bash
-pip install bytehaul
+pip install "bytehaul==0.2.1"
 ```
 
 ## Windows 下的覆盖率报告
@@ -193,4 +199,4 @@ powershell -ExecutionPolicy Bypass -File scripts/coverage-windows.ps1 -Scope all
 powershell -ExecutionPolicy Bypass -File scripts/coverage-windows.ps1 -Scope all-targets -Format json
 ```
 
-该脚本默认按与 Linux CI 一致的 `all-targets` 口径执行，并为每次运行使用新的隔离 target 目录；仓库的最终覆盖率门禁仍然在 Linux CI 上通过 Tarpaulin 校验。
+该脚本使用 cargo-llvm-cov，默认选择 `all-targets` 并显式检查 95% 行覆盖率；每次使用独立的构建和默认报告目录。Windows 与 Linux 编译路径及统计分母不同，脚本成功仅表示所选 Windows 范围达标。Linux 的基准门禁仍使用 [README 中的共享入口](../README.md#coverage)。

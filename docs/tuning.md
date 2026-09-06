@@ -9,7 +9,7 @@ This guide covers the key parameters that affect bytehaul's download performance
 **Default:** 1 MiB  
 **Range:** Must be > 0
 
-The piece size determines the granularity of multi-connection downloading and resume tracking. Each piece is independently assigned to a worker, downloaded, and checkpointed in the control file.
+The piece size determines the granularity of multi-connection downloading and resume tracking. Workers may receive whole pieces or distinct subranges of the same piece; the control file records completion only when the entire piece is complete.
 
 | Scenario | Recommended Value |
 |----------|-------------------|
@@ -43,7 +43,7 @@ Limits payload bytes reserved for the writer queue and write-back cache. Bytehau
 **Default:** 4  
 **Range:** Must be ≥ 1
 
-Number of parallel HTTP connections used for a single download. Each worker fetches a different piece concurrently.
+Number of parallel HTTP connections used for a single download. Workers can fetch different pieces or non-overlapping subranges of the same piece concurrently.
 
 | Network / Server | Recommended Value |
 |------------------|-------------------|
@@ -63,13 +63,13 @@ Number of parallel HTTP connections used for a single download. Each worker fetc
 
 Size of the internal Tokio channel buffer between HTTP stream readers and the write-back cache. Controls how many data chunks can be in-flight between the network layer and the caching layer.
 
-In most scenarios the default is optimal. Increase it only if you observe workers frequently blocking on channel sends (visible in `trace`-level logs).
+In most scenarios the default is optimal. Increase it only if profiling shows workers frequently waiting for channel capacity; current logs do not directly record each channel wait.
 
 ## `min_split_size`
 
 **Default:** 10 MiB
 
-Files smaller than this threshold are downloaded with a single connection regardless of `max_connections`. This avoids the overhead of multi-connection coordination for small files.
+For a fresh download, files at or below this threshold use a single connection regardless of `max_connections`. This avoids the overhead of multi-connection coordination for small files.
 
 ## `control_save_interval`
 
@@ -89,7 +89,7 @@ How often the downloader evaluates whether it should persist a durable control f
 **Default:** 2  
 **Range:** Must be ≥ 1
 
-Coalesces multiple autosave ticks into one durable save. If unsaved progress exists, bytehaul will only call the heavy `sync_data + control save` path on every Nth autosave tick. User-triggered `pause`, cancellation, and failure paths still force an immediate durable save.
+Coalesces multiple autosave ticks into one durable save. If unsaved progress exists, bytehaul will only call the heavy `sync_data + control save` path on every Nth autosave tick. Pause, cancellation and network-failure paths bypass this batching and attempt a checkpoint. If the writer cannot write or synchronize successfully, the previous durable checkpoint is preserved instead of claiming new progress.
 
 | Scenario | Recommended Value |
 |----------|-------------------|
@@ -120,9 +120,9 @@ Rate limiter for the download. Set to a non-zero value to cap bandwidth usage. U
 
 Requests and response-body retries share exponential back-off with equal jitter to avoid thundering-herd effects when multiple clients retry against the same server. A single-connection body failure resumes from the writer's flushed contiguous prefix; a Range or object-metadata mismatch safely truncates and restarts from zero.
 
-## Benchmark Snapshot
+## Historical Benchmark Snapshot (2026-04-06)
 
-Local Windows baseline captured on 2026-04-06 with:
+This Windows baseline predates 0.2.1 and its scheduler/cache simplifications. It records the implementation at that time, not current release performance:
 
 ```text
 cargo bench --bench storage_bench -- --sample-size 10 --measurement-time 0.05 --warm-up-time 0.05 --noplot
@@ -130,7 +130,7 @@ cargo bench --bench storage_bench -- --sample-size 10 --measurement-time 0.05 --
 
 Treat these as directional local baselines, not portable capacity claims. The shortened Criterion run was chosen to keep iteration time low while validating that the new benchmark surfaces produce usable numbers.
 
-| Benchmark | Current local range |
+| Benchmark | Historical local range |
 |-----------|---------------------|
 | `single_progress_reporting_throttled` | `12.883 µs – 14.010 µs` |
 | `control_save_only` | `2.1611 ms – 2.6577 ms` |
