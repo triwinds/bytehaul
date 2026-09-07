@@ -36,6 +36,8 @@ use crate::storage::piece_map::PieceMap;
 use crate::storage::segment::Segment;
 use crate::storage::writer::{WriterCommand, WriterTask};
 
+type SharedProbeResponse = Arc<TokioMutex<Option<(HttpResponse, ResponseMeta, usize)>>>;
+
 struct MultiControlSaveContext<'a> {
     spec: &'a DownloadSpec,
     meta: &'a ResponseMeta,
@@ -508,7 +510,7 @@ async fn worker_loop(
     cancel_rx: watch::Receiver<StopSignal>,
     budget: Arc<MemoryBudget>,
     speed_limit: SpeedLimit,
-    first_response: Arc<TokioMutex<Option<(HttpResponse, ResponseMeta, usize)>>>,
+    first_response: SharedProbeResponse,
     total_size: u64,
     log_level: LogLevel,
     download_id: u64,
@@ -699,7 +701,7 @@ async fn worker_loop(
 }
 
 async fn take_matching_probe_response(
-    first_response: &Arc<TokioMutex<Option<(HttpResponse, ResponseMeta, usize)>>>,
+    first_response: &SharedProbeResponse,
     segment: &Segment,
 ) -> Option<(HttpResponse, ResponseMeta)> {
     let mut first_response = first_response.lock().await;

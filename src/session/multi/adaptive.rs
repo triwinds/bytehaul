@@ -430,7 +430,7 @@ pub(super) async fn worker_loop(
     mut stop: watch::Receiver<StopSignal>,
     budget: Arc<MemoryBudget>,
     speed: SpeedLimit,
-    first_response: Arc<TokioMutex<Option<(HttpResponse, ResponseMeta, usize)>>>,
+    first_response: SharedProbeResponse,
     total: u64,
     log_level: LogLevel,
     download_id: u64,
