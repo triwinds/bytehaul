@@ -107,6 +107,18 @@ pub enum Checksum {
     Sha512(String),
 }
 
+/// Automatic recovery policy for known-size, multi-connection Range downloads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SlowTransferMode {
+    /// Preserve ordinary timeout/retry behavior without performance recovery.
+    Disabled,
+    /// Recover persistently slow ranges and keep idle workers available.
+    #[default]
+    Adaptive,
+    /// Also race eligible tail ranges using a bounded temporary-file challenger.
+    AdaptiveWithHedging,
+}
+
 /// Specification for a download task.
 #[derive(Debug, Clone)]
 pub struct DownloadSpec {
@@ -124,6 +136,11 @@ pub struct DownloadSpec {
     pub(crate) http_proxy: Option<String>,
     pub(crate) https_proxy: Option<String>,
     pub(crate) read_timeout: Duration,
+    pub(crate) slow_transfer_mode: SlowTransferMode,
+    pub(crate) low_speed_limit: Option<u64>,
+    pub(crate) low_speed_duration: Duration,
+    pub(crate) slow_start_grace: Duration,
+    pub(crate) slow_sample_window: Duration,
     pub(crate) memory_budget: usize,
     pub(crate) file_allocation: FileAllocation,
     pub(crate) channel_buffer: usize,
@@ -170,6 +187,11 @@ impl DownloadSpec {
             http_proxy: None,
             https_proxy: None,
             read_timeout: Duration::from_secs(60),
+            slow_transfer_mode: SlowTransferMode::default(),
+            low_speed_limit: None,
+            low_speed_duration: Duration::from_secs(15),
+            slow_start_grace: Duration::from_secs(5),
+            slow_sample_window: Duration::from_secs(5),
             memory_budget: 64 * 1024 * 1024, // 64 MiB
             file_allocation: FileAllocation::default(),
             channel_buffer: 64,
@@ -408,6 +430,61 @@ impl DownloadSpec {
         self
     }
 
+    /// Automatic performance recovery mode (default: adaptive).
+    pub fn slow_transfer_mode(mut self, value: SlowTransferMode) -> Self {
+        self.slow_transfer_mode = value;
+        self
+    }
+
+    /// Returns the configured slow transfer mode.
+    pub fn get_slow_transfer_mode(&self) -> SlowTransferMode {
+        self.slow_transfer_mode
+    }
+
+    /// Optional absolute minimum reading speed in bytes/second; must be positive.
+    pub fn low_speed_limit(mut self, value: u64) -> Self {
+        self.low_speed_limit = Some(value);
+        self
+    }
+
+    /// Returns the configured low speed limit.
+    pub fn get_low_speed_limit(&self) -> Option<u64> {
+        self.low_speed_limit
+    }
+
+    /// Continuous low-speed duration (default: 15 seconds).
+    pub fn low_speed_duration(mut self, value: Duration) -> Self {
+        self.low_speed_duration = value;
+        self
+    }
+
+    /// Returns the configured low speed duration.
+    pub fn get_low_speed_duration(&self) -> Duration {
+        self.low_speed_duration
+    }
+
+    /// Initial reading grace period (default: 5 seconds).
+    pub fn slow_start_grace(mut self, value: Duration) -> Self {
+        self.slow_start_grace = value;
+        self
+    }
+
+    /// Returns the configured slow start grace.
+    pub fn get_slow_start_grace(&self) -> Duration {
+        self.slow_start_grace
+    }
+
+    /// Effective network reading sample window (default: 5 seconds).
+    pub fn slow_sample_window(mut self, value: Duration) -> Self {
+        self.slow_sample_window = value;
+        self
+    }
+
+    /// Returns the configured slow sample window.
+    pub fn get_slow_sample_window(&self) -> Duration {
+        self.slow_sample_window
+    }
+
     /// Set the memory budget in bytes for the write-back cache (default: 64 MiB).
     pub fn memory_budget(mut self, memory_budget: usize) -> Self {
         self.memory_budget = memory_budget;
@@ -513,6 +590,22 @@ impl DownloadSpec {
 
     /// Validate the configuration and return an error if any value is out of range.
     pub fn validate(&self) -> Result<(), DownloadError> {
+        if self.low_speed_limit == Some(0) {
+            return Err(DownloadError::InvalidConfig(
+                "low_speed_limit must be >= 1".into(),
+            ));
+        }
+        for (name, value) in [
+            ("low_speed_duration", self.low_speed_duration),
+            ("slow_start_grace", self.slow_start_grace),
+            ("slow_sample_window", self.slow_sample_window),
+        ] {
+            if value.is_zero() || value > Duration::from_secs(86400) {
+                return Err(DownloadError::InvalidConfig(format!(
+                    "{name} must be > 0 and <= 86400 seconds"
+                )));
+            }
+        }
         if self.url.trim().is_empty() {
             return Err(DownloadError::InvalidConfig("url cannot be empty".into()));
         }

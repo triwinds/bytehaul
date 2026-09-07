@@ -286,3 +286,32 @@ uv run --no-sync --project . pytest
 ```
 
 在 `maturin develop` 之后运行测试时使用 `--no-sync`，避免 uv 再次同步时替换刚构建的开发扩展。
+
+## 慢请求恢复（源码版本）
+
+尚未包含在已发布的 0.2.1 包中。`download(...)` 和 `Downloader.download(...)` 均支持以下参数；`None` 沿用 Rust 默认值。
+
+| 参数 | 默认值 | 含义 |
+| --- | --- | --- |
+| `slow_transfer_mode` | `"adaptive"` | `"disabled"`、`"adaptive"` 或 `"adaptive_with_hedging"`，不区分大小写 |
+| `low_speed_limit` | `None` | 可选绝对速率下限，字节/秒，必须大于零 |
+| `low_speed_duration` | `15.0` | 持续低速判定时间，秒 |
+| `slow_start_grace` | `5.0` | 启动宽限，秒 |
+| `slow_sample_window` | `5.0` | 采样窗口，秒 |
+
+时间参数必须有限、大于零且不超过 86,400 秒。多连接 Range 下载默认自动恢复慢请求并接管尾部分片；竞速需要显式开启，且要求强 ETag 与空闲并发槽。所有请求合计不超过 `max_connections`，共用限速预算，备用数据不重复计入进度。
+
+```python
+from bytehaul import Downloader
+
+task = Downloader(log_level="debug").download(
+    "https://example.com/file.bin",
+    "file.bin",
+    slow_transfer_mode="adaptive_with_hedging",
+)
+task.wait()
+```
+
+自动恢复与竞速共享 `min(total_size / 100, 16 MiB)` 的额外 Range 工作预算，不够则跳过；普通错误重试沿用原策略。主动限速和本地背压不计为网络慢。使用 `"disabled"` 保留原调度行为；单连接与不支持 Range 的回退行为保持不变。详见 [Rust 慢请求恢复说明](advanced.zh-CN.md)。
+
+当 `max_download_speed` 非零时，自动低速恢复和竞速会暂停，避免将主动限速误判为网络故障；普通超时与错误重试仍然生效。

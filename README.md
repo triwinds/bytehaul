@@ -11,6 +11,8 @@ A Rust async HTTP download library with Python bindings (also available on PyPI)
 
 These examples target **0.2.1**, which improves response-body retries and storage-failure handling while preserving existing resume-file compatibility. See the [0.2.1 release notes](https://github.com/triwinds/bytehaul/releases/tag/v0.2.1).
 
+The current source checkout adds adaptive slow-request recovery and opt-in tail hedging; see [slow-transfer recovery](docs/advanced.md#slow-transfer-recovery-source-checkout). This is not included in the published 0.2.1 package.
+
 ## Documentation
 
 - [简体中文 README](docs/README.zh-CN.md)

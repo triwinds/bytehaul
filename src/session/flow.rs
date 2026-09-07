@@ -13,7 +13,7 @@ use crate::storage::writer::WriterCommand;
 /// Below the threshold there is always room for one maximum-sized chunk.
 pub(super) struct MemoryBudget {
     pub semaphore: Arc<Semaphore>,
-    max_chunk: usize,
+    pub(super) max_chunk: usize,
     pub watermark: usize,
 }
 
@@ -75,7 +75,7 @@ impl MemoryBudget {
     }
 }
 
-async fn wait_for_stop(cancel_rx: &mut watch::Receiver<StopSignal>) -> DownloadError {
+pub(super) async fn wait_for_stop(cancel_rx: &mut watch::Receiver<StopSignal>) -> DownloadError {
     loop {
         if let Some(error) = stop_signal_error(*cancel_rx.borrow_and_update()) {
             return error;

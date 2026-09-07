@@ -223,6 +223,35 @@ Frozen snapshot of download progress.
 
 Valid `log_level` values: `"off"`, `"error"`, `"warn"`, `"info"`, `"debug"`, `"trace"` (case-insensitive).
 
+### Slow-transfer recovery (source checkout)
+
+Not available in the published 0.2.1 package. These options apply to both `download(...)` and `Downloader.download(...)`; `None` selects the Rust engine default.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `slow_transfer_mode` | `"adaptive"` | `"disabled"`, `"adaptive"`, or `"adaptive_with_hedging"` (case-insensitive) |
+| `low_speed_limit` | `None` | Optional positive absolute floor, bytes/second |
+| `low_speed_duration` | `15.0` | Sustained low-speed time, seconds |
+| `slow_start_grace` | `5.0` | Startup grace, seconds |
+| `slow_sample_window` | `5.0` | Speed observation window, seconds |
+
+Durations must be finite, positive and at most 86,400 seconds. Adaptive recovery is on by default for multi-connection Range downloads. Hedging is opt-in, needs a strong ETag and a spare connection slot, and stages at most one small spare response before choosing a writer. It does not duplicate progress or exceed `max_connections`. All network payload shares the configured rate limit. Performance recovery and hedging together reserve at most `min(total_size / 100, 16 MiB)` of extra Range work; requests that do not fit are skipped. Normal error retries use the existing retry policy.
+
+```python
+from bytehaul import Downloader
+
+task = Downloader(log_level="debug").download(
+    "https://example.com/file.bin",
+    "file.bin",
+    slow_transfer_mode="adaptive_with_hedging",
+)
+task.wait()
+```
+
+Use `slow_transfer_mode="disabled"` to retain the previous scheduling behavior. Single-connection and non-Range fallback behavior is unchanged. Recovery excludes intentional rate limiting and local backpressure; it cannot remove a shared origin bandwidth limit.
+
+When `max_download_speed` is nonzero, automatic slow-request recovery and hedging are suppressed to avoid treating intentional rate limiting as a network fault. Ordinary timeouts and error retries still apply.
+
 ### Network options
 
 Use these on `Downloader(...)` to set defaults, or pass `proxy`, `http_proxy`, and `https_proxy` directly to `downloader.download(...)` or the blocking `download(...)` helper.

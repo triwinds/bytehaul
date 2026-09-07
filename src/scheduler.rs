@@ -361,6 +361,10 @@ impl SchedulerState {
         true
     }
 
+    pub fn has_available(&self) -> bool {
+        self.available_range_count != 0
+    }
+
     pub fn all_done(&self) -> bool {
         self.piece_map.all_done()
     }

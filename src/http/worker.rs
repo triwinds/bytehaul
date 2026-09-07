@@ -35,6 +35,11 @@ impl HttpWorker {
         }
     }
 
+    pub(crate) fn with_validator(mut self, etag: &str) -> Self {
+        self.headers.insert("if-match".into(), etag.into());
+        self
+    }
+
     pub async fn final_url(&self) -> Result<String, DownloadError> {
         if let Some(url) = self.cached_final_url().await {
             return Ok(url);

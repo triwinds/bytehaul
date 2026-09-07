@@ -16,6 +16,7 @@ Primary evidence:
 | --- | --- |
 | [Architecture and Module Boundaries](./architecture.md) | Placing engine, HTTP, session, storage, or workspace changes |
 | [Transfer Storage Contracts](./transfer-storage.md) | Changing backpressure, leased cache, scheduler or checkpoint durability |
+| [Slow Transfer Recovery](./slow-transfer.md) | Changing adaptive detection, tail recovery, hedging or its Python options |
 | [Configuration and Public API](./configuration-and-api.md) | Adding options, builders, exported types, defaults, or docs |
 | [Errors and Observability](./errors-and-observability.md) | Changing failures, retries, Python exceptions, or logs |
 | [Python Bindings](./python-bindings.md) | Editing PyO3 classes/functions, runtime/GIL behavior, exports, or packaging |

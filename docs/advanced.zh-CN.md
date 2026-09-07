@@ -33,6 +33,31 @@ let spec = DownloadSpec::new("https://example.com/file.bin")
 
 如果省略 `.output_path(...)`，bytehaul 会依次按 `Content-Disposition`、URL 路径最后一段、默认名 `download` 自动选择文件名。若未设置 `.output_dir(...)`，仍可继续直接传绝对输出路径。
 
+## 慢请求恢复（源码版本）
+
+该功能适用于当前源码，尚未包含在已发布的 0.2.1 包中。
+
+多连接 Range 下载默认使用 `SlowTransferMode::Adaptive`：识别持续低速请求后，可取消并重新分配分片，尾部空闲 worker 也可接管。速度判断排除主动限速和本地转发等待；短暂波动或即将完成的请求不会直接触发恢复。`Disabled` 保留原调度行为。
+
+```rust
+use bytehaul::{DownloadSpec, SlowTransferMode};
+use std::time::Duration;
+
+let spec = DownloadSpec::new("https://example.com/file.bin")
+    .slow_transfer_mode(SlowTransferMode::AdaptiveWithHedging)
+    .low_speed_duration(Duration::from_secs(15))
+    .slow_start_grace(Duration::from_secs(5))
+    .slow_sample_window(Duration::from_secs(5));
+```
+
+`low_speed_limit(bytes_per_second)` 可设置大于零的绝对速率下限；默认不设绝对下限，参考健康请求速率。三个时间参数必须大于零且不超过 86,400 秒，默认分别是持续低速 15 秒、启动宽限 5 秒、采样窗口 5 秒。
+
+竞速需显式开启，只为较小的尾部分片增加至多一个备用请求，要求强 ETag 和兼容的条件请求头。备用响应先独立暂存，完整校验后才能切换写入权。主请求与备用请求合计不超过 `max_connections`，所有网络数据共用 `max_download_speed`。自动恢复与竞速共享 `min(total_size / 100, 16 MiB)` 的额外工作预算；范围超过预算就跳过，因此小文件可能不会触发性能恢复。普通网络错误继续遵守独立的既有重试策略。
+
+进度不累加重复流量，回收未完成尝试时可能回退。打开 debug 日志可观察恢复决策。这些策略不能提高共享源站或磁盘的带宽上限；单连接与不支持 Range 的回退行为保持不变。
+
+当 `max_download_speed` 非零时，自动低速恢复和竞速会暂停，避免将主动限速误判为网络故障；普通超时与错误重试仍然生效。
+
 ## 网络层配置
 
 下载器客户端上保存的是默认网络配置。DNS / DoH / IPv6 仍通过 `Downloader::builder()` 设置；单个任务则可以在 `DownloadSpec` 上覆盖 `connect_timeout` 和代理：

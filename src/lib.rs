@@ -50,7 +50,7 @@ mod scheduler;
 mod session;
 mod storage;
 
-pub use config::{Checksum, DownloadSpec, FileAllocation, LogLevel};
+pub use config::{Checksum, DownloadSpec, FileAllocation, LogLevel, SlowTransferMode};
 pub use error::DownloadError;
 pub use manager::{DownloadHandle, Downloader, DownloaderBuilder};
 pub use progress::{DownloadState, ProgressSnapshot};

@@ -95,6 +95,13 @@ fn test_runtime_duration_and_non_zero_helpers() {
         .unwrap_err()
         .to_string()
         .contains(">= 0"));
+    let overflow = duration_from_secs("connect_timeout", f64::MAX).unwrap_err();
+    with_python(|py| assert!(overflow.is_instance_of::<ConfigError>(py)));
+    assert!(overflow.to_string().contains("connect_timeout"));
+    assert_eq!(
+        duration_from_secs("control_save_interval", 0.0).unwrap(),
+        Duration::ZERO
+    );
 
     assert_eq!(non_zero_u32("max_connections", 2).unwrap(), 2);
     assert!(non_zero_u32("max_connections", 0)
@@ -237,6 +244,11 @@ fn test_apply_client_options_and_build_download_spec() {
         None,
         None,
         None,
+        Some("adaptive_with_hedging".into()),
+        Some(4096),
+        Some(1.5),
+        Some(0.25),
+        Some(0.5),
     )
     .unwrap();
 
@@ -263,6 +275,14 @@ fn test_apply_client_options_and_build_download_spec() {
         Some(Duration::from_secs_f64(4.0))
     );
     assert_eq!(spec.get_max_download_speed(), 12345);
+    assert_eq!(
+        spec.get_slow_transfer_mode(),
+        SlowTransferMode::AdaptiveWithHedging
+    );
+    assert_eq!(spec.get_low_speed_limit(), Some(4096));
+    assert_eq!(spec.get_low_speed_duration(), Duration::from_secs_f64(1.5));
+    assert_eq!(spec.get_slow_start_grace(), Duration::from_secs_f64(0.25));
+    assert_eq!(spec.get_slow_sample_window(), Duration::from_secs_f64(0.5));
     assert!(matches!(
         spec.get_checksum(),
         Some(Checksum::Sha256(ref checksum)) if checksum == "abc123"
@@ -290,6 +310,11 @@ fn test_apply_client_options_and_build_download_spec() {
         None,
         None,
         Some("   ".into()),
+        None,
+        None,
+        None,
+        None,
+        None,
         None,
         None,
         None,
@@ -369,6 +394,11 @@ fn test_build_download_spec_with_checksum_and_control_interval() {
         Some("sha512: deadbeef ".into()),
         Some(3.0),
         Some(4),
+        None,
+        None,
+        None,
+        None,
+        None,
     )
     .unwrap();
 
@@ -381,6 +411,21 @@ fn test_build_download_spec_with_checksum_and_control_interval() {
         Duration::from_secs_f64(3.0)
     );
     assert_eq!(spec.get_autosave_sync_every(), 4);
+    let defaults = DownloadSpec::new("https://example.com/file.bin");
+    assert_eq!(
+        spec.get_slow_transfer_mode(),
+        defaults.get_slow_transfer_mode()
+    );
+    assert_eq!(spec.get_low_speed_limit(), defaults.get_low_speed_limit());
+    assert_eq!(
+        spec.get_low_speed_duration(),
+        defaults.get_low_speed_duration()
+    );
+    assert_eq!(spec.get_slow_start_grace(), defaults.get_slow_start_grace());
+    assert_eq!(
+        spec.get_slow_sample_window(),
+        defaults.get_slow_sample_window()
+    );
 }
 
 #[test]
@@ -487,6 +532,11 @@ fn test_download_task_methods_and_consumption_errors() {
             None,
             None,
             None,
+            None,
+            None,
+            None,
+            None,
+            None,
         )
         .unwrap();
 
@@ -543,6 +593,11 @@ fn test_download_task_pause_maps_to_paused_error() {
             None,
             None,
             Some(true),
+            None,
+            None,
+            None,
+            None,
+            None,
             None,
             None,
             None,
@@ -644,6 +699,11 @@ fn test_py_downloader_download_success_and_module_registration() {
             None,
             None,
             None,
+            None,
+            None,
+            None,
+            None,
+            None,
         )
         .unwrap();
 
@@ -724,6 +784,11 @@ fn test_top_level_download_success_and_failure() {
             None,
             None,
             Some("debug".into()),
+            None,
+            None,
+            None,
+            None,
+            None,
         )
         .unwrap();
     });
@@ -762,8 +827,31 @@ fn test_top_level_download_success_and_failure() {
             None,
             None,
             None,
+            None,
+            None,
+            None,
+            None,
+            None,
         )
         .unwrap_err()
     });
     assert!(err.to_string().contains("DownloadFailedError"));
+}
+
+#[test]
+fn test_slow_transfer_mode_parser() {
+    init_python();
+    for (text, expected) in [
+        ("disabled", SlowTransferMode::Disabled),
+        ("ADAPTIVE", SlowTransferMode::Adaptive),
+        (
+            "adaptive_with_hedging",
+            SlowTransferMode::AdaptiveWithHedging,
+        ),
+    ] {
+        assert_eq!(parse_slow_transfer_mode(text).unwrap(), expected);
+    }
+    let error = parse_slow_transfer_mode("fast").unwrap_err();
+    with_python(|py| assert!(error.is_instance_of::<ConfigError>(py)));
+    assert!(error.to_string().contains("slow_transfer_mode"));
 }

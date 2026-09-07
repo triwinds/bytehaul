@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Once, OnceLock};
 use std::time::Duration;
 
-use bytehaul::{Checksum, DownloadError, DownloadSpec, FileAllocation, LogLevel};
+use bytehaul::{Checksum, DownloadError, DownloadSpec, FileAllocation, LogLevel, SlowTransferMode};
 use pyo3::create_exception;
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
@@ -43,7 +43,8 @@ fn duration_from_secs(field: &str, value: f64) -> PyResult<Duration> {
     if value < 0.0 {
         return Err(config_error(format!("{field} must be >= 0")));
     }
-    Ok(Duration::from_secs_f64(value))
+    Duration::try_from_secs_f64(value)
+        .map_err(|_| config_error(format!("{field} is outside the supported duration range")))
 }
 
 fn parse_socket_addr(field: &str, value: &str) -> PyResult<SocketAddr> {
@@ -168,6 +169,17 @@ fn parse_file_allocation(value: &str) -> PyResult<FileAllocation> {
     }
 }
 
+fn parse_slow_transfer_mode(value: &str) -> PyResult<SlowTransferMode> {
+    match value.to_ascii_lowercase().as_str() {
+        "disabled" => Ok(SlowTransferMode::Disabled),
+        "adaptive" => Ok(SlowTransferMode::Adaptive),
+        "adaptive_with_hedging" => Ok(SlowTransferMode::AdaptiveWithHedging),
+        _ => Err(config_error(
+            "slow_transfer_mode must be one of: 'disabled', 'adaptive', 'adaptive_with_hedging'",
+        )),
+    }
+}
+
 fn parse_log_level(value: &str) -> PyResult<LogLevel> {
     value.parse::<LogLevel>().map_err(|_| {
         config_error("log_level must be one of: 'off', 'error', 'warn', 'info', 'debug', 'trace'")
@@ -235,6 +247,11 @@ fn build_download_spec(
     checksum: Option<String>,
     control_save_interval: Option<f64>,
     autosave_sync_every: Option<u32>,
+    slow_transfer_mode: Option<String>,
+    low_speed_limit: Option<u64>,
+    low_speed_duration: Option<f64>,
+    slow_start_grace: Option<f64>,
+    slow_sample_window: Option<f64>,
 ) -> PyResult<DownloadSpec> {
     let mut spec = DownloadSpec::new(url);
 
@@ -312,6 +329,22 @@ fn build_download_spec(
     }
     if let Some(autosave_sync_every) = autosave_sync_every {
         spec = spec.autosave_sync_every(non_zero_u32("autosave_sync_every", autosave_sync_every)?);
+    }
+
+    if let Some(mode) = slow_transfer_mode {
+        spec = spec.slow_transfer_mode(parse_slow_transfer_mode(&mode)?);
+    }
+    if let Some(limit) = low_speed_limit {
+        spec = spec.low_speed_limit(non_zero_u64("low_speed_limit", limit)?);
+    }
+    if let Some(value) = low_speed_duration {
+        spec = spec.low_speed_duration(duration_from_secs("low_speed_duration", value)?);
+    }
+    if let Some(value) = slow_start_grace {
+        spec = spec.slow_start_grace(duration_from_secs("slow_start_grace", value)?);
+    }
+    if let Some(value) = slow_sample_window {
+        spec = spec.slow_sample_window(duration_from_secs("slow_sample_window", value)?);
     }
 
     spec.validate()
@@ -546,7 +579,12 @@ impl PyDownloader {
             checksum_sha256 = None,
             checksum = None,
             control_save_interval = None,
-            autosave_sync_every = None
+            autosave_sync_every = None,
+            slow_transfer_mode = None,
+            low_speed_limit = None,
+            low_speed_duration = None,
+            slow_start_grace = None,
+            slow_sample_window = None
         )
     )]
     #[allow(clippy::too_many_arguments)]
@@ -576,6 +614,11 @@ impl PyDownloader {
         checksum: Option<String>,
         control_save_interval: Option<f64>,
         autosave_sync_every: Option<u32>,
+        slow_transfer_mode: Option<String>,
+        low_speed_limit: Option<u64>,
+        low_speed_duration: Option<f64>,
+        slow_start_grace: Option<f64>,
+        slow_sample_window: Option<f64>,
     ) -> PyResult<PyDownloadTask> {
         let spec = build_download_spec(
             url,
@@ -602,6 +645,11 @@ impl PyDownloader {
             checksum,
             control_save_interval,
             autosave_sync_every,
+            slow_transfer_mode,
+            low_speed_limit,
+            low_speed_duration,
+            slow_start_grace,
+            slow_sample_window,
         )?;
         let runtime = shared_runtime()?;
         let _guard = runtime.enter();
@@ -645,7 +693,12 @@ impl PyDownloader {
         checksum = None,
         control_save_interval = None,
         autosave_sync_every = None,
-        log_level = None
+        log_level = None,
+        slow_transfer_mode = None,
+        low_speed_limit = None,
+        low_speed_duration = None,
+        slow_start_grace = None,
+        slow_sample_window = None
     )
 )]
 #[allow(clippy::too_many_arguments)]
@@ -679,6 +732,11 @@ fn download(
     control_save_interval: Option<f64>,
     autosave_sync_every: Option<u32>,
     log_level: Option<String>,
+    slow_transfer_mode: Option<String>,
+    low_speed_limit: Option<u64>,
+    low_speed_duration: Option<f64>,
+    slow_start_grace: Option<f64>,
+    slow_sample_window: Option<f64>,
 ) -> PyResult<()> {
     let level = match &log_level {
         Some(s) => parse_log_level(s)?,
@@ -710,6 +768,11 @@ fn download(
         checksum,
         control_save_interval,
         autosave_sync_every,
+        slow_transfer_mode,
+        low_speed_limit,
+        low_speed_duration,
+        slow_start_grace,
+        slow_sample_window,
     )?;
     let runtime = shared_runtime()?;
 

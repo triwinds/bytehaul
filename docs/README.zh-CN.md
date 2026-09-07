@@ -11,6 +11,8 @@ Rust 异步 HTTP 下载库，带有 Python 绑定（同时在 PyPI 发布），�
 
 本文示例适用于 **0.2.1**，该版本修复响应体重试和存储失败状态，并保留已有断点文件格式兼容性。参阅 [0.2.1 发布说明](https://github.com/triwinds/bytehaul/releases/tag/v0.2.1)。
 
+当前源码新增自适应慢请求恢复和可选尾部竞速，详见[慢请求恢复](advanced.zh-CN.md)。该功能尚未包含在已发布的 0.2.1 包中。
+
 ## 文档
 
 - [English README](../README.md)

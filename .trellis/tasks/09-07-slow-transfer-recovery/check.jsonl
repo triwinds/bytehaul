@@ -1,0 +1,9 @@
+{"file": ".trellis/spec/bytehaul-python/backend/index.md", "reason": "Required contract and evidence for slow-transfer recovery"}
+{"file": ".trellis/spec/bytehaul-python/backend/architecture.md", "reason": "Required contract and evidence for slow-transfer recovery"}
+{"file": ".trellis/spec/bytehaul-python/backend/transfer-storage.md", "reason": "Required contract and evidence for slow-transfer recovery"}
+{"file": ".trellis/spec/bytehaul-python/backend/configuration-and-api.md", "reason": "Required contract and evidence for slow-transfer recovery"}
+{"file": ".trellis/spec/bytehaul-python/backend/errors-and-observability.md", "reason": "Required contract and evidence for slow-transfer recovery"}
+{"file": ".trellis/spec/bytehaul-python/backend/python-bindings.md", "reason": "Required contract and evidence for slow-transfer recovery"}
+{"file": ".trellis/spec/bytehaul-python/backend/testing-and-quality.md", "reason": "Required contract and evidence for slow-transfer recovery"}
+{"file": ".trellis/spec/guides/index.md", "reason": "Required contract and evidence for slow-transfer recovery"}
+{"file": ".trellis/tasks/09-07-slow-transfer-recovery/research/industry-and-code.md", "reason": "Required contract and evidence for slow-transfer recovery"}

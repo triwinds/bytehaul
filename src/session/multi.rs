@@ -1,3 +1,5 @@
+mod adaptive;
+
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -148,6 +150,7 @@ pub(super) async fn run_multi_worker(
         max_retry_elapsed: spec.max_retry_elapsed,
         max_active_leases: num_workers,
         min_segment_size: spec.min_segment_size.min(spec.piece_size),
+        recovery: adaptive::Coordinator::new(spec, meta, output_path, total_size),
     });
 
     for worker_id in 0..num_workers {
@@ -252,12 +255,12 @@ pub(super) async fn run_multi_worker(
                         if workers.is_empty() { break; }
                     }
                     Some(Ok(Err(e))) => {
-                        if download_error.is_none() && !matches!(e, DownloadError::ChannelClosed) {
+                        if download_error.is_none() && (worker_cfg.recovery.is_some() || !matches!(e, DownloadError::ChannelClosed)) {
                             log_warn!(log_level, download_id = download_id,
                                 error = %e, "worker failed");
                             download_error = Some(e);
                         }
-                        if workers.is_empty() { break; }
+                        if worker_cfg.recovery.is_some() || workers.is_empty() { break; }
                     }
                     Some(Err(join_err)) => {
                         if !join_err.is_cancelled() {
@@ -267,7 +270,7 @@ pub(super) async fn run_multi_worker(
                                 format!("worker panicked: {join_err}"),
                             ));
                         }
-                        if workers.is_empty() { break; }
+                        if worker_cfg.recovery.is_some() || workers.is_empty() { break; }
                     }
                     None => break,
                 }
@@ -281,6 +284,10 @@ pub(super) async fn run_multi_worker(
             ah.abort();
         }
         while workers.next().await.is_some() {}
+    }
+
+    if let Some(recovery) = &worker_cfg.recovery {
+        recovery.report(log_level, download_id);
     }
 
     drop(save_write_tx);
@@ -493,6 +500,7 @@ struct WorkerConfig {
     max_retry_elapsed: Option<Duration>,
     max_active_leases: usize,
     min_segment_size: u64,
+    recovery: Option<Arc<adaptive::Coordinator>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -510,6 +518,24 @@ async fn worker_loop(
     log_level: LogLevel,
     download_id: u64,
 ) -> Result<(), DownloadError> {
+    if let Some(recovery) = &cfg.recovery {
+        return adaptive::worker_loop(
+            worker_id,
+            &cfg,
+            recovery,
+            scheduler,
+            write_tx,
+            received_bytes,
+            cancel_rx,
+            budget,
+            speed_limit,
+            first_response,
+            total_size,
+            log_level,
+            download_id,
+        )
+        .await;
+    }
     let mut cancel_rx = cancel_rx;
     let mut first_response = first_response;
     log_debug!(
@@ -1312,6 +1338,7 @@ mod coverage_tests {
             max_retry_elapsed: Some(Duration::from_secs(2)),
             max_active_leases: 1,
             min_segment_size: 256,
+            recovery: None,
         });
 
         worker_loop(
@@ -1355,6 +1382,7 @@ mod coverage_tests {
             max_retry_elapsed: Some(Duration::from_secs(5)),
             max_active_leases: 1,
             min_segment_size: 256,
+            recovery: None,
         });
 
         tokio::spawn(async move {
@@ -1591,6 +1619,7 @@ mod coverage_tests {
             max_retry_elapsed: None,
             max_active_leases: 1,
             min_segment_size: 4,
+            recovery: None,
         })
     }
 
@@ -1790,7 +1819,7 @@ mod coverage_tests {
         let spec = DownloadSpec::new(format!("http://{addr}/piece"))
             .resume(true)
             .piece_size(256)
-            .max_connections(1)
+            .max_connections(4)
             .file_allocation(crate::config::FileAllocation::None);
         let previous = ControlSnapshot {
             url: spec.url.clone(),

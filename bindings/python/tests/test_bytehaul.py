@@ -1,6 +1,7 @@
 """Tests for the bytehaul Python bindings."""
 
 import http.server
+import inspect
 import pathlib
 import threading
 import time
@@ -438,3 +439,113 @@ class TestExceptionInstances:
             task.wait()
         assert isinstance(exc_info.value, BytehaulError)
         assert isinstance(exc_info.value, DownloadFailedError)
+
+
+class TestSlowTransferOptions:
+    @pytest.mark.parametrize("object_api", [False, True])
+    def test_existing_positional_signature_is_preserved(self, object_api):
+        # Appending options must not reinterpret previously valid positional calls.
+        names = [
+            "url", "output_path", "output_dir", "headers", "max_connections",
+            "connect_timeout", "proxy", "http_proxy", "https_proxy",
+        ]
+        if not object_api:
+            names.extend(["dns_servers", "doh_servers", "enable_ipv6"])
+        names.extend([
+            "read_timeout", "memory_budget", "file_allocation", "resume",
+            "piece_size", "min_split_size", "max_retries", "retry_base_delay",
+            "retry_max_delay", "max_retry_elapsed", "max_download_speed",
+            "checksum_sha256", "checksum", "control_save_interval", "autosave_sync_every",
+        ])
+        if not object_api:
+            names.append("log_level")
+        added = [
+            "slow_transfer_mode", "low_speed_limit", "low_speed_duration",
+            "slow_start_grace", "slow_sample_window",
+        ]
+        api = Downloader().download if object_api else download
+        parameters = inspect.signature(api).parameters
+        assert list(parameters) == names + added
+        assert all(
+            parameters[name].kind == inspect.Parameter.POSITIONAL_OR_KEYWORD
+            for name in names
+        )
+        assert all(parameters[name].default is None for name in added)
+
+    @pytest.mark.parametrize("object_api", [False, True])
+    @pytest.mark.parametrize(
+        "field,value",
+        [
+            ("slow_transfer_mode", "fast"),
+            ("low_speed_limit", 0),
+            *[
+                (field, value)
+                for field in ("low_speed_duration", "slow_start_grace", "slow_sample_window")
+                for value in (0.0, -1.0, 1e-300, float("nan"), float("inf"), 86401.0, 1e300)
+            ],
+        ],
+    )
+    def test_invalid_options(self, server, tmp_path, object_api, field, value):
+        # Both API routes must reject configuration before starting a request.
+        api = Downloader().download if object_api else download
+        with pytest.raises(ConfigError, match=field):
+            api(f"{server}/ok", tmp_path / "invalid.bin", **{field: value})
+        assert not (tmp_path / "invalid.bin").exists()
+
+    @pytest.mark.parametrize("object_api", [False, True])
+    @pytest.mark.parametrize("mode", [None, "disabled", "adaptive", "adaptive_with_hedging"])
+    def test_modes_preserve_plain_get_fallback(self, server, tmp_path, object_api, mode):
+        out = tmp_path / "fallback.bin"
+        options = dict(
+            slow_transfer_mode=mode,
+            low_speed_limit=1024,
+            low_speed_duration=0.1,
+            slow_start_grace=0.1,
+            slow_sample_window=0.1,
+        )
+        if object_api:
+            task = Downloader().download(f"{server}/ok", out, **options)
+            task.wait()
+        else:
+            download(f"{server}/ok", out, **options)
+        assert out.read_bytes() == SAMPLE_BODY
+
+    @pytest.mark.parametrize("object_api", [False, True])
+    @pytest.mark.parametrize("mode", ["disabled", "adaptive", "adaptive_with_hedging"])
+    def test_range_download_with_policy(self, tmp_path, object_api, mode):
+        body = bytes(range(256)) * 128
+        ranges = []
+
+        class RangeHandler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                start_text, end_text = self.headers["Range"].removeprefix("bytes=").split("-")
+                start, end = int(start_text), min(int(end_text), len(body) - 1)
+                ranges.append((start, end))
+                self.send_response(206)
+                self.send_header("Content-Range", f"bytes {start}-{end}/{len(body)}")
+                self.send_header("Content-Length", str(end - start + 1))
+                self.send_header("ETag", '\"stable-object\"')
+                self.end_headers()
+                self.wfile.write(body[start : end + 1])
+
+            def log_message(self, format, *args):
+                pass
+
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), RangeHandler)
+        thread = threading.Thread(target=srv.serve_forever, daemon=True)
+        thread.start()
+        try:
+            url = f"http://127.0.0.1:{srv.server_address[1]}/file"
+            out = tmp_path / "ranges.bin"
+            options = dict(slow_transfer_mode=mode, max_connections=3, piece_size=4096, min_split_size=1)
+            if object_api:
+                task = Downloader().download(url, out, **options)
+                task.wait()
+            else:
+                download(url, out, **options)
+            assert out.read_bytes() == body
+            assert len(ranges) >= 2
+        finally:
+            srv.shutdown()
+            srv.server_close()
+            thread.join(timeout=5)

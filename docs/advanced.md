@@ -33,6 +33,31 @@ bytehaul now validates these task-level settings through `DownloadSpec::validate
 
 If you omit `.output_path(...)`, bytehaul will detect the filename from `Content-Disposition`, then the URL path, then `download`. Absolute output paths are still accepted when `.output_dir(...)` is not set.
 
+## Slow-transfer recovery (source checkout)
+
+This feature is available in the current source checkout and is not part of the published 0.2.1 package.
+
+Multi-connection Range downloads use `SlowTransferMode::Adaptive` by default: sustained slow requests can be cancelled and their segments reassigned, including near completion. Reading speed excludes intentional rate-limit and local forwarding waits. Short fluctuations and requests about to finish do not automatically trigger recovery. Use `Disabled` to keep the previous scheduling behavior.
+
+```rust
+use bytehaul::{DownloadSpec, SlowTransferMode};
+use std::time::Duration;
+
+let spec = DownloadSpec::new("https://example.com/file.bin")
+    .slow_transfer_mode(SlowTransferMode::AdaptiveWithHedging)
+    .low_speed_duration(Duration::from_secs(15))
+    .slow_start_grace(Duration::from_secs(5))
+    .slow_sample_window(Duration::from_secs(5));
+```
+
+`low_speed_limit(bytes_per_second)` optionally sets a positive absolute threshold; the default uses a healthy-request baseline without an absolute floor. The three durations must be positive and at most 86,400 seconds. Defaults are 15 seconds below the threshold, 5 seconds of startup grace and a 5-second sample window.
+
+Hedging is opt-in. It uses at most one spare request for a small trailing segment, requires a strong ETag and compatible conditional headers, and stages the spare response separately before switching the writer. The original and spare requests together remain within `max_connections`; all network payload shares `max_download_speed`. Automatic recovery and hedging share an extra-work budget of `min(total_size / 100, 16 MiB)`. A range that cannot fit is skipped, so small downloads may receive no automatic retry for performance. Ordinary error retries retain their existing separate retry policy.
+
+Progress counts effective download bytes, not duplicate traffic; it can decrease when an incomplete attempt is reclaimed. Enable debug logging to inspect recovery decisions. These policies do not increase a shared server or disk bandwidth limit. Single-connection and non-Range fallback behavior is unchanged.
+
+When `max_download_speed` is nonzero, automatic slow-request recovery and hedging are suppressed to avoid treating intentional rate limiting as a network fault. Ordinary timeouts and error retries still apply.
+
 ## Network Settings
 
 Network stack defaults live on the shared downloader client. DNS / DoH / IPv6 settings are configured on `Downloader::builder()`, and each download can still override `connect_timeout` and proxy settings on `DownloadSpec`:
