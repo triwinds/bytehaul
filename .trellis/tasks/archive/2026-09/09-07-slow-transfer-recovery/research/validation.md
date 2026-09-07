@@ -38,3 +38,5 @@ First actual Linux run `20260907T052100Z-51a2fa07`: **95.97% (3973/4140), exit 0
 Fresh run `20260907T052736Z-dc1f5053`: **95.90% (3975/4145), exit 0**. All 449 Rust tests passed, including the final captured-deadline regression; benchmark smoke and example targets passed. Threshold remains 95%, no source exclusions were added. Full JSON/HTML/raw log/metadata copied to `target/slow-transfer-validation/linux-final`. Final source SHA256 evidence is beside the reports. Latest Python 104 tests, workspace Clippy, formatting, diff checks, doc test and rustdoc all pass.
 
 Task-owned containers, default-VM preparation image/volume and dedicated Colima profile/data removed after report verification. Existing Docker context remains `colima`. No commit/push/archive performed before workflow confirmation.
+
+Work committed as `4d3b27e` after explicit user confirmation. Two pre-existing trailing blank lines in task markdown were normalized during archive bookkeeping; no implementation changes.

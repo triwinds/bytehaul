@@ -97,4 +97,3 @@ Linux 使用 `rtk proxy python3 scripts/coverage.py`（按需先 --install），
 - [x] 取得用户明确实现授权：“开始实现吧”。
 - [x] 根据当前平台 dispatch 配置决定是否需要 curated jsonl；需要时加入真实 spec/research 条目，不能留示例。
 - [x] 已运行 task.py start，遵循 trellis-before-dev / 实现与检查流程。
-
