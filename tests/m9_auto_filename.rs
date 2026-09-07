@@ -95,6 +95,8 @@ async fn test_output_dir_and_relative_output_path_are_combined() {
 async fn test_auto_filename_resume_after_pause() {
     let content: Vec<u8> = (0..2_000_000u32).map(|index| (index % 251) as u8).collect();
     let expected = content.clone();
+    let resumed_offset = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let observed_offset = resumed_offset.clone();
 
     let data = std::sync::Arc::new(content);
     let route = warp::path("resume-auto")
@@ -108,6 +110,7 @@ async fn test_auto_filename_resume_after_pause() {
                     let range = range.trim_start_matches("bytes=");
                     let parts: Vec<&str> = range.split('-').collect();
                     let start: u64 = parts[0].parse().unwrap_or(0);
+                    observed_offset.store(start, std::sync::atomic::Ordering::SeqCst);
                     let end: u64 = if parts.len() > 1 && !parts[1].is_empty() {
                         parts[1]
                             .parse::<u64>()
@@ -134,12 +137,16 @@ async fn test_auto_filename_resume_after_pause() {
                 }
                 None => {
                     let chunks: Vec<Result<Vec<u8>, std::convert::Infallible>> = data
-                        .chunks(16 * 1024)
+                        .chunks(512 * 1024)
                         .map(|chunk| Ok(chunk.to_vec()))
                         .collect();
-                    let stream = futures::stream::iter(chunks).then(
-                        |chunk: Result<Vec<u8>, std::convert::Infallible>| async move {
-                            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+                    let stream = futures::stream::iter(chunks).enumerate().then(
+                        |(index, chunk)| async move {
+                            // Keep the transfer incomplete regardless of runner scheduling.
+                            // Pausing drops this body; resume is served by the Range branch.
+                            if index > 0 {
+                                futures::future::pending::<()>().await;
+                            }
                             chunk
                         },
                     );
@@ -170,7 +177,20 @@ async fn test_auto_filename_resume_after_pause() {
         .max_connections(1);
 
     let handle = downloader.download(spec.clone());
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    let mut progress = handle.subscribe_progress();
+    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        loop {
+            if progress.borrow_and_update().downloaded > 0 {
+                break;
+            }
+            progress
+                .changed()
+                .await
+                .expect("download stopped before making progress");
+        }
+    })
+    .await
+    .expect("download should make progress before pause");
     handle.pause();
 
     assert!(matches!(handle.wait().await, Err(DownloadError::Paused)));
@@ -184,8 +204,15 @@ async fn test_auto_filename_resume_after_pause() {
     );
 
     let resumed = downloader.download(spec);
-    resumed.wait().await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(15), resumed.wait())
+        .await
+        .expect("resume should finish using the saved progress")
+        .unwrap();
 
+    assert!(
+        resumed_offset.load(std::sync::atomic::Ordering::SeqCst) > 0,
+        "resume should request the remaining bytes"
+    );
     assert_eq!(std::fs::read(&output_path).unwrap(), expected);
     assert!(
         !control_path.exists(),
