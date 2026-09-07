@@ -479,7 +479,12 @@ pub(super) async fn worker_loop(
                         backoff_deadline = state.blocked_until;
                         None
                     } else if let Some((piece, start, end)) = state.pending.pop_front() {
-                        let slots = recovery.slots.available_permits() + 1;
+                        // Fragment reclaimed work for the full worker pool rather
+                        // than only the permits free at this instant. Other
+                        // workers may still be finishing ordinary pieces, and
+                        // using the transient permit count would hand one
+                        // unsplittable range to the first worker that wakes.
+                        let slots = cfg.max_active_leases.max(1);
                         let len = end - start;
                         let split = len.div_ceil(slots as u64).max(cfg.min_segment_size);
                         let split_end = if len.saturating_sub(split) >= cfg.min_segment_size {
