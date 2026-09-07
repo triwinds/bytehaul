@@ -430,7 +430,7 @@ pub(super) async fn worker_loop(
     mut stop: watch::Receiver<StopSignal>,
     budget: Arc<MemoryBudget>,
     speed: SpeedLimit,
-    mut first: Option<(HttpResponse, ResponseMeta, usize)>,
+    first_response: Arc<TokioMutex<Option<(HttpResponse, ResponseMeta, usize)>>>,
     total: u64,
     log_level: LogLevel,
     download_id: u64,
@@ -525,9 +525,7 @@ pub(super) async fn worker_loop(
                 .lock()
                 .active
                 .insert(segment.lease_key(), observation.clone());
-            let response = first.take().filter(|(_, meta, piece)| {
-                *piece == segment.piece_id && probe_response_matches_segment(meta, &segment)
-            });
+            let response = super::take_matching_probe_response(&first_response, &segment).await;
             let context = AttemptContext {
                 worker: &worker,
                 cfg,
@@ -546,7 +544,7 @@ pub(super) async fn worker_loop(
             };
             let outcome = run_attempt(
                 &context,
-                response.map(|(r, m, _)| (r, m)),
+                response,
                 &mut stop,
                 &lineage,
             )

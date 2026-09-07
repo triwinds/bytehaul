@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, watch, Mutex as TokioMutex};
 
 use super::flow::MemoryBudget;
 
@@ -127,7 +127,7 @@ pub(super) async fn run_multi_worker(
 
     let mut abort_handles = Vec::with_capacity(num_workers);
     let mut workers = FuturesUnordered::new();
-    let mut probe_response = probe_response;
+    let first_response = Arc::new(TokioMutex::new(probe_response));
     let save_write_tx = write_tx.clone();
     let mut control_save_tracker = ControlSaveTracker::new(initial_completed_bytes);
     let control_save_ctx = MultiControlSaveContext {
@@ -154,11 +154,6 @@ pub(super) async fn run_multi_worker(
     });
 
     for worker_id in 0..num_workers {
-        let first = if worker_id == 0 {
-            probe_response.take()
-        } else {
-            None
-        };
         let handle = tokio::spawn(worker_loop(
             worker_id,
             worker_cfg.clone(),
@@ -168,7 +163,7 @@ pub(super) async fn run_multi_worker(
             cancel_rx.clone(),
             budget.clone(),
             speed_limit.clone(),
-            first,
+            first_response.clone(),
             total_size,
             log_level,
             download_id,
@@ -513,7 +508,7 @@ async fn worker_loop(
     cancel_rx: watch::Receiver<StopSignal>,
     budget: Arc<MemoryBudget>,
     speed_limit: SpeedLimit,
-    first_response: Option<(HttpResponse, ResponseMeta, usize)>,
+    first_response: Arc<TokioMutex<Option<(HttpResponse, ResponseMeta, usize)>>>,
     total_size: u64,
     log_level: LogLevel,
     download_id: u64,
@@ -537,7 +532,6 @@ async fn worker_loop(
         .await;
     }
     let mut cancel_rx = cancel_rx;
-    let mut first_response = first_response;
     log_debug!(
         log_level,
         download_id = download_id,
@@ -599,38 +593,24 @@ async fn worker_loop(
 
         loop {
             begin_lease_and_wait(&write_tx, segment.lease_key()).await?;
-            let result = if let Some((resp, meta, pid)) = first_response.take() {
-                if pid == segment.piece_id && probe_response_matches_segment(&meta, &segment) {
-                    match validate_segment_response(206, None, &meta, &segment, total_size) {
-                        Ok(()) => {
-                            stream_segment(
-                                resp,
-                                cfg.read_timeout,
-                                total_size,
-                                &segment,
-                                &write_tx,
-                                &received_bytes,
-                                &mut cancel_rx,
-                                &budget,
-                                &speed_limit,
-                            )
-                            .await
-                        }
-                        Err(error) => Err((error, 0)),
+            let response = take_matching_probe_response(&first_response, &segment).await;
+            let result = if let Some((resp, meta)) = response {
+                match validate_segment_response(206, None, &meta, &segment, total_size) {
+                    Ok(()) => {
+                        stream_segment(
+                            resp,
+                            cfg.read_timeout,
+                            total_size,
+                            &segment,
+                            &write_tx,
+                            &received_bytes,
+                            &mut cancel_rx,
+                            &budget,
+                            &speed_limit,
+                        )
+                        .await
                     }
-                } else {
-                    download_segment(
-                        &cfg.worker,
-                        cfg.read_timeout,
-                        total_size,
-                        &segment,
-                        &write_tx,
-                        &received_bytes,
-                        &mut cancel_rx,
-                        &budget,
-                        &speed_limit,
-                    )
-                    .await
+                    Err(error) => Err((error, 0)),
                 }
             } else {
                 download_segment(
@@ -715,6 +695,22 @@ async fn worker_loop(
                 }
             }
         }
+    }
+}
+
+async fn take_matching_probe_response(
+    first_response: &Arc<TokioMutex<Option<(HttpResponse, ResponseMeta, usize)>>>,
+    segment: &Segment,
+) -> Option<(HttpResponse, ResponseMeta)> {
+    let mut first_response = first_response.lock().await;
+    if first_response.as_ref().is_some_and(|(_, meta, piece_id)| {
+        *piece_id == segment.piece_id && probe_response_matches_segment(meta, segment)
+    }) {
+        first_response
+            .take()
+            .map(|(response, meta, _)| (response, meta))
+    } else {
+        None
     }
 }
 
