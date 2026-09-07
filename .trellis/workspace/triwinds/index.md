@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 8
+- **Total Sessions**: 9
 - **Last Active**: 2026-09-07
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~185 | Active |
+| `journal-1.md` | ~207 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 9 | 2026-09-07 | Adaptive slow transfer recovery and bounded tail hedging | `4d3b27e` | `master` |
 | 8 | 2026-09-07 | Synchronize public guides for 0.2.1 | c9e34a0 | `master` |
 | 7 | 2026-09-07 | Merge repair branch and publish 0.2.1 | `654f783`, `5ebda09` | `master` |
 | 6 | 2026-09-06 | Replace flaky dynamic split timing assertion | `d25f8f3` | `fix/retry-body-transport-errors` |

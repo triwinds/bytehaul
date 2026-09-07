@@ -183,3 +183,25 @@ Updated README and English/Chinese guides for 0.2.1 installation, master badges 
 ### Status
 
 [OK] **Completed**
+
+
+## Session 9: Adaptive slow transfer recovery and bounded tail hedging
+
+**Date**: 2026-09-07
+**Task**: Adaptive slow transfer recovery and bounded tail hedging
+**Package**: bytehaul-python
+**Branch**: `master`
+
+### Summary
+
+Implemented default adaptive low-speed recovery and tail takeover, opt-in bounded ETag-validated hedging, Rust/Python API options, docs and deterministic regressions. Independent review resolved cancellation, candidate identity and Retry-After wakeup races. Final Linux gate: 449 Rust tests, 95.90% line coverage (3975/4145); rebuilt Python: 104 tests; Clippy/docs/format checks passed. Local shortened-threshold slow-tail median 6.71s to 0.78s; real origin not verified. Temporary Linux environment removed; no push.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `4d3b27e` | (see git log) |
+
+### Status
+
+[OK] **Completed**
