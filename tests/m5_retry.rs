@@ -264,7 +264,10 @@ fn truncated_then_restart_server(
                 }
                 _ => unreachable!(),
             }
-            stream.shutdown(Shutdown::Both).unwrap();
+            // Rejecting changed metadata can close the client socket before cleanup.
+            if let Err(error) = stream.shutdown(Shutdown::Both) {
+                assert_eq!(error.kind(), std::io::ErrorKind::NotConnected);
+            }
         }
     });
     (format!("http://{address}/{path_segment}"), handle)
