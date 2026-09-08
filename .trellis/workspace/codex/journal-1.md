@@ -27,3 +27,25 @@ Implemented and verified bounded fast-tail detection. All 450 Rust tests plus do
 ### Status
 
 [OK] **Completed**
+
+
+## Session 2: Continuous requests and confirmed prefix recovery
+
+**Date**: 2026-09-09
+**Task**: Continuous requests and confirmed prefix recovery
+**Package**: bytehaul-python
+**Branch**: `master`
+
+### Summary
+
+Implemented opt-in contiguous request batching and strong-validator confirmed-prefix retries/recovery, Rust/Python API, TLS pooling tests and benchmarks. Final checks:466 Rust tests,1 doctest,116 Python tests,Clippy,rustdoc and formatting passed. All78 final diagnostic outputs byte-validated; simulated setup+response latency median reduced57.5%,prefix handoff avoids512KiB replay. User authorized commit and push.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `be98b02` | (see git log) |
+
+### Status
+
+[OK] **Completed**
