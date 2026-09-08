@@ -142,6 +142,7 @@ struct Lineage {
     recoveries: u8,
 }
 type SharedLineage = Arc<Mutex<Lineage>>;
+type PendingRange = (usize, u64, u64, usize);
 struct Recovered {
     piece: usize,
     start: u64,
@@ -153,7 +154,7 @@ struct State {
     active: BTreeMap<LeaseKey, Arc<Mutex<Observation>>>,
     history: VecDeque<(Instant, f64)>,
     recovered: Vec<Recovered>,
-    pending: VecDeque<(usize, u64, u64)>,
+    pending: VecDeque<PendingRange>,
     reserved: u64,
     actions: u64,
     hedge: bool,
@@ -350,11 +351,14 @@ impl Coordinator {
             recoveries: 0,
         }))
     }
-    fn recovered(&self, segment: &Segment, lineage: &SharedLineage) {
+    fn recovered(&self, segment: &Segment, lineage: &SharedLineage, max_active_leases: usize) {
         let mut state = self.state.lock();
-        state
-            .pending
-            .push_back((segment.piece_id, segment.start, segment.end));
+        state.pending.push_back((
+            segment.piece_id,
+            segment.start,
+            segment.end,
+            max_active_leases.max(1),
+        ));
         if !state
             .recovered
             .iter()
@@ -430,7 +434,7 @@ pub(super) async fn worker_loop(
     mut stop: watch::Receiver<StopSignal>,
     budget: Arc<MemoryBudget>,
     speed: SpeedLimit,
-    mut first: Option<(HttpResponse, ResponseMeta, usize)>,
+    first_response: SharedProbeResponse,
     total: u64,
     log_level: LogLevel,
     download_id: u64,
@@ -478,17 +482,17 @@ pub(super) async fn worker_loop(
                         // between the decision and registering the timer.
                         backoff_deadline = state.blocked_until;
                         None
-                    } else if let Some((piece, start, end)) = state.pending.pop_front() {
-                        let slots = recovery.slots.available_permits() + 1;
+                    } else if let Some((piece, start, end, slots)) = state.pending.pop_front() {
                         let len = end - start;
                         let split = len.div_ceil(slots as u64).max(cfg.min_segment_size);
-                        let split_end = if len.saturating_sub(split) >= cfg.min_segment_size {
-                            start + split
-                        } else {
-                            end
-                        };
+                        let split_end =
+                            if slots > 1 && len.saturating_sub(split) >= cfg.min_segment_size {
+                                start + split
+                            } else {
+                                end
+                            };
                         if split_end < end {
-                            state.pending.push_front((piece, split_end, end));
+                            state.pending.push_front((piece, split_end, end, slots - 1));
                         }
                         scheduler.assign_subrange(piece, start, split_end, worker_id)
                     } else {
@@ -525,9 +529,7 @@ pub(super) async fn worker_loop(
                 .lock()
                 .active
                 .insert(segment.lease_key(), observation.clone());
-            let response = first.take().filter(|(_, meta, piece)| {
-                *piece == segment.piece_id && probe_response_matches_segment(meta, &segment)
-            });
+            let response = super::take_matching_probe_response(&first_response, &segment).await;
             let context = AttemptContext {
                 worker: &worker,
                 cfg,
@@ -546,7 +548,7 @@ pub(super) async fn worker_loop(
             };
             let outcome = run_attempt(
                 &context,
-                response.map(|(r, m, _)| (r, m)),
+                response,
                 &mut stop,
                 &lineage,
             )
@@ -581,7 +583,7 @@ pub(super) async fn worker_loop(
                                 .fetch_add(observation.lock().wire, Ordering::Relaxed);
                             {
                                 let mut scheduler = scheduler.lock();
-                                recovery.recovered(&segment, &lineage);
+                                recovery.recovered(&segment, &lineage, cfg.max_active_leases);
                                 scheduler.reclaim(segment.lease_key());
                             }
                             log_info!(
@@ -1192,7 +1194,7 @@ mod tests {
             None,
             "ordinary work retains its existing policy"
         );
-        state.pending.push_back((0, 0, 1000));
+        state.pending.push_back((0, 0, 1000, 1));
         assert_eq!(state.pending_backoff(now), Some(Duration::from_secs(30)));
         assert_eq!(state.pending_backoff(now + Duration::from_secs(31)), None);
         assert_eq!(
@@ -1207,7 +1209,7 @@ mod tests {
         let now = Instant::now();
         let captured = {
             let mut state = recovery.state.lock();
-            state.pending.push_back((0, 0, 1000));
+            state.pending.push_back((0, 0, 1000, 1));
             state.blocked_until = Some(now + Duration::from_secs(1));
             assert!(state.pending_backoff(now).is_some());
             state.blocked_until
