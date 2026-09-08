@@ -461,7 +461,7 @@ class TestSlowTransferOptions:
             names.append("log_level")
         added = [
             "slow_transfer_mode", "low_speed_limit", "low_speed_duration",
-            "slow_start_grace", "slow_sample_window",
+            "slow_start_grace", "slow_sample_window", "request_batch_size",
         ]
         api = Downloader().download if object_api else download
         parameters = inspect.signature(api).parameters
@@ -512,7 +512,8 @@ class TestSlowTransferOptions:
 
     @pytest.mark.parametrize("object_api", [False, True])
     @pytest.mark.parametrize("mode", ["disabled", "adaptive", "adaptive_with_hedging"])
-    def test_range_download_with_policy(self, tmp_path, object_api, mode):
+    @pytest.mark.parametrize("request_batch_size", [None, 0, 16384])
+    def test_range_download_with_policy(self, tmp_path, object_api, mode, request_batch_size):
         body = bytes(range(256)) * 128
         ranges = []
 
@@ -537,7 +538,7 @@ class TestSlowTransferOptions:
         try:
             url = f"http://127.0.0.1:{srv.server_address[1]}/file"
             out = tmp_path / "ranges.bin"
-            options = dict(slow_transfer_mode=mode, max_connections=3, piece_size=4096, min_split_size=1)
+            options = dict(slow_transfer_mode=mode, max_connections=3, piece_size=4096, min_split_size=1, request_batch_size=request_batch_size)
             if object_api:
                 task = Downloader().download(url, out, **options)
                 task.wait()
@@ -545,6 +546,8 @@ class TestSlowTransferOptions:
                 download(url, out, **options)
             assert out.read_bytes() == body
             assert len(ranges) >= 2
+            if request_batch_size:
+                assert any(end - start + 1 > 4096 for start, end in ranges)
         finally:
             srv.shutdown()
             srv.server_close()

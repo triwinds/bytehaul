@@ -28,7 +28,8 @@ pub(crate) enum WriterCommand {
         /// Which lease this data belongs to (for cache aggregation).
         lease_key: Option<LeaseKey>,
     },
-    /// A lease is fully downloaded; flush its cached data to disk.
+    /// Flush a complete lease or a stopped attempt's confirmed prefix and
+    /// retire its writer identity. The acknowledgement does not imply fsync.
     FlushLease {
         lease_key: LeaseKey,
         ack: oneshot::Sender<()>,

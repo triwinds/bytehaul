@@ -33,11 +33,45 @@ bytehaul now validates these task-level settings through `DownloadSpec::validate
 
 If you omit `.output_path(...)`, bytehaul will detect the filename from `Content-Disposition`, then the URL path, then `download`. Absolute output paths are still accepted when `.output_dir(...)` is not set.
 
+## Contiguous requests and connection reuse
+
+The current development version supports opt-in multi-piece Range requests:
+
+```rust
+use bytehaul::DownloadSpec;
+use std::time::Duration;
+
+let spec = DownloadSpec::new("https://example.com/file.bin")
+    .piece_size(1024 * 1024)
+    .request_batch_size(4 * 1024 * 1024)
+    .http_idle_pool(4, Duration::from_secs(30));
+```
+
+`request_batch_size` defaults to zero (disabled). It bounds contiguous request
+grouping by bytes and an internal maximum of 64 leases, without changing piece
+or checkpoint granularity. A value smaller than a piece does not split it.
+Grouping stops at completed, active or partially processed pieces and leaves
+work for other workers. It applies to known-size multi-connection downloads,
+including when slow-transfer recovery is disabled. Connection pooling is a
+separate experimental setting; zero idle connections disables it. A server
+that closes connections cannot benefit from idle pooling.
+
+When a strong ETag and compatible conditional headers protect object identity,
+interrupted multi-worker requests and adaptive reassignment can preserve a
+writer-confirmed prefix and request only the suffix. Incomplete pieces remain
+incomplete in persisted checkpoints, so process restarts may replay them.
+Retries retain their original count/time budget. Missing or weak validators
+keep whole-range replay, and malformed responses do not qualify for prefix reuse.
+
+Use [the local comparison example](../examples/http_efficiency_compare.rs) to
+measure request/connection counts and elapsed time under controlled latency and
+disconnection. These mechanisms reduce overhead; gains depend on the origin.
+
 ## Slow-transfer recovery
 
 This feature is available starting with version 0.2.2.
 
-Multi-connection Range downloads use `SlowTransferMode::Adaptive` by default: sustained slow requests can be cancelled and their segments reassigned, including near completion. Reading speed excludes intentional rate-limit and local forwarding waits. Short fluctuations and requests about to finish do not automatically trigger recovery. Use `Disabled` to keep the previous scheduling behavior.
+Multi-connection Range downloads use `SlowTransferMode::Adaptive` by default: sustained slow requests can be cancelled and their segments reassigned, including near completion. Reading speed excludes intentional rate-limit and local forwarding waits. Short fluctuations and requests about to finish do not automatically trigger recovery. Use `Disabled` to disable performance-triggered cancellation and hedging.
 
 ```rust
 use bytehaul::{DownloadSpec, SlowTransferMode};

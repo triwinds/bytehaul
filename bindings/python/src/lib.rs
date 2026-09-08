@@ -252,8 +252,12 @@ fn build_download_spec(
     low_speed_duration: Option<f64>,
     slow_start_grace: Option<f64>,
     slow_sample_window: Option<f64>,
+    request_batch_size: Option<u64>,
 ) -> PyResult<DownloadSpec> {
     let mut spec = DownloadSpec::new(url);
+    if let Some(bytes) = request_batch_size {
+        spec = spec.request_batch_size(bytes);
+    }
 
     if let Some(output_path) = output_path {
         spec = spec.output_path(output_path);
@@ -584,7 +588,8 @@ impl PyDownloader {
             low_speed_limit = None,
             low_speed_duration = None,
             slow_start_grace = None,
-            slow_sample_window = None
+            slow_sample_window = None,
+            request_batch_size = None
         )
     )]
     #[allow(clippy::too_many_arguments)]
@@ -619,6 +624,7 @@ impl PyDownloader {
         low_speed_duration: Option<f64>,
         slow_start_grace: Option<f64>,
         slow_sample_window: Option<f64>,
+        request_batch_size: Option<u64>,
     ) -> PyResult<PyDownloadTask> {
         let spec = build_download_spec(
             url,
@@ -650,6 +656,7 @@ impl PyDownloader {
             low_speed_duration,
             slow_start_grace,
             slow_sample_window,
+            request_batch_size,
         )?;
         let runtime = shared_runtime()?;
         let _guard = runtime.enter();
@@ -698,7 +705,8 @@ impl PyDownloader {
         low_speed_limit = None,
         low_speed_duration = None,
         slow_start_grace = None,
-        slow_sample_window = None
+        slow_sample_window = None,
+        request_batch_size = None
     )
 )]
 #[allow(clippy::too_many_arguments)]
@@ -737,6 +745,7 @@ fn download(
     low_speed_duration: Option<f64>,
     slow_start_grace: Option<f64>,
     slow_sample_window: Option<f64>,
+    request_batch_size: Option<u64>,
 ) -> PyResult<()> {
     let level = match &log_level {
         Some(s) => parse_log_level(s)?,
@@ -773,6 +782,7 @@ fn download(
         low_speed_duration,
         slow_start_grace,
         slow_sample_window,
+        request_batch_size,
     )?;
     let runtime = shared_runtime()?;
 

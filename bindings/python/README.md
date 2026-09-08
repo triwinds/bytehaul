@@ -223,6 +223,20 @@ Frozen snapshot of download progress.
 
 Valid `log_level` values: `"off"`, `"error"`, `"warn"`, `"info"`, `"debug"`, `"trace"` (case-insensitive).
 
+### Contiguous requests
+
+The current development version adds `request_batch_size` to both download
+APIs, after existing positional parameters. `None` or `0` keeps one lease per
+request; for example, `request_batch_size=4 * 1024 * 1024` groups adjacent pieces
+into bounded Range requests. Completion/checkpoint granularity remains
+`piece_size`, with at most 64 leases per batch. Values below a piece do not split
+it, and grouping stops at completed/active/partially processed pieces.
+
+Strong-ETag multi-connection transfers can also retain writer-confirmed prefixes
+on interrupted-body retries or adaptive reassignment. Incomplete pieces remain
+incomplete across process restarts. These engine behaviors apply to both Python
+entry points, while the experimental HTTP idle-pool option remains Rust-only.
+
 ### Slow-transfer recovery
 
 Available starting with version 0.2.2. These options apply to both `download(...)` and `Downloader.download(...)`; `None` selects the Rust engine default.
@@ -248,7 +262,7 @@ task = Downloader(log_level="debug").download(
 task.wait()
 ```
 
-Use `slow_transfer_mode="disabled"` to retain the previous scheduling behavior. Single-connection and non-Range fallback behavior is unchanged. Recovery excludes intentional rate limiting and local backpressure; it cannot remove a shared origin bandwidth limit.
+Use `slow_transfer_mode="disabled"` to disable performance-triggered cancellation and hedging. Single-connection and non-Range fallback behavior is unchanged. Recovery excludes intentional rate limiting and local backpressure; it cannot remove a shared origin bandwidth limit.
 
 When `max_download_speed` is nonzero, automatic slow-request recovery and hedging are suppressed to avoid treating intentional rate limiting as a network fault. Ordinary timeouts and error retries still apply.
 

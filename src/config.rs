@@ -146,6 +146,7 @@ pub struct DownloadSpec {
     pub(crate) channel_buffer: usize,
     pub(crate) resume: bool,
     pub(crate) piece_size: u64,
+    pub(crate) request_batch_size: u64,
     pub(crate) min_split_size: u64,
     pub(crate) min_segment_size: u64,
     /// Maximum additional retries per request/transfer scope (0 = no retries).
@@ -196,7 +197,8 @@ impl DownloadSpec {
             file_allocation: FileAllocation::default(),
             channel_buffer: 64,
             resume: true,
-            piece_size: 1024 * 1024,          // 1 MiB
+            piece_size: 1024 * 1024, // 1 MiB
+            request_batch_size: 0,
             min_split_size: 10 * 1024 * 1024, // 10 MiB
             min_segment_size: 256 * 1024,     // 256 KiB
             max_retries: 5,
@@ -306,6 +308,21 @@ impl DownloadSpec {
     /// Returns the piece size in bytes used for multi-connection splitting.
     pub fn get_piece_size(&self) -> u64 {
         self.piece_size
+    }
+
+    /// Returns the target byte limit for contiguous multi-piece HTTP requests.
+    /// Zero disables batching (the default).
+    pub fn get_request_batch_size(&self) -> u64 {
+        self.request_batch_size
+    }
+
+    /// Opt into contiguous multi-piece HTTP requests, bounded by this byte limit
+    /// and an internal lease-count limit. Piece/checkpoint granularity is unchanged.
+    /// A value smaller than a piece does not split that piece; zero disables batching.
+    /// Applies only to known-size multi-connection Range downloads.
+    pub fn request_batch_size(mut self, bytes: u64) -> Self {
+        self.request_batch_size = bytes;
+        self
     }
 
     /// Returns the minimum file size required before the download is split
@@ -691,6 +708,13 @@ mod tests {
     #[test]
     fn test_download_spec_defaults() {
         let spec = DownloadSpec::new("https://example.com/file");
+        assert_eq!(spec.get_request_batch_size(), 0);
+        assert_eq!(
+            spec.clone()
+                .request_batch_size(4 * 1024 * 1024)
+                .get_request_batch_size(),
+            4 * 1024 * 1024
+        );
         assert_eq!(spec.url, "https://example.com/file");
         assert_eq!(spec.output_path, None);
         assert_eq!(spec.output_dir, None);

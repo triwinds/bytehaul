@@ -13,11 +13,14 @@ fn range_server(
 ) -> (
     std::net::SocketAddr,
     Arc<AtomicUsize>,
+    Arc<AtomicUsize>,
     impl std::future::Future<Output = ()>,
 ) {
     let data = Arc::new(content);
     let range_requests = Arc::new(AtomicUsize::new(0));
     let counter = range_requests.clone();
+    let longest = Arc::new(AtomicUsize::new(0));
+    let request_length = longest.clone();
     let route = warp::path("data")
         .and(warp::header::optional::<String>("range"))
         .map(move |range: Option<String>| {
@@ -36,6 +39,7 @@ fn range_server(
             } else {
                 (0, total - 1)
             };
+            request_length.fetch_max(end - start + 1, Ordering::SeqCst);
             let payload = data[start..=end].to_vec();
             let started = body_started.clone();
             let stream = futures::stream::once(async move {
@@ -55,7 +59,7 @@ fn range_server(
                 .unwrap()
         });
     let (addr, server) = warp::serve(route).bind_ephemeral(([127, 0, 0, 1], 0));
-    (addr, range_requests, server)
+    (addr, range_requests, longest, server)
 }
 
 #[tokio::test]
@@ -64,7 +68,8 @@ async fn tiny_and_nondivisible_budgets_preserve_single_and_multi_downloads() {
         for budget in [1, 100, 4097] {
             let size = if budget == 1 { 31 } else { 32 * 1024 + 13 };
             let expected: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
-            let (addr, requests, server) = range_server(expected.clone(), Arc::new(Notify::new()));
+            let (addr, requests, _, server) =
+                range_server(expected.clone(), Arc::new(Notify::new()));
             let server = tokio::spawn(server);
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("data.bin");
@@ -99,11 +104,12 @@ async fn tiny_and_nondivisible_budgets_preserve_single_and_multi_downloads() {
 
 #[tokio::test]
 async fn pause_and_cancel_interrupt_rate_limited_body_waits() {
-    for connections in [1, 4] {
+    for (connections, batch) in [(1, 0), (4, 0), (4, 65536)] {
         for pause in [false, true] {
-            let expected: Vec<u8> = (0..65537).map(|i| (i % 251) as u8).collect();
+            let size = if batch > 0 { 262145 } else { 65537 };
+            let expected: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
             let started = Arc::new(Notify::new());
-            let (addr, _, server) = range_server(expected.clone(), started.clone());
+            let (addr, _, longest, server) = range_server(expected.clone(), started.clone());
             let server = tokio::spawn(server);
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("stoppable.bin");
@@ -113,6 +119,7 @@ async fn pause_and_cancel_interrupt_rate_limited_body_waits() {
                 .max_connections(connections)
                 .min_split_size(1)
                 .piece_size(16384)
+                .request_batch_size(batch)
                 .memory_budget(97)
                 .channel_buffer(1)
                 .max_download_speed(64);
@@ -128,6 +135,7 @@ async fn pause_and_cancel_interrupt_rate_limited_body_waits() {
                     if tokio::fs::metadata(&path)
                         .await
                         .is_ok_and(|meta| meta.len() > 0)
+                        && (batch == 0 || longest.load(Ordering::SeqCst) > 16384)
                     {
                         break;
                     }
@@ -136,6 +144,12 @@ async fn pause_and_cancel_interrupt_rate_limited_body_waits() {
             })
             .await
             .expect("initial limited chunk never reached the writer");
+            if batch > 0 {
+                assert!(
+                    longest.load(Ordering::SeqCst) > 16384,
+                    "stop must exercise a batched body"
+                );
+            }
             if pause {
                 handle.pause();
             } else {

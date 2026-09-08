@@ -248,24 +248,10 @@ impl Coordinator {
         output: &Path,
         total: u64,
     ) -> Option<Arc<Self>> {
-        if spec.slow_transfer_mode == SlowTransferMode::Disabled {
+        if spec.slow_transfer_mode == SlowTransferMode::Disabled && spec.request_batch_size == 0 {
             return None;
         }
-        let conflict = spec.headers.keys().any(|h| {
-            h.eq_ignore_ascii_case("if-match")
-                || h.eq_ignore_ascii_case("if-range")
-                || h.eq_ignore_ascii_case("if-none-match")
-                || h.eq_ignore_ascii_case("if-unmodified-since")
-                || h.eq_ignore_ascii_case("if-modified-since")
-        });
-        let validator = if conflict {
-            None
-        } else {
-            meta.etag
-                .as_deref()
-                .filter(|v| strong_etag(v))
-                .map(str::to_owned)
-        };
+        let validator = usable_validator(spec, meta);
         Some(Arc::new(Self {
             policy: Policy {
                 mode: spec.slow_transfer_mode,
@@ -475,6 +461,28 @@ impl Coordinator {
         state.blocked_until = state.blocked_until.max(until);
     }
 }
+pub(super) fn usable_validator(spec: &DownloadSpec, meta: &ResponseMeta) -> Option<String> {
+    let conflict = spec.headers.keys().any(|h| {
+        [
+            "if-match",
+            "if-range",
+            "if-none-match",
+            "if-unmodified-since",
+            "if-modified-since",
+        ]
+        .iter()
+        .any(|condition| h.eq_ignore_ascii_case(condition))
+    });
+    (!conflict)
+        .then(|| {
+            meta.etag
+                .as_deref()
+                .filter(|v| strong_etag(v))
+                .map(str::to_owned)
+        })
+        .flatten()
+}
+
 fn strong_etag(value: &str) -> bool {
     value.starts_with('"')
         && value.ends_with('"')
@@ -524,9 +532,7 @@ pub(super) async fn worker_loop(
     log_level: LogLevel,
     download_id: u64,
 ) -> Result<(), DownloadError> {
-    let validator = (recovery.policy.mode == SlowTransferMode::AdaptiveWithHedging)
-        .then_some(recovery.validator.as_deref())
-        .flatten();
+    let validator = recovery.validator.as_deref();
     let worker = match validator {
         Some(etag) => cfg.worker.clone().with_validator(etag),
         None => cfg.worker.clone(),
@@ -581,10 +587,14 @@ pub(super) async fn worker_loop(
                         }
                         scheduler.assign_subrange(piece, start, split_end, worker_id)
                     } else {
-                        scheduler.assign_to_with_split(
+                        scheduler.assign_to_with_request_split(
                             worker_id,
                             cfg.max_active_leases,
                             cfg.min_segment_size,
+                            recovery
+                                .slot_capacity
+                                .saturating_sub(recovery.slots.available_permits())
+                                .saturating_sub(1),
                         )
                     };
                     segment.map(|segment| (segment, permit))
@@ -603,24 +613,46 @@ pub(super) async fn worker_loop(
             owner: recovery,
         };
         let lineage = recovery.lineage(&segment, cfg);
+        // Consume an exact probe before batching, so it neither becomes an
+        // unused live response nor forces a second request for the same bytes.
+        let mut initial_response =
+            super::take_matching_probe_response(&first_response, &segment).await;
+        // Recovered ranges keep their existing per-piece lineage and splitting.
+        let mut queued: VecDeque<Segment> = if segment.attempt == 1 && initial_response.is_none() {
+            scheduler
+                .lock()
+                .extend_batch(
+                    &segment,
+                    worker_id,
+                    cfg.max_active_leases,
+                    cfg.request_batch_size,
+                )
+                .into()
+        } else {
+            VecDeque::new()
+        };
+        let mut request_end = queued.back().map_or(segment.end, |last| last.end);
+        let mut stream = None;
+        let mut observation = Arc::new(Mutex::new(Observation::new(
+            Instant::now(),
+            recovery.policy.window,
+        )));
         loop {
             begin_lease_and_wait(&write_tx, segment.lease_key()).await?;
-            let observation = Arc::new(Mutex::new(Observation::new(
-                Instant::now(),
-                recovery.policy.window,
-            )));
+            observation.lock().forwarded = 0;
             recovery
                 .state
                 .lock()
                 .active
                 .insert(segment.lease_key(), observation.clone());
-            let response = super::take_matching_probe_response(&first_response, &segment).await;
+            let response = initial_response.take();
             let context = AttemptContext {
                 worker: &worker,
                 cfg,
                 recovery,
                 scheduler: &scheduler,
                 segment: &segment,
+                request_end,
                 write_tx: &write_tx,
                 received: &received,
                 budget: &budget,
@@ -631,10 +663,17 @@ pub(super) async fn worker_loop(
                 log_level,
                 download_id,
             };
-            let outcome = run_attempt(&context, response, &mut stop, &lineage).await;
+            let outcome = run_attempt(&context, response, &mut stop, &lineage, &mut stream).await;
             // run_attempt's futures have been dropped: no producer can enqueue
             // old generation data after this point.
-            recovery.finish_observation(segment.lease_key(), matches!(outcome, Outcome::Complete));
+            if matches!(outcome, Outcome::Complete) && !queued.is_empty() {
+                // Move one request observation across piece identities without
+                // fabricating several independent healthy history samples.
+                recovery.state.lock().active.remove(&segment.lease_key());
+            } else {
+                recovery
+                    .finish_observation(segment.lease_key(), matches!(outcome, Outcome::Complete));
+            }
             match outcome {
                 Outcome::Complete => {
                     flush_lease_and_wait(&write_tx, segment.lease_key()).await?;
@@ -643,23 +682,59 @@ pub(super) async fn worker_loop(
                     }
                     recovery.completed(&segment, &lineage);
                     recovery.changed.notify_waiters();
+                    if let Some(next) = queued.pop_front() {
+                        segment = next;
+                        continue;
+                    }
                     break;
                 }
                 Outcome::Recover | Outcome::Staged(_) | Outcome::Failed(_) => {
-                    let forwarded = observation.lock().forwarded;
-                    if forwarded > 0 {
-                        received.fetch_sub(forwarded, Ordering::Relaxed);
+                    // Cancelled attempt futures no longer own the retained body.
+                    // No unstarted reserved piece has contributed progress.
+                    let read_ahead = stream
+                        .as_ref()
+                        .map_or(0, |body| body.wire.saturating_sub(body.consumed));
+                    drop(stream.take());
+                    for unused in queued.drain(..) {
+                        scheduler.lock().reclaim(unused.lease_key());
                     }
-                    if let Err(error) = discard_lease_and_wait(&write_tx, segment.lease_key()).await
+                    request_end = segment.end;
+                    let forwarded = observation.lock().forwarded;
+                    let (outcome, mut retry_decision) = match outcome {
+                        Outcome::Failed(error) => {
+                            (None, Some(lineage.lock().retries.decide(error)))
+                        }
+                        outcome => (Some(outcome), None),
+                    };
+                    let retain = validator.is_some()
+                        && forwarded > 0
+                        && forwarded < segment.end - segment.start
+                        && (matches!(outcome, Some(Outcome::Recover))
+                            || matches!(&retry_decision, Some(RetryDecision::Retry { .. })));
+                    let mut prefix = segment.clone();
+                    prefix.end = prefix.start + forwarded;
+                    if let Err(error) = super::settle_prefix(
+                        &write_tx,
+                        &scheduler,
+                        &mut segment,
+                        &received,
+                        forwarded,
+                        retain,
+                    )
+                    .await
                     {
                         scheduler.lock().reclaim(segment.lease_key());
                         return Err(error);
                     }
+                    if retain {
+                        recovery.completed(&prefix, &lineage);
+                    }
                     match outcome {
-                        Outcome::Recover => {
-                            recovery
-                                .duplicate
-                                .fetch_add(observation.lock().wire, Ordering::Relaxed);
+                        Some(Outcome::Recover) => {
+                            recovery.duplicate.fetch_add(
+                                read_ahead + if retain { 0 } else { forwarded },
+                                Ordering::Relaxed,
+                            );
                             {
                                 let mut scheduler = scheduler.lock();
                                 recovery.recovered(&segment, &lineage, cfg.max_active_leases);
@@ -672,18 +747,18 @@ pub(super) async fn worker_loop(
                                 start = segment.start,
                                 end = segment.end,
                                 attempt = segment.attempt,
-                                "slow attempt reclaimed after writer discard acknowledgement"
+                                "slow attempt reclaimed after writer acknowledgement"
                             );
                             recovery.changed.notify_waiters();
                             break;
                         }
-                        Outcome::Staged(mut staged) => {
+                        Some(Outcome::Staged(mut staged)) => {
                             recovery
                                 .duplicate
                                 .fetch_sub(segment.end - segment.start, Ordering::Relaxed);
                             recovery
                                 .duplicate
-                                .fetch_add(observation.lock().wire, Ordering::Relaxed);
+                                .fetch_add(read_ahead + forwarded, Ordering::Relaxed);
                             segment = scheduler
                                 .lock()
                                 .renew(segment.lease_key(), worker_id)
@@ -714,8 +789,10 @@ pub(super) async fn worker_loop(
                             );
                             break;
                         }
-                        Outcome::Failed(error) => {
-                            let decision = lineage.lock().retries.decide(error);
+                        None => {
+                            let decision = retry_decision
+                                .take()
+                                .expect("failed attempt has retry decision");
                             match decision {
                                 RetryDecision::Stop(error) => {
                                     scheduler.lock().reclaim(segment.lease_key());
@@ -732,11 +809,15 @@ pub(super) async fn worker_loop(
                                                 "cannot renew adaptive retry lease".into(),
                                             )
                                         })?;
+                                    observation = Arc::new(Mutex::new(Observation::new(
+                                        Instant::now(),
+                                        recovery.policy.window,
+                                    )));
                                     sleep_with_backoff(backoff, &mut stop).await?;
                                 }
                             }
                         }
-                        Outcome::Complete => unreachable!(),
+                        Some(Outcome::Complete | Outcome::Failed(_)) => unreachable!(),
                     }
                 }
             }
@@ -753,6 +834,7 @@ struct AttemptContext<'a> {
     recovery: &'a Coordinator,
     scheduler: &'a Scheduler,
     segment: &'a Segment,
+    request_end: u64,
     write_tx: &'a mpsc::Sender<WriterCommand>,
     received: &'a Arc<AtomicU64>,
     budget: &'a Arc<MemoryBudget>,
@@ -774,9 +856,10 @@ async fn run_attempt(
     response: Option<(HttpResponse, ResponseMeta)>,
     stop: &mut watch::Receiver<StopSignal>,
     lineage: &SharedLineage,
+    stream: &mut Option<RequestStream>,
 ) -> Outcome {
     let mut primary_stop = stop.clone();
-    let primary = primary(ctx, response, &mut primary_stop);
+    let primary = primary(ctx, response, &mut primary_stop, stream);
     tokio::pin!(primary);
     let mut ticker = tokio::time::interval(ctx.recovery.tick());
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -804,6 +887,7 @@ async fn run_attempt(
                 }
             },
             _ = ticker.tick() => {
+                if ctx.recovery.policy.mode == SlowTransferMode::Disabled { continue; }
                 let now = Instant::now();
                 let baseline = ctx.recovery.baseline(ctx.segment.lease_key(), now);
                 if ctx.log_level >= LogLevel::Debug {
@@ -814,7 +898,7 @@ async fn run_attempt(
                         baseline_bytes_sec = ?baseline, "adaptive request sample");
                 }
                 let len = ctx.segment.end-ctx.segment.start;
-                let tail_baseline = if !matches!(ctx.speed, SpeedLimit::Limited(_))
+                let tail_baseline = if ctx.request_end == ctx.segment.end && !matches!(ctx.speed, SpeedLimit::Limited(_))
                     && ctx.recovery.tail_eligible(len, ctx.scheduler.lock().has_available()) {
                     ctx.recovery.sample_baseline(ctx.segment.lease_key(), now, true)
                 } else { None };
@@ -834,7 +918,7 @@ async fn run_attempt(
                 if !eligible || challenger.is_some() { continue; }
                 let len = ctx.segment.end-ctx.segment.start;
                 let mut slot = None;
-                if ctx.validator.is_some() && ctx.recovery.policy.mode == SlowTransferMode::AdaptiveWithHedging && len <= MAX_HEDGE
+                if ctx.request_end == ctx.segment.end && ctx.validator.is_some() && ctx.recovery.policy.mode == SlowTransferMode::AdaptiveWithHedging && len <= MAX_HEDGE
                     && !ctx.scheduler.lock().has_available() {
                     slot = ctx.recovery.slots.clone().try_acquire_owned().ok();
                 }
@@ -877,12 +961,13 @@ impl From<std::io::Error> for CandidateFailure {
 async fn checked_response(
     ctx: &AttemptContext<'_>,
     response: Option<(HttpResponse, ResponseMeta)>,
+    request_end: u64,
 ) -> Result<HttpResponse, CandidateFailure> {
     let (response, meta) = match response {
         Some(response) => response,
         None => {
             ctx.worker
-                .send_range(ctx.segment.start, ctx.segment.end - 1)
+                .send_range(ctx.segment.start, request_end - 1)
                 .await?
         }
     };
@@ -901,16 +986,25 @@ async fn checked_response(
             identity_changed: true,
         });
     }
-    validate_segment_response(
+    let retry_after = response
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok());
+    validate_range_response(
         response.status().as_u16(),
-        None,
+        retry_after,
         &meta,
-        ctx.segment,
-        ctx.total,
+        RangeValidationMode::Segment,
+        ExpectedRange {
+            start: ctx.segment.start,
+            end_inclusive: request_end - 1,
+            total_size: Some(ctx.total),
+        },
     )?;
-    if ctx
-        .validator
-        .is_some_and(|etag| meta.etag.as_deref() != Some(etag))
+    if ctx.recovery.policy.mode == SlowTransferMode::AdaptiveWithHedging
+        && ctx
+            .validator
+            .is_some_and(|etag| meta.etag.as_deref() != Some(etag))
     {
         return Err(CandidateFailure {
             error: DownloadError::ResumeMismatch(
@@ -921,74 +1015,112 @@ async fn checked_response(
     }
     Ok(response)
 }
+struct RequestStream {
+    body: hyper::body::Incoming,
+    buffered: bytes::Bytes,
+    wire: u64,
+    expected: u64,
+    consumed: u64,
+}
+
 async fn primary(
     ctx: &AttemptContext<'_>,
     response: Option<(HttpResponse, ResponseMeta)>,
     stop: &mut watch::Receiver<StopSignal>,
+    stream: &mut Option<RequestStream>,
 ) -> Result<(), DownloadError> {
-    let mut body = checked_response(ctx, response)
-        .await
-        .map_err(|failure| failure.error)?
-        .into_body();
-    let mut wire = 0u64;
+    if stream.is_none() {
+        let body = checked_response(ctx, response, ctx.request_end)
+            .await
+            .map_err(|failure| failure.error)?
+            .into_body();
+        *stream = Some(RequestStream {
+            body,
+            buffered: bytes::Bytes::new(),
+            wire: 0,
+            consumed: 0,
+            expected: ctx.request_end - ctx.segment.start,
+        });
+    }
+    let stream = stream.as_mut().expect("initialized request body");
     loop {
-        ctx.observation.lock().phase(Phase::Reading);
-        let chunk = next_data_chunk(&mut body, ctx.cfg.read_timeout).await?;
-        let Some(mut data) = chunk else {
-            break;
-        };
-        wire = wire.saturating_add(data.len() as u64);
-        ctx.recovery
-            .wire
-            .fetch_add(data.len() as u64, Ordering::Relaxed);
-        ctx.observation.lock().wire = wire;
-        if wire > ctx.segment.end - ctx.segment.start {
-            return Err(DownloadError::ResumeMismatch(
-                "server overran adaptive range".into(),
-            ));
+        let forwarded = ctx.observation.lock().forwarded;
+        if forwarded == ctx.segment.end - ctx.segment.start && ctx.segment.end < ctx.request_end {
+            // A frame may contain the next piece. Keep its suffix across the
+            // flush/complete barrier instead of issuing another HTTP request.
+            ctx.observation.lock().phase(Phase::WriterBarrier);
+            return Ok(());
         }
-        while !data.is_empty() {
-            let len = data.len().min(ctx.budget.max_chunk);
-            ctx.observation.lock().phase(Phase::RateLimited);
-            ctx.speed.acquire(len).await;
-            ctx.observation.lock().phase(Phase::MemoryBlocked);
-            let permit = ctx
-                .budget
-                .semaphore
-                .acquire_many(len as u32)
-                .await
-                .map_err(|_| DownloadError::ChannelClosed)?;
-            ctx.observation.lock().phase(Phase::ChannelBlocked);
-            let slot = ctx
-                .write_tx
-                .reserve()
-                .await
-                .map_err(|_| DownloadError::ChannelClosed)?;
-            let offset = ctx.segment.start + ctx.observation.lock().forwarded;
-            slot.send(WriterCommand::Data {
-                data: data.split_to(len),
-                offset,
-                lease_key: Some(ctx.segment.lease_key()),
-            });
-            permit.forget();
-            ctx.observation.lock().forwarded += len as u64;
-            ctx.received.fetch_add(len as u64, Ordering::Relaxed);
-            if let Some(error) = stop_signal_error(*stop.borrow()) {
-                return Err(error);
+        if stream.buffered.is_empty() {
+            ctx.observation.lock().phase(Phase::Reading);
+            let chunk = next_data_chunk(&mut stream.body, ctx.cfg.read_timeout).await?;
+            let Some(data) = chunk else {
+                if stream.wire != stream.expected {
+                    return Err(DownloadError::Transport(crate::error::TransportError::new(
+                        crate::error::TransportErrorKind::Body,
+                        std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "range body ended early",
+                        ),
+                    )));
+                }
+                ctx.observation.lock().phase(Phase::WriterBarrier);
+                return Ok(());
+            };
+            stream.wire = stream.wire.saturating_add(data.len() as u64);
+            ctx.recovery
+                .wire
+                .fetch_add(data.len() as u64, Ordering::Relaxed);
+            ctx.observation.lock().wire += data.len() as u64;
+            if stream.wire > stream.expected {
+                return Err(DownloadError::ResumeMismatch(
+                    "server overran requested range".into(),
+                ));
+            }
+            stream.buffered = data;
+            if stream.buffered.is_empty() {
+                continue;
             }
         }
+        let remaining = ctx.segment.end - ctx.segment.start - forwarded;
+        let len = stream
+            .buffered
+            .len()
+            .min(ctx.budget.max_chunk)
+            .min(usize::try_from(remaining).unwrap_or(usize::MAX));
+        if len == 0 {
+            return Err(DownloadError::ResumeMismatch(
+                "server overran final piece".into(),
+            ));
+        }
+        ctx.observation.lock().phase(Phase::RateLimited);
+        ctx.speed.acquire(len).await;
+        ctx.observation.lock().phase(Phase::MemoryBlocked);
+        let permit = ctx
+            .budget
+            .semaphore
+            .acquire_many(len as u32)
+            .await
+            .map_err(|_| DownloadError::ChannelClosed)?;
+        ctx.observation.lock().phase(Phase::ChannelBlocked);
+        let slot = ctx
+            .write_tx
+            .reserve()
+            .await
+            .map_err(|_| DownloadError::ChannelClosed)?;
+        slot.send(WriterCommand::Data {
+            data: stream.buffered.split_to(len),
+            offset: ctx.segment.start + forwarded,
+            lease_key: Some(ctx.segment.lease_key()),
+        });
+        permit.forget();
+        stream.consumed += len as u64;
+        ctx.observation.lock().forwarded += len as u64;
+        ctx.received.fetch_add(len as u64, Ordering::Relaxed);
+        if let Some(error) = stop_signal_error(*stop.borrow()) {
+            return Err(error);
+        }
     }
-    ctx.observation.lock().phase(Phase::WriterBarrier);
-    if wire != ctx.segment.end - ctx.segment.start {
-        return Err(DownloadError::Transport(crate::error::TransportError::new(
-            crate::error::TransportErrorKind::Body,
-            std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "adaptive range body ended early",
-            ),
-        )));
-    }
-    Ok(())
 }
 
 struct Staged {
@@ -1047,7 +1179,9 @@ async fn stage(ctx: &AttemptContext<'_>) -> Result<Staged, CandidateFailure> {
         file: tokio::fs::File::from_std(file),
         _path: path,
     };
-    let mut body = checked_response(ctx, None).await?.into_body();
+    let mut body = checked_response(ctx, None, ctx.segment.end)
+        .await?
+        .into_body();
     let mut wire = 0u64;
     while let Some(mut data) = next_data_chunk(&mut body, ctx.cfg.read_timeout).await? {
         wire = wire.saturating_add(data.len() as u64);

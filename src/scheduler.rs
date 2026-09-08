@@ -244,6 +244,25 @@ impl SchedulerState {
         self.assign_to_with_split(worker_id, 1, u64::MAX)
     }
 
+    /// Assign using occupied HTTP requests rather than reserved piece leases
+    /// when deciding whether to split work for spare request slots.
+    /// `occupied_requests` excludes the request currently seeking an assignment.
+    pub fn assign_to_with_request_split(
+        &mut self,
+        worker_id: usize,
+        max_requests: usize,
+        min_segment_size: u64,
+        occupied_requests: usize,
+    ) -> Option<Segment> {
+        let available_request_slots = max_requests.saturating_sub(occupied_requests);
+        self.assign_to_with_split(
+            worker_id,
+            self.active_lease_count
+                .saturating_add(available_request_slots),
+            min_segment_size,
+        )
+    }
+
     pub fn assign_to_with_split(
         &mut self,
         worker_id: usize,
@@ -309,6 +328,75 @@ impl SchedulerState {
             return None;
         }
         self.issue_lease(piece_id, range, worker_id)
+    }
+
+    /// Reserve contiguous untouched pieces after an existing whole-piece lease.
+    /// The returned leases exclude `first`; the byte and 64-lease limits include it.
+    /// Leave independent ranges for the other configured request workers, without
+    /// treating reserved piece leases as occupied HTTP request slots.
+    pub fn extend_batch(
+        &mut self,
+        first: &Segment,
+        worker_id: usize,
+        max_connections: usize,
+        byte_cap: u64,
+    ) -> Vec<Segment> {
+        let mut additional = Vec::new();
+        let Some(piece) = self.pieces.get(&first.piece_id) else {
+            return additional;
+        };
+        let Some(active) = piece.active_leases.get(&first.lease_id) else {
+            return additional;
+        };
+        let (start, end) = self.piece_map.piece_range(first.piece_id);
+        if first.owner_worker_id != worker_id
+            || (first.start, first.end) != (start, end)
+            || active.range != (ByteRange { start, end })
+        {
+            return additional;
+        }
+        let reserved_for_peers = max_connections.saturating_sub(1);
+        let mut request_end = first.end;
+        for piece_id in first.piece_id + 1..self.piece_map.piece_count() {
+            if additional.len() == 63
+                || self.available_range_count <= reserved_for_peers
+                || !self.available_pieces[piece_id]
+                || self.pieces.contains_key(&piece_id)
+            {
+                break;
+            }
+            let (start, end) = self.piece_map.piece_range(piece_id);
+            if start != request_end || end - first.start > byte_cap {
+                break;
+            }
+            let Some(segment) = self.issue_lease(piece_id, ByteRange { start, end }, worker_id)
+            else {
+                break;
+            };
+            additional.push(segment);
+            request_end = end;
+            self.next_candidate = (piece_id + 1) % self.piece_map.piece_count();
+        }
+        additional
+    }
+
+    /// Retain a writer-confirmed prefix in runtime state, leaving the same lease
+    /// identity active for its suffix. The caller must first retire writer access
+    /// and then renew or reclaim this lease before producing any more data.
+    /// Partial progress never publishes a durable whole-piece completion bit.
+    pub fn retain_prefix(&mut self, lease_key: LeaseKey, confirmed_end: u64) -> bool {
+        let Some(piece) = self.pieces.get_mut(&lease_key.piece_id) else {
+            return false;
+        };
+        let Some(active) = piece.active_leases.get_mut(&lease_key.lease_id) else {
+            return false;
+        };
+        if confirmed_end <= active.range.start || confirmed_end >= active.range.end {
+            return false;
+        }
+        active.range.start = confirmed_end;
+        piece.has_completed_ranges = true;
+        true
     }
 
     /// Replace an active lease with a fresh lease identity for the same piece.
@@ -456,6 +544,179 @@ impl SchedulerState {
 mod tests {
     use super::*;
     use crate::storage::piece_map::PieceMap;
+
+    #[test]
+    fn request_aware_assignment_splits_despite_reserved_piece_leases() {
+        let mut sched = SchedulerState::new(PieceMap::new(4_096, 1_024));
+        // One HTTP request owns three contiguous pieces; three request slots
+        // remain free when the last missing piece is assigned.
+        let reserved = (0..3)
+            .map(|piece| {
+                sched
+                    .assign_subrange(piece, piece as u64 * 1_024, (piece as u64 + 1) * 1_024, 0)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let first = sched.assign_to_with_request_split(1, 4, 256, 1).unwrap();
+        let second = sched.assign_to_with_request_split(2, 4, 256, 2).unwrap();
+        let third = sched.assign_to_with_request_split(3, 4, 256, 3).unwrap();
+        assert_eq!((first.start, first.end), (3_072, 3_414));
+        assert_eq!((second.start, second.end), (3_414, 3_755));
+        assert_eq!((third.start, third.end), (3_755, 4_096));
+        assert_eq!(
+            (sched.active_lease_count, sched.available_range_count),
+            (6, 0)
+        );
+        for segment in reserved.into_iter().chain([first, second, third]) {
+            assert!(sched.complete(segment.lease_key()));
+        }
+        assert!(sched.all_done());
+        assert_eq!(sched.completed_bytes(), 4_096);
+    }
+
+    #[test]
+    fn request_aware_assignment_preserves_minimum_and_occupied_slot_limits() {
+        let mut sched = SchedulerState::new(PieceMap::new(900, 900));
+        let whole = sched.assign_to_with_request_split(0, 4, 512, 0).unwrap();
+        assert_eq!((whole.start, whole.end), (0, 900));
+        let mut sched = SchedulerState::new(PieceMap::new(1_024, 1_024));
+        // Occupied requests may include setup/backoff without any lease.
+        let whole = sched.assign_to_with_request_split(0, 4, 128, 3).unwrap();
+        assert_eq!((whole.start, whole.end), (0, 1_024));
+    }
+
+    #[test]
+    fn retained_prefix_survives_renewal_and_reclaim_without_durable_bits() {
+        let mut sched = SchedulerState::new(PieceMap::new(1_000, 1_000));
+        let first = sched.assign().unwrap();
+        for invalid in [0, 1_000, 1_001] {
+            assert!(!sched.retain_prefix(first.lease_key(), invalid));
+        }
+        assert!(sched.retain_prefix(first.lease_key(), 300));
+        assert_eq!(
+            (sched.active_lease_count, sched.available_range_count),
+            (1, 0)
+        );
+        assert_eq!(sched.completed_bytes(), 0);
+        assert_eq!(sched.snapshot_bitset(), vec![0]);
+        let renewed = sched.renew(first.lease_key(), 2).unwrap();
+        assert_eq!(
+            (renewed.start, renewed.end, renewed.attempt),
+            (300, 1_000, 2)
+        );
+        assert!(!sched.retain_prefix(first.lease_key(), 600));
+        assert!(!sched.complete(first.lease_key()));
+        assert!(!sched.reclaim(first.lease_key()));
+        assert!(!sched.retain_prefix(renewed.lease_key(), 200));
+        assert!(sched.retain_prefix(renewed.lease_key(), 600));
+        assert!(sched.reclaim(renewed.lease_key()));
+        assert_eq!(
+            (sched.active_lease_count, sched.available_range_count),
+            (0, 1)
+        );
+        let hints = sched.control_hints();
+        assert_eq!(hints.dirty_piece_ids, vec![0]);
+        assert!(hints.inflight_piece_ids.is_empty());
+        let suffix = sched.assign().unwrap();
+        assert_eq!((suffix.start, suffix.end, suffix.attempt), (600, 1_000, 3));
+        assert!(sched.complete(suffix.lease_key()));
+        assert_eq!(sched.completed_bytes(), 1_000);
+        assert_eq!(
+            (sched.active_lease_count, sched.available_range_count),
+            (0, 0)
+        );
+        assert!(sched.pieces.is_empty());
+    }
+
+    #[test]
+    fn retained_prefix_does_not_cover_other_missing_subranges() {
+        let mut sched = SchedulerState::new(PieceMap::new(1_000, 1_000));
+        let middle = sched.assign_subrange(0, 200, 800, 0).unwrap();
+        assert!(sched.retain_prefix(middle.lease_key(), 400));
+        assert!(sched.reclaim(middle.lease_key()));
+        assert_eq!(sched.available_range_count, 2);
+        let left = sched.assign().unwrap();
+        let right = sched.assign().unwrap();
+        assert_eq!((left.start, left.end), (0, 200));
+        assert_eq!((right.start, right.end), (400, 1_000));
+        assert!(sched.complete(right.lease_key()));
+        assert_eq!(sched.completed_bytes(), 0);
+        assert!(sched.complete(left.lease_key()));
+        assert!(sched.all_done());
+    }
+
+    #[test]
+    fn batches_bound_bytes_leases_and_preserve_independent_work() {
+        let mut sched = SchedulerState::new(PieceMap::new(10_000, 1_000));
+        let first = sched.assign_to(4).unwrap();
+        let extra = sched.extend_batch(&first, 4, 4, 3_500);
+        assert_eq!(
+            extra.iter().map(|s| (s.start, s.end)).collect::<Vec<_>>(),
+            vec![(1_000, 2_000), (2_000, 3_000)]
+        );
+        assert_eq!(
+            (sched.active_lease_count, sched.available_range_count),
+            (3, 7)
+        );
+        let next = sched.assign_to(5).unwrap();
+        assert_eq!(next.start, 3_000);
+        let extra = sched.extend_batch(&next, 5, 4, u64::MAX);
+        assert_eq!(extra.len(), 3);
+        assert_eq!(sched.available_range_count, 3);
+        for worker in 0..3 {
+            assert!(sched.assign_to(worker).is_some());
+        }
+        let mut tiny = SchedulerState::new(PieceMap::new(200, 1));
+        let first = tiny.assign().unwrap();
+        let extra = tiny.extend_batch(&first, 0, 1, u64::MAX);
+        assert_eq!(extra.len(), 63);
+        assert_eq!(tiny.active_lease_count, 64);
+        for lease in std::iter::once(first).chain(extra) {
+            assert!(tiny.complete(lease.lease_key()));
+        }
+        assert_eq!(tiny.completed_bytes(), 64);
+    }
+
+    #[test]
+    fn batches_stop_at_completed_active_partial_or_touched_holes() {
+        for hole in 0..4 {
+            let mut sched = SchedulerState::new(PieceMap::new(5_000, 1_000));
+            let end = if hole == 2 { 2_500 } else { 3_000 };
+            let blocked = sched.assign_subrange(2, 2_000, end, 7).unwrap();
+            match hole {
+                0 | 2 => {
+                    assert!(sched.complete(blocked.lease_key()));
+                }
+                3 => {
+                    assert!(sched.reclaim(blocked.lease_key()));
+                }
+                _ => {}
+            }
+            let first = sched.assign().unwrap();
+            let extra = sched.extend_batch(&first, 0, 1, u64::MAX);
+            assert_eq!(extra.len(), 1);
+            assert_eq!(extra[0].piece_id, 1);
+            assert!(sched.available_pieces[3]);
+        }
+    }
+
+    #[test]
+    fn batches_reject_stale_partial_or_mismatched_first_leases() {
+        let mut sched = SchedulerState::new(PieceMap::new(5_000, 1_000));
+        let first = sched.assign().unwrap();
+        assert!(sched.extend_batch(&first, 1, 1, u64::MAX).is_empty());
+        assert!(sched.extend_batch(&first, 0, 1, 999).is_empty());
+        let renewed = sched.renew(first.lease_key(), 0).unwrap();
+        assert!(sched.extend_batch(&first, 0, 1, u64::MAX).is_empty());
+        assert!(sched.retain_prefix(renewed.lease_key(), 500));
+        assert!(sched.extend_batch(&renewed, 0, 1, u64::MAX).is_empty());
+        let suffix = sched.renew(renewed.lease_key(), 0).unwrap();
+        assert!(sched.extend_batch(&suffix, 0, 1, u64::MAX).is_empty());
+        assert_eq!(
+            (sched.active_lease_count, sched.available_range_count),
+            (1, 4)
+        );
+    }
 
     #[test]
     fn test_runtime_state_is_sparse_and_released_on_completion() {

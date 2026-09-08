@@ -33,11 +33,39 @@ let spec = DownloadSpec::new("https://example.com/file.bin")
 
 如果省略 `.output_path(...)`，bytehaul 会依次按 `Content-Disposition`、URL 路径最后一段、默认名 `download` 自动选择文件名。若未设置 `.output_dir(...)`，仍可继续直接传绝对输出路径。
 
+## 连续请求与连接复用
+
+当前开发版本支持显式启用跨 piece 的连续 Range 请求：
+
+```rust
+use bytehaul::DownloadSpec;
+use std::time::Duration;
+
+let spec = DownloadSpec::new("https://example.com/file.bin")
+    .piece_size(1024 * 1024)
+    .request_batch_size(4 * 1024 * 1024)
+    .http_idle_pool(4, Duration::from_secs(30));
+```
+
+`request_batch_size` 默认零，表示关闭合并。合并同时受字节数和最多 64 个租约限制，
+piece 与检查点粒度保持不变；小于 piece 的值不会将它切小。遇到已完成、已分配或
+部分处理过的 piece 时停止合并，并为其他 worker 留出工作。该选项适用于已知大小的
+多连接下载，包括关闭慢请求恢复的模式。连接池是独立的实验性设置，空闲连接数为零
+表示关闭；服务端主动关闭连接时，无法获得空闲连接复用的收益。
+
+当强 ETag 和兼容的条件请求头能够保护对象一致性时，多连接断流重试和慢请求重新
+分配可保留写入器确认的前缀，只请求剩余后缀。未完成的 piece 不会因此写入检查点
+完成位，因此进程重启后仍可能重新下载它。重试次数和时间预算保持原有范围；缺少
+验证器或只有弱验证器时仍重下整个范围，格式错误的响应不适用前缀复用。
+
+可用[本地对比示例](../examples/http_efficiency_compare.rs)测量请求数、连接数，以及
+受控延迟和断流下的耗时。实际收益取决于源站。
+
 ## 慢请求恢复
 
 该功能从 0.2.2 起提供。
 
-多连接 Range 下载默认使用 `SlowTransferMode::Adaptive`：识别持续低速请求后，可取消并重新分配分片，尾部空闲 worker 也可接管。速度判断排除主动限速和本地转发等待；短暂波动或即将完成的请求不会直接触发恢复。`Disabled` 保留原调度行为。
+多连接 Range 下载默认使用 `SlowTransferMode::Adaptive`：识别持续低速请求后，可取消并重新分配分片，尾部空闲 worker 也可接管。速度判断排除主动限速和本地转发等待；短暂波动或即将完成的请求不会直接触发恢复。`Disabled` 关闭因性能原因触发的取消和对冲。
 
 ```rust
 use bytehaul::{DownloadSpec, SlowTransferMode};

@@ -50,7 +50,7 @@ fn fixture_size(
             let end = end.parse::<u64>().unwrap().min(total-1)+1;
             // Reclaimed/subdivided ranges are gated; the request barrier
             // proves actual takeover independently of elapsed download time.
-            let gated = start >= slow_start && start < slow_start+piece;
+            let gated = start < slow_start+piece && end > slow_start;
             let original = gated && first.fetch_add(1, Ordering::SeqCst) == 0;
             let (mut sender, body) = warp::hyper::Body::channel();
             let (release, mut gate) = oneshot::channel();
@@ -61,6 +61,10 @@ fn fixture_size(
                 if status != 206 { return; }
                 let mut offset = start;
                 if original {
+                    if offset < slow_start {
+                        if sender.send_data(bytes(offset,slow_start).into()).await.is_err() { return; }
+                        offset = slow_start;
+                    }
                     loop {
                         tokio::select! {
                             _ = &mut gate => break,
@@ -133,29 +137,50 @@ async fn default_policy_recovers_tail_in_both_modes() {
         SlowTransferMode::Adaptive,
         SlowTransferMode::AdaptiveWithHedging,
     ] {
-        let mut server = fixture(Some("\"stable\""), TOTAL, 206);
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("out");
-        // Leave all detection durations and the absolute floor at their defaults.
-        let config = DownloadSpec::new(&server.url)
-            .output_path(&path)
-            .resume(false)
-            .piece_size(PIECE)
-            .min_segment_size(PIECE)
-            .min_split_size(1)
-            .max_connections(4)
-            .max_retries(0)
-            .read_timeout(Duration::from_secs(15))
-            .slow_transfer_mode(mode);
-        let handle = Downloader::builder().build().unwrap().download(config);
-        let original = next(&mut server).await;
-        // The original stays gated; a replacement must arrive before the
-        // ordinary 5-second window plus 15-second sustained gate can elapse.
-        let replacement = next(&mut server).await;
-        assert_eq!((replacement.start, replacement.end), (TOTAL - PIECE, TOTAL));
-        replacement.release.send(()).unwrap();
-        finish(handle, &path, TOTAL).await;
-        drop(original);
+        for batch in [0, PIECE * 4] {
+            // The scheduler leaves three independent pieces for other workers.
+            // Slow the last constituent of the preceding batch, after its healthy
+            // prefix, while those independent final pieces complete normally.
+            let slow_start = TOTAL - if batch == 0 { PIECE } else { PIECE * 4 };
+            let mut server = fixture_size(Some("\"stable\""), TOTAL, 206, PIECE, slow_start);
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("out");
+            // Leave all detection durations and the absolute floor at their defaults.
+            let config = DownloadSpec::new(&server.url)
+                .output_path(&path)
+                .resume(false)
+                .piece_size(PIECE)
+                .min_segment_size(PIECE)
+                .min_split_size(1)
+                .max_connections(4)
+                .max_retries(0)
+                .read_timeout(Duration::from_secs(15))
+                .slow_transfer_mode(mode)
+                .request_batch_size(batch);
+            let handle = Downloader::builder().build().unwrap().download(config);
+            let original = next(&mut server).await;
+            if batch > 0 {
+                assert!(original.start < slow_start,
+                "fixture must slow a retained body after an earlier constituent: {} >= {slow_start}", original.start);
+            }
+            assert_eq!(original.end, slow_start + PIECE);
+            // The original stays gated; a replacement must arrive before the
+            // ordinary 5-second window plus 15-second sustained gate can elapse.
+            let replacement = next(&mut server).await;
+            assert_eq!(replacement.end, slow_start + PIECE);
+            if mode == SlowTransferMode::Adaptive {
+                assert!(
+                    replacement.start > slow_start && replacement.start < slow_start + PIECE,
+                    "recovery must preserve the confirmed slow prefix"
+                );
+            } else {
+                assert_eq!(replacement.start, slow_start);
+            }
+            assert_eq!(replacement.condition.as_deref(), Some("\"stable\""));
+            replacement.release.send(()).unwrap();
+            finish(handle, &path, TOTAL).await;
+            drop(original);
+        }
     }
 }
 #[tokio::test]
@@ -170,14 +195,20 @@ async fn drip_recovery_reclaims_and_splits_for_idle_workers() {
     let original = next(&mut server).await;
     assert_eq!((original.start, original.end), (0, PIECE));
     let mut replacements = Vec::new();
-    for _ in 0..4 {
+    for _ in 0..3 {
         replacements.push(next(&mut server).await);
     }
     let mut ranges: Vec<_> = replacements.iter().map(|r| (r.start, r.end)).collect();
     ranges.sort_unstable();
+    let retained = ranges[0].0;
+    assert!(retained > 0 && retained < 1024);
     assert_eq!(
         ranges,
-        [(0, 1024), (1024, 2048), (2048, 3072), (3072, 4096)]
+        [
+            (retained, retained + 1024),
+            (retained + 1024, retained + 2048),
+            (retained + 2048, 4096)
+        ]
     );
     for replacement in replacements {
         replacement.release.send(()).unwrap();

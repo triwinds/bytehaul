@@ -23,6 +23,9 @@ use parking_lot::Mutex;
 use tower_service::Service;
 use url::Url;
 
+#[cfg(test)]
+mod tls_tests;
+
 use crate::error::{BoxError, DownloadError, TransportError};
 use crate::http::{HttpRequestBody, HttpResponse};
 

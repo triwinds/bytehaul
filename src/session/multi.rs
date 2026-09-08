@@ -1,5 +1,10 @@
 mod adaptive;
 
+#[cfg(test)]
+mod prefix_tests;
+#[cfg(test)]
+mod transfer_tests;
+
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -152,6 +157,8 @@ pub(super) async fn run_multi_worker(
         max_retry_elapsed: spec.max_retry_elapsed,
         max_active_leases: num_workers,
         min_segment_size: spec.min_segment_size.min(spec.piece_size),
+        request_batch_size: spec.request_batch_size,
+        validator: adaptive::usable_validator(spec, meta),
         recovery: adaptive::Coordinator::new(spec, meta, output_path, total_size),
     });
 
@@ -497,6 +504,8 @@ struct WorkerConfig {
     max_retry_elapsed: Option<Duration>,
     max_active_leases: usize,
     min_segment_size: u64,
+    request_batch_size: u64,
+    validator: Option<String>,
     recovery: Option<Arc<adaptive::Coordinator>>,
 }
 
@@ -533,6 +542,10 @@ async fn worker_loop(
         )
         .await;
     }
+    let worker = match cfg.validator.as_deref() {
+        Some(etag) => cfg.worker.clone().with_validator(etag),
+        None => cfg.worker.clone(),
+    };
     let mut cancel_rx = cancel_rx;
     log_debug!(
         log_level,
@@ -597,7 +610,9 @@ async fn worker_loop(
             begin_lease_and_wait(&write_tx, segment.lease_key()).await?;
             let response = take_matching_probe_response(&first_response, &segment).await;
             let result = if let Some((resp, meta)) = response {
-                match validate_segment_response(206, None, &meta, &segment, total_size) {
+                match validate_identity(cfg.validator.as_deref(), &meta).and_then(|()| {
+                    validate_segment_response(206, None, &meta, &segment, total_size)
+                }) {
                     Ok(()) => {
                         stream_segment(
                             resp,
@@ -616,7 +631,8 @@ async fn worker_loop(
                 }
             } else {
                 download_segment(
-                    &cfg.worker,
+                    &worker,
+                    cfg.validator.as_deref(),
                     cfg.read_timeout,
                     total_size,
                     &segment,
@@ -648,16 +664,26 @@ async fn worker_loop(
                     break;
                 }
                 Err((e, bytes_read)) => {
-                    if bytes_read > 0 {
-                        received_bytes.fetch_sub(bytes_read, Ordering::Relaxed);
-                    }
-                    if let Err(error) = discard_lease_and_wait(&write_tx, segment.lease_key()).await
+                    let decision = retry_state.decide(e);
+                    let retain = cfg.validator.is_some()
+                        && matches!(decision, RetryDecision::Retry { .. })
+                        && bytes_read > 0
+                        && bytes_read < segment.end - segment.start;
+                    if let Err(error) = settle_prefix(
+                        &write_tx,
+                        &scheduler,
+                        &mut segment,
+                        &received_bytes,
+                        bytes_read,
+                        retain,
+                    )
+                    .await
                     {
                         let _ = scheduler.lock().reclaim(segment.lease_key());
                         return Err(error);
                     }
 
-                    match retry_state.decide(e) {
+                    match decision {
                         RetryDecision::Stop(error) => {
                             log_warn!(log_level, download_id = download_id, worker_id = worker_id,
                                 piece_id = segment.piece_id, error = %error,
@@ -697,6 +723,50 @@ async fn worker_loop(
                 }
             }
         }
+    }
+}
+
+fn validate_identity(validator: Option<&str>, meta: &ResponseMeta) -> Result<(), DownloadError> {
+    if validator.is_some_and(|expected| {
+        meta.etag
+            .as_deref()
+            .is_some_and(|actual| actual != expected)
+    }) {
+        return Err(DownloadError::ResumeMismatch(
+            "object validator changed during ranged download".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// The producer has stopped before this FIFO barrier. FlushLease confirms every
+/// forwarded contiguous byte and retires the old writer identity. The scheduler
+/// records only that prefix in runtime state; no durable piece bit is set.
+async fn settle_prefix(
+    write_tx: &mpsc::Sender<WriterCommand>,
+    scheduler: &Scheduler,
+    segment: &mut Segment,
+    received: &AtomicU64,
+    forwarded: u64,
+    retain: bool,
+) -> Result<(), DownloadError> {
+    if retain {
+        if let Err(error) = flush_lease_and_wait(write_tx, segment.lease_key()).await {
+            received.fetch_sub(forwarded, Ordering::Relaxed);
+            return Err(error);
+        }
+        let end = segment.start + forwarded;
+        if !scheduler.lock().retain_prefix(segment.lease_key(), end) {
+            received.fetch_sub(forwarded, Ordering::Relaxed);
+            return Err(DownloadError::Internal("stale prefix handoff".into()));
+        }
+        segment.start = end;
+        Ok(())
+    } else {
+        received.fetch_sub(forwarded, Ordering::Relaxed);
+        discard_lease_and_wait(write_tx, segment.lease_key())
+            .await
+            .map(|_| ())
     }
 }
 
@@ -750,6 +820,7 @@ fn validate_segment_response(
 #[allow(clippy::too_many_arguments)]
 async fn download_segment(
     worker: &HttpWorker,
+    validator: Option<&str>,
     timeout: Duration,
     total_size: u64,
     segment: &Segment,
@@ -764,6 +835,7 @@ async fn download_segment(
         .await
         .map_err(|error| (error, 0))?;
 
+    validate_identity(validator, &meta).map_err(|error| (error, 0))?;
     let status = response.status().as_u16();
     let retry_after = response
         .headers()
@@ -1336,6 +1408,8 @@ mod coverage_tests {
             max_retry_elapsed: Some(Duration::from_secs(2)),
             max_active_leases: 1,
             min_segment_size: 256,
+            request_batch_size: 0,
+            validator: None,
             recovery: None,
         });
 
@@ -1380,6 +1454,8 @@ mod coverage_tests {
             max_retry_elapsed: Some(Duration::from_secs(5)),
             max_active_leases: 1,
             min_segment_size: 256,
+            request_batch_size: 0,
+            validator: None,
             recovery: None,
         });
 
@@ -1617,6 +1693,8 @@ mod coverage_tests {
             max_retry_elapsed: None,
             max_active_leases: 1,
             min_segment_size: 4,
+            request_batch_size: 0,
+            validator: None,
             recovery: None,
         })
     }

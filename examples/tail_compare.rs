@@ -1,5 +1,5 @@
 //! Controlled 128 MiB loopback comparison using production policy defaults.
-//! `cargo run --example tail_compare -- <aria2c-path-or-dash> [rounds] [filter]`
+//! `cargo run --example tail_compare -- <aria2c-path-or-dash> [rounds] [filter] [batch-bytes]`
 //! A dash skips aria2. Filters: normal-only, tail-only, recovery-only,
 //! hedge-only, aria-only.
 //! CSV goes to stdout; request/recovery diagnostics go to stderr.
@@ -135,6 +135,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("rounds must be positive".into());
     }
     let filter = std::env::args().nth(3);
+    let batch_bytes: u64 = std::env::args().nth(4).map_or(Ok(0), |s| s.parse())?;
     if !matches!(
         filter.as_deref(),
         None | Some("normal-only" | "tail-only" | "recovery-only" | "hedge-only" | "aria-only")
@@ -236,6 +237,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let spec = DownloadSpec::new(&url)
                         .output_path(&output)
                         .max_connections(4)
+                        .request_batch_size(batch_bytes)
                         .min_split_size(4 * 1024 * 1024)
                         .resume(false)
                         .file_allocation(FileAllocation::None)
