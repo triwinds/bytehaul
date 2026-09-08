@@ -14,6 +14,9 @@ use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 const COOLDOWN: Duration = Duration::from_secs(10);
 const MAX_EXTRA: u64 = 16 * 1024 * 1024;
 const MAX_HEDGE: u64 = 1024 * 1024;
+const TAIL_WINDOW: Duration = Duration::from_secs(1);
+const TAIL_GRACE: Duration = Duration::from_secs(1);
+const TAIL_DURATION: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
@@ -36,6 +39,8 @@ struct Observation {
     slow_since: Option<Duration>,
     rate: Option<f64>,
     window: Duration,
+    tail_samples: VecDeque<(Duration, u64)>,
+    tail_slow_since: Option<Duration>,
 }
 impl Observation {
     fn new(now: Instant, window: Duration) -> Self {
@@ -50,6 +55,8 @@ impl Observation {
             slow_since: None,
             rate: None,
             window,
+            tail_samples: VecDeque::from([(Duration::ZERO, 0)]),
+            tail_slow_since: None,
         }
     }
     fn advance(&mut self, now: Instant) {
@@ -64,6 +71,15 @@ impl Observation {
             self.samples.push_back((self.reading, self.wire));
             self.slow_since = None;
             self.rate = None;
+        }
+        if self.phase != Phase::Reading
+            && self
+                .blocked_since
+                .is_some_and(|at| now.saturating_duration_since(at) >= self.window.min(TAIL_WINDOW))
+        {
+            self.tail_samples.clear();
+            self.tail_samples.push_back((self.reading, self.wire));
+            self.tail_slow_since = None;
         }
         self.phase_at = now;
     }
@@ -93,6 +109,42 @@ impl Observation {
         self.rate = (span >= self.window).then(|| (self.wire - bytes) as f64 / span.as_secs_f64());
         self.rate
     }
+    fn tail_sample(&mut self, now: Instant) -> Option<f64> {
+        self.advance(now);
+        if self.phase != Phase::Reading {
+            return None;
+        }
+        let window = self.window.min(TAIL_WINDOW);
+        self.tail_samples.push_back((self.reading, self.wire));
+        while self.tail_samples.len() > 2
+            && self.reading.saturating_sub(self.tail_samples[1].0) >= window
+        {
+            self.tail_samples.pop_front();
+        }
+        let (at, bytes) = *self.tail_samples.front()?;
+        let span = self.reading.saturating_sub(at);
+        (span >= window).then(|| (self.wire - bytes) as f64 / span.as_secs_f64())
+    }
+    fn should_recover_tail(
+        &mut self,
+        now: Instant,
+        baseline: Option<f64>,
+        spec: &Policy,
+        len: u64,
+    ) -> bool {
+        let rate = self.tail_sample(now);
+        let Some((rate, healthy)) = rate.zip(baseline.filter(|rate| *rate > 0.)) else {
+            self.tail_slow_since = None;
+            return false;
+        };
+        if self.reading < spec.grace.min(TAIL_GRACE) || rate >= healthy * 0.25 {
+            self.tail_slow_since = None;
+            return false;
+        }
+        let since = *self.tail_slow_since.get_or_insert(self.reading);
+        self.reading.saturating_sub(since) >= spec.duration.min(TAIL_DURATION)
+            && recovery_benefits(rate, healthy, len, self.forwarded, spec.window)
+    }
     fn should_recover(
         &mut self,
         now: Instant,
@@ -117,17 +169,21 @@ impl Observation {
         if self.reading.saturating_sub(since) < spec.duration {
             return false;
         }
-        let remaining = len.saturating_sub(self.forwarded);
         // Explicit absolute thresholds can recover without historical peers,
         // but use a finite conservative rate floor for the benefit estimate.
         let healthy = baseline.or(spec.absolute.map(|v| v as f64));
         let Some(healthy) = healthy.filter(|v| *v > 0.) else {
             return false;
         };
-        let keep = remaining as f64 / rate.max(1.);
-        let replace = len as f64 / healthy + spec.window.as_secs_f64().min(1.);
-        remaining > 0 && keep > replace * 2. && keep - replace > spec.window.as_secs_f64().min(2.)
+        recovery_benefits(rate, healthy, len, self.forwarded, spec.window)
     }
+}
+
+fn recovery_benefits(rate: f64, healthy: f64, len: u64, forwarded: u64, window: Duration) -> bool {
+    let remaining = len.saturating_sub(forwarded);
+    let keep = remaining as f64 / rate.max(1.);
+    let replace = len as f64 / healthy + window.as_secs_f64().min(1.);
+    remaining > 0 && keep > replace * 2. && keep - replace > window.as_secs_f64().min(2.)
 }
 
 struct Policy {
@@ -176,6 +232,7 @@ pub(super) struct Coordinator {
     validator: Option<String>,
     output_dir: PathBuf,
     slots: Arc<Semaphore>,
+    slot_capacity: usize,
     changed: Notify,
     state: Mutex<State>,
     extra_limit: u64,
@@ -224,6 +281,7 @@ impl Coordinator {
                 .unwrap_or(Path::new("."))
                 .to_path_buf(),
             slots: Arc::new(Semaphore::new(spec.max_connections as usize)),
+            slot_capacity: spec.max_connections as usize,
             changed: Notify::new(),
             state: Mutex::new(State {
                 active: BTreeMap::new(),
@@ -257,11 +315,29 @@ impl Coordinator {
     }
     fn tick(&self) -> Duration {
         (self.policy.window / 5)
-            .min(Duration::from_secs(1))
+            .min(TAIL_WINDOW / 5)
             .max(Duration::from_nanos(1))
     }
     fn baseline(&self, target: LeaseKey, now: Instant) -> Option<f64> {
+        self.sample_baseline(target, now, false)
+    }
+    fn tail_eligible(&self, len: u64, available: bool) -> bool {
+        len <= MAX_HEDGE
+            && !available
+            && self.slots.available_permits() > 0
+            && self.state.lock().pending.is_empty()
+    }
+    fn sample_baseline(&self, target: LeaseKey, now: Instant, tail: bool) -> Option<f64> {
         let mut state = self.state.lock();
+        // A slot also covers writer setup, discard and retry backoff, where
+        // no observation is registered. Those requests provide no healthy
+        // network evidence and must suppress the accelerated path.
+        if tail
+            && (!state.active.contains_key(&target)
+                || self.slot_capacity - self.slots.available_permits() != state.active.len())
+        {
+            return None;
+        }
         let ttl = self
             .policy
             .window
@@ -273,8 +349,17 @@ impl Coordinator {
         let mut current = Vec::new();
         for (&key, sample) in &state.active {
             if key != target {
-                if let Some(rate) = sample.lock().sample(now) {
+                let mut sample = sample.lock();
+                let rate = if tail {
+                    sample.tail_sample(now)
+                } else {
+                    sample.sample(now)
+                };
+                if let Some(rate) = rate {
                     current.push(rate);
+                } else if tail {
+                    // Missing live evidence cannot endorse a historical peak.
+                    return None;
                 }
             }
         }
@@ -546,13 +631,7 @@ pub(super) async fn worker_loop(
                 log_level,
                 download_id,
             };
-            let outcome = run_attempt(
-                &context,
-                response,
-                &mut stop,
-                &lineage,
-            )
-            .await;
+            let outcome = run_attempt(&context, response, &mut stop, &lineage).await;
             // run_attempt's futures have been dropped: no producer can enqueue
             // old generation data after this point.
             recovery.finish_observation(segment.lease_key(), matches!(outcome, Outcome::Complete));
@@ -734,7 +813,17 @@ async fn run_attempt(
                         forwarded_bytes = sample.forwarded, reading_ms = sample.reading.as_millis() as u64,
                         baseline_bytes_sec = ?baseline, "adaptive request sample");
                 }
-                let eligible = ctx.observation.lock().should_recover(now, baseline, &ctx.recovery.policy, ctx.segment.end-ctx.segment.start);
+                let len = ctx.segment.end-ctx.segment.start;
+                let tail_baseline = if !matches!(ctx.speed, SpeedLimit::Limited(_))
+                    && ctx.recovery.tail_eligible(len, ctx.scheduler.lock().has_available()) {
+                    ctx.recovery.sample_baseline(ctx.segment.lease_key(), now, true)
+                } else { None };
+                let (ordinary, tail) = {
+                    let mut observation = ctx.observation.lock();
+                    (observation.should_recover(now, baseline, &ctx.recovery.policy, len),
+                     observation.should_recover_tail(now, tail_baseline, &ctx.recovery.policy, len))
+                };
+                let eligible = ordinary || tail;
                 // A user cap deliberately couples all request rates. Keep
                 // observing phases but conservatively suppress speculative
                 // performance work while that cap is active.
@@ -752,7 +841,7 @@ async fn run_attempt(
                 let hedge = slot.is_some();
                 if !ctx.recovery.reserve(len, lineage, hedge, now) { continue; }
                 log_info!(ctx.log_level, download_id = ctx.download_id, worker_id = ctx.segment.owner_worker_id,
-                    attempt = ctx.segment.attempt, start = ctx.segment.start, end = ctx.segment.end, hedge,
+                    attempt = ctx.segment.attempt, start = ctx.segment.start, end = ctx.segment.end, hedge, fast_tail = tail,
                     "sustained low reading speed; bounded recovery selected");
                 if let Some(permit) = slot {
                     hedge_guard = Some(HedgeGuard(ctx.recovery));
@@ -1046,6 +1135,141 @@ mod tests {
             retries: RetryState::new(2, Duration::ZERO, Duration::ZERO, None),
             recoveries: 0,
         }))
+    }
+    #[test]
+    fn default_tail_detection_is_short_sustained_and_resets_without_evidence() {
+        let recovery = coordinator(1_000_000);
+        let policy = &recovery.policy;
+        let start = Instant::now();
+        let mut observation = Observation::new(start, policy.window);
+        observation.phase = Phase::Reading;
+        observation.blocked_since = None;
+        for second in 0..=3 {
+            observation.wire = second * 10;
+            let now = start + Duration::from_secs(second);
+            assert!(!observation.should_recover(now, Some(2000.), policy, 10000));
+            assert_eq!(
+                observation.should_recover_tail(now, Some(2000.), policy, 10000),
+                second == 3
+            );
+        }
+        let now = start + Duration::from_secs(3);
+        observation.slow_since = Some(Duration::from_secs(2));
+        let ordinary_samples = observation.samples.clone();
+        observation.forwarded = 9999;
+        assert!(!observation.should_recover_tail(now, Some(2000.), policy, 10000));
+        observation.forwarded = 0;
+        assert!(!observation.should_recover_tail(now, None, policy, 10000));
+        assert_eq!(observation.tail_slow_since, None);
+        assert!(!observation.should_recover_tail(now, Some(2000.), policy, 10000));
+        assert_eq!(observation.slow_since, Some(Duration::from_secs(2)));
+        assert_eq!(observation.samples, ordinary_samples);
+        observation.wire += 10000;
+        assert!(!observation.should_recover_tail(
+            start + Duration::from_secs(4),
+            Some(2000.),
+            policy,
+            10000
+        ));
+        assert_eq!(observation.tail_slow_since, None);
+    }
+    #[test]
+    fn tail_blocks_clear_only_short_history_and_exclude_local_time() {
+        for phase in [
+            Phase::Headers,
+            Phase::RateLimited,
+            Phase::MemoryBlocked,
+            Phase::ChannelBlocked,
+            Phase::WriterBarrier,
+        ] {
+            let start = Instant::now();
+            let mut observation = Observation::new(start, Duration::from_secs(5));
+            observation.phase = phase;
+            observation.tail_slow_since = Some(Duration::ZERO);
+            observation.slow_since = Some(Duration::ZERO);
+            assert_eq!(
+                observation.tail_sample(start + Duration::from_secs(1)),
+                None
+            );
+            assert_eq!(observation.tail_slow_since, None);
+            assert_eq!(observation.slow_since, Some(Duration::ZERO));
+            assert_eq!(observation.reading, Duration::ZERO);
+            observation.phase = Phase::Reading;
+            observation.blocked_since = None;
+            assert_eq!(
+                observation.tail_sample(start + Duration::from_millis(1500)),
+                None
+            );
+        }
+    }
+    #[test]
+    fn tail_requires_idle_slot_exhausted_work_and_mature_healthy_peers() {
+        let recovery = coordinator(1_000_000);
+        let now = Instant::now();
+        let key = LeaseKey {
+            piece_id: 0,
+            lease_id: 1,
+        };
+        assert!(recovery.tail_eligible(MAX_HEDGE, false));
+        assert!(!recovery.tail_eligible(MAX_HEDGE + 1, false));
+        assert!(!recovery.tail_eligible(MAX_HEDGE, true));
+        let permits = recovery.slots.try_acquire_many(4).unwrap();
+        assert!(!recovery.tail_eligible(MAX_HEDGE, false));
+        drop(permits);
+        recovery.state.lock().pending.push_back((0, 0, 1000, 1));
+        assert!(!recovery.tail_eligible(MAX_HEDGE, false));
+        recovery.state.lock().pending.clear();
+        let _target_permit = recovery.slots.try_acquire().unwrap();
+        recovery
+            .state
+            .lock()
+            .active
+            .insert(key, Arc::new(Mutex::new(reading(now))));
+        assert_eq!(recovery.sample_baseline(key, now, true), None);
+        recovery
+            .state
+            .lock()
+            .history
+            .extend([(now, 2000.), (now, 2000.)]);
+        assert_eq!(recovery.sample_baseline(key, now, true), Some(2000.));
+        let peer_key = LeaseKey {
+            piece_id: 1,
+            lease_id: 2,
+        };
+        let peer_permit = recovery.slots.try_acquire().unwrap();
+        assert_eq!(
+            recovery.sample_baseline(key, now, true),
+            None,
+            "an occupied slot without an observation cannot endorse history"
+        );
+        for (age, phase, wire, expected) in [
+            (0, Phase::Reading, 2000, None),
+            (2, Phase::MemoryBlocked, 4000, None),
+            (2, Phase::Reading, 10, None),
+            (2, Phase::Reading, 4000, Some(2000.)),
+        ] {
+            let mut peer = reading(now - Duration::from_secs(age));
+            peer.phase = phase;
+            peer.wire = wire;
+            recovery
+                .state
+                .lock()
+                .active
+                .insert(peer_key, Arc::new(Mutex::new(peer)));
+            assert_eq!(recovery.sample_baseline(key, now, true), expected);
+        }
+        recovery.state.lock().active.remove(&peer_key);
+        assert_eq!(
+            recovery.sample_baseline(key, now, true),
+            None,
+            "a peer leaving observation for discard or backoff still occupies a slot"
+        );
+        drop(peer_permit);
+        assert_eq!(recovery.sample_baseline(key, now, true), Some(2000.));
+        assert_eq!(
+            recovery.sample_baseline(key, now + Duration::from_secs(61), true),
+            None
+        );
     }
     #[test]
     fn sustained_detection_requires_grace_window_duration_and_benefit() {

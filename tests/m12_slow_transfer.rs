@@ -128,6 +128,37 @@ async fn finish(handle: bytehaul::DownloadHandle, path: &std::path::Path, total:
     );
 }
 #[tokio::test]
+async fn default_policy_recovers_tail_in_both_modes() {
+    for mode in [
+        SlowTransferMode::Adaptive,
+        SlowTransferMode::AdaptiveWithHedging,
+    ] {
+        let mut server = fixture(Some("\"stable\""), TOTAL, 206);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out");
+        // Leave all detection durations and the absolute floor at their defaults.
+        let config = DownloadSpec::new(&server.url)
+            .output_path(&path)
+            .resume(false)
+            .piece_size(PIECE)
+            .min_segment_size(PIECE)
+            .min_split_size(1)
+            .max_connections(4)
+            .max_retries(0)
+            .read_timeout(Duration::from_secs(15))
+            .slow_transfer_mode(mode);
+        let handle = Downloader::builder().build().unwrap().download(config);
+        let original = next(&mut server).await;
+        // The original stays gated; a replacement must arrive before the
+        // ordinary 5-second window plus 15-second sustained gate can elapse.
+        let replacement = next(&mut server).await;
+        assert_eq!((replacement.start, replacement.end), (TOTAL - PIECE, TOTAL));
+        replacement.release.send(()).unwrap();
+        finish(handle, &path, TOTAL).await;
+        drop(original);
+    }
+}
+#[tokio::test]
 async fn drip_recovery_reclaims_and_splits_for_idle_workers() {
     let mut server = fixture_size(Some("\"stable\""), TOTAL, 206, PIECE, 0);
     let dir = tempfile::tempdir().unwrap();

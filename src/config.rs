@@ -431,6 +431,8 @@ impl DownloadSpec {
     }
 
     /// Automatic performance recovery mode (default: adaptive).
+    /// Small trailing ranges with idle capacity and healthy reference speeds
+    /// can use a shorter observation period; `Disabled` suppresses both paths.
     pub fn slow_transfer_mode(mut self, value: SlowTransferMode) -> Self {
         self.slow_transfer_mode = value;
         self
@@ -452,7 +454,8 @@ impl DownloadSpec {
         self.low_speed_limit
     }
 
-    /// Continuous low-speed duration (default: 15 seconds).
+    /// Ordinary continuous low-speed duration (default: 15 seconds).
+    /// Eligible small trailing ranges use at most 2 seconds, with a healthy baseline.
     pub fn low_speed_duration(mut self, value: Duration) -> Self {
         self.low_speed_duration = value;
         self
@@ -464,6 +467,7 @@ impl DownloadSpec {
     }
 
     /// Initial reading grace period (default: 5 seconds).
+    /// Eligible small trailing ranges use at most 1 second.
     pub fn slow_start_grace(mut self, value: Duration) -> Self {
         self.slow_start_grace = value;
         self
@@ -475,6 +479,7 @@ impl DownloadSpec {
     }
 
     /// Effective network reading sample window (default: 5 seconds).
+    /// Eligible small trailing ranges also use a separate window of at most 1 second.
     pub fn slow_sample_window(mut self, value: Duration) -> Self {
         self.slow_sample_window = value;
         self

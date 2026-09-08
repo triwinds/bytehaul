@@ -1,0 +1,7 @@
+scenario,round,mode,seconds,requests,tail_attempts,verified_bytes
+tail,1,adaptive,10.486,132,5,134217728
+tail,1,hedging,10.061,129,2,134217728
+tail,2,adaptive,10.298,132,5,134217728
+tail,2,hedging,10.295,129,2,134217728
+tail,3,hedging,10.571,129,2,134217728
+tail,3,adaptive,9.982,132,5,134217728
