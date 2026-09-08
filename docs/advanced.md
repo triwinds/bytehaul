@@ -33,9 +33,9 @@ bytehaul now validates these task-level settings through `DownloadSpec::validate
 
 If you omit `.output_path(...)`, bytehaul will detect the filename from `Content-Disposition`, then the URL path, then `download`. Absolute output paths are still accepted when `.output_dir(...)` is not set.
 
-## Slow-transfer recovery (source checkout)
+## Slow-transfer recovery
 
-This feature is available in the current source checkout and is not part of the published 0.2.1 package.
+This feature is available starting with version 0.2.2.
 
 Multi-connection Range downloads use `SlowTransferMode::Adaptive` by default: sustained slow requests can be cancelled and their segments reassigned, including near completion. Reading speed excludes intentional rate-limit and local forwarding waits. Short fluctuations and requests about to finish do not automatically trigger recovery. Use `Disabled` to keep the previous scheduling behavior.
 

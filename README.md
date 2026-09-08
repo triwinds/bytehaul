@@ -9,9 +9,9 @@
 
 A Rust async HTTP download library with Python bindings (also available on PyPI), supporting resume, multi-connection downloads, write-back cache, rate limiting, and checksum verification.
 
-These examples target **0.2.1**, which improves response-body retries and storage-failure handling while preserving existing resume-file compatibility. See the [0.2.1 release notes](https://github.com/triwinds/bytehaul/releases/tag/v0.2.1).
+These examples target **0.2.2**, which adds adaptive slow-request recovery and opt-in tail hedging while preserving existing resume-file compatibility. See the [0.2.2 release notes](https://github.com/triwinds/bytehaul/releases/tag/v0.2.2).
 
-The current source checkout adds adaptive slow-request recovery and opt-in tail hedging; see [slow-transfer recovery](docs/advanced.md#slow-transfer-recovery-source-checkout). This is not included in the published 0.2.1 package.
+Version 0.2.2 includes adaptive slow-request recovery and opt-in tail hedging; see [slow-transfer recovery](docs/advanced.md#slow-transfer-recovery).
 
 ## Documentation
 
@@ -39,20 +39,20 @@ The current source checkout adds adaptive slow-request recovery and opt-in tail 
 Add `bytehaul` to your project via Cargo:
 
 ```bash
-cargo add bytehaul@0.2.1
+cargo add bytehaul@0.2.2
 ```
 
 Or add it manually to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-bytehaul = "0.2.1"
+bytehaul = "0.2.2"
 ```
 
 ### Python
 
 ```bash
-pip install "bytehaul==0.2.1"
+pip install "bytehaul==0.2.2"
 ```
 
 Requires Python 3.9+. A single wheel per platform covers all supported Python versions (abi3).

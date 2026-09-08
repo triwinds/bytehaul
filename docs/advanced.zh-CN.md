@@ -33,9 +33,9 @@ let spec = DownloadSpec::new("https://example.com/file.bin")
 
 如果省略 `.output_path(...)`，bytehaul 会依次按 `Content-Disposition`、URL 路径最后一段、默认名 `download` 自动选择文件名。若未设置 `.output_dir(...)`，仍可继续直接传绝对输出路径。
 
-## 慢请求恢复（源码版本）
+## 慢请求恢复
 
-该功能适用于当前源码，尚未包含在已发布的 0.2.1 包中。
+该功能从 0.2.2 起提供。
 
 多连接 Range 下载默认使用 `SlowTransferMode::Adaptive`：识别持续低速请求后，可取消并重新分配分片，尾部空闲 worker 也可接管。速度判断排除主动限速和本地转发等待；短暂波动或即将完成的请求不会直接触发恢复。`Disabled` 保留原调度行为。
 

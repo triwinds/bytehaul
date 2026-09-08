@@ -9,9 +9,9 @@
 
 Rust 异步 HTTP 下载库，带有 Python 绑定（同时在 PyPI 发布），支持断点续传、多连接并发、回写缓存、限速和校验。
 
-本文示例适用于 **0.2.1**，该版本修复响应体重试和存储失败状态，并保留已有断点文件格式兼容性。参阅 [0.2.1 发布说明](https://github.com/triwinds/bytehaul/releases/tag/v0.2.1)。
+本文示例适用于 **0.2.2**，该版本新增自适应慢请求恢复和可选尾部竞速，并保留已有断点文件格式兼容性。参阅 [0.2.2 发布说明](https://github.com/triwinds/bytehaul/releases/tag/v0.2.2)。
 
-当前源码新增自适应慢请求恢复和可选尾部竞速，详见[慢请求恢复](advanced.zh-CN.md)。该功能尚未包含在已发布的 0.2.1 包中。
+0.2.2 新增自适应慢请求恢复和可选尾部竞速，详见[慢请求恢复](advanced.zh-CN.md)。
 
 ## 文档
 
@@ -41,20 +41,20 @@ Rust 异步 HTTP 下载库，带有 Python 绑定（同时在 PyPI 发布），�
 通过 Cargo 添加依赖：
 
 ```bash
-cargo add bytehaul@0.2.1
+cargo add bytehaul@0.2.2
 ```
 
 或手动添加到 `Cargo.toml`：
 
 ```toml
 [dependencies]
-bytehaul = "0.2.1"
+bytehaul = "0.2.2"
 ```
 
 ### Python
 
 ```bash
-pip install "bytehaul==0.2.1"
+pip install "bytehaul==0.2.2"
 ```
 
 需要 Python 3.9+。每个平台只需一个 wheel 即可覆盖所有支持的 Python 版本（abi3）。

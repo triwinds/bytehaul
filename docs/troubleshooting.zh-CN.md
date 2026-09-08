@@ -172,7 +172,7 @@ uv run maturin develop
 如果是生产环境，请直接安装 wheel：
 
 ```bash
-pip install "bytehaul==0.2.1"
+pip install "bytehaul==0.2.2"
 ```
 
 ## Windows 下的覆盖率报告

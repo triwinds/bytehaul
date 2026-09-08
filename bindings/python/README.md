@@ -1,6 +1,6 @@
 # bytehaul
 
-Python bindings for the [bytehaul](https://github.com/triwinds/bytehaul) Rust download library. This guide targets the published **0.2.1** release.
+Python bindings for the [bytehaul](https://github.com/triwinds/bytehaul) Rust download library. This guide targets the published **0.2.2** release.
 
 [中文使用文档](../../docs/python.zh-CN.md)
 
@@ -16,10 +16,10 @@ Each source-build command block below assumes you start from the repository root
 ### From PyPI
 
 ```bash
-pip install "bytehaul==0.2.1"
+pip install "bytehaul==0.2.2"
 ```
 
-See the [0.2.1 release notes](https://github.com/triwinds/bytehaul/releases/tag/v0.2.1).
+See the [0.2.2 release notes](https://github.com/triwinds/bytehaul/releases/tag/v0.2.2).
 
 ### From source (development)
 
@@ -223,9 +223,9 @@ Frozen snapshot of download progress.
 
 Valid `log_level` values: `"off"`, `"error"`, `"warn"`, `"info"`, `"debug"`, `"trace"` (case-insensitive).
 
-### Slow-transfer recovery (source checkout)
+### Slow-transfer recovery
 
-Not available in the published 0.2.1 package. These options apply to both `download(...)` and `Downloader.download(...)`; `None` selects the Rust engine default.
+Available starting with version 0.2.2. These options apply to both `download(...)` and `Downloader.download(...)`; `None` selects the Rust engine default.
 
 | Parameter | Default | Meaning |
 | --- | --- | --- |

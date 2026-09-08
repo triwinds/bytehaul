@@ -1,6 +1,6 @@
 # bytehaul Python 使用文档
 
-本文介绍已发布的 **bytehaul 0.2.1** Python 绑定，以及从源码构建的方法。
+本文介绍已发布的 **bytehaul 0.2.2** Python 绑定，以及从源码构建的方法。
 
 [English Python Guide](../bindings/python/README.md)
 
@@ -12,10 +12,10 @@
 ## 安装发布版本
 
 ```bash
-pip install "bytehaul==0.2.1"
+pip install "bytehaul==0.2.2"
 ```
 
-参阅 [0.2.1 发布说明](https://github.com/triwinds/bytehaul/releases/tag/v0.2.1)。下面的源码构建命令均假定从仓库根目录开始执行。
+参阅 [0.2.2 发布说明](https://github.com/triwinds/bytehaul/releases/tag/v0.2.2)。下面的源码构建命令均假定从仓库根目录开始执行。
 
 ## 初始化开发环境
 
@@ -287,9 +287,9 @@ uv run --no-sync --project . pytest
 
 在 `maturin develop` 之后运行测试时使用 `--no-sync`，避免 uv 再次同步时替换刚构建的开发扩展。
 
-## 慢请求恢复（源码版本）
+## 慢请求恢复
 
-尚未包含在已发布的 0.2.1 包中。`download(...)` 和 `Downloader.download(...)` 均支持以下参数；`None` 沿用 Rust 默认值。
+从 0.2.2 起提供。`download(...)` 和 `Downloader.download(...)` 均支持以下参数；`None` 沿用 Rust 默认值。
 
 | 参数 | 默认值 | 含义 |
 | --- | --- | --- |
