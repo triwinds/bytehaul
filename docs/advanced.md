@@ -35,7 +35,7 @@ If you omit `.output_path(...)`, bytehaul will detect the filename from `Content
 
 ## Contiguous requests and connection reuse
 
-The current development version supports opt-in multi-piece Range requests:
+Version 0.2.3 supports opt-in multi-piece Range requests:
 
 ```rust
 use bytehaul::DownloadSpec;
@@ -86,7 +86,7 @@ let spec = DownloadSpec::new("https://example.com/file.bin")
 
 `low_speed_limit(bytes_per_second)` optionally sets a positive absolute threshold; the default uses a healthy-request baseline without an absolute floor. The three durations must be positive and at most 86,400 seconds. Defaults are 15 seconds below the threshold, 5 seconds of startup grace and a 5-second sample window.
 
-In the current development version, a trailing range of at most 1 MiB can recover earlier when no unassigned work remains and a request slot is idle. A separate detector caps the configured sample window, grace and sustained duration at 1, 1 and 2 seconds respectively. It requires recent healthy reference speeds and a worthwhile estimated time saving; an absolute speed floor alone is insufficient. Missing or immature live-peer evidence, collective slowdown and local backpressure prevent acceleration. Ordinary detection retains the configured durations. This applies to both adaptive modes; `Disabled` disables it.
+In version 0.2.3, a trailing range of at most 1 MiB can recover earlier when no unassigned work remains and a request slot is idle. A separate detector caps the configured sample window, grace and sustained duration at 1, 1 and 2 seconds respectively. It requires recent healthy reference speeds and a worthwhile estimated time saving; an absolute speed floor alone is insufficient. Missing or immature live-peer evidence, collective slowdown and local backpressure prevent acceleration. Ordinary detection retains the configured durations. This applies to both adaptive modes; `Disabled` disables it.
 
 Hedging is opt-in. It uses at most one spare request for a small trailing segment, requires a strong ETag and compatible conditional headers, and stages the spare response separately before switching the writer. The original and spare requests together remain within `max_connections`; all network payload shares `max_download_speed`. Automatic recovery and hedging share an extra-work budget of `min(total_size / 100, 16 MiB)`. A range that cannot fit is skipped, so small downloads may receive no automatic retry for performance. Ordinary error retries retain their existing separate retry policy.
 

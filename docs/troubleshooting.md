@@ -162,7 +162,7 @@ uv run maturin develop
 
 For production use, install the wheel:
 ```bash
-pip install "bytehaul==0.2.2"
+pip install "bytehaul==0.2.3"
 ```
 
 ## Windows Coverage Reports

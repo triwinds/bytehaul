@@ -1,6 +1,6 @@
 # bytehaul
 
-Python bindings for the [bytehaul](https://github.com/triwinds/bytehaul) Rust download library. This guide targets the published **0.2.2** release.
+Python bindings for the [bytehaul](https://github.com/triwinds/bytehaul) Rust download library. This guide targets the published **0.2.3** release.
 
 [中文使用文档](../../docs/python.zh-CN.md)
 
@@ -16,10 +16,10 @@ Each source-build command block below assumes you start from the repository root
 ### From PyPI
 
 ```bash
-pip install "bytehaul==0.2.2"
+pip install "bytehaul==0.2.3"
 ```
 
-See the [0.2.2 release notes](https://github.com/triwinds/bytehaul/releases/tag/v0.2.2).
+See the [0.2.3 release notes](https://github.com/triwinds/bytehaul/releases/tag/v0.2.3).
 
 ### From source (development)
 
@@ -225,7 +225,7 @@ Valid `log_level` values: `"off"`, `"error"`, `"warn"`, `"info"`, `"debug"`, `"t
 
 ### Contiguous requests
 
-The current development version adds `request_batch_size` to both download
+Version 0.2.3 adds `request_batch_size` to both download
 APIs, after existing positional parameters. `None` or `0` keeps one lease per
 request; for example, `request_batch_size=4 * 1024 * 1024` groups adjacent pieces
 into bounded Range requests. Completion/checkpoint granularity remains
