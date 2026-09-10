@@ -35,7 +35,7 @@ If you omit `.output_path(...)`, bytehaul will detect the filename from `Content
 
 ## Contiguous requests and connection reuse
 
-Version 0.2.3 supports opt-in multi-piece Range requests:
+Version 0.2.3 supports multi-piece Range requests by default:
 
 ```rust
 use bytehaul::DownloadSpec;
@@ -47,14 +47,15 @@ let spec = DownloadSpec::new("https://example.com/file.bin")
     .http_idle_pool(4, Duration::from_secs(30));
 ```
 
-`request_batch_size` defaults to zero (disabled). It bounds contiguous request
-grouping by bytes and an internal maximum of 64 leases, without changing piece
-or checkpoint granularity. A value smaller than a piece does not split it.
-Grouping stops at completed, active or partially processed pieces and leaves
-work for other workers. It applies to known-size multi-connection downloads,
-including when slow-transfer recovery is disabled. Connection pooling is a
-separate experimental setting; zero idle connections disables it. A server
-that closes connections cannot benefit from idle pooling.
+`request_batch_size` defaults to 4 MiB. Set it to zero to disable grouping. It
+bounds contiguous request grouping by bytes and an internal maximum of 64
+leases, without changing piece or checkpoint granularity. A value smaller than
+a piece does not split it. Grouping stops at completed, active or partially
+processed pieces and leaves work for other workers. It applies to known-size
+multi-connection downloads, including when slow-transfer recovery is disabled.
+Connection pooling defaults to 4 idle connections per host with a 30-second
+timeout; `disable_http_idle_pool()` or an explicit zero idle limit disables it.
+A server that closes connections cannot benefit from idle pooling.
 
 When a strong ETag and compatible conditional headers protect object identity,
 interrupted multi-worker requests and adaptive reassignment can preserve a

@@ -489,7 +489,9 @@ async fn test_multi_worker_range_requests_use_distinct_connections() {
         .file_allocation(FileAllocation::None)
         .max_connections(4)
         .piece_size(piece_size as u64)
-        .min_split_size(1);
+        .min_split_size(1)
+        .request_batch_size(0)
+        .disable_http_idle_pool();
 
     let handle = downloader.download(spec);
     handle.wait().await.unwrap();
@@ -517,6 +519,56 @@ async fn test_multi_worker_range_requests_use_distinct_connections() {
         range_events.len(),
         "range requests reused a TCP connection: {:?}",
         events
+    );
+}
+
+#[tokio::test]
+async fn test_multi_worker_defaults_batch_ranges_and_reuse_connections() {
+    let piece_size = 64 * 1024usize;
+    let piece_count = 128usize;
+    let size = piece_size * piece_count;
+    let content: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+
+    let (addr, request_log, shutdown_tx, server) =
+        spawn_connection_counting_range_server("default-efficiency", content.clone());
+
+    let dir = tempfile::tempdir().unwrap();
+    let output_path = dir.path().join("default-efficiency.bin");
+
+    let downloader = Downloader::builder().build().unwrap();
+    let spec = DownloadSpec::new(format!("http://{addr}/default-efficiency"))
+        .output_path(output_path.clone())
+        .file_allocation(FileAllocation::None)
+        .max_connections(4)
+        .piece_size(piece_size as u64)
+        .min_split_size(1);
+
+    let handle = downloader.download(spec);
+    handle.wait().await.unwrap();
+
+    let _ = shutdown_tx.send(());
+    server.await.unwrap();
+
+    assert_eq!(std::fs::read(&output_path).unwrap(), content);
+
+    let range_events: Vec<_> = request_log
+        .snapshot()
+        .into_iter()
+        .filter(|event| event.range_header.is_some())
+        .collect();
+    let unique_connections: HashSet<_> = range_events
+        .iter()
+        .map(|event| event.connection_id)
+        .collect();
+
+    assert!(
+        range_events.len() < piece_count,
+        "default batching did not combine adjacent pieces: {} requests for {piece_count} pieces",
+        range_events.len()
+    );
+    assert!(
+        unique_connections.len() < range_events.len(),
+        "default idle pooling did not reuse a connection: {range_events:?}"
     );
 }
 

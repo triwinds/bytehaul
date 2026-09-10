@@ -35,7 +35,7 @@ let spec = DownloadSpec::new("https://example.com/file.bin")
 
 ## 连续请求与连接复用
 
-0.2.3 支持显式启用跨 piece 的连续 Range 请求：
+0.2.3 默认启用跨 piece 的连续 Range 请求：
 
 ```rust
 use bytehaul::DownloadSpec;
@@ -47,11 +47,12 @@ let spec = DownloadSpec::new("https://example.com/file.bin")
     .http_idle_pool(4, Duration::from_secs(30));
 ```
 
-`request_batch_size` 默认零，表示关闭合并。合并同时受字节数和最多 64 个租约限制，
-piece 与检查点粒度保持不变；小于 piece 的值不会将它切小。遇到已完成、已分配或
-部分处理过的 piece 时停止合并，并为其他 worker 留出工作。该选项适用于已知大小的
-多连接下载，包括关闭慢请求恢复的模式。连接池是独立的实验性设置，空闲连接数为零
-表示关闭；服务端主动关闭连接时，无法获得空闲连接复用的收益。
+`request_batch_size` 默认 4 MiB；设置为零可关闭合并。合并同时受字节数和最多 64 个
+租约限制，piece 与检查点粒度保持不变；小于 piece 的值不会将它切小。遇到已完成、
+已分配或部分处理过的 piece 时停止合并，并为其他 worker 留出工作。该选项适用于已知
+大小的多连接下载，包括关闭慢请求恢复的模式。连接池默认每个 host 保留最多 4 条空闲
+连接，超时 30 秒；使用 `disable_http_idle_pool()` 或将空闲连接上限设为零可关闭连接池。
+服务端主动关闭连接时，无法获得空闲连接复用的收益。
 
 当强 ETag 和兼容的条件请求头能够保护对象一致性时，多连接断流重试和慢请求重新
 分配可保留写入器确认的前缀，只请求剩余后缀。未完成的 piece 不会因此写入检查点

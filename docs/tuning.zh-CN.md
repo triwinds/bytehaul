@@ -113,9 +113,19 @@ HTTP 流读取层和回写缓存之间内部 Tokio channel 的缓冲区大小。
 
 请求和响应体重试共用指数退避，并叠加等抖动（equal jitter），以降低多个客户端下载同一服务端时同时重试造成的冲击。单连接 body 失败会从已 flush 的连续前缀续传；若 Range 或对象 metadata 不匹配，会安全地清空后从零开始。
 
-## HTTP 空闲连接池对比
+## `request_batch_size`
 
-连接池继续显式开启：使用 `DownloadSpec::http_idle_pool(4, Duration::from_secs(30))` 或 `DownloaderBuilder::http_idle_pool(...)`，默认保持关闭。
+**默认值：** 4 MiB
+**单位：** 字节；设置为 `0` 可关闭合并
+
+对已知大小的多连接下载，把相邻 piece 合并到一个有上限的 HTTP Range 请求中。它不改变
+`piece_size`、检查点粒度和每个请求最多 64 个租约。需要保持严格的单 piece 请求边界时可设为
+`0`；源站更适合小 Range 时可降低该值。增大它能减少请求和响应建立开销，但会减少其他 worker
+可独立领取的工作，也可能放大单次请求失败后的重试成本。
+
+## HTTP 空闲连接池
+
+默认启用连接池：每个 host 最多保留 4 条空闲连接，空闲超时为 30 秒。源站不适合连接复用时，可使用 `DownloadSpec::disable_http_idle_pool()`，或将 `DownloaderBuilder::http_idle_pool(0, ...)` 作为显式关闭配置。服务端主动关闭连接时无法获得复用收益。
 
 本地对比命令：
 
@@ -123,4 +133,4 @@ HTTP 流读取层和回写缓存之间内部 Tokio channel 的缓冲区大小。
 env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy cargo run --release --example pool_compare -- 3 2
 ```
 
-2026-09-06 的三轮交替测试使用 32 MiB 数据、4 个 worker、1 MiB piece，服务端对每次请求延迟 2 ms。关闭／开启连接池的中位耗时为 101.1／68.5 ms，接受的 TCP 连接数从 33 降到 5；每轮均为 33 次请求，输出逐字节一致。这是本机 HTTP 对比，没有覆盖公网、TLS 握手或代理可靠性，因此继续保留显式开关。
+2026-09-06 的三轮交替测试使用 32 MiB 数据、4 个 worker、1 MiB piece，服务端对每次请求延迟 2 ms。关闭／开启连接池的中位耗时为 101.1／68.5 ms，接受的 TCP 连接数从 33 降到 5；每轮均为 33 次请求，输出逐字节一致。这是本机 HTTP 对比，没有覆盖公网、TLS 握手或代理可靠性；上线后仍应监控连接失败和源站行为。

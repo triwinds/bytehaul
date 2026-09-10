@@ -120,6 +120,13 @@ Rate limiter for the download. Set to a non-zero value to cap bandwidth usage. U
 
 Requests and response-body retries share exponential back-off with equal jitter to avoid thundering-herd effects when multiple clients retry against the same server. A single-connection body failure resumes from the writer's flushed contiguous prefix; a Range or object-metadata mismatch safely truncates and restarts from zero.
 
+## `request_batch_size`
+
+**Default:** 4 MiB
+**Unit:** bytes; `0` disables grouping
+
+Groups adjacent pieces into one bounded HTTP Range request for known-size multi-connection downloads. It does not change `piece_size`, checkpoint granularity, or the maximum of 64 leases per request. Set it to `0` when exact one-piece request boundaries are needed, or lower it for origins that benefit from smaller ranges. Larger values reduce request/response setup overhead but can leave less independent work for other workers and may increase the cost of a failed request.
+
 ## Historical Benchmark Snapshot (2026-04-06)
 
 This Windows baseline predates 0.2.1 and its scheduler/cache simplifications. It records the implementation at that time, not current release performance:
@@ -144,9 +151,9 @@ Treat these as directional local baselines, not portable capacity claims. The sh
 
 If you need stable comparisons across commits, rerun the same command on an idle machine and compare Criterion's generated history rather than treating a single short local run as definitive.
 
-## HTTP idle pool comparison
+## HTTP idle pool
 
-Idle pooling remains opt-in: `DownloadSpec::http_idle_pool(4, Duration::from_secs(30))` or `DownloaderBuilder::http_idle_pool(...)`. The default remains disabled.
+Idle pooling is enabled by default with up to 4 idle connections per host and a 30-second idle timeout. Use `DownloadSpec::disable_http_idle_pool()` or configure `DownloaderBuilder::http_idle_pool(0, ...)` when a source is incompatible with reuse. A server that closes connections cannot benefit from the pool.
 
 Reproduce the local diagnostic with:
 
@@ -154,4 +161,4 @@ Reproduce the local diagnostic with:
 env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy cargo run --release --example pool_compare -- 3 2
 ```
 
-On 2026-09-06, three alternating runs downloading 32 MiB with four workers and 1 MiB pieces gave median times of 101.1 ms with pooling disabled and 68.5 ms with pooling enabled. Accepted TCP connections fell from 33 to 5; all runs made 33 requests and verified every output byte. The server delays each request by 2 ms. This localhost HTTP comparison measures neither WAN/TLS handshakes nor proxy reliability, so it does not justify changing the default.
+On 2026-09-06, three alternating runs downloading 32 MiB with four workers and 1 MiB pieces gave median times of 101.1 ms with pooling disabled and 68.5 ms with pooling enabled. Accepted TCP connections fell from 33 to 5; all runs made 33 requests and verified every output byte. The server delays each request by 2 ms. This localhost comparison does not model WAN/TLS handshakes or proxy reliability, so production measurements should still monitor connection failures and origin behavior.

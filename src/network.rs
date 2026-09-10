@@ -26,6 +26,7 @@ use url::Url;
 #[cfg(test)]
 mod tls_tests;
 
+use crate::config::{DEFAULT_HTTP_IDLE_POOL_MAX_PER_HOST, DEFAULT_HTTP_IDLE_POOL_TIMEOUT};
 use crate::error::{BoxError, DownloadError, TransportError};
 use crate::http::{HttpRequestBody, HttpResponse};
 
@@ -113,8 +114,8 @@ impl Default for ClientNetworkConfig {
     fn default() -> Self {
         Self {
             connect_timeout: Duration::from_secs(30),
-            pool_max_idle_per_host: 0,
-            pool_idle_timeout: Duration::from_secs(30),
+            pool_max_idle_per_host: DEFAULT_HTTP_IDLE_POOL_MAX_PER_HOST,
+            pool_idle_timeout: DEFAULT_HTTP_IDLE_POOL_TIMEOUT,
             all_proxy: None,
             http_proxy: None,
             https_proxy: None,
@@ -606,8 +607,11 @@ mod tests {
     fn test_network_config_defaults() {
         let config = ClientNetworkConfig::default();
         assert_eq!(config.connect_timeout, Duration::from_secs(30));
-        assert_eq!(config.pool_max_idle_per_host, 0);
-        assert_eq!(config.pool_idle_timeout, Duration::from_secs(30));
+        assert_eq!(
+            config.pool_max_idle_per_host,
+            DEFAULT_HTTP_IDLE_POOL_MAX_PER_HOST
+        );
+        assert_eq!(config.pool_idle_timeout, DEFAULT_HTTP_IDLE_POOL_TIMEOUT);
         assert!(config.all_proxy.is_none());
         assert!(config.http_proxy.is_none());
         assert!(config.https_proxy.is_none());
@@ -641,7 +645,10 @@ mod tests {
 
         assert_eq!(config.connect_timeout, Duration::from_secs(30));
         assert_eq!(updated.connect_timeout, Duration::from_secs(9));
-        assert_eq!(updated.pool_max_idle_per_host, 0);
+        assert_eq!(
+            updated.pool_max_idle_per_host,
+            DEFAULT_HTTP_IDLE_POOL_MAX_PER_HOST
+        );
         assert!(updated.enable_ipv6);
     }
 

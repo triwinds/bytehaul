@@ -1,5 +1,5 @@
 //! Controlled HTTP/1.1 pooling, batching and interrupted-body comparison.
-//! cargo run --example http_efficiency_compare -- [rounds]
+//! cargo run --example http_efficiency_compare -- [rounds] [aria2c-path] [slow-connect|slow-connect-paced]
 //! CSV on stdout; exact-byte checks are outside the measured interval.
 //! Delays model connection setup / response latency, not a real WAN.
 use bytehaul::{DownloadSpec, Downloader, FileAllocation};
@@ -25,6 +25,9 @@ const CUT: usize = SIZE / 2 + PIECE / 2;
 struct Scenario {
     name: &'static str,
     setup_ms: u64,
+    // Zero delays only the first accepted socket; N delays every Nth socket.
+    setup_every: usize,
+    body_chunk_ms: u64,
     response_ms: u64,
     interrupt: bool,
     strong_etag: bool,
@@ -45,9 +48,14 @@ async fn serve(
     body: Arc<Vec<u8>>,
     stats: Arc<Stats>,
     scenario: Scenario,
+    connection_id: usize,
 ) -> io::Result<()> {
     stream.set_nodelay(true)?;
-    tokio::time::sleep(Duration::from_millis(scenario.setup_ms)).await;
+    if (scenario.setup_every == 0 && connection_id == 1)
+        || (scenario.setup_every > 0 && connection_id.is_multiple_of(scenario.setup_every))
+    {
+        tokio::time::sleep(Duration::from_millis(scenario.setup_ms)).await;
+    }
     let mut reader = BufReader::new(stream);
     loop {
         let mut line = String::new();
@@ -126,6 +134,9 @@ async fn serve(
                 && !stats.interrupted.swap(true, Ordering::SeqCst);
             let stop = if cut { CUT } else { end + 1 };
             for chunk in body[start..stop].chunks(64 * 1024) {
+                if scenario.body_chunk_ms > 0 {
+                    tokio::time::sleep(Duration::from_millis(scenario.body_chunk_ms)).await;
+                }
                 reader.get_mut().write_all(chunk).await?;
                 stats
                     .body_bytes
@@ -150,6 +161,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if rounds == 0 {
         return Err("rounds must be positive".into());
     }
+    let aria = std::env::args().nth(2);
+    let filter = std::env::args().nth(3);
+    if filter
+        .as_deref()
+        .is_some_and(|s| !matches!(s, "slow-connect" | "slow-connect-paced"))
+    {
+        return Err("unknown scenario filter".into());
+    }
     let body = Arc::new(
         (0..SIZE)
             .map(|i| ((i * 31 + i / 257) % 251) as u8)
@@ -158,12 +177,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let base = Scenario {
         name: "local",
         setup_ms: 0,
+        setup_every: 1,
+        body_chunk_ms: if filter.as_deref() == Some("slow-connect-paced") {
+            5
+        } else {
+            0
+        },
         response_ms: 0,
         interrupt: false,
         strong_etag: true,
         close: false,
     };
-    let scenarios = [
+    let mut scenarios = vec![
         base,
         Scenario {
             name: "setup100_response25",
@@ -196,12 +221,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ..base
         },
     ];
-    let policies = [
+    if filter.is_some() {
+        scenarios = vec![
+            base,
+            Scenario {
+                name: "all_connections_300ms",
+                setup_ms: 300,
+                ..base
+            },
+            Scenario {
+                name: "every_fourth_connection_1500ms",
+                setup_ms: 1500,
+                setup_every: 4,
+                ..base
+            },
+            Scenario {
+                name: "first_connection_1500ms",
+                setup_ms: 1500,
+                setup_every: 0,
+                ..base
+            },
+        ];
+    }
+    let mut policies = vec![
         ("unpooled", 0, 0),
         ("pooled", 4, 0),
         ("batched", 0, 4 * PIECE as u64),
         ("pooled_batched", 4, 4 * PIECE as u64),
+        ("pooled_batch8", 4, 8 * PIECE as u64),
+        ("pooled_batch16", 4, 16 * PIECE as u64),
     ];
+    if filter.is_some() {
+        policies.truncate(4);
+    }
+    if aria.is_some() {
+        policies.push(("aria2", 0, 0));
+    }
     println!("scenario,round,policy,seconds,connections,requests,unaligned_range_requests,server_body_bytes,validated_bytes");
     for scenario in scenarios {
         for round in 0..rounds {
@@ -218,10 +273,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         tokio::select! {
                             result = listener.accept() => {
                                 let (stream, _) = result?;
-                                server_stats.connections.fetch_add(1, Ordering::SeqCst);
+                                let connection_id = server_stats.connections.fetch_add(1, Ordering::SeqCst) + 1;
                                 let body = server_body.clone();
                                 let stats = server_stats.clone();
-                                clients.spawn(async move { let _ = serve(stream, body, stats, scenario).await; });
+                                clients.spawn(async move { let _ = serve(stream, body, stats, scenario, connection_id).await; });
                             }
                             _ = clients.join_next(), if !clients.is_empty() => {}
                         }
@@ -231,6 +286,62 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 });
                 let temp = tempfile::tempdir()?;
                 let output = temp.path().join("output.bin");
+                if name == "aria2" {
+                    let started = Instant::now();
+                    let result = tokio::time::timeout(
+                        Duration::from_secs(60),
+                        tokio::process::Command::new(aria.as_ref().expect("aria2 path"))
+                            .args([
+                                "--no-conf=true",
+                                "--all-proxy=",
+                                "--split=4",
+                                "--max-connection-per-server=4",
+                                "--min-split-size=1M",
+                                "--file-allocation=none",
+                                "--allow-overwrite=true",
+                                "--auto-file-renaming=false",
+                                "--summary-interval=0",
+                                "--console-log-level=warn",
+                                "--download-result=hide",
+                                "--max-tries=3",
+                                "--retry-wait=0",
+                            ])
+                            .arg(format!("--dir={}", temp.path().display()))
+                            .arg("--out=output.bin")
+                            .arg(format!("http://{address}/file"))
+                            .kill_on_drop(true)
+                            .output(),
+                    )
+                    .await;
+                    let seconds = started.elapsed().as_secs_f64();
+                    server.abort();
+                    let _ = server.await;
+                    let result = result??;
+                    if !result.status.success() {
+                        return Err(format!(
+                            "aria2 failed: {} {}",
+                            String::from_utf8_lossy(&result.stdout),
+                            String::from_utf8_lossy(&result.stderr)
+                        )
+                        .into());
+                    }
+                    let actual = tokio::fs::read(&output).await?;
+                    assert_eq!(actual, *body, "aria2 {} output differs", scenario.name);
+                    assert_eq!(stats.interrupted.load(Ordering::SeqCst), scenario.interrupt);
+                    println!(
+                        "{},{},{},{:.3},{},{},{},{},{}",
+                        scenario.name,
+                        round + 1,
+                        name,
+                        seconds,
+                        stats.connections.load(Ordering::SeqCst),
+                        stats.requests.load(Ordering::SeqCst),
+                        stats.suffixes.load(Ordering::SeqCst),
+                        stats.body_bytes.load(Ordering::SeqCst),
+                        actual.len()
+                    );
+                    continue;
+                }
                 let downloader = Downloader::builder().build()?;
                 let spec = DownloadSpec::new(format!("http://{address}/file"))
                     .output_path(&output)

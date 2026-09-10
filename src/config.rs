@@ -4,6 +4,10 @@ use std::time::Duration;
 
 use crate::error::DownloadError;
 
+pub(crate) const DEFAULT_HTTP_IDLE_POOL_MAX_PER_HOST: usize = 4;
+pub(crate) const DEFAULT_HTTP_IDLE_POOL_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const DEFAULT_REQUEST_BATCH_SIZE: u64 = 4 * 1024 * 1024;
+
 /// Log verbosity level for download tasks.
 ///
 /// The default is `Off`, which means no log events are emitted by the library.
@@ -171,7 +175,8 @@ impl DownloadSpec {
     /// Create a new download specification for the given URL.
     ///
     /// All other fields are populated with sensible defaults:
-    /// 4 connections, 1 MiB pieces, 64 MiB memory budget, resume enabled, etc.
+    /// 4 connections, 1 MiB pieces, 4 MiB request batches, a 4-connection
+    /// per-host idle pool, 64 MiB memory budget, resume enabled, etc.
     pub fn new(url: impl Into<String>) -> Self {
         Self {
             url: url.into(),
@@ -181,8 +186,8 @@ impl DownloadSpec {
             max_connections: 4,
             connect_timeout: Duration::from_secs(30),
             connect_timeout_overridden: false,
-            pool_max_idle_per_host: 0,
-            pool_idle_timeout: Duration::from_secs(30),
+            pool_max_idle_per_host: DEFAULT_HTTP_IDLE_POOL_MAX_PER_HOST,
+            pool_idle_timeout: DEFAULT_HTTP_IDLE_POOL_TIMEOUT,
             pool_config_overridden: false,
             all_proxy: None,
             http_proxy: None,
@@ -198,7 +203,7 @@ impl DownloadSpec {
             channel_buffer: 64,
             resume: true,
             piece_size: 1024 * 1024, // 1 MiB
-            request_batch_size: 0,
+            request_batch_size: DEFAULT_REQUEST_BATCH_SIZE,
             min_split_size: 10 * 1024 * 1024, // 10 MiB
             min_segment_size: 256 * 1024,     // 256 KiB
             max_retries: 5,
@@ -311,12 +316,12 @@ impl DownloadSpec {
     }
 
     /// Returns the target byte limit for contiguous multi-piece HTTP requests.
-    /// Zero disables batching (the default).
+    /// The default is 4 MiB; zero disables batching.
     pub fn get_request_batch_size(&self) -> u64 {
         self.request_batch_size
     }
 
-    /// Opt into contiguous multi-piece HTTP requests, bounded by this byte limit
+    /// Configure contiguous multi-piece HTTP requests, bounded by this byte limit
     /// and an internal lease-count limit. Piece/checkpoint granularity is unchanged.
     /// A value smaller than a piece does not split that piece; zero disables batching.
     /// Applies only to known-size multi-connection Range downloads.
@@ -408,7 +413,7 @@ impl DownloadSpec {
         self
     }
 
-    /// Configure the experimental HTTP idle pool for this download only.
+    /// Configure the HTTP idle pool for this download only.
     pub fn http_idle_pool(mut self, max_idle_per_host: usize, idle_timeout: Duration) -> Self {
         self.pool_max_idle_per_host = max_idle_per_host;
         self.pool_idle_timeout = idle_timeout;
@@ -708,7 +713,7 @@ mod tests {
     #[test]
     fn test_download_spec_defaults() {
         let spec = DownloadSpec::new("https://example.com/file");
-        assert_eq!(spec.get_request_batch_size(), 0);
+        assert_eq!(spec.get_request_batch_size(), DEFAULT_REQUEST_BATCH_SIZE);
         assert_eq!(
             spec.clone()
                 .request_batch_size(4 * 1024 * 1024)
@@ -721,8 +726,11 @@ mod tests {
         assert_eq!(spec.max_connections, 4);
         assert_eq!(spec.connect_timeout, Duration::from_secs(30));
         assert!(!spec.connect_timeout_overridden);
-        assert_eq!(spec.pool_max_idle_per_host, 0);
-        assert_eq!(spec.pool_idle_timeout, Duration::from_secs(30));
+        assert_eq!(
+            spec.pool_max_idle_per_host,
+            DEFAULT_HTTP_IDLE_POOL_MAX_PER_HOST
+        );
+        assert_eq!(spec.pool_idle_timeout, DEFAULT_HTTP_IDLE_POOL_TIMEOUT);
         assert!(!spec.pool_config_overridden);
         assert_eq!(spec.all_proxy, None);
         assert_eq!(spec.http_proxy, None);

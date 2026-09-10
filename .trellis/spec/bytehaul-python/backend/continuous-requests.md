@@ -8,7 +8,7 @@ observation lifetime or the `request_batch_size` Rust/Python option.
 ## 2. Signatures
 
 - `DownloadSpec::{request_batch_size, get_request_batch_size}` use u64 bytes;
-  default zero disables grouping. Python appends `request_batch_size=None` to
+  default 4 MiB enables grouping; explicit zero disables it. Python appends `request_batch_size=None` to
   both download functions and translates through `build_download_spec`.
 - `SchedulerState::extend_batch(first, worker_id, max_connections, byte_cap)`
   returns additional contiguous piece leases, excluding the first lease.
@@ -39,7 +39,8 @@ observation lifetime or the `request_batch_size` Rust/Python option.
   scheduler range; renew or reclaim suffix. Never enqueue more with retired key.
   Runtime partial completion does not create a whole-piece durable bit. V1/V2
   checkpoints continue to replay incomplete pieces after restart.
-- Pooling and grouping are independent, opt-in controls. Connection: close
+- Pooling and grouping are independent controls, enabled by default (4 idle
+  connections per host / 30 seconds, and 4 MiB batches). Connection: close
   prevents reuse. TLS tests use private scoped roots, never system trust edits.
 
 ## 4. Validation & Error Matrix

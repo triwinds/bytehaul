@@ -226,16 +226,18 @@ Valid `log_level` values: `"off"`, `"error"`, `"warn"`, `"info"`, `"debug"`, `"t
 ### Contiguous requests
 
 Version 0.2.3 adds `request_batch_size` to both download
-APIs, after existing positional parameters. `None` or `0` keeps one lease per
-request; for example, `request_batch_size=4 * 1024 * 1024` groups adjacent pieces
-into bounded Range requests. Completion/checkpoint granularity remains
-`piece_size`, with at most 64 leases per batch. Values below a piece do not split
-it, and grouping stops at completed/active/partially processed pieces.
+APIs, after existing positional parameters. `None` selects the Rust default of
+4 MiB; `0` keeps one lease per request. Other positive values, such as
+`request_batch_size=8 * 1024 * 1024`, group adjacent pieces into bounded Range
+requests. Completion/checkpoint granularity remains `piece_size`, with at most
+64 leases per batch. Values below a piece do not split it, and grouping stops at
+completed/active/partially processed pieces.
 
 Strong-ETag multi-connection transfers can also retain writer-confirmed prefixes
 on interrupted-body retries or adaptive reassignment. Incomplete pieces remain
 incomplete across process restarts. These engine behaviors apply to both Python
-entry points, while the experimental HTTP idle-pool option remains Rust-only.
+entry points. Python uses the Rust default HTTP idle pool (4 connections per
+host, 30 seconds); explicit pool tuning remains available through the Rust API.
 
 ### Slow-transfer recovery
 

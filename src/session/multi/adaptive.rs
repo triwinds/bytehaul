@@ -1617,7 +1617,8 @@ mod tests {
         assert!(Coordinator::new(
             &config
                 .clone()
-                .slow_transfer_mode(SlowTransferMode::Disabled),
+                .slow_transfer_mode(SlowTransferMode::Disabled)
+                .request_batch_size(0),
             &meta(None),
             Path::new("file"),
             100

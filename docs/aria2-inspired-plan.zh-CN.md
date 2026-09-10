@@ -48,7 +48,7 @@ bytehaul 当前已经具备几条比较好的基础：
 - 控制文件里的 `downloaded_bytes` 字段在两种模式下含义不同：多 worker 下来自 `scheduler.completed_bytes()`（已 mark complete 的 piece 累加），单连接下来自 `FlushAll` 返回的 `written_bytes`（已落盘前缀）。两者都不是 received bytes，但同名字段容易让阅读者把它读成单一概念。
 - 保存多 worker 控制文件前会通过 `FlushAll { sync_data: true }` 让 writer 先 flush + `sync_data`；单连接保存路径同样依赖 `flush_stats.written_bytes` 作为已落盘前缀。
 - `Downloader` 用 `client_cache: HashMap<ClientNetworkConfig, BytehaulClient>` 按生效网络配置缓存 `BytehaulClient`，避免重复构建 DNS/TLS/proxy client。
-- 网络层目前通过 `builder.pool_max_idle_per_host(0)` 禁用 hyper 空闲连接池；`tests/m3_multiworker.rs::test_multi_worker_range_requests_use_distinct_connections` 显式断言默认多 Range 请求不会复用 TCP 连接。
+- 网络层默认通过 hyper 保留每个 host 最多 4 条空闲连接；`tests/m3_multiworker.rs` 同时覆盖默认复用和显式禁用后的独立连接。
 
 主要差距是：
 
@@ -72,7 +72,7 @@ aria2 的连接复用主要由三层组成：
 对 bytehaul 的含义：
 
 - 不建议自己实现 aria2 风格 socket pool。hyper client 已经提供连接池能力，更适合 Rust async 生态。
-- 当前禁用空闲连接池是安全但偏保守的选择；后续可以通过内部配置重新打开 hyper idle pool 做实验。
+- 当前默认启用小规模空闲连接池；`disable_http_idle_pool()` 可在源站不适合复用时回退，仍不建议自行实现 aria2 风格 socket pool。
 - 不建议支持 HTTP pipelining。它和现代服务端、中间代理、错误恢复的交互复杂，收益有限。
 - 连接复用不能弱化 Range 校验。即使复用同一 TCP 连接，每个 segment response 仍必须独立通过校验。
 
@@ -287,26 +287,23 @@ struct SegmentLease {
 状态：已完成（2026-05-24）。
 
 - 已增加实验性 idle-pool 配置：`DownloaderBuilder::http_idle_pool(...)` 与 `DownloadSpec::http_idle_pool(...)` / `disable_http_idle_pool()` 会进入 `ClientNetworkConfig`，因此也自动进入 `Downloader::client_cache` key，避免不同 pool 参数误复用 client。
-- 默认值仍然保持 `pool_max_idle_per_host = 0`，因此现有默认行为不变；只有显式开启实验配置时才允许 hyper 复用空闲连接。
-- 新增低层连接池测试覆盖 keep-alive 复用和 `Connection: close` 后自动重连；默认禁用 idle pool 的多 worker 集成测试仍保持“每个 Range 请求使用不同 TCP 连接”。
-- 本阶段验证：`cargo test --lib test_idle_pool_reuses_keep_alive_connection`；`cargo test --lib test_idle_pool_reconnects_after_connection_close`；`cargo test --lib test_download_rebuilds_client_for_spec_idle_pool_override`；`cargo test --test m3_multiworker test_multi_worker_range_requests_use_distinct_connections`。
+- 默认值现已调整为 `pool_max_idle_per_host = 4`、空闲超时 30 秒；`disable_http_idle_pool()` 和显式零值保留关闭路径。连接池参数仍会进入 client cache key。
+- 低层连接池测试覆盖 keep-alive 复用和 `Connection: close` 后自动重连；多 worker 集成测试分别覆盖默认复用和显式禁用后的独立连接。
+- 本阶段验证：`cargo test --lib test_idle_pool_reuses_keep_alive_connection`；`cargo test --lib test_idle_pool_reconnects_after_connection_close`；`cargo test --lib test_download_rebuilds_client_for_spec_idle_pool_override`；`cargo test --test m3_multiworker test_multi_worker_range_requests_use_distinct_connections`；`cargo test --test m3_multiworker test_multi_worker_defaults_batch_ranges_and_reuse_connections`。
 
-当前网络层关闭 hyper idle pool：
+需要显式关闭 hyper idle pool 时：
 
 ```rust
 builder.pool_max_idle_per_host(0);
 ```
 
-建议分两步做：
-
-1. 增加内部实验配置，允许设置 `pool_max_idle_per_host` 和 idle timeout。
-2. 用集成测试和基准确认复用行为、性能收益和失败恢复，再决定是否暴露公共配置或调整默认值。
+连接池配置、client cache key、低层复用测试和默认行为验证已经完成；后续只需依据跨平台/公网复测决定是否调整 4 条和 30 秒这两个默认参数。
 
 实现注意：
 
 - 如果 idle pool 参数进入 downloader/task 配置，必须加进 `ClientNetworkConfig`（它当前已经是 `client_cache` 的 HashMap key），否则不同 pool 参数的 client 会被错误复用。
-- `tests/m3_multiworker.rs::test_multi_worker_range_requests_use_distinct_connections` 应保留，用来锁定默认禁用 idle pool 的行为。
-- 新增开启 idle pool 的测试应只覆盖实验配置下的连接复用。
+- `tests/m3_multiworker.rs::test_multi_worker_range_requests_use_distinct_connections` 保留为显式禁用回归；默认行为由相邻的复用与批处理测试覆盖。
+- 新增测试应继续覆盖 `Connection: close`、代理和 client cache 隔离，不能假设源站永远保持连接。
 
 测试场景：
 

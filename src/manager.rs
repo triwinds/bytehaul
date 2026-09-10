@@ -37,7 +37,7 @@ impl DownloaderBuilder {
         self
     }
 
-    /// Configure the experimental HTTP idle pool for clients built by this downloader.
+    /// Configure the HTTP idle pool for clients built by this downloader.
     pub fn http_idle_pool(mut self, max_idle_per_host: usize, idle_timeout: Duration) -> Self {
         self.client_config.pool_max_idle_per_host = max_idle_per_host;
         self.client_config.pool_idle_timeout = idle_timeout;

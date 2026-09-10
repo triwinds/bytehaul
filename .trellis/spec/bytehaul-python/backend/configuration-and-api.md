@@ -44,10 +44,12 @@ Keep units explicit. Rust uses `Duration` and byte counts; Python seconds go thr
 
 Defaults are contracts: `src/config.rs::test_download_spec_defaults` asserts them and READMEs describe them. Python `None` should select the Rust default unless the Python API explicitly promises otherwise. Reuse `build_download_spec` for object and convenience APIs.
 
-`request_batch_size` is a u64 byte cap, default zero (disabled), appended as an
+`request_batch_size` is a u64 byte cap, default 4 MiB (explicit zero disables), appended as an
 optional argument to both Python download APIs. It changes request aggregation,
 not piece/checkpoint size. Positive values below a piece retain that piece's
-normal geometry. Idle pooling stays an independent experimental Rust option.
+normal geometry. Idle pooling defaults to 4 idle connections per host for 30
+seconds. Python inherits these Rust defaults; explicit pool tuning remains
+Rust-only. Preserve explicit pool disable overrides.
 
 ## Avoid
 
