@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use bytehaul::{DownloadSpec, Downloader, FileAllocation};
 use warp::Filter;
 
@@ -135,11 +137,17 @@ async fn test_dns_failure_propagates() {
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path().join("dns_fail.bin");
 
+    // A name-resolution failure is classified as a connect failure, which is
+    // retryable; the retry budget itself is covered by `m5_retry`. This test is
+    // about the error reaching the caller, so it keeps a minimal budget instead
+    // of paying the default 1 s→30 s exponential backoff for half a minute.
     let spec = DownloadSpec::new("http://this.domain.definitely.does.not.exist.invalid/file")
         .output_path(out.clone())
         .file_allocation(FileAllocation::None)
         .resume(false)
-        .max_connections(1);
+        .max_connections(1)
+        .max_retries(1)
+        .retry_base_delay(Duration::from_millis(10));
 
     let dl = Downloader::builder().build().unwrap();
     let handle = dl.download(spec);

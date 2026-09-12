@@ -24,11 +24,19 @@ fn range_server(
                     let range = range.trim_start_matches("bytes=");
                     let parts: Vec<&str> = range.split('-').collect();
                     let start: u64 = parts[0].parse().unwrap_or(0);
-                    let end: u64 = if parts.len() > 1 && !parts[1].is_empty() {
-                        parts[1].parse().unwrap_or(data.len() as u64 - 1)
-                    } else {
-                        data.len() as u64 - 1
-                    };
+                    // A client may ask for more than the file holds before it
+                    // knows the size (the scheduler probes with a whole piece).
+                    // A real server clamps the range to the representation, so
+                    // this fixture has to clamp as well: slicing past the end
+                    // panics the handler, and the resulting 500 is retryable,
+                    // which turned every download in this file into a ~40 s
+                    // retry-backoff loop.
+                    let end: u64 = parts
+                        .get(1)
+                        .filter(|value| !value.is_empty())
+                        .and_then(|value| value.parse().ok())
+                        .unwrap_or(data.len() as u64 - 1)
+                        .min(data.len() as u64 - 1);
                     let slice = &data[start as usize..=end as usize];
                     warp::http::Response::builder()
                         .status(206)
