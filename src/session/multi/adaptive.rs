@@ -33,7 +33,13 @@ struct Observation {
     phase_at: Instant,
     blocked_since: Option<Instant>,
     reading: Duration,
+    headers: Duration,
+    backpressure: Duration,
+    writer_barrier: Duration,
+    request_id: Option<u64>,
+    last_reason: Option<(&'static str, &'static str)>,
     wire: u64,
+    enqueued: u64,
     forwarded: u64,
     samples: VecDeque<(Duration, u64)>,
     slow_since: Option<Duration>,
@@ -49,7 +55,13 @@ impl Observation {
             phase_at: now,
             blocked_since: Some(now),
             reading: Duration::ZERO,
+            headers: Duration::ZERO,
+            backpressure: Duration::ZERO,
+            writer_barrier: Duration::ZERO,
+            request_id: None,
+            last_reason: None,
             wire: 0,
+            enqueued: 0,
             forwarded: 0,
             samples: VecDeque::from([(Duration::ZERO, 0)]),
             slow_since: None,
@@ -61,6 +73,14 @@ impl Observation {
     }
     fn advance(&mut self, now: Instant) {
         let elapsed = now.saturating_duration_since(self.phase_at);
+        match self.phase {
+            Phase::Headers => self.headers += elapsed,
+            Phase::WriterBarrier => self.writer_barrier += elapsed,
+            Phase::RateLimited | Phase::MemoryBlocked | Phase::ChannelBlocked => {
+                self.backpressure += elapsed
+            }
+            Phase::Reading => {}
+        }
         if self.phase == Phase::Reading {
             self.reading += elapsed;
         } else if self
@@ -179,6 +199,18 @@ impl Observation {
     }
 }
 
+/// All application-observed bytes not yet enqueued belong to read-ahead,
+/// including the current frame while local forwarding is blocked. Hyper/socket
+/// buffers never handed to this task are outside this body-layer accounting.
+fn cancellation_cost_bound(sample: &Observation, len: u64, protected: bool) -> u64 {
+    let read_ahead = sample.wire.saturating_sub(sample.enqueued);
+    if protected {
+        read_ahead
+    } else {
+        len.saturating_add(read_ahead)
+    }
+}
+
 fn recovery_benefits(rate: f64, healthy: f64, len: u64, forwarded: u64, window: Duration) -> bool {
     let remaining = len.saturating_sub(forwarded);
     let keep = remaining as f64 / rate.max(1.);
@@ -212,11 +244,29 @@ struct State {
     recovered: Vec<Recovered>,
     pending: VecDeque<PendingRange>,
     reserved: u64,
+    consumed_extra: u64,
+    decisions: BTreeMap<&'static str, u64>,
+    retries: u64,
     actions: u64,
     hedge: bool,
     last_action: Option<Instant>,
     blocked_until: Option<Instant>,
 }
+/// Owns exactly one in-flight cost bound. Dropping an interrupted action settles
+/// its observed cost once, including producer cancellation and writer failure.
+struct Reservation {
+    state: Arc<Mutex<State>>,
+    bound: u64,
+    cost: u64,
+}
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        let mut state = self.state.lock();
+        state.reserved -= self.bound;
+        state.consumed_extra = state.consumed_extra.saturating_add(self.cost);
+    }
+}
+
 impl State {
     fn pending_backoff(&self, now: Instant) -> Option<Duration> {
         if self.pending.is_empty() {
@@ -234,7 +284,7 @@ pub(super) struct Coordinator {
     slots: Arc<Semaphore>,
     slot_capacity: usize,
     changed: Notify,
-    state: Mutex<State>,
+    state: Arc<Mutex<State>>,
     extra_limit: u64,
     history_limit: usize,
     // Wire counters are diagnostic and never feed effective progress.
@@ -269,17 +319,20 @@ impl Coordinator {
             slots: Arc::new(Semaphore::new(spec.max_connections as usize)),
             slot_capacity: spec.max_connections as usize,
             changed: Notify::new(),
-            state: Mutex::new(State {
+            state: Arc::new(Mutex::new(State {
                 active: BTreeMap::new(),
                 history: VecDeque::new(),
                 recovered: Vec::new(),
                 pending: VecDeque::new(),
                 reserved: 0,
+                consumed_extra: 0,
+                decisions: BTreeMap::new(),
+                retries: 0,
                 actions: 0,
                 hedge: false,
                 last_action: None,
                 blocked_until: None,
-            }),
+            })),
             extra_limit: (total / 100).min(MAX_EXTRA),
             history_limit: (spec.max_connections as usize).saturating_mul(2).max(4),
             wire: AtomicU64::new(0),
@@ -294,6 +347,12 @@ impl Coordinator {
             wire_bytes = self.wire.load(Ordering::Relaxed),
             duplicate_bytes = self.duplicate.load(Ordering::Relaxed),
             reserved_extra_bytes = state.reserved,
+            consumed_extra_bytes = state.consumed_extra,
+            reservation_semantics = "in_flight_application_body_cost",
+            body_counter_scope = "adaptive_primary_and_challenger_data_frames",
+            discarded_or_staged_body_bytes = self.duplicate.load(Ordering::Relaxed),
+            ordinary_retries = state.retries,
+            recovery_decision_ticks = ?state.decisions,
             extra_budget_bytes = self.extra_limit,
             recovery_actions = state.actions,
             "adaptive transfer diagnostics"
@@ -357,37 +416,68 @@ impl Coordinator {
             .filter(|r| *r > 0.)
             .collect();
         if rates.len() < 2 {
+            *state
+                .decisions
+                .entry("baseline_insufficient_samples")
+                .or_default() += 1;
             return None;
         }
         rates.sort_by(f64::total_cmp);
         let baseline = rates[rates.len() / 2];
         // Several live requests slowing together supersede historical peaks.
         if !current.is_empty() && current.iter().all(|rate| *rate < baseline * 0.5) {
+            *state.decisions.entry("baseline_all_live_slow").or_default() += 1;
             return None;
         }
         Some(baseline)
     }
+    #[cfg(test)]
     fn reserve(&self, len: u64, lineage: &SharedLineage, hedge: bool, now: Instant) -> bool {
+        self.reserve_result(len, lineage, hedge, now).is_ok()
+    }
+    fn reserve_result(
+        &self,
+        len: u64,
+        lineage: &SharedLineage,
+        hedge: bool,
+        now: Instant,
+    ) -> Result<Reservation, &'static str> {
         let mut state = self.state.lock();
-        if state.hedge
-            || state.blocked_until.is_some_and(|until| now < until)
-            || state
-                .last_action
-                .is_some_and(|at| now.saturating_duration_since(at) < COOLDOWN)
-            || len > self.extra_limit.saturating_sub(state.reserved)
+        let reason = if state.hedge {
+            Some("challenger_active")
+        } else if state.blocked_until.is_some_and(|until| now < until) {
+            Some("global_backoff")
+        } else if state
+            .last_action
+            .is_some_and(|at| now.saturating_duration_since(at) < COOLDOWN)
         {
-            return false;
+            Some("cooldown")
+        } else if len
+            > self
+                .extra_limit
+                .saturating_sub(state.reserved.saturating_add(state.consumed_extra))
+        {
+            Some("budget")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            return Err(reason);
         }
         let mut lineage = lineage.lock();
         if lineage.recoveries >= 2 {
-            return false;
+            return Err("lineage_limit");
         }
         lineage.recoveries += 1;
         state.reserved += len;
         state.actions += 1;
         state.hedge = hedge;
         state.last_action = Some(now);
-        true
+        Ok(Reservation {
+            state: self.state.clone(),
+            bound: len,
+            cost: len,
+        })
     }
     fn finish_observation(&self, key: LeaseKey, completed: bool) {
         let mut state = self.state.lock();
@@ -433,7 +523,7 @@ impl Coordinator {
         if !state
             .recovered
             .iter()
-            .any(|r| Arc::ptr_eq(&r.lineage, lineage))
+            .any(|r| r.piece == segment.piece_id && Arc::ptr_eq(&r.lineage, lineage))
         {
             state.recovered.push(Recovered {
                 piece: segment.piece_id,
@@ -449,7 +539,7 @@ impl Coordinator {
         if let Some(record) = state
             .recovered
             .iter_mut()
-            .find(|r| Arc::ptr_eq(&r.lineage, lineage))
+            .find(|r| r.piece == segment.piece_id && Arc::ptr_eq(&r.lineage, lineage))
         {
             record.remaining = record.remaining.saturating_sub(segment.end - segment.start);
         }
@@ -638,7 +728,11 @@ pub(super) async fn worker_loop(
             recovery.policy.window,
         )));
         loop {
+            observation.lock().phase(Phase::WriterBarrier);
             begin_lease_and_wait(&write_tx, segment.lease_key()).await?;
+            if stream.is_none() {
+                observation.lock().phase(Phase::Headers);
+            }
             observation.lock().forwarded = 0;
             recovery
                 .state
@@ -677,6 +771,17 @@ pub(super) async fn worker_loop(
             match outcome {
                 Outcome::Complete => {
                     flush_lease_and_wait(&write_tx, segment.lease_key()).await?;
+                    {
+                        let mut sample = observation.lock();
+                        sample.advance(Instant::now());
+                        log_debug!(log_level, download_id, worker_id,
+                            request_id = ?sample.request_id, lease = ?segment.lease_key(),
+                            start = segment.start, end = segment.end, batch_end = request_end,
+                            reading_ms = sample.reading.as_millis() as u64,
+                            backpressure_ms = sample.backpressure.as_millis() as u64,
+                            writer_barrier_ms = sample.writer_barrier.as_millis() as u64,
+                            "adaptive piece writer acknowledged");
+                    }
                     if !scheduler.lock().complete(segment.lease_key()) {
                         return Err(DownloadError::Internal("stale adaptive completion".into()));
                     }
@@ -688,16 +793,13 @@ pub(super) async fn worker_loop(
                     }
                     break;
                 }
-                Outcome::Recover | Outcome::Staged(_) | Outcome::Failed(_) => {
+                Outcome::Recover(_) | Outcome::Staged(_) | Outcome::Failed(_) => {
                     // Cancelled attempt futures no longer own the retained body.
                     // No unstarted reserved piece has contributed progress.
                     let read_ahead = stream
                         .as_ref()
                         .map_or(0, |body| body.wire.saturating_sub(body.consumed));
                     drop(stream.take());
-                    for unused in queued.drain(..) {
-                        scheduler.lock().reclaim(unused.lease_key());
-                    }
                     request_end = segment.end;
                     let forwarded = observation.lock().forwarded;
                     let (outcome, mut retry_decision) = match outcome {
@@ -709,10 +811,11 @@ pub(super) async fn worker_loop(
                     let retain = validator.is_some()
                         && forwarded > 0
                         && forwarded < segment.end - segment.start
-                        && (matches!(outcome, Some(Outcome::Recover))
+                        && (matches!(outcome, Some(Outcome::Recover(_)))
                             || matches!(&retry_decision, Some(RetryDecision::Retry { .. })));
                     let mut prefix = segment.clone();
                     prefix.end = prefix.start + forwarded;
+                    observation.lock().phase(Phase::WriterBarrier);
                     if let Err(error) = super::settle_prefix(
                         &write_tx,
                         &scheduler,
@@ -726,15 +829,41 @@ pub(super) async fn worker_loop(
                         scheduler.lock().reclaim(segment.lease_key());
                         return Err(error);
                     }
+                    {
+                        let mut sample = observation.lock();
+                        sample.advance(Instant::now());
+                        log_debug!(log_level, download_id, worker_id,
+                            request_id = ?sample.request_id, lease = ?prefix.lease_key(),
+                            retained_prefix = retain, forwarded_bytes = forwarded,
+                            read_ahead_body_bytes = read_ahead,
+                            reading_ms = sample.reading.as_millis() as u64,
+                            backpressure_ms = sample.backpressure.as_millis() as u64,
+                            writer_barrier_ms = sample.writer_barrier.as_millis() as u64,
+                            "adaptive interrupted request writer acknowledged");
+                    }
+                    // The producer is gone and FIFO acknowledgement completed.
+                    // Released batch leases inherit action/retry history, rather
+                    // than becoming fresh work with a reset lineage.
+                    if let Some(RetryDecision::Retry { backoff, .. }) = &retry_decision {
+                        recovery.backoff(*backoff);
+                    }
+                    for unused in queued.drain(..) {
+                        let mut scheduler = scheduler.lock();
+                        if !matches!(&retry_decision, Some(RetryDecision::Stop(_))) {
+                            recovery.recovered(&unused, &lineage, cfg.max_active_leases);
+                            scheduler.reclaim(unused.lease_key());
+                        }
+                    }
                     if retain {
                         recovery.completed(&prefix, &lineage);
                     }
+                    recovery.duplicate.fetch_add(
+                        read_ahead + if retain { 0 } else { forwarded },
+                        Ordering::Relaxed,
+                    );
                     match outcome {
-                        Some(Outcome::Recover) => {
-                            recovery.duplicate.fetch_add(
-                                read_ahead + if retain { 0 } else { forwarded },
-                                Ordering::Relaxed,
-                            );
+                        Some(Outcome::Recover(mut reservation)) => {
+                            reservation.cost = read_ahead + if retain { 0 } else { forwarded };
                             {
                                 let mut scheduler = scheduler.lock();
                                 recovery.recovered(&segment, &lineage, cfg.max_active_leases);
@@ -753,12 +882,6 @@ pub(super) async fn worker_loop(
                             break;
                         }
                         Some(Outcome::Staged(mut staged)) => {
-                            recovery
-                                .duplicate
-                                .fetch_sub(segment.end - segment.start, Ordering::Relaxed);
-                            recovery
-                                .duplicate
-                                .fetch_add(read_ahead + forwarded, Ordering::Relaxed);
                             segment = scheduler
                                 .lock()
                                 .renew(segment.lease_key(), worker_id)
@@ -767,11 +890,27 @@ pub(super) async fn worker_loop(
                                         "cannot renew hedge winner lease".into(),
                                     )
                                 })?;
+                            let writer_setup = Instant::now();
                             begin_lease_and_wait(&write_tx, segment.lease_key()).await?;
+                            let writer_setup_ms = writer_setup.elapsed().as_millis() as u64;
+                            let copy_started = Instant::now();
                             staged
                                 .copy_to(&segment, &write_tx, &received, &budget, &mut stop)
                                 .await?;
+                            let staged_copy_ms = copy_started.elapsed().as_millis() as u64;
+                            let barrier_started = Instant::now();
                             flush_lease_and_wait(&write_tx, segment.lease_key()).await?;
+                            log_debug!(log_level, download_id, worker_id,
+                                request_id = ?staged.request_id, lease = ?segment.lease_key(),
+                                writer_setup_ms, staged_copy_ms,
+                                writer_barrier_ms = barrier_started.elapsed().as_millis() as u64,
+                                "hedge winner writer acknowledged");
+                            // Only after the winner's writer acknowledgement can
+                            // its staged bytes become useful rather than extra.
+                            staged.reservation.cost = read_ahead + forwarded;
+                            recovery
+                                .duplicate
+                                .fetch_sub(segment.end - segment.start, Ordering::Relaxed);
                             if !scheduler.lock().complete(segment.lease_key()) {
                                 return Err(DownloadError::Internal(
                                     "stale hedge winner completion".into(),
@@ -799,6 +938,7 @@ pub(super) async fn worker_loop(
                                     return Err(error);
                                 }
                                 RetryDecision::Retry { backoff, error, .. } => {
+                                    recovery.state.lock().retries += 1;
                                     recovery.backoff(backoff);
                                     log_warn!(log_level, download_id, worker_id, attempt = segment.attempt, error = %error, backoff_ms = backoff.as_millis() as u64, "adaptive segment failed, retrying");
                                     segment = scheduler
@@ -809,11 +949,11 @@ pub(super) async fn worker_loop(
                                                 "cannot renew adaptive retry lease".into(),
                                             )
                                         })?;
+                                    sleep_with_backoff(backoff, &mut stop).await?;
                                     observation = Arc::new(Mutex::new(Observation::new(
                                         Instant::now(),
                                         recovery.policy.window,
                                     )));
-                                    sleep_with_backoff(backoff, &mut stop).await?;
                                 }
                             }
                         }
@@ -845,9 +985,58 @@ struct AttemptContext<'a> {
     log_level: LogLevel,
     download_id: u64,
 }
+impl AttemptContext<'_> {
+    fn decision(&self, reason: &'static str, baseline: Option<f64>) {
+        // Fixed reason vocabulary bounds memory; emit only state changes.
+        *self
+            .recovery
+            .state
+            .lock()
+            .decisions
+            .entry(reason)
+            .or_default() += 1;
+        let has_available = self.scheduler.lock().has_available();
+        let tail_block = if self.segment.end - self.segment.start > MAX_HEDGE {
+            "range_too_large"
+        } else if has_available {
+            "unclaimed_work"
+        } else if self.recovery.slots.available_permits() == 0 {
+            "no_idle_slot"
+        } else if !self.recovery.state.lock().pending.is_empty() {
+            "pending_recovery"
+        } else if baseline.is_none() {
+            "no_healthy_baseline"
+        } else {
+            "none"
+        };
+        let mut sample = self.observation.lock();
+        if sample.last_reason == Some((reason, tail_block)) {
+            return;
+        }
+        sample.last_reason = Some((reason, tail_block));
+        sample.advance(Instant::now());
+        log_debug!(self.log_level, download_id = self.download_id,
+            worker_id = self.segment.owner_worker_id, request_id = ?sample.request_id,
+            lease = ?self.segment.lease_key(), start = self.segment.start, end = self.segment.end,
+            batch_end = self.request_end, reserved_batch_bytes = self.request_end - self.segment.end,
+            remaining_piece_bytes = (self.segment.end - self.segment.start).saturating_sub(sample.forwarded),
+            remaining_required_bytes = self.total.saturating_sub(self.received.load(Ordering::Relaxed)),
+            idle_slots = self.recovery.slots.available_permits(),
+            active_slots = self.recovery.slot_capacity - self.recovery.slots.available_permits(),
+            fast_tail_block = tail_block,
+            batch_final_piece = self.request_end == self.segment.end,
+            hedge_validator_available = self.validator.is_some(),
+            reason, phase = ?sample.phase, body_bytes = sample.wire,
+            reading_ms = sample.reading.as_millis() as u64,
+            headers_phase_ms = sample.headers.as_millis() as u64,
+            backpressure_ms = sample.backpressure.as_millis() as u64,
+            writer_barrier_ms = sample.writer_barrier.as_millis() as u64,
+            baseline_bytes_sec = ?baseline, "adaptive recovery decision");
+    }
+}
 enum Outcome {
     Complete,
-    Recover,
+    Recover(Reservation),
     Staged(Staged),
     Failed(DownloadError),
 }
@@ -887,18 +1076,11 @@ async fn run_attempt(
                 }
             },
             _ = ticker.tick() => {
-                if ctx.recovery.policy.mode == SlowTransferMode::Disabled { continue; }
+                if ctx.recovery.policy.mode == SlowTransferMode::Disabled { ctx.decision("disabled", None); continue; }
                 let now = Instant::now();
                 let baseline = ctx.recovery.baseline(ctx.segment.lease_key(), now);
-                if ctx.log_level >= LogLevel::Debug {
-                    let sample = ctx.observation.lock();
-                    log_debug!(ctx.log_level, download_id = ctx.download_id, worker_id = ctx.segment.owner_worker_id,
-                        attempt = ctx.segment.attempt, phase = ?sample.phase, wire_bytes = sample.wire,
-                        forwarded_bytes = sample.forwarded, reading_ms = sample.reading.as_millis() as u64,
-                        baseline_bytes_sec = ?baseline, "adaptive request sample");
-                }
                 let len = ctx.segment.end-ctx.segment.start;
-                let tail_baseline = if ctx.request_end == ctx.segment.end && !matches!(ctx.speed, SpeedLimit::Limited(_))
+                let tail_baseline = if !matches!(ctx.speed, SpeedLimit::Limited(_))
                     && ctx.recovery.tail_eligible(len, ctx.scheduler.lock().has_available()) {
                     ctx.recovery.sample_baseline(ctx.segment.lease_key(), now, true)
                 } else { None };
@@ -912,28 +1094,61 @@ async fn run_attempt(
                 // observing phases but conservatively suppress speculative
                 // performance work while that cap is active.
                 if matches!(ctx.speed, SpeedLimit::Limited(_)) {
-                    log_debug!(ctx.log_level, download_id = ctx.download_id, "performance recovery suppressed by task speed cap");
+                    ctx.decision("rate_limit", baseline);
                     continue;
                 }
-                if !eligible || challenger.is_some() { continue; }
+                if challenger.is_some() { ctx.decision("challenger_active", baseline); continue; }
+                if !eligible {
+                    let phase = ctx.observation.lock().phase;
+                    let reason = if phase != Phase::Reading { "not_reading" }
+                        else if baseline.is_none() && ctx.recovery.policy.absolute.is_none() { "no_healthy_baseline" }
+                        else { "slow_threshold_or_benefit" };
+                    ctx.decision(reason, baseline);
+                    continue;
+                }
                 let len = ctx.segment.end-ctx.segment.start;
                 let mut slot = None;
                 if ctx.request_end == ctx.segment.end && ctx.validator.is_some() && ctx.recovery.policy.mode == SlowTransferMode::AdaptiveWithHedging && len <= MAX_HEDGE
                     && !ctx.scheduler.lock().has_available() {
                     slot = ctx.recovery.slots.clone().try_acquire_owned().ok();
                 }
-                let hedge = slot.is_some();
-                if !ctx.recovery.reserve(len, lineage, hedge, now) { continue; }
+                let mut hedge = slot.is_some();
+                // This task owns the primary future. Once selected it is dropped
+                // before another body poll; no producer can race this snapshot.
+                let mut cost_bound = if hedge { len } else {
+                    cancellation_cost_bound(&ctx.observation.lock(), len, ctx.validator.is_some())
+                };
+                let mut reservation = match ctx.recovery.reserve_result(cost_bound, lineage, hedge, now) {
+                    Ok(reservation) => reservation,
+                    Err("budget") if hedge => {
+                        // A refused hedge has not consumed an action or lineage
+                        // allowance. Release its spare permit before considering
+                        // the existing cancel-before-resume path, rechecking all
+                        // reservation guards against that path's own cost bound.
+                        drop(slot.take());
+                        *ctx.recovery.state.lock().decisions.entry("hedge_budget").or_default() += 1;
+                        hedge = false;
+                        cost_bound = cancellation_cost_bound(&ctx.observation.lock(), len, ctx.validator.is_some());
+                        match ctx.recovery.reserve_result(cost_bound, lineage, false, now) {
+                            Ok(reservation) => reservation,
+                            Err(reason) => { ctx.decision(reason, baseline); continue; }
+                        }
+                    }
+                    Err(reason) => { ctx.decision(reason, baseline); continue; }
+                };
+                if hedge { reservation.cost = 0; }
+                ctx.decision("selected", baseline);
                 log_info!(ctx.log_level, download_id = ctx.download_id, worker_id = ctx.segment.owner_worker_id,
-                    attempt = ctx.segment.attempt, start = ctx.segment.start, end = ctx.segment.end, hedge, fast_tail = tail,
+                    attempt = ctx.segment.attempt, start = ctx.segment.start, end = ctx.segment.end,
+                    hedge, fast_tail = tail, cost_bound_bytes = cost_bound,
                     "sustained low reading speed; bounded recovery selected");
                 if let Some(permit) = slot {
                     hedge_guard = Some(HedgeGuard(ctx.recovery));
                     challenger = Some(Box::pin(async move {
                         let _slot = Slot { permit: Some(permit), owner: ctx.recovery };
-                        stage(ctx).await
+                        stage(ctx, reservation).await
                     }));
-                } else { return Outcome::Recover; }
+                } else { return Outcome::Recover(reservation); }
             }
         }
     }
@@ -967,10 +1182,25 @@ async fn checked_response(
         Some(response) => response,
         None => {
             ctx.worker
+                .clone()
+                .with_attempt(
+                    ctx.segment.owner_worker_id,
+                    ctx.segment.piece_id,
+                    ctx.segment.lease_key().lease_id,
+                )
                 .send_range(ctx.segment.start, request_end - 1)
                 .await?
         }
     };
+    let diagnostics = response
+        .extensions()
+        .get::<crate::http::worker::RequestDiagnostics>();
+    log_debug!(ctx.log_level, download_id = ctx.download_id,
+        worker_id = ctx.segment.owner_worker_id,
+        request_id = ?diagnostics.map(|d| d.id), lease = ?ctx.segment.lease_key(),
+        start = ctx.segment.start, end = request_end,
+        headers_ms = ?diagnostics.map(|d| d.headers_elapsed.as_millis() as u64),
+        "adaptive response associated with lease");
     // A positively different validator is an identity failure even when the
     // same response also has an invalid range/total. Missing metadata on an
     // already malformed response remains an optional-candidate failure.
@@ -1030,10 +1260,14 @@ async fn primary(
     stream: &mut Option<RequestStream>,
 ) -> Result<(), DownloadError> {
     if stream.is_none() {
-        let body = checked_response(ctx, response, ctx.request_end)
+        let response = checked_response(ctx, response, ctx.request_end)
             .await
-            .map_err(|failure| failure.error)?
-            .into_body();
+            .map_err(|failure| failure.error)?;
+        ctx.observation.lock().request_id = response
+            .extensions()
+            .get::<crate::http::worker::RequestDiagnostics>()
+            .map(|d| d.id);
+        let body = response.into_body();
         *stream = Some(RequestStream {
             body,
             buffered: bytes::Bytes::new(),
@@ -1115,7 +1349,11 @@ async fn primary(
         });
         permit.forget();
         stream.consumed += len as u64;
-        ctx.observation.lock().forwarded += len as u64;
+        {
+            let mut sample = ctx.observation.lock();
+            sample.forwarded += len as u64;
+            sample.enqueued += len as u64;
+        }
         ctx.received.fetch_add(len as u64, Ordering::Relaxed);
         if let Some(error) = stop_signal_error(*stop.borrow()) {
             return Err(error);
@@ -1126,6 +1364,8 @@ async fn primary(
 struct Staged {
     file: tokio::fs::File,
     _path: tempfile::TempPath,
+    reservation: Reservation,
+    request_id: Option<u64>,
 }
 impl Staged {
     async fn copy_to(
@@ -1170,7 +1410,11 @@ impl Staged {
         Ok(())
     }
 }
-async fn stage(ctx: &AttemptContext<'_>) -> Result<Staged, CandidateFailure> {
+async fn stage(
+    ctx: &AttemptContext<'_>,
+    mut reservation: Reservation,
+) -> Result<Staged, CandidateFailure> {
+    reservation.cost = 0;
     let temporary = tempfile::Builder::new()
         .prefix(".bytehaul-hedge-")
         .tempfile_in(&ctx.recovery.output_dir)?;
@@ -1178,13 +1422,37 @@ async fn stage(ctx: &AttemptContext<'_>) -> Result<Staged, CandidateFailure> {
     let mut staged = Staged {
         file: tokio::fs::File::from_std(file),
         _path: path,
+        reservation,
+        request_id: None,
     };
-    let mut body = checked_response(ctx, None, ctx.segment.end)
-        .await?
-        .into_body();
+    let response = checked_response(ctx, None, ctx.segment.end).await?;
+    staged.request_id = response
+        .extensions()
+        .get::<crate::http::worker::RequestDiagnostics>()
+        .map(|d| d.id);
+    // A speculative body's worst-case extra cost must be known before reading
+    // it. Content-Length lets Hyper cap admitted body data at this exact range;
+    // an optional chunked challenger is abandoned without touching the primary.
+    let framed_length = response
+        .headers()
+        .get(hyper::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    if framed_length != Some(ctx.segment.end - ctx.segment.start)
+        || response
+            .headers()
+            .contains_key(hyper::header::TRANSFER_ENCODING)
+    {
+        return Err(DownloadError::ResumeMismatch(
+            "challenger requires an exact Content-Length for its extra-byte bound".into(),
+        )
+        .into());
+    }
+    let mut body = response.into_body();
     let mut wire = 0u64;
     while let Some(mut data) = next_data_chunk(&mut body, ctx.cfg.read_timeout).await? {
         wire = wire.saturating_add(data.len() as u64);
+        staged.reservation.cost = wire;
         ctx.recovery
             .wire
             .fetch_add(data.len() as u64, Ordering::Relaxed);
@@ -1270,6 +1538,377 @@ mod tests {
             recoveries: 0,
         }))
     }
+    #[test]
+    fn prefix_recovery_reserves_only_unforwarded_body_and_settles_once() {
+        let recovery = coordinator(64_469_455);
+        let lineage = lineage();
+        let now = Instant::now();
+        let mut sample = reading(now);
+        // One earlier piece plus a partial current piece are already enqueued;
+        // a frame suffix is still local, including bytes awaiting a permit.
+        sample.wire = 1024 * 1024 + 80_000;
+        sample.enqueued = 1024 * 1024 + 40_000;
+        sample.forwarded = 40_000;
+        let bound = cancellation_cost_bound(&sample, 1024 * 1024, true);
+        assert_eq!(bound, 40_000);
+        assert!(cancellation_cost_bound(&sample, 1024 * 1024, false) > recovery.extra_limit);
+        let mut reservation = recovery
+            .reserve_result(bound, &lineage, false, now)
+            .unwrap();
+        assert_eq!(recovery.state.lock().reserved, 40_000);
+        assert_eq!(recovery.state.lock().consumed_extra, 0);
+        // A conservative bound can be refunded when less discarded traffic is
+        // proved; unused bound must not remain consumed across the next lease.
+        reservation.cost = 30_000;
+        drop(reservation);
+        assert_eq!(recovery.state.lock().reserved, 0);
+        assert_eq!(recovery.state.lock().consumed_extra, 30_000);
+        assert_eq!(
+            recovery
+                .reserve_result(1024 * 1024, &lineage, true, now + COOLDOWN)
+                .err(),
+            Some("budget")
+        );
+        assert_eq!(lineage.lock().recoveries, 1);
+    }
+
+    #[test]
+    fn refused_hedge_and_over_budget_cancellation_do_not_charge_an_action() {
+        let recovery = coordinator(64_469_455);
+        let lineage = lineage();
+        let now = Instant::now();
+        let mut sample = reading(now);
+        sample.wire = recovery.extra_limit + 1;
+        let spare = recovery.slots.try_acquire().unwrap();
+        assert_eq!(
+            recovery
+                .reserve_result(1024 * 1024, &lineage, true, now)
+                .err(),
+            Some("budget")
+        );
+        drop(spare);
+        let cancellation = cancellation_cost_bound(&sample, 1024 * 1024, true);
+        assert_eq!(
+            recovery
+                .reserve_result(cancellation, &lineage, false, now)
+                .err(),
+            Some("budget")
+        );
+        let state = recovery.state.lock();
+        assert_eq!(state.actions, 0);
+        assert_eq!(state.reserved, 0);
+        assert_eq!(state.consumed_extra, 0);
+        assert_eq!(state.last_action, None);
+        assert!(!state.hedge);
+        assert_eq!(lineage.lock().recoveries, 0);
+        assert_eq!(recovery.slots.available_permits(), recovery.slot_capacity);
+    }
+
+    #[test]
+    fn zero_cost_and_interrupted_reservations_remain_bounded() {
+        let recovery = coordinator(64_469_455);
+        let lineage = lineage();
+        let now = Instant::now();
+        let reservation = recovery.reserve_result(123, &lineage, false, now).unwrap();
+        // Dropping a future during writer acknowledgement charges its bound
+        // exactly once even when the success settlement code never runs.
+        drop(reservation);
+        assert_eq!(recovery.state.lock().reserved, 0);
+        assert_eq!(recovery.state.lock().consumed_extra, 123);
+        drop(
+            recovery
+                .reserve_result(0, &lineage, false, now + COOLDOWN)
+                .unwrap(),
+        );
+        assert_eq!(
+            recovery
+                .reserve_result(0, &lineage, false, now + COOLDOWN * 2)
+                .err(),
+            Some("lineage_limit")
+        );
+        assert_eq!(recovery.state.lock().consumed_extra, 123);
+        assert_eq!(recovery.state.lock().actions, 2);
+    }
+
+    #[tokio::test]
+    async fn writer_barrier_success_failure_and_abort_settle_reservation_once() {
+        for outcome in ["confirm", "writer_failure", "cancel"] {
+            let recovery = coordinator(64_469_455);
+            let mut reservation = recovery
+                .reserve_result(321, &lineage(), false, Instant::now())
+                .unwrap();
+            let scheduler: Scheduler =
+                Arc::new(Mutex::new(SchedulerState::new(PieceMap::new(32, 32))));
+            let mut segment = scheduler.lock().assign_to(0).unwrap();
+            let received = Arc::new(AtomicU64::new(12));
+            let (write_tx, mut write_rx) = mpsc::channel(1);
+            let task = tokio::spawn(async move {
+                let result = super::super::settle_prefix(
+                    &write_tx,
+                    &scheduler,
+                    &mut segment,
+                    &received,
+                    12,
+                    true,
+                )
+                .await;
+                if result.is_ok() {
+                    reservation.cost = 123;
+                }
+                drop(reservation);
+                result
+            });
+            let Some(WriterCommand::FlushLease { ack, .. }) = write_rx.recv().await else {
+                panic!("prefix must wait on the authoritative writer");
+            };
+            assert_eq!(recovery.state.lock().reserved, 321);
+            assert_eq!(recovery.state.lock().consumed_extra, 0);
+            assert!(!task.is_finished());
+            match outcome {
+                "confirm" => {
+                    ack.send(()).unwrap();
+                    task.await.unwrap().unwrap();
+                }
+                "writer_failure" => {
+                    drop(ack);
+                    assert!(matches!(
+                        task.await.unwrap(),
+                        Err(DownloadError::ChannelClosed)
+                    ));
+                }
+                _ => {
+                    task.abort();
+                    assert!(task.await.unwrap_err().is_cancelled());
+                    assert!(ack.send(()).is_err());
+                }
+            }
+            assert_eq!(recovery.state.lock().reserved, 0);
+            assert_eq!(
+                recovery.state.lock().consumed_extra,
+                if outcome == "confirm" { 123 } else { 321 }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn real_memory_backpressure_suppresses_recovery_and_cancels() {
+        use warp::Filter;
+        let calls = Arc::new(AtomicU64::new(0));
+        let request_calls = calls.clone();
+        let route = warp::any().map(move || {
+            request_calls.fetch_add(1, Ordering::Relaxed);
+            warp::http::Response::builder()
+                .status(206)
+                .header("content-length", "32")
+                .header("content-range", "bytes 0-31/32")
+                .header("etag", "\"v1\"")
+                .body(vec![7u8; 32])
+                .unwrap()
+        });
+        let (addr, server) = warp::serve(route).bind_ephemeral(([127, 0, 0, 1], 0));
+        let server = tokio::spawn(server);
+        let spec = DownloadSpec::new(format!("http://{addr}/file"))
+            .low_speed_limit(1024)
+            .slow_start_grace(Duration::from_millis(20))
+            .slow_sample_window(Duration::from_millis(30))
+            .low_speed_duration(Duration::from_millis(60));
+        let client = crate::network::ClientNetworkConfig::default()
+            .build_client()
+            .unwrap();
+        let worker = HttpWorker::new(client, &spec);
+        let recovery = Coordinator::new(
+            &spec,
+            &meta(Some("\"v1\"")),
+            Path::new("unused"),
+            64_469_455,
+        )
+        .unwrap();
+        let scheduler: Scheduler = Arc::new(Mutex::new(SchedulerState::new(PieceMap::new(32, 32))));
+        let segment = scheduler.lock().assign_to(0).unwrap();
+        let cfg = WorkerConfig {
+            worker: worker.clone(),
+            read_timeout: Duration::from_secs(2),
+            max_retries: 0,
+            retry_base_delay: Duration::ZERO,
+            retry_max_delay: Duration::ZERO,
+            max_retry_elapsed: None,
+            max_active_leases: 4,
+            min_segment_size: 32,
+            request_batch_size: 0,
+            validator: Some("\"v1\"".into()),
+            recovery: None,
+        };
+        let budget = Arc::new(MemoryBudget::new(32));
+        let _all_memory = budget.semaphore.acquire_many(32).await.unwrap();
+        let (write_tx, _write_rx) = mpsc::channel(1);
+        let received = Arc::new(AtomicU64::new(0));
+        let observation = Arc::new(Mutex::new(Observation::new(
+            Instant::now(),
+            spec.slow_sample_window,
+        )));
+        recovery
+            .state
+            .lock()
+            .active
+            .insert(segment.lease_key(), observation.clone());
+        let _slot = recovery.slots.try_acquire().unwrap();
+        let speed = SpeedLimit::Unlimited;
+        let ctx = AttemptContext {
+            worker: &worker,
+            cfg: &cfg,
+            recovery: &recovery,
+            scheduler: &scheduler,
+            segment: &segment,
+            request_end: 32,
+            write_tx: &write_tx,
+            received: &received,
+            budget: &budget,
+            speed: &speed,
+            total: 32,
+            validator: Some("\"v1\""),
+            observation: &observation,
+            log_level: LogLevel::Off,
+            download_id: 0,
+        };
+        let (stop_tx, mut stop) = watch::channel(StopSignal::Running);
+        let mut stream = None;
+        let lineage = lineage();
+        let attempt = run_attempt(&ctx, None, &mut stop, &lineage, &mut stream);
+        tokio::pin!(attempt);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                tokio::select! {
+                    _ = &mut attempt => panic!("request must remain blocked on memory"),
+                    _ = tokio::time::sleep(Duration::from_millis(1)) => {
+                        if observation.lock().phase == Phase::MemoryBlocked { break; }
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(observation.lock().wire, 32);
+        assert_eq!(cancellation_cost_bound(&observation.lock(), 32, true), 32);
+        tokio::select! {
+            _ = &mut attempt => panic!("local pressure must not trigger recovery"),
+            _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+        }
+        assert_eq!(recovery.state.lock().actions, 0);
+        assert_eq!(received.load(Ordering::Relaxed), 0);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        stop_tx.send(StopSignal::Cancel).unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), &mut attempt)
+                .await
+                .unwrap(),
+            Outcome::Failed(DownloadError::Cancelled)
+        ));
+        server.abort();
+    }
+
+    #[test]
+    fn released_batch_pieces_share_lineage_without_merging_completion_accounting() {
+        let recovery = coordinator(64_469_455);
+        let lineage = lineage();
+        let first = Segment {
+            piece_id: 1,
+            lease_id: 1,
+            start: 100,
+            end: 200,
+            owner_worker_id: 0,
+            attempt: 1,
+        };
+        let second = Segment {
+            piece_id: 2,
+            lease_id: 2,
+            start: 200,
+            end: 300,
+            owner_worker_id: 0,
+            attempt: 1,
+        };
+        recovery.recovered(&first, &lineage, 4);
+        recovery.recovered(&second, &lineage, 4);
+        assert_eq!(recovery.state.lock().recovered.len(), 2);
+        recovery.completed(&first, &lineage);
+        let state = recovery.state.lock();
+        assert_eq!(state.recovered.len(), 1);
+        assert_eq!(state.recovered[0].piece, 2);
+        assert_eq!(state.recovered[0].remaining, 100);
+        assert!(Arc::ptr_eq(&state.recovered[0].lineage, &lineage));
+    }
+
+    #[test]
+    fn diagnostic_timing_separates_headers_reading_and_local_waits() {
+        let start = Instant::now();
+        let mut observation = Observation::new(start, Duration::from_secs(30));
+        observation.advance(start + Duration::from_secs(2));
+        observation.phase = Phase::Reading;
+        observation.advance(start + Duration::from_secs(5));
+        observation.phase = Phase::MemoryBlocked;
+        observation.advance(start + Duration::from_secs(9));
+        observation.phase = Phase::ChannelBlocked;
+        observation.advance(start + Duration::from_secs(14));
+        observation.phase = Phase::RateLimited;
+        observation.advance(start + Duration::from_secs(20));
+        observation.phase = Phase::WriterBarrier;
+        observation.advance(start + Duration::from_secs(27));
+        assert_eq!(observation.headers, Duration::from_secs(2));
+        assert_eq!(observation.reading, Duration::from_secs(3));
+        assert_eq!(observation.backpressure, Duration::from_secs(15));
+        assert_eq!(observation.writer_barrier, Duration::from_secs(7));
+        // Repeated snapshots do not add elapsed time a second time.
+        observation.advance(start + Duration::from_secs(27));
+        assert_eq!(observation.writer_barrier, Duration::from_secs(7));
+    }
+
+    #[test]
+    fn reservation_diagnostics_preserve_budget_cooldown_and_lineage_guards() {
+        let recovery = coordinator(10_000);
+        let lineage = lineage();
+        let now = Instant::now();
+        assert_eq!(
+            recovery
+                .reserve_result(101, &lineage, false, now)
+                .map(|_| ()),
+            Err("budget")
+        );
+        assert_eq!(recovery.state.lock().actions, 0);
+        assert_eq!(lineage.lock().recoveries, 0);
+        recovery.backoff(Duration::from_secs(1));
+        assert_eq!(
+            recovery
+                .reserve_result(10, &lineage, false, now)
+                .map(|_| ()),
+            Err("global_backoff")
+        );
+        let later = now + Duration::from_secs(2);
+        assert_eq!(
+            recovery
+                .reserve_result(10, &lineage, false, later)
+                .map(|_| ()),
+            Ok(())
+        );
+        assert_eq!(
+            recovery
+                .reserve_result(10, &lineage, false, later)
+                .map(|_| ()),
+            Err("cooldown")
+        );
+        assert_eq!(
+            recovery
+                .reserve_result(10, &lineage, false, later + COOLDOWN)
+                .map(|_| ()),
+            Ok(())
+        );
+        assert_eq!(
+            recovery
+                .reserve_result(10, &lineage, false, later + COOLDOWN * 2)
+                .map(|_| ()),
+            Err("lineage_limit")
+        );
+        assert_eq!(recovery.state.lock().consumed_extra, 20);
+    }
+
     #[test]
     fn default_tail_detection_is_short_sustained_and_resets_without_evidence() {
         let recovery = coordinator(1_000_000);
@@ -1526,7 +2165,7 @@ mod tests {
         assert!(!recovery.reserve(1, &lineage, false, now + Duration::from_secs(9)));
         assert!(recovery.reserve(500, &lineage, true, now + Duration::from_secs(10)));
         assert!(!recovery.reserve(1, &lineage, false, now + Duration::from_secs(20)));
-        assert_eq!(recovery.state.lock().reserved, 1000);
+        assert_eq!(recovery.state.lock().consumed_extra, 1000);
         drop(HedgeGuard(&recovery));
         let large = coordinator(u64::MAX);
         assert_eq!(large.extra_limit, MAX_EXTRA);

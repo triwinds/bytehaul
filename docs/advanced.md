@@ -89,7 +89,19 @@ let spec = DownloadSpec::new("https://example.com/file.bin")
 
 In version 0.2.3, a trailing range of at most 1 MiB can recover earlier when no unassigned work remains and a request slot is idle. A separate detector caps the configured sample window, grace and sustained duration at 1, 1 and 2 seconds respectively. It requires recent healthy reference speeds and a worthwhile estimated time saving; an absolute speed floor alone is insufficient. Missing or immature live-peer evidence, collective slowdown and local backpressure prevent acceleration. Ordinary detection retains the configured durations. This applies to both adaptive modes; `Disabled` disables it.
 
-Hedging is opt-in. It uses at most one spare request for a small trailing segment, requires a strong ETag and compatible conditional headers, and stages the spare response separately before switching the writer. The original and spare requests together remain within `max_connections`; all network payload shares `max_download_speed`. Automatic recovery and hedging share an extra-work budget of `min(total_size / 100, 16 MiB)`. A range that cannot fit is skipped, so small downloads may receive no automatic retry for performance. Ordinary error retries retain their existing separate retry policy.
+Hedging is opt-in. It uses at most one spare request for a small trailing segment, requires a strong ETag and compatible conditional headers, and stages the spare response separately before switching the writer. The original and spare requests together remain within `max_connections`; all network payload shares `max_download_speed`. Automatic recovery and hedging share an extra-work budget of `min(total_size / 100, 16 MiB)`. Protected cancel-before-resume reserves consumed read-ahead that may be discarded; the necessary suffix is not extra work. Unprotected replay and a parallel hedge require conservative range-sized reservations, so a hedge can remain over budget when safe cancel/resume is allowed. This budget measures consumed HTTP body data, excluding unread transport buffers and TCP/TLS overhead. Ordinary error retries retain their existing separate retry policy.
+
+When healthy peer history exists and other slots are idle, adaptive recovery can
+stop a slow request in the middle of a batch. It retains a writer-confirmed prefix
+and releases queued pieces for scheduling only after the old producer has stopped
+and the writer has acknowledged the handoff. Released pieces share the original
+retry count, elapsed budget and Retry-After; request batching does not grant new
+retries. Only complete flushed pieces enter a resumable checkpoint. The default
+request batch size remains 4 MiB.
+
+In hedging mode, an unaffordable full-range challenger can fall back to protected
+cancel/resume if its smaller cost fits. The spare slot is released first, and
+budget, cooldown and retry guards are checked again. The budget is never enlarged.
 
 Progress counts effective download bytes, not duplicate traffic; it can decrease when an incomplete attempt is reclaimed. Enable debug logging to inspect recovery decisions. These policies do not increase a shared server or disk bandwidth limit. Single-connection and non-Range fallback behavior is unchanged.
 
@@ -223,3 +235,23 @@ let result = handle.wait().await; // returns Err(DownloadError::Cancelled)
 ```
 
 `Cancelled`, `Paused`, and `Completed` are distinct end states. Both `cancel()` and `pause()` end the current task and attempt to preserve resumable state when resume is enabled. A write or synchronization failure leaves the previous durable checkpoint in place. Normal completion attempts to remove the control file; single-connection cleanup failure is an error, while multi-connection cleanup is best effort.
+
+### Request response-headers deadline (unreleased)
+
+Rust `DownloadSpec::request_headers_timeout(Duration)` and the appended Python
+`request_headers_timeout` argument (seconds, default `None`) bound each request
+from invocation through response headers, including pool waiting and DNS/TCP/TLS
+connection setup. This is not pure server TTFB. Omission preserves the existing
+header deadline inherited from `read_timeout`; body reads still use `read_timeout`.
+The value must be positive and representable as a monotonic-clock deadline.
+The connector's timeout can expire earlier.
+
+Each retry and redirect hop gets a fresh deadline, including probes, GET fallback,
+resume, and ordinary Range requests. This is not a total redirect-chain or download
+deadline: existing retry counts, `max_retry_elapsed` check boundaries, and 429/503
+`Retry-After` behavior remain unchanged. There is no automatic deadline shortening
+or response-headers hedging.
+
+Existing probe transport failures (including timeouts) may enter GET fallback;
+these retain their separate retry scopes. `max_retry_elapsed` is not a hard
+whole-download deadline or a combined deadline for both phases.

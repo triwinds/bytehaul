@@ -153,3 +153,18 @@ DownloadManager
 ## 许可证
 
 MIT
+
+### 请求响应头期限（未发布）
+
+Rust 的 `DownloadSpec::request_headers_timeout(Duration)` 与 Python 两个下载 API
+末尾新增的 `request_headers_timeout`（秒，默认 `None`）设置单次请求从发起到收到
+响应头的期限，包含连接池等待、DNS/TCP/TLS 建连，并非纯服务端 TTFB。省略时继续
+使用原来的 `read_timeout` 响应头期限；响应体读取仍由 `read_timeout` 控制。
+值必须为正数且能表示为单调时钟期限。连接超时可能更早生效。
+
+每次重试和每个重定向跳转分别计时，probe、GET fallback、续传和普通 Range 均适用。
+这不是整个重定向链或整个下载的总期限；原有重试次数、`max_retry_elapsed` 检查边界
+和 429/503 的 `Retry-After` 保持不变。未配置时不会自动缩短期限或发起响应头 hedge。
+
+现有行为中，probe 的传输错误（含超时）可进入 GET fallback；两者保留各自的重试预算。
+`max_retry_elapsed` 不是整个下载（或两阶段合计）的硬期限。

@@ -239,6 +239,7 @@ except DownloadFailedError as exc:
 | `max_connections` | `int` | `4` | 最大并发连接数 |
 | `connect_timeout` | `float` | `30.0` | 连接超时，单位秒 |
 | `read_timeout` | `float` | `60.0` | 读取超时，单位秒 |
+| `request_headers_timeout` | `float` | `None` | 单次请求到响应头期限（含建连），省略时继承 `read_timeout` |
 | `memory_budget` | `int` | `67108864` | 内存预算，单位字节 |
 | `file_allocation` | `"none" \| "prealloc"` | `"prealloc"` | 文件预分配策略 |
 | `resume` | `bool` | `True` | 是否启用断点续传 |
@@ -312,6 +313,21 @@ task = Downloader(log_level="debug").download(
 task.wait()
 ```
 
-自动恢复与竞速共享 `min(total_size / 100, 16 MiB)` 的额外 Range 工作预算，不够则跳过；普通错误重试沿用原策略。主动限速和本地背压不计为网络慢。使用 `"disabled"` 保留原调度行为；单连接与不支持 Range 的回退行为保持不变。详见 [Rust 慢请求恢复说明](advanced.zh-CN.md)。
+自动恢复与竞速共享 `min(total_size / 100, 16 MiB)` 的额外 body 工作预算，不够则跳过。强校验对象取消续传只为可能丢弃的已读取数据预留，必需后缀不算额外流量；竞速仍需预留完整范围。预算不包含未消费的传输缓冲及 TCP/TLS 开销。批次中途接管后释放的分片共享原有重试预算与 Retry-After；普通错误重试沿用原策略。主动限速和本地背压不计为网络慢。使用 `"disabled"` 关闭性能恢复；单连接与不支持 Range 的回退行为保持不变。详见 [Rust 慢请求恢复说明](advanced.zh-CN.md)。
 
 当 `max_download_speed` 非零时，自动低速恢复和竞速会暂停，避免将主动限速误判为网络故障；普通超时与错误重试仍然生效。
+
+### 请求响应头期限（未发布）
+
+Rust 的 `DownloadSpec::request_headers_timeout(Duration)` 与 Python 两个下载 API
+末尾新增的 `request_headers_timeout`（秒，默认 `None`）设置单次请求从发起到收到
+响应头的期限，包含连接池等待、DNS/TCP/TLS 建连，并非纯服务端 TTFB。省略时继续
+使用原来的 `read_timeout` 响应头期限；响应体读取仍由 `read_timeout` 控制。
+值必须为正数且能表示为单调时钟期限。连接超时可能更早生效。
+
+每次重试和每个重定向跳转分别计时，probe、GET fallback、续传和普通 Range 均适用。
+这不是整个重定向链或整个下载的总期限；原有重试次数、`max_retry_elapsed` 检查边界
+和 429/503 的 `Retry-After` 保持不变。未配置时不会自动缩短期限或发起响应头 hedge。
+
+现有行为中，probe 的传输错误（含超时）可进入 GET fallback；两者保留各自的重试预算。
+`max_retry_elapsed` 不是整个下载（或两阶段合计）的硬期限。

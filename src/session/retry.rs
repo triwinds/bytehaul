@@ -173,7 +173,26 @@ where
 {
     let mut retry_state = RetryState::new(max_retries, base_delay, max_delay, max_retry_elapsed);
     loop {
-        match op().await {
+        if let Some(error) = stop_signal_error(*cancel_rx.borrow()) {
+            return Err(error);
+        }
+        let operation = op();
+        tokio::pin!(operation);
+        let result = loop {
+            tokio::select! {
+                biased;
+                changed = cancel_rx.changed() => {
+                    if changed.is_err() {
+                        break operation.await;
+                    }
+                    if let Some(error) = stop_signal_error(*cancel_rx.borrow_and_update()) {
+                        return Err(error);
+                    }
+                }
+                result = &mut operation => break result,
+            }
+        };
+        match result {
             Ok(val) => return Ok(val),
             Err(e) => match retry_state.decide(e) {
                 RetryDecision::Stop(error) => return Err(error),
@@ -188,6 +207,66 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn stop_interrupts_pending_operation() {
+        for signal in [StopSignal::Pause, StopSignal::Cancel] {
+            let (tx, mut rx) = watch::channel(StopSignal::Running);
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let mut started_tx = Some(started_tx);
+            let operation =
+                retry_with_backoff(0, Duration::ZERO, Duration::ZERO, None, &mut rx, || {
+                    started_tx.take().unwrap().send(()).unwrap();
+                    std::future::pending::<Result<(), DownloadError>>()
+                });
+            let stop = async {
+                started_rx.await.unwrap();
+                tx.send(signal).unwrap();
+            };
+            let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::join!(operation, stop)
+            })
+            .await
+            .expect("stop did not interrupt pending operation");
+            assert!(matches!(
+                (signal, result),
+                (StopSignal::Pause, Err(DownloadError::Paused))
+                    | (StopSignal::Cancel, Err(DownloadError::Cancelled))
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn already_stopped_does_not_start_operation() {
+        for signal in [StopSignal::Pause, StopSignal::Cancel] {
+            let (_tx, mut rx) = watch::channel(signal);
+            let result: Result<(), DownloadError> =
+                retry_with_backoff(0, Duration::ZERO, Duration::ZERO, None, &mut rx, || {
+                    panic!("operation started after stop request");
+                    #[allow(unreachable_code)]
+                    std::future::ready(Ok(()))
+                })
+                .await;
+            assert!(matches!(
+                (signal, result),
+                (StopSignal::Pause, Err(DownloadError::Paused))
+                    | (StopSignal::Cancel, Err(DownloadError::Cancelled))
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn closed_sender_allows_pending_operation_to_finish() {
+        let (tx, mut rx) = watch::channel(StopSignal::Running);
+        drop(tx);
+        let result =
+            retry_with_backoff(0, Duration::ZERO, Duration::ZERO, None, &mut rx, || async {
+                tokio::task::yield_now().await;
+                Ok(42)
+            })
+            .await;
+        assert_eq!(result.unwrap(), 42);
+    }
 
     fn retryable_error() -> DownloadError {
         DownloadError::HttpStatus {

@@ -500,7 +500,7 @@ async fn run_download_inner(
     progress_tx: &watch::Sender<ProgressSnapshot>,
     cancel_rx: watch::Receiver<StopSignal>,
 ) -> Result<PathBuf, DownloadError> {
-    let worker = HttpWorker::new(client.clone(), &spec);
+    let worker = HttpWorker::new(client.clone(), &spec).with_diagnostics(log_level, download_id);
     let mut cancel_rx = cancel_rx;
     let speed_limit = SpeedLimit::new(spec.max_download_speed);
 

@@ -39,9 +39,9 @@ mod config;
 mod error;
 mod eta;
 mod filename;
-mod http;
 #[macro_use]
 mod logging;
+mod http;
 mod manager;
 mod network;
 mod progress;

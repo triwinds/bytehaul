@@ -250,6 +250,7 @@ fn test_apply_client_options_and_build_download_spec() {
         Some(0.25),
         Some(0.5),
         Some(16384),
+        Some(0.75),
     )
     .unwrap();
 
@@ -268,6 +269,10 @@ fn test_apply_client_options_and_build_download_spec() {
     assert!(!spec.get_resume());
     assert_eq!(spec.get_piece_size(), 4096);
     assert_eq!(spec.get_request_batch_size(), 16384);
+    assert_eq!(
+        spec.get_request_headers_timeout(),
+        Some(Duration::from_millis(750))
+    );
     assert_eq!(spec.get_min_split_size(), 2048);
     assert_eq!(spec.get_max_retries(), 7);
     assert_eq!(spec.get_retry_base_delay(), Duration::from_secs_f64(0.5));
@@ -312,6 +317,7 @@ fn test_apply_client_options_and_build_download_spec() {
         None,
         None,
         Some("   ".into()),
+        None,
         None,
         None,
         None,
@@ -397,6 +403,7 @@ fn test_build_download_spec_with_checksum_and_control_interval() {
         Some("sha512: deadbeef ".into()),
         Some(3.0),
         Some(4),
+        None,
         None,
         None,
         None,
@@ -542,6 +549,7 @@ fn test_download_task_methods_and_consumption_errors() {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -598,6 +606,7 @@ fn test_download_task_pause_maps_to_paused_error() {
             None,
             None,
             Some(true),
+            None,
             None,
             None,
             None,
@@ -711,6 +720,7 @@ fn test_py_downloader_download_success_and_module_registration() {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -797,6 +807,7 @@ fn test_top_level_download_success_and_failure() {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
     });
@@ -809,6 +820,7 @@ fn test_top_level_download_success_and_failure() {
             py,
             "http://127.0.0.1:1/fail".into(),
             Some(unique_path("top-level-error")),
+            None,
             None,
             None,
             None,

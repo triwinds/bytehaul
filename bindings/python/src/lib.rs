@@ -253,8 +253,13 @@ fn build_download_spec(
     slow_start_grace: Option<f64>,
     slow_sample_window: Option<f64>,
     request_batch_size: Option<u64>,
+    request_headers_timeout: Option<f64>,
 ) -> PyResult<DownloadSpec> {
     let mut spec = DownloadSpec::new(url);
+    if let Some(seconds) = request_headers_timeout {
+        spec =
+            spec.request_headers_timeout(duration_from_secs("request_headers_timeout", seconds)?);
+    }
     if let Some(bytes) = request_batch_size {
         spec = spec.request_batch_size(bytes);
     }
@@ -589,7 +594,8 @@ impl PyDownloader {
             low_speed_duration = None,
             slow_start_grace = None,
             slow_sample_window = None,
-            request_batch_size = None
+            request_batch_size = None,
+            request_headers_timeout = None
         )
     )]
     #[allow(clippy::too_many_arguments)]
@@ -625,6 +631,7 @@ impl PyDownloader {
         slow_start_grace: Option<f64>,
         slow_sample_window: Option<f64>,
         request_batch_size: Option<u64>,
+        request_headers_timeout: Option<f64>,
     ) -> PyResult<PyDownloadTask> {
         let spec = build_download_spec(
             url,
@@ -657,6 +664,7 @@ impl PyDownloader {
             slow_start_grace,
             slow_sample_window,
             request_batch_size,
+            request_headers_timeout,
         )?;
         let runtime = shared_runtime()?;
         let _guard = runtime.enter();
@@ -706,7 +714,8 @@ impl PyDownloader {
         low_speed_duration = None,
         slow_start_grace = None,
         slow_sample_window = None,
-        request_batch_size = None
+        request_batch_size = None,
+        request_headers_timeout = None
     )
 )]
 #[allow(clippy::too_many_arguments)]
@@ -746,6 +755,7 @@ fn download(
     slow_start_grace: Option<f64>,
     slow_sample_window: Option<f64>,
     request_batch_size: Option<u64>,
+    request_headers_timeout: Option<f64>,
 ) -> PyResult<()> {
     let level = match &log_level {
         Some(s) => parse_log_level(s)?,
@@ -783,6 +793,7 @@ fn download(
         slow_start_grace,
         slow_sample_window,
         request_batch_size,
+        request_headers_timeout,
     )?;
     let runtime = shared_runtime()?;
 

@@ -51,6 +51,19 @@ normal geometry. Idle pooling defaults to 4 idle connections per host for 30
 seconds. Python inherits these Rust defaults; explicit pool tuning remains
 Rust-only. Preserve explicit pool disable overrides.
 
+`DownloadSpec::request_headers_timeout(Duration)` / `get_request_headers_timeout`
+is optional; `None` inherits `read_timeout`. It bounds each client invocation up
+to headers, including pool/connection/DNS/TCP/TLS setup, with a fresh deadline
+for each redirect hop and retry. It is neither pure TTFB nor a whole-download
+deadline. Body reads retain `read_timeout`, and connect timeout can fire earlier.
+Reject zero or an unrepresentable monotonic deadline, with no arbitrary 24-hour
+cap. Append Python `request_headers_timeout=None` to both download APIs through
+the shared spec builder. This request policy does not alter cached client keys.
+Probe and GET fallback preserve their existing separate retry scopes;
+`max_retry_elapsed` is checked at retry admission, not a hard operation timeout.
+Pending retry operations must observe pause/cancel without restarting on a
+redundant Running update.
+
 ## Avoid
 
 - Do not duplicate defaults in execution branches or expose raw public fields to bypass validation.

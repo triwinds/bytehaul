@@ -21,6 +21,25 @@ The piece size determines the granularity of multi-connection downloading and re
 - Smaller pieces → finer resume granularity, but more scheduling overhead and larger control files
 - Larger pieces → less overhead, but more data to re-download on resume after a partial piece failure
 
+## `request_batch_size`
+
+**Default:** 4 MiB; zero disables grouping.
+
+This is the HTTP request byte cap for known-size multi-connection downloads,
+independent of `piece_size` and checkpoint
+granularity. Larger caps reduce response-header round trips, but can hold more
+unfinished work behind one slow response. Adaptive recovery can release queued
+pieces after a safe midbatch handoff; it still requires healthy history and a
+spare slot. A cap smaller than one piece does not split that piece, and grouping
+stops at completed or active pieces and the limit of 64 leases per request.
+
+Use the deterministic matrix in
+[`http_efficiency_compare`](../examples/http_efficiency_compare.rs) to compare
+0/4/8/16 MiB with pooling enabled and a 4 MiB unpooled control. Measure tail
+completion, requests, extra body data and memory alongside total elapsed time.
+The default remains 4 MiB; a faster healthy case alone does not justify a larger
+default. Fixture heap peaks include server/runtime allocations and are not RSS.
+
 ## `memory_budget`
 
 **Default:** 64 MiB  
@@ -119,13 +138,6 @@ Rate limiter for the download. Set to a non-zero value to cap bandwidth usage. U
 | `max_retry_elapsed` | None | Total retry time budget (None = unlimited) |
 
 Requests and response-body retries share exponential back-off with equal jitter to avoid thundering-herd effects when multiple clients retry against the same server. A single-connection body failure resumes from the writer's flushed contiguous prefix; a Range or object-metadata mismatch safely truncates and restarts from zero.
-
-## `request_batch_size`
-
-**Default:** 4 MiB
-**Unit:** bytes; `0` disables grouping
-
-Groups adjacent pieces into one bounded HTTP Range request for known-size multi-connection downloads. It does not change `piece_size`, checkpoint granularity, or the maximum of 64 leases per request. Set it to `0` when exact one-piece request boundaries are needed, or lower it for origins that benefit from smaller ranges. Larger values reduce request/response setup overhead but can leave less independent work for other workers and may increase the cost of a failed request.
 
 ## Historical Benchmark Snapshot (2026-04-06)
 

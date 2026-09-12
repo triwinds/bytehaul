@@ -32,6 +32,11 @@ observation lifetime or the `request_batch_size` Rust/Python option.
 - Errors release uncompleted reserved leases and drop the old body before retry
   or recovery. Completed pieces are never replayed or progress-rolled-back by a
   later piece's error. Ordinary retry limits and recovery lineage remain bounded.
+- Midbatch performance recovery drops the producer, acknowledges the FIFO writer
+  prefix barrier, then releases queued leases. Released pieces share the original
+  lineage's retries, elapsed budget, Retry-After and recovery cooldown; never let
+  a different worker's claim create a fresh budget. Exhausted scheduler work is
+  independent of being on the final piece of an existing batch.
 - Only strong ETag with compatible conditional headers enables automatic
   If-Match/prefix reuse. Explicit validator changes and 412 are fatal. Do not
   retain data from an identity/framing-invalid response.
@@ -69,8 +74,9 @@ before validating response length.
 Scheduler tests cover continuity, byte/count caps, peer work, prefix lifecycle,
 stale keys and counters. Public integration tests verify exact requested ranges,
 bytes, progress, interruption, identity, body boundaries and resumed holes.
-Retain default fast-tail regressions when grouped requests reach their last
-piece. Python tests cover appended signature and both APIs. TLS tests prove
+Retain default fast-tail regressions for first, middle and last batch pieces,
+and the gated released-piece Retry-After/shared-budget regression. Python tests
+cover appended signature and both APIs. TLS tests prove
 actual connection count and UnknownIssuer without weakening production trust.
 Diagnostic CSV separates wall-clock measurements from CI behavior assertions.
 

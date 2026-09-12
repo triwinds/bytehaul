@@ -52,6 +52,15 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(SAMPLE_BODY)))
             self.end_headers()
             self.wfile.write(SAMPLE_BODY)
+        elif self.path == "/headers-slow":
+            time.sleep(0.3)
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(SAMPLE_BODY)))
+            self.end_headers()
+            try:
+                self.wfile.write(SAMPLE_BODY)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
         elif self.path == "/slow":
             self.send_response(200)
             self.send_header("Content-Length", str(len(SAMPLE_BODY)))
@@ -461,7 +470,7 @@ class TestSlowTransferOptions:
             names.append("log_level")
         added = [
             "slow_transfer_mode", "low_speed_limit", "low_speed_duration",
-            "slow_start_grace", "slow_sample_window", "request_batch_size",
+            "slow_start_grace", "slow_sample_window", "request_batch_size", "request_headers_timeout",
         ]
         api = Downloader().download if object_api else download
         parameters = inspect.signature(api).parameters
@@ -552,3 +561,32 @@ class TestSlowTransferOptions:
             srv.shutdown()
             srv.server_close()
             thread.join(timeout=5)
+
+
+class TestRequestHeadersTimeout:
+    @pytest.mark.parametrize("object_api", [False, True])
+    @pytest.mark.parametrize("value", [0, -1, 1e-300, float("nan"), float("inf"), 1e300])
+    def test_invalid(self, object_api, value):
+        api = Downloader().download if object_api else download
+        with pytest.raises(ConfigError, match="request_headers_timeout"):
+            api("http://127.0.0.1:1/unused", request_headers_timeout=value)
+
+    @pytest.mark.parametrize("object_api", [False, True])
+    def test_body_can_outlast_headers_deadline(self, server, tmp_path, object_api):
+        api = Downloader().download if object_api else download
+        path = tmp_path / "headers-body.bin"
+        task = api(f"{server}/slow", str(path), max_connections=1,
+                   request_headers_timeout=0.5, read_timeout=2.0)
+        if object_api:
+            task.wait()
+        assert path.read_bytes() == SAMPLE_BODY
+
+
+    @pytest.mark.parametrize("object_api", [False, True])
+    def test_headers_deadline(self, server, tmp_path, object_api):
+        api = Downloader().download if object_api else download
+        with pytest.raises(DownloadFailedError, match="request timed out"):
+            task = api(f"{server}/headers-slow", str(tmp_path / "headers.bin"),
+                       max_connections=1, max_retries=0, request_headers_timeout=0.05)
+            if object_api:
+                task.wait()

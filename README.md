@@ -151,3 +151,23 @@ DownloadManager
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+### Request response-headers deadline (unreleased)
+
+Rust `DownloadSpec::request_headers_timeout(Duration)` and the appended Python
+`request_headers_timeout` argument (seconds, default `None`) bound each request
+from invocation through response headers, including pool waiting and DNS/TCP/TLS
+connection setup. This is not pure server TTFB. Omission preserves the existing
+header deadline inherited from `read_timeout`; body reads still use `read_timeout`.
+The value must be positive and representable as a monotonic-clock deadline.
+The connector's timeout can expire earlier.
+
+Each retry and redirect hop gets a fresh deadline, including probes, GET fallback,
+resume, and ordinary Range requests. This is not a total redirect-chain or download
+deadline: existing retry counts, `max_retry_elapsed` check boundaries, and 429/503
+`Retry-After` behavior remain unchanged. There is no automatic deadline shortening
+or response-headers hedging.
+
+Existing probe transport failures (including timeouts) may enter GET fallback;
+these retain their separate retry scopes. `max_retry_elapsed` is not a hard
+whole-download deadline or a combined deadline for both phases.

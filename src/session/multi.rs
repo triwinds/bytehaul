@@ -149,7 +149,7 @@ pub(super) async fn run_multi_worker(
     };
 
     let worker_cfg = Arc::new(WorkerConfig {
-        worker: HttpWorker::new(client.clone(), spec),
+        worker: HttpWorker::new(client.clone(), spec).with_diagnostics(log_level, download_id),
         read_timeout: spec.read_timeout,
         max_retries: spec.max_retries,
         retry_base_delay: spec.retry_base_delay,
@@ -259,22 +259,24 @@ pub(super) async fn run_multi_worker(
                         if workers.is_empty() { break; }
                     }
                     Some(Ok(Err(e))) => {
-                        if download_error.is_none() && (worker_cfg.recovery.is_some() || !matches!(e, DownloadError::ChannelClosed)) {
+                        if download_error.is_none() {
                             log_warn!(log_level, download_id = download_id,
                                 error = %e, "worker failed");
                             download_error = Some(e);
                         }
-                        if worker_cfg.recovery.is_some() || workers.is_empty() { break; }
+                        // A terminal failure must stop peers before reclaimed work
+                        // can acquire a fresh retry budget, including Disabled mode.
+                        break;
                     }
                     Some(Err(join_err)) => {
-                        if !join_err.is_cancelled() {
-                            log_error!(log_level, download_id = download_id,
-                                error = %join_err, "worker panicked");
-                            download_error = Some(DownloadError::TaskFailed(
-                                format!("worker panicked: {join_err}"),
-                            ));
-                        }
-                        if worker_cfg.recovery.is_some() || workers.is_empty() { break; }
+                        // User stop requests abort and drain in their own branch.
+                        // Any join failure here must also stop the remaining producers.
+                        log_error!(log_level, download_id = download_id,
+                            error = %join_err, "worker task failed");
+                        download_error = Some(DownloadError::TaskFailed(
+                            format!("worker task failed: {join_err}"),
+                        ));
+                        break;
                     }
                     None => break,
                 }

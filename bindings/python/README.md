@@ -202,6 +202,7 @@ Frozen snapshot of download progress.
 | `max_connections`   | `int`            | `4`           |
 | `connect_timeout`   | `float` (secs)   | `30.0`        |
 | `read_timeout`      | `float` (secs)   | `60.0`        |
+| `request_headers_timeout` | `float` (secs) | `None` (inherit `read_timeout`) |
 | `memory_budget`     | `int`            | `67108864`    |
 | `file_allocation`   | `"none" \| "prealloc"` | `"prealloc"` |
 | `resume`            | `bool`           | `True`        |
@@ -251,7 +252,7 @@ Available starting with version 0.2.2. These options apply to both `download(...
 | `slow_start_grace` | `5.0` | Startup grace, seconds |
 | `slow_sample_window` | `5.0` | Speed observation window, seconds |
 
-Durations must be finite, positive and at most 86,400 seconds. Adaptive recovery is on by default for multi-connection Range downloads. Hedging is opt-in, needs a strong ETag and a spare connection slot, and stages at most one small spare response before choosing a writer. It does not duplicate progress or exceed `max_connections`. All network payload shares the configured rate limit. Performance recovery and hedging together reserve at most `min(total_size / 100, 16 MiB)` of extra Range work; requests that do not fit are skipped. Normal error retries use the existing retry policy.
+Slow-transfer policy durations must be finite, positive and at most 86,400 seconds. Adaptive recovery is on by default for multi-connection Range downloads. Hedging is opt-in, needs a strong ETag and a spare connection slot, and stages at most one small spare response before choosing a writer. It does not duplicate progress or exceed `max_connections`. All network payload shares the configured rate limit. Performance recovery and hedging share an extra-body budget of `min(total_size / 100, 16 MiB)`. Protected cancel/resume reserves consumed data that may be discarded, excluding the necessary suffix; hedging still reserves its full range. Unread transport buffers and TCP/TLS overhead are outside this accounting. Midbatch handoff preserves shared retry budgets and Retry-After for released pieces. Normal error retries use the existing retry policy.
 
 ```python
 from bytehaul import Downloader
@@ -313,3 +314,23 @@ The project uses `abi3-py39`, so a single wheel per platform covers all Python 3
 ## License
 
 MIT. See the repository LICENSE file.
+
+### Request response-headers deadline (unreleased)
+
+Rust `DownloadSpec::request_headers_timeout(Duration)` and the appended Python
+`request_headers_timeout` argument (seconds, default `None`) bound each request
+from invocation through response headers, including pool waiting and DNS/TCP/TLS
+connection setup. This is not pure server TTFB. Omission preserves the existing
+header deadline inherited from `read_timeout`; body reads still use `read_timeout`.
+The value must be positive and representable as a monotonic-clock deadline.
+The connector's timeout can expire earlier.
+
+Each retry and redirect hop gets a fresh deadline, including probes, GET fallback,
+resume, and ordinary Range requests. This is not a total redirect-chain or download
+deadline: existing retry counts, `max_retry_elapsed` check boundaries, and 429/503
+`Retry-After` behavior remain unchanged. There is no automatic deadline shortening
+or response-headers hedging.
+
+Existing probe transport failures (including timeouts) may enter GET fallback;
+these retain their separate retry scopes. `max_retry_elapsed` is not a hard
+whole-download deadline or a combined deadline for both phases.

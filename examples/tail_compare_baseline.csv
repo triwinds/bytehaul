@@ -1,4 +1,0 @@
-scenario,round,mode,seconds,requests,tail_attempts,verified_bytes
-tail,1,hedging,28.384,129,2,134217728
-tail,2,hedging,27.427,129,2,134217728
-tail,3,hedging,28.106,129,2,134217728

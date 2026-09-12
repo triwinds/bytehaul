@@ -140,6 +140,7 @@ pub struct DownloadSpec {
     pub(crate) http_proxy: Option<String>,
     pub(crate) https_proxy: Option<String>,
     pub(crate) read_timeout: Duration,
+    pub(crate) request_headers_timeout: Option<Duration>,
     pub(crate) slow_transfer_mode: SlowTransferMode,
     pub(crate) low_speed_limit: Option<u64>,
     pub(crate) low_speed_duration: Duration,
@@ -193,6 +194,7 @@ impl DownloadSpec {
             http_proxy: None,
             https_proxy: None,
             read_timeout: Duration::from_secs(60),
+            request_headers_timeout: None,
             slow_transfer_mode: SlowTransferMode::default(),
             low_speed_limit: None,
             low_speed_duration: Duration::from_secs(15),
@@ -276,6 +278,22 @@ impl DownloadSpec {
     /// Returns the per-request read timeout.
     pub fn get_read_timeout(&self) -> Duration {
         self.read_timeout
+    }
+
+    /// Optional deadline for each request through receipt of response headers.
+    /// Includes connection establishment; each redirected hop gets its own deadline.
+    /// `None` preserves the header deadline inherited from `read_timeout`.
+    pub fn get_request_headers_timeout(&self) -> Option<Duration> {
+        self.request_headers_timeout
+    }
+
+    /// Set the per-request response-headers deadline, including connection setup.
+    /// Each redirect hop and retry starts a fresh deadline. This does not change
+    /// body-read timeouts or retry/Retry-After budgets. The connector timeout may
+    /// expire earlier. Must be positive and representable as a monotonic-clock deadline.
+    pub fn request_headers_timeout(mut self, timeout: Duration) -> Self {
+        self.request_headers_timeout = Some(timeout);
+        self
     }
 
     pub(crate) fn has_connect_timeout_override(&self) -> bool {
@@ -633,6 +651,13 @@ impl DownloadSpec {
                 )));
             }
         }
+        if self.request_headers_timeout.is_some_and(|timeout| {
+            timeout.is_zero() || std::time::Instant::now().checked_add(timeout).is_none()
+        }) {
+            return Err(DownloadError::InvalidConfig(
+                "request_headers_timeout must be positive and representable as a deadline".into(),
+            ));
+        }
         if self.url.trim().is_empty() {
             return Err(DownloadError::InvalidConfig("url cannot be empty".into()));
         }
@@ -708,6 +733,29 @@ impl DownloadSpec {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn request_headers_timeout_defaults_and_validation() {
+        let spec = super::DownloadSpec::new("https://example.com/file");
+        assert_eq!(spec.get_request_headers_timeout(), None);
+        let spec = spec.request_headers_timeout(std::time::Duration::from_secs(2));
+        assert_eq!(
+            spec.get_request_headers_timeout(),
+            Some(std::time::Duration::from_secs(2))
+        );
+        assert!(spec.validate().is_ok());
+        assert!(spec
+            .clone()
+            .request_headers_timeout(std::time::Duration::from_secs(86401))
+            .validate()
+            .is_ok());
+        for timeout in [std::time::Duration::ZERO, std::time::Duration::MAX] {
+            assert!(matches!(
+                spec.clone().request_headers_timeout(timeout).validate(),
+                Err(super::DownloadError::InvalidConfig(_))
+            ));
+        }
+    }
+
     use super::*;
 
     #[test]

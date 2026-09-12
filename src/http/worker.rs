@@ -1,38 +1,168 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use hyper::header::LOCATION;
 use hyper::{HeaderMap, StatusCode};
 use tokio::sync::Mutex;
 use url::Url;
 
-use crate::config::DownloadSpec;
+use crate::config::{DownloadSpec, LogLevel};
 use crate::error::DownloadError;
 use crate::http::request;
 use crate::http::response::ResponseMeta;
 use crate::http::HttpResponse;
 use crate::network::BytehaulClient;
 
+static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Identifies one client invocation, including each redirected hop.
+/// Hyper may transparently resend inside an invocation; this is not a socket count.
+#[derive(Clone, Debug)]
+pub(crate) struct RequestDiagnostics {
+    pub id: u64,
+    pub headers_elapsed: Duration,
+}
+
+#[derive(Default)]
+struct RequestCounters {
+    started: AtomicU64,
+    headers: AtomicU64,
+    successful_status: AtomicU64,
+    redirects: AtomicU64,
+    log_level: LogLevel,
+    download_id: u64,
+}
+impl Drop for RequestCounters {
+    fn drop(&mut self) {
+        log_info!(
+            self.log_level,
+            download_id = self.download_id,
+            requests_started = self.started.load(Ordering::Relaxed),
+            responses_received = self.headers.load(Ordering::Relaxed),
+            successful_status_responses = self.successful_status.load(Ordering::Relaxed),
+            redirect_responses = self.redirects.load(Ordering::Relaxed),
+            scope = "worker_clone_group_client_invocations",
+            "HTTP request counters"
+        );
+    }
+}
+
 /// HTTP worker responsible for sending requests and validating responses.
 #[derive(Clone)]
 pub(crate) struct HttpWorker {
     client: BytehaulClient,
+    log_level: LogLevel,
+    download_id: u64,
     url: String,
     headers: HashMap<String, String>,
     timeout: Duration,
     final_url: Arc<Mutex<Option<String>>>,
+    counters: Arc<RequestCounters>,
+    attempt: Option<(usize, usize, u64)>,
 }
 
 impl HttpWorker {
     pub fn new(client: BytehaulClient, spec: &DownloadSpec) -> Self {
         Self {
             client,
+            log_level: LogLevel::Off,
+            download_id: 0,
             url: spec.url.clone(),
             headers: spec.headers.clone(),
-            timeout: spec.read_timeout,
+            timeout: spec.request_headers_timeout.unwrap_or(spec.read_timeout),
             final_url: Arc::new(Mutex::new(None)),
+            counters: Arc::new(RequestCounters::default()),
+            attempt: None,
         }
+    }
+
+    pub(crate) fn with_diagnostics(mut self, log_level: LogLevel, download_id: u64) -> Self {
+        self.log_level = log_level;
+        self.download_id = download_id;
+        self.counters = Arc::new(RequestCounters {
+            log_level,
+            download_id,
+            started: AtomicU64::new(0),
+            headers: AtomicU64::new(0),
+            successful_status: AtomicU64::new(0),
+            redirects: AtomicU64::new(0),
+        });
+        self
+    }
+
+    async fn send_request(
+        &self,
+        req: hyper::Request<crate::http::HttpRequestBody>,
+    ) -> Result<HttpResponse, DownloadError> {
+        let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+        let started = Instant::now();
+        self.counters.started.fetch_add(1, Ordering::Relaxed);
+        // Only log our numeric Range, never URLs or arbitrary user headers.
+        let range = req
+            .headers()
+            .get(hyper::header::RANGE)
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| {
+                value
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || b"bytes=-".contains(&b))
+            });
+        log_debug!(
+            self.log_level,
+            download_id = self.download_id,
+            request_id,
+            request_headers_timeout_ms = self.timeout.as_millis() as u64,
+            range,
+            worker_id = ?self.attempt.map(|context| context.0),
+            piece_id = ?self.attempt.map(|context| context.1),
+            lease_id = ?self.attempt.map(|context| context.2),
+            "HTTP request started"
+        );
+        let result = self.client.request_with_timeout(req, self.timeout).await;
+        let headers_elapsed = started.elapsed();
+        match result {
+            Ok(mut response) => {
+                self.counters.headers.fetch_add(1, Ordering::Relaxed);
+                if response.status().is_success() {
+                    self.counters
+                        .successful_status
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                if response.status().is_redirection() {
+                    self.counters.redirects.fetch_add(1, Ordering::Relaxed);
+                }
+                log_debug!(
+                    self.log_level,
+                    download_id = self.download_id,
+                    request_id,
+                    status = response.status().as_u16(),
+                    headers_ms = headers_elapsed.as_millis() as u64,
+                    "HTTP response headers received"
+                );
+                response.extensions_mut().insert(RequestDiagnostics {
+                    id: request_id,
+                    headers_elapsed,
+                });
+                Ok(response)
+            }
+            Err(error) => {
+                log_debug!(
+                    self.log_level,
+                    download_id = self.download_id,
+                    request_id,
+                    headers_ms = headers_elapsed.as_millis() as u64,
+                    "HTTP request failed before headers"
+                );
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn with_attempt(mut self, worker_id: usize, piece_id: usize, lease_id: u64) -> Self {
+        self.attempt = Some((worker_id, piece_id, lease_id));
+        self
     }
 
     pub(crate) fn with_validator(mut self, etag: &str) -> Self {
@@ -109,11 +239,9 @@ impl HttpWorker {
         let mut current = parse_download_url(start_url)?;
 
         for _ in 0..10 {
-            tracing::debug!(url = %current, "sending GET request");
             let req = request::build_get_request(&current, &self.headers);
-            let response = self.client.request_with_timeout(req, self.timeout).await?;
+            let response = self.send_request(req).await?;
             let status = response.status();
-            tracing::debug!(status = status.as_u16(), "GET response received");
 
             if status.is_redirection() {
                 current = redirect_location(&current, response.headers(), status)?;
@@ -142,10 +270,9 @@ impl HttpWorker {
 
         for _ in 0..10 {
             let req = request::build_range_request(&current, &self.headers, start, end);
-            let response = self.client.request_with_timeout(req, self.timeout).await?;
+            let response = self.send_request(req).await?;
 
             let status = response.status();
-            tracing::debug!(status = status.as_u16(), start = start, end = end, url = %current, "Range response received");
 
             if status.is_redirection() {
                 current = redirect_location(&current, response.headers(), status)?;
@@ -173,7 +300,7 @@ impl HttpWorker {
 
         for _ in 0..10 {
             let req = request::build_get_request(&current, &self.headers);
-            let response = self.client.request_with_timeout(req, self.timeout).await?;
+            let response = self.send_request(req).await?;
             let status = response.status();
             if !status.is_redirection() {
                 return Ok(current);
@@ -292,6 +419,32 @@ mod tests {
             .build_client()
             .unwrap();
         HttpWorker::new(client, &spec)
+    }
+
+    #[tokio::test]
+    async fn request_diagnostics_count_redirects_and_share_across_clones() {
+        let route =
+            warp::path("redirect")
+                .map(|| {
+                    warp::http::Response::builder()
+                        .status(302)
+                        .header("location", "/file")
+                        .body("")
+                })
+                .or(warp::path("file")
+                    .map(|| warp::http::Response::builder().status(200).body("data")));
+        let (addr, server) = warp::serve(route).bind_ephemeral(([127, 0, 0, 1], 0));
+        tokio::spawn(server);
+        let worker = worker_for(format!("http://{addr}/redirect"));
+        let (first, _) = worker.send_get().await.unwrap();
+        let first_id = first.extensions().get::<RequestDiagnostics>().unwrap().id;
+        let (second, _) = worker.clone().send_get().await.unwrap();
+        let second_id = second.extensions().get::<RequestDiagnostics>().unwrap().id;
+        assert_ne!(first_id, second_id);
+        assert_eq!(worker.counters.started.load(Ordering::Relaxed), 3);
+        assert_eq!(worker.counters.headers.load(Ordering::Relaxed), 3);
+        assert_eq!(worker.counters.successful_status.load(Ordering::Relaxed), 2);
+        assert_eq!(worker.counters.redirects.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
