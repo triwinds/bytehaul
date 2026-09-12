@@ -223,7 +223,7 @@ let result = handle.wait().await; // 返回 Err(DownloadError::Cancelled)
 
 `Cancelled`、`Paused`、`Completed` 是不同的结束状态。`cancel()` 和 `pause()` 都会结束当前任务；启用续传时，两者都会尝试保存可恢复状态。写盘或同步失败时保留此前的持久化断点。正常完成会尝试删除控制文件；单连接将清理失败视为错误，多连接的清理是尽力而为。
 
-### 请求到响应头期限（未发布）
+### 请求到响应头期限
 
 Rust 的 `DownloadSpec::request_headers_timeout(Duration)` 与两个 Python 下载
 API 末尾的 `request_headers_timeout`（秒，默认 `None`）限制每次请求调用到收到

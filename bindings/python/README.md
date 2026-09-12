@@ -1,6 +1,6 @@
 # bytehaul
 
-Python bindings for the [bytehaul](https://github.com/triwinds/bytehaul) Rust download library. This guide targets the published **0.2.3** release.
+Python bindings for the [bytehaul](https://github.com/triwinds/bytehaul) Rust download library. This guide targets the published **0.2.4** release.
 
 [中文使用文档](../../docs/python.zh-CN.md)
 
@@ -16,10 +16,10 @@ Each source-build command block below assumes you start from the repository root
 ### From PyPI
 
 ```bash
-pip install "bytehaul==0.2.3"
+pip install "bytehaul==0.2.4"
 ```
 
-See the [0.2.3 release notes](https://github.com/triwinds/bytehaul/releases/tag/v0.2.3).
+See the [0.2.4 release notes](https://github.com/triwinds/bytehaul/releases/tag/v0.2.4).
 
 ### From source (development)
 
@@ -315,7 +315,7 @@ The project uses `abi3-py39`, so a single wheel per platform covers all Python 3
 
 MIT. See the repository LICENSE file.
 
-### Request response-headers deadline (unreleased)
+### Request response-headers deadline
 
 Rust `DownloadSpec::request_headers_timeout(Duration)` and the appended Python
 `request_headers_timeout` argument (seconds, default `None`) bound each request

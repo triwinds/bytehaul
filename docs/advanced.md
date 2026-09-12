@@ -236,7 +236,7 @@ let result = handle.wait().await; // returns Err(DownloadError::Cancelled)
 
 `Cancelled`, `Paused`, and `Completed` are distinct end states. Both `cancel()` and `pause()` end the current task and attempt to preserve resumable state when resume is enabled. A write or synchronization failure leaves the previous durable checkpoint in place. Normal completion attempts to remove the control file; single-connection cleanup failure is an error, while multi-connection cleanup is best effort.
 
-### Request response-headers deadline (unreleased)
+### Request response-headers deadline
 
 Rust `DownloadSpec::request_headers_timeout(Duration)` and the appended Python
 `request_headers_timeout` argument (seconds, default `None`) bound each request

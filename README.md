@@ -9,9 +9,9 @@
 
 A Rust async HTTP download library with Python bindings (also available on PyPI), supporting resume, multi-connection downloads, write-back cache, rate limiting, and checksum verification.
 
-These examples target **0.2.3**, which improves contiguous Range requests and slow-tail recovery while preserving existing resume-file compatibility. See the [0.2.3 release notes](https://github.com/triwinds/bytehaul/releases/tag/v0.2.3).
+These examples target **0.2.4**, which improves HTTP connection reuse, contiguous Range requests, cancellation, response-header deadlines, and slow-tail recovery while preserving existing resume-file compatibility. See the [0.2.4 release notes](https://github.com/triwinds/bytehaul/releases/tag/v0.2.4).
 
-Version 0.2.3 includes batched contiguous requests, confirmed-prefix reuse, and bounded slow-tail recovery; see [advanced usage](docs/advanced.md).
+Version 0.2.4 includes default HTTP pooling and request batching, cooperative cancellation, per-request response-header deadlines, confirmed-prefix reuse, and bounded slow-tail recovery; see [advanced usage](docs/advanced.md).
 
 ## Documentation
 
@@ -39,20 +39,20 @@ Version 0.2.3 includes batched contiguous requests, confirmed-prefix reuse, and 
 Add `bytehaul` to your project via Cargo:
 
 ```bash
-cargo add bytehaul@0.2.3
+cargo add bytehaul@0.2.4
 ```
 
 Or add it manually to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-bytehaul = "0.2.3"
+bytehaul = "0.2.4"
 ```
 
 ### Python
 
 ```bash
-pip install "bytehaul==0.2.3"
+pip install "bytehaul==0.2.4"
 ```
 
 Requires Python 3.9+. A single wheel per platform covers all supported Python versions (abi3).
@@ -152,7 +152,7 @@ DownloadManager
 
 MIT. See [LICENSE](LICENSE).
 
-### Request response-headers deadline (unreleased)
+### Request response-headers deadline
 
 Rust `DownloadSpec::request_headers_timeout(Duration)` and the appended Python
 `request_headers_timeout` argument (seconds, default `None`) bound each request
