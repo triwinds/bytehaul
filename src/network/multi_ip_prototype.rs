@@ -2,16 +2,19 @@
 //! The outer TLS connector receives the origin URI, while only TCP is pinned.
 
 use super::*;
-use http_body_util::BodyExt;
-use hyper::body::Incoming;
+use crate::http::HttpBody;
 use hyper::rt::{Read, ReadBufCursor, Write};
 use hyper_util::client::legacy::connect::{Connected, Connection};
 use hyper_util::rt::TokioIo;
+use std::future::Future;
 use std::io;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context, Poll};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tower_service::Service;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Identity {
@@ -128,14 +131,20 @@ fn group(
 
 // A body owner, not a response extension: into_body must retain the permit.
 struct LeasedBody {
-    body: Incoming,
+    body: HttpBody,
     permit: Option<OwnedSemaphorePermit>,
 }
 
 impl LeasedBody {
     async fn finish(mut self) {
-        while let Some(frame) = self.body.frame().await {
-            frame.unwrap();
+        // Drain through the neutral body interface; the fixture releases each
+        // held body on demand, so bound the wait explicitly.
+        loop {
+            match self.body.next_chunk(Duration::from_secs(30)).await {
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(error) => panic!("leased body drain failed: {error}"),
+            }
         }
         self.permit.take();
     }
@@ -145,7 +154,7 @@ async fn request(group: &Group, slots: Arc<Semaphore>, uri: &str) -> (Identity, 
     let permit = slots.acquire_owned().await.unwrap();
     let response = group
         .request(
-            hyper::Request::builder()
+            http::Request::builder()
                 .uri(uri)
                 .body(HttpRequestBody::new())
                 .unwrap(),
@@ -156,7 +165,7 @@ async fn request(group: &Group, slots: Arc<Semaphore>, uri: &str) -> (Identity, 
     (
         identity,
         LeasedBody {
-            body: response.into_body(),
+            body: HttpBody::from(response.into_body()),
             permit: Some(permit),
         },
     )
@@ -405,7 +414,7 @@ async fn pinned_tls_uses_origin_sni_and_rejects_wrong_name() {
         body.finish().await;
         let error = client
             .request(
-                hyper::Request::builder()
+                http::Request::builder()
                     .uri("https://wrong.example/range")
                     .body(HttpRequestBody::new())
                     .unwrap(),

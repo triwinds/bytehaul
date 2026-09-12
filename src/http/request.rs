@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use hyper::{Request, Version};
+use http::{Request, Version};
 
 use crate::http::HttpRequestBody;
 

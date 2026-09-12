@@ -149,7 +149,11 @@ pub(super) async fn run_multi_worker(
     };
 
     let worker_cfg = Arc::new(WorkerConfig {
-        worker: HttpWorker::new(client.clone(), spec).with_diagnostics(log_level, download_id),
+        worker: HttpWorker::new(client.clone(), spec)
+            .with_diagnostics(log_level, download_id)
+            // Every worker may hold one response body at a time, so each gets a
+            // share of the session's memory budget.
+            .with_body_budget(budget.transport_body_budget(num_workers)),
         read_timeout: spec.read_timeout,
         max_retries: spec.max_retries,
         retry_base_delay: spec.retry_base_delay,

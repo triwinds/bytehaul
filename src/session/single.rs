@@ -1412,8 +1412,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_single_autosaves_existing_progress_before_body_arrives() {
+        // The body is delayed long enough for the pre-body autosave to be
+        // observable. How the backend splits "body bytes" from "EOF" differs
+        // (Hyper delivers the whole body in one frame, libcurl delivers
+        // callback-sized chunks plus a terminal message), so a later autosave
+        // tick may legitimately advance the file to the final prefix. The
+        // invariant under test is the pre-body autosave of the written prefix.
         let (url, server) =
-            spawn_single_response_server(4, b"data".to_vec(), Duration::from_millis(50));
+            spawn_single_response_server(4, b"data".to_vec(), Duration::from_millis(200));
         let response = get_response(&url).await;
         let dir = tempfile::tempdir().unwrap();
         let control_path = dir.path().join("single-autosave.bytehaul");
@@ -1424,6 +1430,23 @@ mod tests {
         let (progress_tx, _) = watch::channel(ProgressSnapshot::default());
         let (_cancel_tx, cancel_rx) = watch::channel(StopSignal::Running);
         let mut tracker = ControlSaveTracker::new(0);
+
+        // Watch the control file while the body is still in flight: the first
+        // snapshot that appears must be the autosave of the already-written
+        // prefix, not the post-body progress.
+        let observed = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let watcher = {
+            let path = control_path.clone();
+            let observed = observed.clone();
+            tokio::spawn(async move {
+                for _ in 0..60 {
+                    if let Ok(loaded) = ControlSnapshot::load(&path).await {
+                        observed.lock().push(loaded.downloaded_bytes);
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+        };
 
         let summary = tokio::time::timeout(
             Duration::from_secs(5),
@@ -1452,9 +1475,20 @@ mod tests {
         drop(write_tx);
         join_writer(writer).await;
         join_server(server).await;
+        watcher.abort();
 
+        let snapshots = observed.lock().clone();
+        assert_eq!(
+            snapshots.first(),
+            Some(&1),
+            "pre-body autosave must persist the written prefix, saw {snapshots:?}"
+        );
         let loaded = ControlSnapshot::load(&control_path).await.unwrap();
-        assert_eq!(loaded.downloaded_bytes, 1);
+        assert!(
+            loaded.downloaded_bytes == 1 || loaded.downloaded_bytes == 5,
+            "final control prefix must be the autosaved one or the completed file, got {}",
+            loaded.downloaded_bytes
+        );
         assert_eq!(summary.downloaded, 5);
         assert!(summary.speed_bytes_per_sec >= 0.0);
     }

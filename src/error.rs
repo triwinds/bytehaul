@@ -52,6 +52,10 @@ impl TransportError {
         )
     }
 
+    /// Classifies a response-body failure. The Hyper adapter maps
+    /// `hyper::Error` here; a libcurl build reports body failures through the
+    /// driver's own `TransportErrorKind` mapping.
+    #[cfg(feature = "hyper-backend")]
     pub(crate) fn body<E>(source: E) -> Self
     where
         E: std::error::Error + Send + Sync + 'static,
@@ -64,6 +68,7 @@ impl TransportError {
     }
 }
 
+#[cfg(feature = "hyper-backend")]
 fn error_chain_has_timeout(error: &(dyn StdError + 'static)) -> bool {
     let mut current = Some(error);
     while let Some(source) = current {
@@ -77,6 +82,9 @@ fn error_chain_has_timeout(error: &(dyn StdError + 'static)) -> bool {
     false
 }
 
+/// Hyper transport failures. The libcurl adapter classifies `curl::Error`
+/// codes in `network::curl::driver` instead, so these stay behind the feature.
+#[cfg(feature = "hyper-backend")]
 impl From<hyper_util::client::legacy::Error> for TransportError {
     fn from(error: hyper_util::client::legacy::Error) -> Self {
         let kind = if error.is_connect() {
@@ -90,6 +98,7 @@ impl From<hyper_util::client::legacy::Error> for TransportError {
     }
 }
 
+#[cfg(feature = "hyper-backend")]
 impl From<hyper::Error> for TransportError {
     fn from(error: hyper::Error) -> Self {
         let kind = if error.is_timeout() {
@@ -377,6 +386,7 @@ mod tests {
         assert!(body.is_retryable());
     }
 
+    #[cfg(feature = "hyper-backend")]
     #[test]
     fn test_error_chain_has_timeout_through_nested_io_sources() {
         #[derive(Debug)]

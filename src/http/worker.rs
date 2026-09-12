@@ -3,8 +3,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use hyper::header::LOCATION;
-use hyper::{HeaderMap, StatusCode};
+use http::header::LOCATION;
+use http::{HeaderMap, StatusCode};
 use tokio::sync::Mutex;
 use url::Url;
 
@@ -12,7 +12,7 @@ use crate::config::{DownloadSpec, LogLevel};
 use crate::error::DownloadError;
 use crate::http::request;
 use crate::http::response::ResponseMeta;
-use crate::http::HttpResponse;
+use crate::http::{BodyBudget, HttpResponse};
 use crate::network::BytehaulClient;
 
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
@@ -61,6 +61,9 @@ pub(crate) struct HttpWorker {
     final_url: Arc<Mutex<Option<String>>>,
     counters: Arc<RequestCounters>,
     attempt: Option<(usize, usize, u64)>,
+    /// Per-transfer body budget handed to the transport (P3). `None` lets the
+    /// transport use its own default.
+    body_budget: Option<usize>,
 }
 
 impl HttpWorker {
@@ -75,7 +78,17 @@ impl HttpWorker {
             final_url: Arc::new(Mutex::new(None)),
             counters: Arc::new(RequestCounters::default()),
             attempt: None,
+            body_budget: None,
         }
+    }
+
+    /// Bounds how many body bytes the transport may buffer per transfer.
+    ///
+    /// The session derives the value from its `MemoryBudget`; the transport
+    /// clamps it to the range it can honour.
+    pub(crate) fn with_body_budget(mut self, bytes: usize) -> Self {
+        self.body_budget = Some(bytes);
+        self
     }
 
     pub(crate) fn with_diagnostics(mut self, log_level: LogLevel, download_id: u64) -> Self {
@@ -94,15 +107,18 @@ impl HttpWorker {
 
     async fn send_request(
         &self,
-        req: hyper::Request<crate::http::HttpRequestBody>,
+        mut req: http::Request<crate::http::HttpRequestBody>,
     ) -> Result<HttpResponse, DownloadError> {
+        if let Some(budget) = self.body_budget {
+            req.extensions_mut().insert(BodyBudget(budget));
+        }
         let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
         let started = Instant::now();
         self.counters.started.fetch_add(1, Ordering::Relaxed);
         // Only log our numeric Range, never URLs or arbitrary user headers.
         let range = req
             .headers()
-            .get(hyper::header::RANGE)
+            .get(http::header::RANGE)
             .and_then(|value| value.to_str().ok())
             .filter(|value| {
                 value
@@ -405,9 +421,8 @@ fn make_http_error(headers: &HeaderMap, status: u16) -> DownloadError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::Bytes;
-    use http_body_util::Empty;
-    use hyper::Response;
+    use crate::http::HttpRequestBody;
+    use http::Response;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use warp::Filter;
@@ -419,6 +434,78 @@ mod tests {
             .build_client()
             .unwrap();
         HttpWorker::new(client, &spec)
+    }
+
+    /// P2 acceptance: the same worker, both backends, one scripted server.
+    /// The response head must arrive before the body does, and the delivered
+    /// bytes must be identical.
+    #[cfg(all(feature = "hyper-backend", feature = "curl-backend"))]
+    #[tokio::test]
+    async fn both_backends_publish_headers_first_and_deliver_the_same_range() {
+        use crate::network::TransportBackend;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        const BODY_DELAY: Duration = Duration::from_millis(300);
+        let payload: Vec<u8> = (0..64u8).collect();
+        let expected = payload.clone();
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut head = Vec::new();
+                let mut buffer = [0u8; 512];
+                while !head.ends_with(b"\r\n\r\n") {
+                    let read = stream.read(&mut buffer).await.unwrap();
+                    assert!(read > 0, "client closed before sending a request");
+                    head.extend_from_slice(&buffer[..read]);
+                }
+                let response = format!(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes 0-63/64\r\nConnection: close\r\n\r\n",
+                    payload.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+                stream.flush().await.unwrap();
+                // The head is on the wire; the body follows much later.
+                tokio::time::sleep(BODY_DELAY).await;
+                stream.write_all(&payload).await.unwrap();
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        for backend in [TransportBackend::Hyper, TransportBackend::Curl] {
+            let client = crate::network::ClientNetworkConfig::default()
+                .with_backend(backend)
+                .build_client()
+                .unwrap();
+            let mut spec =
+                DownloadSpec::new(format!("http://{address}/range")).output_path("unused.bin");
+            spec.read_timeout = Duration::from_secs(5);
+            let worker = HttpWorker::new(client, &spec);
+
+            let started = Instant::now();
+            let (mut response, meta) = worker.send_range(0, 63).await.unwrap();
+            let head_elapsed = started.elapsed();
+            assert!(
+                head_elapsed < BODY_DELAY,
+                "{backend:?} waited for the body before returning headers: {head_elapsed:?}"
+            );
+            assert_eq!(meta.content_range_total, Some(64));
+
+            let mut received = Vec::new();
+            while let Some(chunk) =
+                crate::http::next_data_chunk(response.body_mut(), Duration::from_secs(5))
+                    .await
+                    .unwrap()
+            {
+                received.extend_from_slice(&chunk);
+            }
+            assert_eq!(received, expected, "{backend:?} delivered different bytes");
+        }
+
+        server.await.unwrap();
     }
 
     #[tokio::test]
@@ -620,7 +707,7 @@ mod tests {
     fn make_http_error_falls_back_to_canonical_reason() {
         let response = Response::builder()
             .status(404)
-            .body(Empty::<Bytes>::new())
+            .body(HttpRequestBody::new())
             .unwrap();
         let (parts, _) = response.into_parts();
 

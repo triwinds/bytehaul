@@ -1246,7 +1246,7 @@ async fn checked_response(
     Ok(response)
 }
 struct RequestStream {
-    body: hyper::body::Incoming,
+    body: crate::http::HttpBody,
     buffered: bytes::Bytes,
     wire: u64,
     expected: u64,
@@ -1431,17 +1431,18 @@ async fn stage(
         .get::<crate::http::worker::RequestDiagnostics>()
         .map(|d| d.id);
     // A speculative body's worst-case extra cost must be known before reading
-    // it. Content-Length lets Hyper cap admitted body data at this exact range;
-    // an optional chunked challenger is abandoned without touching the primary.
+    // it. Content-Length lets the backend cap admitted body data at this exact
+    // range; an optional chunked challenger is abandoned without touching the
+    // primary.
     let framed_length = response
         .headers()
-        .get(hyper::header::CONTENT_LENGTH)
+        .get(http::header::CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u64>().ok());
     if framed_length != Some(ctx.segment.end - ctx.segment.start)
         || response
             .headers()
-            .contains_key(hyper::header::TRANSFER_ENCODING)
+            .contains_key(http::header::TRANSFER_ENCODING)
     {
         return Err(DownloadError::ResumeMismatch(
             "challenger requires an exact Content-Length for its extra-byte bound".into(),

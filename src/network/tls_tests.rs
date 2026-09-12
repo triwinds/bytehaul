@@ -2,7 +2,6 @@
 //! this does not exercise Downloader's platform trust-store configuration.
 
 use super::*;
-use http_body_util::BodyExt;
 use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair, KeyUsagePurpose};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -122,8 +121,8 @@ impl TlsFixture {
         BytehaulClient::Direct(Arc::new(builder.build(connector)))
     }
 
-    fn request(&self, start: usize) -> hyper::Request<HttpRequestBody> {
-        hyper::Request::builder()
+    fn request(&self, start: usize) -> http::Request<HttpRequestBody> {
+        http::Request::builder()
             .uri(format!("https://{}/range", self.addr))
             .header("range", format!("bytes={start}-{}", start + 3))
             .body(HttpRequestBody::new())
@@ -137,13 +136,13 @@ async fn verify_ranges(close: bool, expected_connections: usize) {
         let client = fixture.client(true);
         for start in [0, 4] {
             let response = client.request(fixture.request(start)).await.unwrap();
-            assert_eq!(response.status(), hyper::StatusCode::PARTIAL_CONTENT);
-            assert_eq!(response.version(), hyper::Version::HTTP_11);
+            assert_eq!(response.status(), http::StatusCode::PARTIAL_CONTENT);
+            assert_eq!(response.version(), http::Version::HTTP_11);
             assert_eq!(
                 response.headers()["content-range"],
                 format!("bytes {start}-{}/8", start + 3)
             );
-            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let body = response.into_body().collect_to_bytes().await.unwrap();
             assert_eq!(body.as_ref(), &b"abcdefgh"[start..start + 4]);
         }
         assert_eq!(

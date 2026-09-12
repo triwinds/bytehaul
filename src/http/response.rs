@@ -1,4 +1,4 @@
-use hyper::{HeaderMap, StatusCode};
+use http::{HeaderMap, StatusCode};
 
 /// Metadata extracted from an HTTP response.
 #[derive(Debug, Clone)]
@@ -91,11 +91,10 @@ impl ResponseMeta {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::Bytes;
-    use http_body_util::Empty;
-    use hyper::Response;
+    use crate::http::HttpRequestBody;
+    use http::Response;
 
-    fn meta_from_response(response: Response<Empty<Bytes>>) -> ResponseMeta {
+    fn meta_from_response(response: Response<HttpRequestBody>) -> ResponseMeta {
         let (parts, _) = response.into_parts();
         ResponseMeta::from_parts(parts.status, &parts.headers, None)
     }
@@ -107,7 +106,7 @@ mod tests {
             .header("content-range", "bytes 100-199/1000")
             .header("content-length", "100")
             .header("content-encoding", "identity")
-            .body(Empty::<Bytes>::new())
+            .body(HttpRequestBody::new())
             .unwrap();
 
         let meta = meta_from_response(response);
@@ -123,7 +122,7 @@ mod tests {
         let response = Response::builder()
             .status(200)
             .header("content-length", "4")
-            .body(Empty::<Bytes>::new())
+            .body(HttpRequestBody::new())
             .unwrap();
 
         let meta = meta_from_response(response);
@@ -137,7 +136,7 @@ mod tests {
         let response = Response::builder()
             .status(200)
             .header("accept-ranges", "bytes")
-            .body(Empty::<Bytes>::new())
+            .body(HttpRequestBody::new())
             .unwrap();
         let meta = meta_from_response(response);
         assert!(meta.accept_ranges);
@@ -148,7 +147,7 @@ mod tests {
         let response = Response::builder()
             .status(200)
             .header("accept-ranges", "none")
-            .body(Empty::<Bytes>::new())
+            .body(HttpRequestBody::new())
             .unwrap();
         let meta = meta_from_response(response);
         assert!(!meta.accept_ranges);
@@ -160,7 +159,7 @@ mod tests {
             .status(200)
             .header("etag", "\"abc123\"")
             .header("last-modified", "Thu, 01 Jan 2026 00:00:00 GMT")
-            .body(Empty::<Bytes>::new())
+            .body(HttpRequestBody::new())
             .unwrap();
         let meta = meta_from_response(response);
         assert_eq!(meta.etag.as_deref(), Some("\"abc123\""));
@@ -175,7 +174,7 @@ mod tests {
         let response = Response::builder()
             .status(206)
             .header("content-range", "bytes 0-99/*")
-            .body(Empty::<Bytes>::new())
+            .body(HttpRequestBody::new())
             .unwrap();
         let meta = meta_from_response(response);
         assert_eq!(meta.content_range_start, Some(0));
@@ -188,7 +187,7 @@ mod tests {
         let response = Response::builder()
             .status(200)
             .header("content-disposition", "attachment; filename=test.bin")
-            .body(Empty::<Bytes>::new())
+            .body(HttpRequestBody::new())
             .unwrap();
         let meta = meta_from_response(response);
         assert_eq!(
@@ -202,7 +201,7 @@ mod tests {
         let response = Response::builder()
             .status(200)
             .header("content-length", "999")
-            .body(Empty::<Bytes>::new())
+            .body(HttpRequestBody::new())
             .unwrap();
         let (parts, _) = response.into_parts();
 

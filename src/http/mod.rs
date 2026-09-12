@@ -1,37 +1,101 @@
+mod body;
 pub(crate) mod request;
 pub(crate) mod response;
 pub(crate) mod worker;
 
 use std::time::Duration;
+#[cfg(feature = "hyper-backend")]
+use std::{
+    pin::Pin,
+    task::{Context, Poll},
+};
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Empty};
-use hyper::body::Incoming;
-use hyper::Response;
 
-use crate::error::{DownloadError, TransportError};
+use crate::error::DownloadError;
 
-pub(crate) type HttpRequestBody = Empty<Bytes>;
-pub(crate) type HttpResponse = Response<Incoming>;
+pub(crate) use body::HttpBody;
 
+/// Request body of every request bytehaul sends: GET/HEAD carry no payload.
+///
+/// Owning the type keeps the request side neutral as well, so a libcurl-only
+/// build does not need the Hyper adapter's body helpers.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HttpRequestBody;
+
+impl HttpRequestBody {
+    pub(crate) fn new() -> Self {
+        Self
+    }
+}
+
+#[cfg(feature = "hyper-backend")]
+impl hyper::body::Body for HttpRequestBody {
+    type Data = Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
+        Poll::Ready(None)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        true
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        hyper::body::SizeHint::with_exact(0)
+    }
+}
+
+/// Neutral response shared by the worker and the sessions: `http` types plus
+/// the backend-owned streaming body.
+pub(crate) type HttpResponse = http::Response<HttpBody>;
+
+/// Request extension: how many body bytes the transport may buffer for this
+/// transfer before it has to stop reading from the network.
+///
+/// The session derives it from its own `MemoryBudget` (see
+/// `session::flow::MemoryBudget::transport_body_budget`), which is what keeps
+/// the bytes queued inside the transport inside the memory the session promised
+/// to bound. A transport that does not buffer bytes (Hyper streams straight
+/// into the reader) simply ignores the hint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BodyBudget(pub(crate) usize);
+
+/// Largest byte budget a transport may buffer for one transfer.
+///
+/// libcurl delivers at most 16 KiB per write callback, so this always leaves
+/// room for a complete callback: a paused transfer can still make progress once
+/// the consumer drains its queue.
+pub(crate) const MAX_BODY_BUDGET_BYTES: usize = 256 * 1024;
+
+/// Smallest byte budget a transport accepts for one transfer.
+///
+/// A session budget can be far smaller than one libcurl callback; the transport
+/// still keeps a few callbacks of headroom so a tiny budget does not turn every
+/// chunk into a pause/unpause round trip. The queue stays bounded either way,
+/// and the write callback accepts a whole chunk whenever the queue is empty, so
+/// progress never depends on this floor.
+pub(crate) const MIN_BODY_BUDGET_BYTES: usize = 64 * 1024;
+
+impl BodyBudget {
+    /// Per-transfer transport budget for a session with `memory_budget` bytes
+    /// and at most `transfers` bodies in flight at the same time.
+    pub(crate) fn for_session(memory_budget: usize, transfers: usize) -> Self {
+        Self((memory_budget / transfers.max(1)).clamp(MIN_BODY_BUDGET_BYTES, MAX_BODY_BUDGET_BYTES))
+    }
+}
+
+/// Read the next data chunk of a response body, bounded by the session's own
+/// wait between chunks. `Ok(None)` is a clean EOF; a failure keeps its cause.
 pub(crate) async fn next_data_chunk(
-    body: &mut Incoming,
+    body: &mut HttpBody,
     read_timeout: Duration,
 ) -> Result<Option<Bytes>, DownloadError> {
-    loop {
-        let frame = tokio::time::timeout(read_timeout, body.frame())
-            .await
-            .map_err(|_| DownloadError::timeout("response body timed out"))?;
-
-        match frame {
-            Some(Ok(frame)) => match frame.into_data() {
-                Ok(data) => return Ok(Some(data)),
-                Err(_) => continue,
-            },
-            Some(Err(error)) => return Err(TransportError::body(error).into()),
-            None => return Ok(None),
-        }
-    }
+    body.next_chunk(read_timeout).await
 }
 
 #[cfg(test)]
@@ -70,7 +134,7 @@ mod tests {
         let client = crate::network::ClientNetworkConfig::default()
             .build_client()
             .unwrap();
-        let request = hyper::Request::builder()
+        let request = http::Request::builder()
             .method("GET")
             .uri(format!("http://{address}/body"))
             .body(HttpRequestBody::new())

@@ -32,14 +32,38 @@ version = "0.2.4"
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tarpaulin)'] }
 
+[features]
+default = ["hyper-backend"]
+# Hyper + Rustls transport; the production backend until P5 of the libcurl plan.
+hyper-backend = [
+    "dep:hyper",
+    "dep:hyper-rustls",
+    "dep:hyper-util",
+    "dep:http-body-util",
+    "dep:hyper-http-proxy",
+    "dep:tower-service",
+]
+# libcurl transport backend (P2 driver, P3 compatibility work).
+# P2 completed the neutral seam, so this feature no longer implies the Hyper
+# adapter: a libcurl-only build is the P4/P5 configuration.
+curl-backend = ["dep:curl", "dep:curl-sys"]
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 hickory-resolver = { version = "0.25", default-features = false, features = ["tokio", "system-config", "https-ring", "rustls-platform-verifier"] }
-hyper = { version = "1.9", features = ["client", "http1"] }
-hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "native-tokio", "rustls-platform-verifier", "tls12", "ring", "rustls-native-certs"] }
-hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio"] }
-http-body-util = "0.1"
-hyper-http-proxy = { version = "1.1", default-features = false, features = ["rustls-tls-native-roots"] }
+# Neutral HTTP types: the worker, the sessions and the transport adapters all
+# speak `http::{Request, Response, HeaderMap, StatusCode}` (see src/http/mod.rs).
+http = "1"
+hyper = { version = "1.9", features = ["client", "http1"], optional = true }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "native-tokio", "rustls-platform-verifier", "tls12", "ring", "rustls-native-certs"], optional = true }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio"], optional = true }
+http-body-util = { version = "0.1", optional = true }
+hyper-http-proxy = { version = "1.1", default-features = false, features = ["rustls-tls-native-roots"], optional = true }
+# Vendored libcurl driver; see docs/libcurl-migration-plan.zh-CN.md (P0/P2).
+curl = { version = "0.4.50", features = ["static-curl"], optional = true }
+# Raw libcurl options the `curl` crate does not wrap yet
+# (`CURLMOPT_NETWORK_CHANGED`, see src/network/curl/driver/mod.rs).
+curl-sys = { version = "0.4.89", default-features = false, optional = true }
 bytes = "1"
 futures = "0.3"
 thiserror = "2"
@@ -53,7 +77,7 @@ sha2 = "0.11"
 sha1 = "0.11"
 md-5 = "0.11"
 fastrand = "2"
-tower-service = "0.3"
+tower-service = { version = "0.3", optional = true }
 url = "2"
 tempfile = "3"
 
@@ -67,7 +91,6 @@ tokio = { version = "1", features = ["full", "test-util"] }
 tracing-subscriber = "0.3"
 warp = "0.3"
 rand = "0.9"
-http = "1"
 criterion = { version = "0.8.2", features = ["html_reports"] }
 
 [[bench]]

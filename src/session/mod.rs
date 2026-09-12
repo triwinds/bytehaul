@@ -16,7 +16,7 @@ use crate::error::DownloadError;
 use crate::filename::{detect_filename, sanitize_relative_path};
 use crate::http::response::ResponseMeta;
 use crate::http::worker::HttpWorker;
-use crate::http::HttpResponse;
+use crate::http::{BodyBudget, HttpResponse};
 use crate::network::BytehaulClient;
 use crate::progress::{DownloadState, ProgressSnapshot};
 use crate::rate_limiter::SpeedLimit;
@@ -500,7 +500,10 @@ async fn run_download_inner(
     progress_tx: &watch::Sender<ProgressSnapshot>,
     cancel_rx: watch::Receiver<StopSignal>,
 ) -> Result<PathBuf, DownloadError> {
-    let worker = HttpWorker::new(client.clone(), &spec).with_diagnostics(log_level, download_id);
+    let worker = HttpWorker::new(client.clone(), &spec)
+        .with_diagnostics(log_level, download_id)
+        // One body in flight at a time until the session picks its mode.
+        .with_body_budget(BodyBudget::for_session(spec.memory_budget, 1).0);
     let mut cancel_rx = cancel_rx;
     let speed_limit = SpeedLimit::new(spec.max_download_speed);
 
@@ -630,7 +633,8 @@ async fn retry_plain_get(
     spec: &DownloadSpec,
     cancel_rx: &mut watch::Receiver<StopSignal>,
 ) -> Result<(HttpResponse, ResponseMeta), DownloadError> {
-    let worker = HttpWorker::new(client, spec);
+    let worker = HttpWorker::new(client, spec)
+        .with_body_budget(BodyBudget::for_session(spec.memory_budget, 1).0);
     retry_with_backoff(
         spec.max_retries,
         spec.retry_base_delay,

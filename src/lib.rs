@@ -34,6 +34,13 @@
 //! - **Proxy & custom DNS** – supports HTTP/HTTPS proxies and
 //!   custom DNS / DNS-over-HTTPS resolvers.
 
+// Exactly one transport backend must be selected at build time; the plan keeps
+// Hyper as the default and the fallback until P5 flips it to libcurl.
+#[cfg(not(any(feature = "hyper-backend", feature = "curl-backend")))]
+compile_error!(
+    "bytehaul needs a transport backend: enable `hyper-backend`, `curl-backend`, or both"
+);
+
 mod checksum;
 mod config;
 mod error;

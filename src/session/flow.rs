@@ -13,6 +13,9 @@ use crate::storage::writer::WriterCommand;
 /// Below the threshold there is always room for one maximum-sized chunk.
 pub(super) struct MemoryBudget {
     pub semaphore: Arc<Semaphore>,
+    /// Total bytes the session promised to bound; the transport's per-transfer
+    /// queue budget is derived from it.
+    bytes: usize,
     pub(super) max_chunk: usize,
     pub watermark: usize,
 }
@@ -21,9 +24,21 @@ impl MemoryBudget {
     pub fn new(bytes: usize) -> Self {
         Self {
             semaphore: Arc::new(Semaphore::new(bytes)),
+            bytes,
             max_chunk: bytes.div_ceil(2).min(u32::MAX as usize),
             watermark: (bytes / 2).max(1),
         }
+    }
+
+    /// Byte budget one in-flight response body may buffer inside the transport.
+    ///
+    /// Bytes queued behind the transport seam are not accounted for by
+    /// `semaphore` yet, so the session divides its own budget across the bodies
+    /// it may keep in flight at once and hands that hint to the request (P3:
+    /// `HttpBody` backpressure reaches the session's memory budget instead of a
+    /// fixed per-transfer constant).
+    pub(super) fn transport_body_budget(&self, transfers: usize) -> usize {
+        crate::http::BodyBudget::for_session(self.bytes, transfers).0
     }
 
     /// Account only commands actually enqueued, including a partial body frame
@@ -93,6 +108,35 @@ mod tests {
     use crate::storage::writer::WriterTask;
     use std::sync::atomic::AtomicU64;
     use std::time::Duration;
+
+    #[test]
+    fn transport_body_budget_follows_the_session_budget_and_stays_bounded() {
+        // A generous budget fills the transport's own per-transfer ceiling.
+        assert_eq!(
+            MemoryBudget::new(64 * 1024 * 1024).transport_body_budget(1),
+            crate::http::MAX_BODY_BUDGET_BYTES
+        );
+        // More bodies in flight at once means each of them buffers less.
+        assert_eq!(
+            MemoryBudget::new(1024 * 1024).transport_body_budget(4),
+            256 * 1024
+        );
+        assert_eq!(
+            MemoryBudget::new(512 * 1024).transport_body_budget(8),
+            crate::http::MIN_BODY_BUDGET_BYTES
+        );
+        // A tiny budget still leaves room for one libcurl callback: below the
+        // floor every chunk would become a pause/unpause round trip.
+        assert_eq!(
+            MemoryBudget::new(97).transport_body_budget(1),
+            crate::http::MIN_BODY_BUDGET_BYTES
+        );
+        // A zero transfer count must not divide by zero.
+        assert_eq!(
+            MemoryBudget::new(0).transport_body_budget(0),
+            crate::http::MIN_BODY_BUDGET_BYTES
+        );
+    }
 
     #[tokio::test]
     async fn tiny_and_nondivisible_budgets_make_progress_across_leases() {

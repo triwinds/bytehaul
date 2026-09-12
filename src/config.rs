@@ -432,6 +432,12 @@ impl DownloadSpec {
     }
 
     /// Configure the HTTP idle pool for this download only.
+    ///
+    /// `max_idle_per_host` is the number of connections the client may keep
+    /// cached per origin. The libcurl backend maps it to the connection cache
+    /// size, so a download that opens more concurrent connections to one origin
+    /// than this value closes them as they go idle: keep it at or above
+    /// `max_connections` to let concurrent transfers reuse their connections.
     pub fn http_idle_pool(mut self, max_idle_per_host: usize, idle_timeout: Duration) -> Self {
         self.pool_max_idle_per_host = max_idle_per_host;
         self.pool_idle_timeout = idle_timeout;

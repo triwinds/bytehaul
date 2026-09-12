@@ -1,42 +1,80 @@
-use std::collections::HashMap;
-use std::future::Future;
-use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
-use std::pin::Pin;
-use std::sync::{Arc, OnceLock};
-use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
 
-use hickory_resolver::config::{
-    LookupIpStrategy, NameServerConfig, NameServerConfigGroup, ResolverConfig,
-};
-use hickory_resolver::proto::xfer::Protocol;
-use hickory_resolver::{name_server::TokioConnectionProvider, TokioResolver};
-use hyper::Uri;
+use http::Uri;
+#[cfg(feature = "hyper-backend")]
 use hyper_http_proxy::{Intercept, Proxy, ProxyConnector};
+#[cfg(feature = "hyper-backend")]
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
-use hyper_util::client::legacy::{
-    connect::{dns::Name as DnsName, HttpConnector},
-    Client,
-};
+#[cfg(feature = "hyper-backend")]
+use hyper_util::client::legacy::{connect::HttpConnector, Client};
+#[cfg(feature = "hyper-backend")]
 use hyper_util::rt::{TokioExecutor, TokioTimer};
-use parking_lot::Mutex;
-use tower_service::Service;
 use url::Url;
 
-#[cfg(test)]
+#[cfg(feature = "curl-backend")]
+pub(crate) mod curl;
+pub(crate) mod dns;
+#[cfg(all(test, feature = "hyper-backend"))]
 mod multi_ip_prototype;
-#[cfg(test)]
+#[cfg(all(test, feature = "hyper-backend"))]
 mod tls_tests;
 
+pub(crate) use dns::BytehaulDnsResolver;
+
 use crate::config::{DEFAULT_HTTP_IDLE_POOL_MAX_PER_HOST, DEFAULT_HTTP_IDLE_POOL_TIMEOUT};
-use crate::error::{BoxError, DownloadError, TransportError};
+use crate::error::DownloadError;
+#[cfg(feature = "hyper-backend")]
+use crate::error::TransportError;
+#[cfg(feature = "hyper-backend")]
+use crate::http::HttpBody;
 use crate::http::{HttpRequestBody, HttpResponse};
 
+#[cfg(feature = "curl-backend")]
+use self::curl::CurlTransport;
+
+#[cfg(feature = "hyper-backend")]
 type DirectHttpConnector = HttpConnector<BytehaulDnsResolver>;
+#[cfg(feature = "hyper-backend")]
 type DirectRustlsConnector = HttpsConnector<DirectHttpConnector>;
+#[cfg(feature = "hyper-backend")]
 type DirectRustlsClient = Client<DirectRustlsConnector, HttpRequestBody>;
+#[cfg(feature = "hyper-backend")]
 type ProxyRustlsConnector = ProxyConnector<DirectRustlsConnector>;
+#[cfg(feature = "hyper-backend")]
 type ProxyRustlsClient = Client<ProxyRustlsConnector, HttpRequestBody>;
+
+/// Which transport a client uses.
+///
+/// `Default` keeps the compile-time choice: Hyper while both backends are
+/// built (until P5 flips the default), libcurl when it is the only backend in
+/// the build. The explicit variants let internal tests and benchmarks exercise
+/// both backends from one build; a single-backend build can only name the
+/// variant it compiled, hence the dead-code allowance.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub(crate) enum TransportBackend {
+    #[default]
+    Default,
+    #[cfg(feature = "hyper-backend")]
+    Hyper,
+    #[cfg(feature = "curl-backend")]
+    Curl,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResolvedBackend {
+    #[cfg(feature = "hyper-backend")]
+    Hyper,
+    #[cfg(feature = "curl-backend")]
+    Curl,
+}
+
+#[cfg(feature = "hyper-backend")]
+const COMPILE_TIME_BACKEND: ResolvedBackend = ResolvedBackend::Hyper;
+#[cfg(all(feature = "curl-backend", not(feature = "hyper-backend")))]
+const COMPILE_TIME_BACKEND: ResolvedBackend = ResolvedBackend::Curl;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct ClientNetworkConfig {
@@ -49,14 +87,20 @@ pub(crate) struct ClientNetworkConfig {
     pub dns_servers: Vec<SocketAddr>,
     pub doh_servers: Vec<String>,
     pub enable_ipv6: bool,
+    pub backend: TransportBackend,
 }
 
 #[derive(Clone)]
 pub(crate) enum BytehaulClient {
+    #[cfg(feature = "hyper-backend")]
     Direct(Arc<DirectRustlsClient>),
+    #[cfg(feature = "hyper-backend")]
     Proxy(Arc<BytehaulProxyClient>),
+    #[cfg(feature = "curl-backend")]
+    Curl(Arc<CurlTransport>),
 }
 
+#[cfg(feature = "hyper-backend")]
 #[derive(Clone)]
 pub(crate) struct BytehaulProxyClient {
     client: ProxyRustlsClient,
@@ -77,15 +121,24 @@ impl EffectiveProxyConfig {
 }
 
 impl BytehaulClient {
+    /// Send one request without a caller-supplied deadline.
+    ///
+    /// Production code always goes through [`Self::request_with_timeout`]; this
+    /// entry point backs the Hyper deadline wrapper and the tests, so a
+    /// libcurl-only build does not carry it.
+    #[cfg(any(feature = "hyper-backend", test))]
     pub(crate) async fn request(
         &self,
-        req: hyper::Request<HttpRequestBody>,
+        req: http::Request<HttpRequestBody>,
     ) -> Result<HttpResponse, DownloadError> {
         match self {
+            #[cfg(feature = "hyper-backend")]
             Self::Direct(client) => client
                 .request(req)
                 .await
+                .map(neutral_response)
                 .map_err(|error| TransportError::from(error).into()),
+            #[cfg(feature = "hyper-backend")]
             Self::Proxy(client) => {
                 let mut req = req;
                 let uri = req.uri().clone();
@@ -96,20 +149,43 @@ impl BytehaulClient {
                     .client
                     .request(req)
                     .await
+                    .map(neutral_response)
                     .map_err(|error| TransportError::from(error).into())
             }
+            #[cfg(feature = "curl-backend")]
+            Self::Curl(transport) => transport.request_with_backstop(req).await,
         }
     }
 
     pub(crate) async fn request_with_timeout(
         &self,
-        req: hyper::Request<HttpRequestBody>,
+        req: http::Request<HttpRequestBody>,
         timeout: Duration,
     ) -> Result<HttpResponse, DownloadError> {
-        tokio::time::timeout(timeout, self.request(req))
-            .await
-            .map_err(|_| DownloadError::timeout("request timed out"))?
+        match self {
+            // The libcurl driver enforces the caller's deadline itself, so it
+            // can remove the handle at the moment the deadline expires. The
+            // caller's value is the only deadline: a shorter internal default
+            // would silently override a longer `request_headers_timeout`.
+            #[cfg(feature = "curl-backend")]
+            Self::Curl(transport) => transport.request(req, timeout).await,
+            // The Hyper client has no deadline of its own, so the caller's
+            // value wraps the whole request future (connect, TLS, headers).
+            #[cfg(feature = "hyper-backend")]
+            _ => tokio::time::timeout(timeout, self.request(req))
+                .await
+                .map_err(|_| DownloadError::timeout("request timed out"))?,
+        }
     }
+}
+
+/// Hand the Hyper response to the session layer as the neutral body, so no
+/// `hyper::body::Incoming` crosses the transport boundary (P1 of the libcurl
+/// migration plan). The libcurl adapter does the same in `curl::transport`.
+#[cfg(feature = "hyper-backend")]
+fn neutral_response(response: http::Response<hyper::body::Incoming>) -> HttpResponse {
+    let (parts, body) = response.into_parts();
+    http::Response::from_parts(parts, HttpBody::from(body))
 }
 
 impl Default for ClientNetworkConfig {
@@ -124,13 +200,38 @@ impl Default for ClientNetworkConfig {
             dns_servers: Vec::new(),
             doh_servers: Vec::new(),
             enable_ipv6: true,
+            backend: TransportBackend::default(),
         }
     }
 }
 
 impl ClientNetworkConfig {
+    /// Select a transport explicitly; `TransportBackend::Default` keeps the
+    /// build-time choice. Internal tests use this to compare both backends
+    /// from a single build; the public selection API is not part of P2.
+    #[cfg(all(test, feature = "hyper-backend", feature = "curl-backend"))]
+    pub(crate) fn with_backend(&self, backend: TransportBackend) -> Self {
+        let mut updated = self.clone();
+        updated.backend = backend;
+        updated
+    }
+
+    fn resolved_backend(&self) -> ResolvedBackend {
+        match self.backend {
+            #[cfg(feature = "hyper-backend")]
+            TransportBackend::Hyper => ResolvedBackend::Hyper,
+            #[cfg(feature = "curl-backend")]
+            TransportBackend::Curl => ResolvedBackend::Curl,
+            TransportBackend::Default => COMPILE_TIME_BACKEND,
+        }
+    }
+
     pub(crate) fn build_client(&self) -> Result<BytehaulClient, DownloadError> {
         let effective_proxies = self.effective_proxies()?;
+        // Record which libcurl/TLS/resolver build is linked when the libcurl
+        // backend is compiled in; the Hyper path logs its own connector facts.
+        #[cfg(feature = "curl-backend")]
+        crate::network::curl::log_runtime_features(crate::config::LogLevel::Debug);
         #[cfg(not(tarpaulin))]
         tracing::debug!(
             connect_timeout_ms = self.connect_timeout.as_millis() as u64,
@@ -140,9 +241,23 @@ impl ClientNetworkConfig {
             custom_dns = !self.dns_servers.is_empty(),
             custom_doh = !self.doh_servers.is_empty(),
             enable_ipv6 = self.enable_ipv6,
+            backend = ?self.resolved_backend(),
             "building HTTP client"
         );
 
+        match self.resolved_backend() {
+            #[cfg(feature = "curl-backend")]
+            ResolvedBackend::Curl => Ok(BytehaulClient::Curl(Arc::new(CurlTransport::new(self)?))),
+            #[cfg(feature = "hyper-backend")]
+            ResolvedBackend::Hyper => self.build_hyper_client(&effective_proxies),
+        }
+    }
+
+    #[cfg(feature = "hyper-backend")]
+    fn build_hyper_client(
+        &self,
+        effective_proxies: &EffectiveProxyConfig,
+    ) -> Result<BytehaulClient, DownloadError> {
         let resolver = self.build_dns_resolver()?;
         let https = self.build_https_connector(resolver)?;
         let mut builder = Client::builder(TokioExecutor::new());
@@ -158,13 +273,13 @@ impl ClientNetworkConfig {
                     "failed to configure proxy connector: {error}"
                 ))
             })?;
-            if let Some(proxy) = effective_proxies.http_proxy {
+            if let Some(proxy) = effective_proxies.http_proxy.clone() {
                 proxy_connector.add_proxy(Proxy::new(Intercept::Http, proxy));
             }
-            if let Some(proxy) = effective_proxies.https_proxy {
+            if let Some(proxy) = effective_proxies.https_proxy.clone() {
                 proxy_connector.add_proxy(Proxy::new(Intercept::Https, proxy));
             }
-            if let Some(proxy) = effective_proxies.all_proxy {
+            if let Some(proxy) = effective_proxies.all_proxy.clone() {
                 proxy_connector.add_proxy(Proxy::new(Intercept::All, proxy));
             }
             let client = builder.build(proxy_connector.clone());
@@ -184,10 +299,12 @@ impl ClientNetworkConfig {
         updated
     }
 
+    /// Builds the shared Hickory resolver (P3: both backends resolve here).
     fn build_dns_resolver(&self) -> Result<BytehaulDnsResolver, DownloadError> {
         BytehaulDnsResolver::new(&self.dns_servers, &self.doh_servers, self.enable_ipv6)
     }
 
+    #[cfg(feature = "hyper-backend")]
     fn build_https_connector(
         &self,
         resolver: BytehaulDnsResolver,
@@ -216,6 +333,7 @@ impl ClientNetworkConfig {
         }
     }
 
+    #[cfg(feature = "hyper-backend")]
     fn build_http_connector(&self, resolver: BytehaulDnsResolver) -> DirectHttpConnector {
         let mut http = HttpConnector::new_with_resolver(resolver);
         http.set_nodelay(true);
@@ -283,304 +401,11 @@ fn proxy_uri(
     })
 }
 
-fn doh_config_cache() -> &'static Mutex<HashMap<(String, bool), DohServerConfig>> {
-    static CACHE: OnceLock<Mutex<HashMap<(String, bool), DohServerConfig>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct DohServerConfig {
-    socket_addrs: Vec<SocketAddr>,
-    tls_dns_name: String,
-    http_endpoint: Option<String>,
-}
-
-#[derive(Clone)]
-pub(crate) struct BytehaulDnsResolver {
-    resolver: TokioResolver,
-}
-
-type ResolverFuture =
-    Pin<Box<dyn Future<Output = Result<std::vec::IntoIter<SocketAddr>, BoxError>> + Send>>;
-
-impl BytehaulDnsResolver {
-    fn new(
-        dns_servers: &[SocketAddr],
-        doh_servers: &[String],
-        enable_ipv6: bool,
-    ) -> Result<Self, DownloadError> {
-        let mut builder = if dns_servers.is_empty() && doh_servers.is_empty() {
-            TokioResolver::builder_tokio().map_err(|err| {
-                DownloadError::Internal(format!("failed to read system DNS configuration: {err}"))
-            })?
-        } else {
-            TokioResolver::builder_with_config(
-                ResolverConfig::from_parts(
-                    None,
-                    vec![],
-                    build_name_server_group(dns_servers, doh_servers, enable_ipv6)?,
-                ),
-                TokioConnectionProvider::default(),
-            )
-        };
-
-        builder.options_mut().ip_strategy = if enable_ipv6 {
-            LookupIpStrategy::Ipv4AndIpv6
-        } else {
-            LookupIpStrategy::Ipv4Only
-        };
-
-        Ok(Self {
-            resolver: builder.build(),
-        })
-    }
-
-    async fn lookup_host(&self, host: String) -> Result<Vec<SocketAddr>, BoxError> {
-        // Hickory owns the bounded TTL cache shared by resolver clones.
-        let lookup = self
-            .resolver
-            .lookup_ip(host.clone())
-            .await
-            .map_err(|error| {
-                #[cfg(not(tarpaulin))]
-                tracing::debug!(host = %host, error = %error, "DNS lookup failed");
-                let boxed: BoxError = Box::new(error);
-                boxed
-            })?;
-
-        let valid_until = lookup.valid_until();
-        let addrs: Vec<SocketAddr> = lookup.iter().map(|ip| SocketAddr::new(ip, 0)).collect();
-        if addrs.is_empty() {
-            #[cfg(not(tarpaulin))]
-            tracing::debug!(host = %host, "DNS lookup returned no IP addresses");
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("no DNS records found for {host}"),
-            )
-            .into());
-        }
-
-        #[cfg(not(tarpaulin))]
-        tracing::debug!(
-            host = %host,
-            addrs = ?addrs,
-            ttl_remaining_ms = duration_to_u64_millis(
-                valid_until.saturating_duration_since(Instant::now())
-            ),
-            "resolved host via DNS lookup"
-        );
-
-        Ok(addrs)
-    }
-}
-
-impl Service<DnsName> for BytehaulDnsResolver {
-    type Response = std::vec::IntoIter<SocketAddr>;
-    type Error = BoxError;
-    type Future = ResolverFuture;
-
-    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn call(&mut self, name: DnsName) -> Self::Future {
-        let resolver = self.clone();
-        let host = name.as_str().to_string();
-        Box::pin(async move {
-            resolver
-                .lookup_host(host)
-                .await
-                .map(|addrs| addrs.into_iter())
-        })
-    }
-}
-
-fn duration_to_u64_millis(duration: Duration) -> u64 {
-    duration.as_millis().min(u64::MAX as u128) as u64
-}
-
-fn build_name_server_group(
-    dns_servers: &[SocketAddr],
-    doh_servers: &[String],
-    enable_ipv6: bool,
-) -> Result<NameServerConfigGroup, DownloadError> {
-    let mut group = NameServerConfigGroup::new();
-    for server in dns_servers {
-        for protocol in [Protocol::Udp, Protocol::Tcp] {
-            group.push(NameServerConfig::new(*server, protocol));
-        }
-    }
-
-    for server in doh_servers {
-        let config = parse_doh_server(server, enable_ipv6)?;
-        for socket_addr in config.socket_addrs {
-            let mut name_server = NameServerConfig::new(socket_addr, Protocol::Https);
-            name_server.tls_dns_name = Some(config.tls_dns_name.clone());
-            name_server.http_endpoint = config.http_endpoint.clone();
-            group.push(name_server);
-        }
-    }
-
-    Ok(group)
-}
-
-fn parse_doh_server(server: &str, enable_ipv6: bool) -> Result<DohServerConfig, DownloadError> {
-    let server = server.trim();
-    if server.is_empty() {
-        return Err(DownloadError::InvalidConfig(
-            "DoH server URLs cannot be empty".into(),
-        ));
-    }
-    if let Some(authority) = server.strip_prefix("https://") {
-        if authority.is_empty()
-            || authority.starts_with('/')
-            || authority.starts_with('?')
-            || authority.starts_with('#')
-        {
-            return Err(DownloadError::InvalidConfig(format!(
-                "DoH server URL '{server}' is missing a host"
-            )));
-        }
-    }
-
-    if let Some(cached) = doh_config_cache()
-        .lock()
-        .get(&(server.to_string(), enable_ipv6))
-        .cloned()
-    {
-        return Ok(cached);
-    }
-
-    let config = parse_doh_server_uncached(server, enable_ipv6, resolve_doh_host)?;
-    doh_config_cache()
-        .lock()
-        .insert((server.to_string(), enable_ipv6), config.clone());
-    Ok(config)
-}
-
-fn parse_doh_server_uncached<F>(
-    server: &str,
-    enable_ipv6: bool,
-    resolve_host: F,
-) -> Result<DohServerConfig, DownloadError>
-where
-    F: FnOnce(&str, u16) -> std::io::Result<Vec<SocketAddr>>,
-{
-    let server = server.trim();
-    if server.is_empty() {
-        return Err(DownloadError::InvalidConfig(
-            "DoH server URLs cannot be empty".into(),
-        ));
-    }
-    if let Some(authority) = server.strip_prefix("https://") {
-        if authority.is_empty()
-            || authority.starts_with('/')
-            || authority.starts_with('?')
-            || authority.starts_with('#')
-        {
-            return Err(DownloadError::InvalidConfig(format!(
-                "DoH server URL '{server}' is missing a host"
-            )));
-        }
-    }
-
-    let url = Url::parse(server).map_err(|error| {
-        if error.to_string() == "empty host" {
-            DownloadError::InvalidConfig(format!("DoH server URL '{server}' is missing a host"))
-        } else {
-            DownloadError::InvalidConfig(format!("invalid DoH server URL '{server}': {error}"))
-        }
-    })?;
-
-    if url.scheme() != "https" {
-        return Err(DownloadError::InvalidConfig(format!(
-            "DoH server URL '{server}' must use https"
-        )));
-    }
-    if !url.username().is_empty() || url.password().is_some() {
-        return Err(DownloadError::InvalidConfig(format!(
-            "DoH server URL '{server}' cannot include credentials"
-        )));
-    }
-    if url.fragment().is_some() {
-        return Err(DownloadError::InvalidConfig(format!(
-            "DoH server URL '{server}' cannot include a fragment"
-        )));
-    }
-
-    let host = url.host().ok_or_else(|| {
-        DownloadError::InvalidConfig(format!("DoH server URL '{server}' is missing a host"))
-    })?;
-    let host_display = host.to_string();
-    let port = url.port_or_known_default().ok_or_else(|| {
-        DownloadError::InvalidConfig(format!("DoH server URL '{server}' is missing a valid port"))
-    })?;
-
-    let host_for_resolution = host_display
-        .strip_prefix('[')
-        .and_then(|value| value.strip_suffix(']'))
-        .unwrap_or(host_display.as_str());
-    let parsed_ip = host_for_resolution.parse::<IpAddr>().ok();
-
-    let mut socket_addrs: Vec<SocketAddr> = if let Some(ip) = parsed_ip {
-        vec![SocketAddr::new(ip, port)]
-    } else {
-        resolve_host(host_for_resolution, port).map_err(|err| {
-            DownloadError::InvalidConfig(format!(
-                "failed to resolve DoH host '{host_display}' from '{server}': {err}"
-            ))
-        })?
-    };
-
-    if !enable_ipv6 {
-        socket_addrs.retain(SocketAddr::is_ipv4);
-    }
-    socket_addrs.sort_unstable();
-    socket_addrs.dedup();
-
-    if socket_addrs.is_empty() {
-        return Err(DownloadError::InvalidConfig(format!(
-            "DoH server URL '{server}' did not resolve to any {} address",
-            if enable_ipv6 { "IP" } else { "IPv4" }
-        )));
-    }
-
-    let mut http_endpoint = url.path().to_string();
-    if http_endpoint.is_empty() || http_endpoint == "/" {
-        http_endpoint.clear();
-    }
-    if let Some(query) = url.query() {
-        if http_endpoint.is_empty() {
-            http_endpoint.push('/');
-        }
-        http_endpoint.push('?');
-        http_endpoint.push_str(query);
-    }
-
-    Ok(DohServerConfig {
-        socket_addrs,
-        tls_dns_name: match parsed_ip {
-            Some(IpAddr::V4(ipv4)) => ipv4.to_string(),
-            Some(IpAddr::V6(ipv6)) => format!("[{ipv6}]"),
-            None => host_display,
-        },
-        http_endpoint: if http_endpoint.is_empty() || http_endpoint == "/dns-query" {
-            None
-        } else {
-            Some(http_endpoint)
-        },
-    })
-}
-
-fn resolve_doh_host(host: &str, port: u16) -> std::io::Result<Vec<SocketAddr>> {
-    (host, port).to_socket_addrs().map(|addrs| addrs.collect())
-}
-
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "hyper-backend")]
+    use super::dns::spawn_dns_test_server;
     use super::*;
-    use http_body_util::BodyExt;
-    use std::str::FromStr;
     use std::sync::Mutex as StdMutex;
     use std::{
         io::{Read, Write},
@@ -589,7 +414,7 @@ mod tests {
     };
 
     fn env_lock() -> &'static StdMutex<()> {
-        static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+        static LOCK: std::sync::OnceLock<StdMutex<()>> = std::sync::OnceLock::new();
         LOCK.get_or_init(|| StdMutex::new(()))
     }
 
@@ -624,24 +449,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_doh_server_caches_results() {
-        let server = "https://localhost/dns-query?cache=network-test";
-        assert!(doh_config_cache()
-            .lock()
-            .get(&(server.to_string(), true))
-            .is_none());
-
-        let first = parse_doh_server(server, true).unwrap();
-        let second = parse_doh_server(server, true).unwrap();
-
-        assert_eq!(first, second);
-        assert!(doh_config_cache()
-            .lock()
-            .get(&(server.to_string(), true))
-            .is_some());
-    }
-
-    #[test]
     fn test_with_connect_timeout_clones_config() {
         let config = ClientNetworkConfig::default();
         let updated = config.with_connect_timeout(Duration::from_secs(9));
@@ -653,151 +460,6 @@ mod tests {
             DEFAULT_HTTP_IDLE_POOL_MAX_PER_HOST
         );
         assert!(updated.enable_ipv6);
-    }
-
-    #[test]
-    fn test_build_name_server_group_adds_udp_and_tcp() {
-        let server = SocketAddr::from(([1, 1, 1, 1], 53));
-        let group = build_name_server_group(&[server], &[], true).unwrap();
-
-        assert_eq!(group.len(), 2);
-        assert!(group
-            .iter()
-            .any(|config| config.socket_addr == server && config.protocol == Protocol::Udp));
-        assert!(group
-            .iter()
-            .any(|config| config.socket_addr == server && config.protocol == Protocol::Tcp));
-    }
-
-    #[test]
-    fn test_build_name_server_group_adds_doh_servers() {
-        let group =
-            build_name_server_group(&[], &["https://127.0.0.1/dns-query".into()], false).unwrap();
-
-        assert_eq!(group.len(), 1);
-        let config = group.iter().next().unwrap();
-        assert_eq!(config.socket_addr, SocketAddr::from(([127, 0, 0, 1], 443)));
-        assert_eq!(config.protocol, Protocol::Https);
-        assert_eq!(config.tls_dns_name.as_deref(), Some("127.0.0.1"));
-        assert!(config.http_endpoint.is_none());
-    }
-
-    #[test]
-    fn test_parse_doh_server_resolves_hostnames_and_custom_paths() {
-        let config = parse_doh_server(
-            "https://localhost/custom-dns?ct=application/dns-message",
-            false,
-        )
-        .unwrap();
-
-        assert!(!config.socket_addrs.is_empty());
-        assert!(config.socket_addrs.iter().all(SocketAddr::is_ipv4));
-        assert_eq!(config.tls_dns_name, "localhost");
-        assert_eq!(
-            config.http_endpoint.as_deref(),
-            Some("/custom-dns?ct=application/dns-message")
-        );
-    }
-
-    #[test]
-    fn test_parse_doh_server_rejects_invalid_urls() {
-        let err = parse_doh_server("http://dns.google/dns-query", true)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("must use https"));
-
-        let err = parse_doh_server("https://user:pass@dns.google/dns-query", true)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("cannot include credentials"));
-    }
-
-    #[test]
-    fn test_parse_doh_server_rejects_empty_or_fragment_urls() {
-        let err = parse_doh_server("   ", true).unwrap_err().to_string();
-        assert!(err.contains("cannot be empty"));
-
-        let err = parse_doh_server("https://dns.google/dns-query#fragment", true)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("cannot include a fragment"));
-    }
-
-    #[test]
-    fn test_parse_doh_server_rejects_missing_host() {
-        let err = parse_doh_server("https:///dns-query", true)
-            .unwrap_err()
-            .to_string();
-
-        assert!(err.contains("missing a host"));
-    }
-
-    #[test]
-    fn test_parse_doh_server_rejects_empty_query_and_fragment_authorities() {
-        for server in ["https://", "https://?dns=1", "https://#fragment"] {
-            let err = parse_doh_server(server, true).unwrap_err().to_string();
-            assert!(
-                err.contains("missing a host"),
-                "unexpected error for {server}: {err}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_parse_doh_server_rejects_ipv6_only_result_when_ipv6_disabled() {
-        let err = parse_doh_server("https://[::1]/dns-query", false)
-            .unwrap_err()
-            .to_string();
-
-        assert!(err.contains("did not resolve to any IPv4 address"));
-    }
-
-    #[test]
-    fn test_parse_doh_server_accepts_ipv6_literal_when_enabled() {
-        let config = parse_doh_server("https://[::1]/dns-query", true).unwrap();
-
-        assert_eq!(
-            config.socket_addrs,
-            vec![SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 443))]
-        );
-        assert_eq!(config.tls_dns_name, "[::1]");
-        assert!(config.http_endpoint.is_none());
-    }
-
-    #[test]
-    fn test_parse_doh_server_preserves_root_query_endpoint() {
-        let config =
-            parse_doh_server("https://127.0.0.1?ct=application/dns-message", true).unwrap();
-
-        assert_eq!(
-            config.socket_addrs,
-            vec![SocketAddr::from(([127, 0, 0, 1], 443))]
-        );
-        assert_eq!(config.tls_dns_name, "127.0.0.1");
-        assert_eq!(
-            config.http_endpoint.as_deref(),
-            Some("/?ct=application/dns-message")
-        );
-    }
-
-    #[test]
-    fn test_parse_doh_server_reports_resolution_failures() {
-        let err =
-            parse_doh_server_uncached("https://resolver-test.invalid/dns-query", true, |_, _| {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "simulated resolution failure",
-                ))
-            })
-            .unwrap_err()
-            .to_string();
-
-        assert!(err.contains("failed to resolve DoH host 'resolver-test.invalid'"));
-    }
-
-    #[test]
-    fn test_duration_to_u64_millis_saturates() {
-        assert_eq!(duration_to_u64_millis(Duration::MAX), u64::MAX);
     }
 
     #[test]
@@ -827,121 +489,6 @@ mod tests {
 
         config.build_client().unwrap();
         clear_proxy_env();
-    }
-
-    #[test]
-    fn test_build_dns_resolver_supports_system_and_custom_servers() {
-        let ipv4_only = ClientNetworkConfig {
-            enable_ipv6: false,
-            ..ClientNetworkConfig::default()
-        };
-        drop(ipv4_only.build_dns_resolver().unwrap());
-
-        let custom =
-            BytehaulDnsResolver::new(&[SocketAddr::from(([1, 1, 1, 1], 53))], &[], true).unwrap();
-        drop(custom);
-
-        let doh =
-            BytehaulDnsResolver::new(&[], &["https://127.0.0.1/dns-query".into()], false).unwrap();
-        drop(doh);
-    }
-
-    #[tokio::test]
-    async fn test_dns_resolver_resolves_localhost() {
-        let mut resolver = BytehaulDnsResolver::new(&[], &[], false).unwrap();
-        let addrs: Vec<_> = resolver
-            .call(DnsName::from_str("localhost").unwrap())
-            .await
-            .unwrap()
-            .collect();
-
-        assert!(!addrs.is_empty());
-        assert!(addrs.iter().all(|addr| addr.port() == 0));
-    }
-
-    async fn spawn_dns_test_server(
-        ttl: u32,
-    ) -> (
-        SocketAddr,
-        Arc<std::sync::atomic::AtomicUsize>,
-        tokio::task::JoinHandle<()>,
-    ) {
-        use hickory_resolver::proto::{
-            op::{Message, MessageType},
-            rr::{rdata::A, RData, Record, RecordType},
-        };
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        let socket = tokio::net::UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
-        let addr = socket.local_addr().unwrap();
-        let queries = Arc::new(AtomicUsize::new(0));
-        let server_queries = queries.clone();
-        let server = tokio::spawn(async move {
-            let mut buf = [0; 4096];
-            loop {
-                let (len, peer) = socket.recv_from(&mut buf).await.unwrap();
-                let request = Message::from_vec(&buf[..len]).unwrap();
-                let query = request.queries()[0].clone();
-                // IPv4-only configuration must never ask for an AAAA record.
-                assert_eq!(query.query_type(), RecordType::A);
-                let count = server_queries.fetch_add(1, Ordering::SeqCst) + 1;
-                let mut response = Message::new();
-                response
-                    .set_id(request.id())
-                    .set_message_type(MessageType::Response)
-                    .set_recursion_desired(true)
-                    .set_recursion_available(true)
-                    .add_query(query.clone())
-                    .add_answer(Record::from_rdata(
-                        query.name().clone(),
-                        ttl,
-                        RData::A(A::new(127, 0, 0, count as u8)),
-                    ));
-                socket
-                    .send_to(&response.to_vec().unwrap(), peer)
-                    .await
-                    .unwrap();
-            }
-        });
-        (addr, queries, server)
-    }
-
-    #[tokio::test]
-    async fn test_dns_resolver_shares_hickory_cache_and_refreshes_expired_answers() {
-        use std::sync::atomic::Ordering;
-
-        let (addr, queries, server) = spawn_dns_test_server(1).await;
-        let mut resolver = BytehaulDnsResolver::new(&[addr], &[], false).unwrap();
-        let name = DnsName::from_str("cache-test.example.").unwrap();
-        let first: Vec<_> = resolver.call(name.clone()).await.unwrap().collect();
-        assert_eq!(first, vec![SocketAddr::from(([127, 0, 0, 1], 0))]);
-
-        let cached: Vec<_> = resolver.clone().call(name.clone()).await.unwrap().collect();
-        assert_eq!(cached, first);
-        assert_eq!(queries.load(Ordering::SeqCst), 1);
-
-        // Hickory uses std::time::Instant for expiry, so advancing Tokio's
-        // paused clock would not exercise the real TTL contract.
-        tokio::time::sleep(Duration::from_millis(1100)).await;
-        let refreshed: Vec<_> = resolver.call(name).await.unwrap().collect();
-        assert_eq!(refreshed, vec![SocketAddr::from(([127, 0, 0, 2], 0))]);
-        assert_eq!(queries.load(Ordering::SeqCst), 2);
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn test_dns_resolver_returns_lookup_error_for_invalid_domain() {
-        let mut resolver = BytehaulDnsResolver::new(&[], &[], false).unwrap();
-        let result = resolver
-            .call(DnsName::from_str("coverage-check.invalid").unwrap())
-            .await;
-
-        let err = match result {
-            Ok(_) => panic!("expected DNS lookup to fail for coverage-check.invalid"),
-            Err(error) => error.to_string(),
-        };
-
-        assert!(!err.is_empty());
     }
 
     #[test]
@@ -1004,6 +551,7 @@ mod tests {
         assert_eq!(proxy.to_string(), "http://127.0.0.1:8080/");
     }
 
+    #[cfg(feature = "hyper-backend")]
     #[tokio::test]
     async fn test_proxy_client_request_uses_proxy_branch() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -1029,14 +577,14 @@ mod tests {
             .unwrap()
         };
 
-        let req = hyper::Request::builder()
+        let req = http::Request::builder()
             .method("GET")
             .uri("http://example.com/proxy-test")
             .body(HttpRequestBody::new())
             .unwrap();
         let response = client.request(req).await.unwrap();
-        assert_eq!(response.status(), hyper::StatusCode::OK);
-        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(response.status(), http::StatusCode::OK);
+        let bytes = response.into_body().collect_to_bytes().await.unwrap();
         assert_eq!(&bytes[..], b"pong");
 
         handle.join().unwrap();
@@ -1056,7 +604,7 @@ mod tests {
         });
 
         let client = ClientNetworkConfig::default().build_client().unwrap();
-        let req = hyper::Request::builder()
+        let req = http::Request::builder()
             .method("GET")
             .uri(format!("http://{addr}/slow"))
             .body(HttpRequestBody::new())
@@ -1075,6 +623,7 @@ mod tests {
         handle.join().unwrap();
     }
 
+    #[cfg(feature = "hyper-backend")]
     fn spawn_connection_pool_test_server(
         close_after_response: bool,
         expected_requests: usize,
@@ -1155,6 +704,7 @@ mod tests {
         (addr, accepted, handle)
     }
 
+    #[cfg(feature = "hyper-backend")]
     #[tokio::test]
     async fn test_idle_pool_closes_expired_socket_without_another_request() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1193,7 +743,7 @@ mod tests {
         };
         let response = client
             .request_with_timeout(
-                hyper::Request::builder()
+                http::Request::builder()
                     .uri(format!("http://{addr}/"))
                     .body(HttpRequestBody::new())
                     .unwrap(),
@@ -1201,7 +751,7 @@ mod tests {
             )
             .await
             .unwrap();
-        response.into_body().collect().await.unwrap();
+        response.into_body().collect_to_bytes().await.unwrap();
         // Keep the client alive: EOF must come from idle expiry, not pool drop.
         tokio::time::timeout(Duration::from_secs(5), server)
             .await
@@ -1210,6 +760,7 @@ mod tests {
         drop(client);
     }
 
+    #[cfg(feature = "hyper-backend")]
     #[tokio::test]
     async fn test_idle_pool_reuses_keep_alive_connection() {
         use std::sync::atomic::Ordering;
@@ -1224,15 +775,15 @@ mod tests {
         .unwrap();
 
         for (expected_start, expected_end) in [(0, 3), (4, 7)] {
-            let req = hyper::Request::builder()
+            let req = http::Request::builder()
                 .method("GET")
                 .uri(format!("http://{addr}/range"))
                 .header("range", format!("bytes={expected_start}-{expected_end}"))
                 .body(HttpRequestBody::new())
                 .unwrap();
             let response = client.request(req).await.unwrap();
-            assert_eq!(response.status(), hyper::StatusCode::PARTIAL_CONTENT);
-            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(response.status(), http::StatusCode::PARTIAL_CONTENT);
+            let bytes = response.into_body().collect_to_bytes().await.unwrap();
             assert_eq!(bytes.len(), 4);
         }
 
@@ -1240,6 +791,7 @@ mod tests {
         assert_eq!(accepted.load(Ordering::SeqCst), 1);
     }
 
+    #[cfg(feature = "hyper-backend")]
     #[tokio::test]
     async fn test_connector_reconnects_using_hickory_cached_dns_answer() {
         use std::sync::atomic::Ordering;
@@ -1258,7 +810,7 @@ mod tests {
             .unwrap()
         };
         for expected in [b"pong", b"more"] {
-            let req = hyper::Request::builder()
+            let req = http::Request::builder()
                 .uri(format!(
                     "http://cache-test.example.:{}/range",
                     http_addr.port()
@@ -1266,7 +818,7 @@ mod tests {
                 .body(HttpRequestBody::new())
                 .unwrap();
             let response = client.request(req).await.unwrap();
-            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let bytes = response.into_body().collect_to_bytes().await.unwrap();
             assert_eq!(bytes.as_ref(), expected);
         }
         http_server.join().unwrap();
@@ -1275,6 +827,7 @@ mod tests {
         dns_server.abort();
     }
 
+    #[cfg(feature = "hyper-backend")]
     #[tokio::test]
     async fn test_idle_pool_reconnects_after_connection_close() {
         use std::sync::atomic::Ordering;
@@ -1289,35 +842,19 @@ mod tests {
         .unwrap();
 
         for (expected_start, expected_end) in [(0, 3), (4, 7)] {
-            let req = hyper::Request::builder()
+            let req = http::Request::builder()
                 .method("GET")
                 .uri(format!("http://{addr}/range"))
                 .header("range", format!("bytes={expected_start}-{expected_end}"))
                 .body(HttpRequestBody::new())
                 .unwrap();
             let response = client.request(req).await.unwrap();
-            assert_eq!(response.status(), hyper::StatusCode::PARTIAL_CONTENT);
-            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(response.status(), http::StatusCode::PARTIAL_CONTENT);
+            let bytes = response.into_body().collect_to_bytes().await.unwrap();
             assert_eq!(bytes.len(), 4);
         }
 
         handle.join().unwrap();
         assert_eq!(accepted.load(Ordering::SeqCst), 2);
-    }
-
-    #[test]
-    fn test_parse_doh_server_reports_empty_host_parse_error() {
-        let err = parse_doh_server("https://:443/dns-query", true)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("missing a host"), "got: {err}");
-    }
-
-    #[test]
-    fn test_parse_doh_server_reports_generic_parse_error() {
-        let err = parse_doh_server("https://[::1", true)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("invalid DoH server URL"), "got: {err}");
     }
 }
