@@ -215,6 +215,7 @@ pub(crate) struct SchedulerState {
     next_candidate: usize,
     next_lease_id: u64,
     snapshot_seq: u64,
+    stopped: bool,
 }
 
 impl SchedulerState {
@@ -231,6 +232,7 @@ impl SchedulerState {
             next_candidate,
             next_lease_id: 1,
             snapshot_seq: 0,
+            stopped: false,
         }
     }
 
@@ -296,6 +298,9 @@ impl SchedulerState {
         range: ByteRange,
         worker_id: usize,
     ) -> Option<Segment> {
+        if self.stopped {
+            return None;
+        }
         let (start, end) = self.piece_map.piece_range(piece_id);
         let piece = self
             .pieces
@@ -449,8 +454,15 @@ impl SchedulerState {
         true
     }
 
+    /// Atomically prevent fresh retry lineages before publishing a fatal worker
+    /// error. Reclaim still clears checkpoint hints; resuming builds a new scheduler.
+    pub fn stop_and_reclaim(&mut self, lease_key: LeaseKey) {
+        self.stopped = true;
+        self.reclaim(lease_key);
+    }
+
     pub fn has_available(&self) -> bool {
-        self.available_range_count != 0
+        !self.stopped && self.available_range_count != 0
     }
 
     pub fn all_done(&self) -> bool {
@@ -543,6 +555,22 @@ impl SchedulerState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fatal_reclaim_prevents_sibling_reassignment_but_preserves_resume() {
+        let mut scheduler = SchedulerState::new(PieceMap::new(64, 32));
+        let failed = scheduler.assign_to(0).unwrap();
+        scheduler.stop_and_reclaim(failed.lease_key());
+        assert!(!scheduler.has_available());
+        assert!(scheduler.assign_to(1).is_none());
+        assert!(scheduler.assign_subrange(0, 0, 16, 1).is_none());
+        assert!(scheduler.control_hints().inflight_piece_ids.is_empty());
+        assert_eq!(scheduler.remaining_count(), 2);
+        assert_eq!(scheduler.completed_bytes(), 0);
+        // The stop flag is runtime-only; a new session may download the piece.
+        let mut resumed = SchedulerState::new(scheduler.piece_map);
+        assert_eq!(resumed.assign().unwrap().start, 0);
+    }
     use crate::storage::piece_map::PieceMap;
 
     #[test]

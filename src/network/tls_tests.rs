@@ -117,6 +117,7 @@ impl TlsFixture {
         // environment or changing the machine's trusted certificate store.
         let mut builder = Client::builder(TokioExecutor::new());
         builder.pool_max_idle_per_host(1);
+        builder.pool_timer(TokioTimer::new());
         builder.pool_idle_timeout(Duration::from_secs(30));
         BytehaulClient::Direct(Arc::new(builder.build(connector)))
     }

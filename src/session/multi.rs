@@ -689,8 +689,8 @@ async fn worker_loop(
                         RetryDecision::Stop(error) => {
                             log_warn!(log_level, download_id = download_id, worker_id = worker_id,
                                 piece_id = segment.piece_id, error = %error,
-                                "segment failed, reclaiming (non-retryable or retry budget exhausted)");
-                            let _ = scheduler.lock().reclaim(segment.lease_key());
+                                "segment failed (non-retryable or retry budget exhausted)");
+                            scheduler.lock().stop_and_reclaim(segment.lease_key());
                             return Err(error);
                         }
                         RetryDecision::Retry {
@@ -1740,7 +1740,7 @@ mod coverage_tests {
     }
 
     #[tokio::test]
-    async fn invalid_probe_total_reclaims_lease_without_forwarding_data() {
+    async fn invalid_probe_total_stops_assignment_without_forwarding_data() {
         let route = warp::any().map(|| vec![0xAC; 4]);
         let (addr, server) = warp::serve(route).bind_ephemeral(([127, 0, 0, 1], 0));
         let server = tokio::spawn(server);
@@ -1780,7 +1780,10 @@ mod coverage_tests {
         let mut scheduler = scheduler.lock();
         assert_eq!(scheduler.remaining_count(), 1);
         assert!(scheduler.control_hints().inflight_piece_ids.is_empty());
-        assert_eq!(scheduler.assign().unwrap().start, 0);
+        assert!(
+            scheduler.assign().is_none(),
+            "fatal error must stop sibling assignments"
+        );
     }
 
     #[tokio::test]

@@ -934,7 +934,7 @@ pub(super) async fn worker_loop(
                                 .expect("failed attempt has retry decision");
                             match decision {
                                 RetryDecision::Stop(error) => {
-                                    scheduler.lock().reclaim(segment.lease_key());
+                                    scheduler.lock().stop_and_reclaim(segment.lease_key());
                                     return Err(error);
                                 }
                                 RetryDecision::Retry { backoff, error, .. } => {

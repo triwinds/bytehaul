@@ -18,11 +18,13 @@ use hyper_util::client::legacy::{
     connect::{dns::Name as DnsName, HttpConnector},
     Client,
 };
-use hyper_util::rt::TokioExecutor;
+use hyper_util::rt::{TokioExecutor, TokioTimer};
 use parking_lot::Mutex;
 use tower_service::Service;
 use url::Url;
 
+#[cfg(test)]
+mod multi_ip_prototype;
 #[cfg(test)]
 mod tls_tests;
 
@@ -146,6 +148,7 @@ impl ClientNetworkConfig {
         let mut builder = Client::builder(TokioExecutor::new());
         builder.pool_max_idle_per_host(self.pool_max_idle_per_host);
         if self.pool_max_idle_per_host > 0 {
+            builder.pool_timer(TokioTimer::new());
             builder.pool_idle_timeout(self.pool_idle_timeout);
         }
 
@@ -1150,6 +1153,61 @@ mod tests {
         });
 
         (addr, accepted, handle)
+    }
+
+    #[tokio::test]
+    async fn test_idle_pool_closes_expired_socket_without_another_request() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut byte = [0];
+                assert_eq!(stream.read(&mut byte).await.unwrap(), 1);
+                request.push(byte[0]);
+                if request.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\npong")
+                .await
+                .unwrap();
+            let mut byte = [0];
+            assert_eq!(stream.read(&mut byte).await.unwrap(), 0);
+        });
+        let client = {
+            let _guard = env_lock().lock().unwrap();
+            clear_proxy_env();
+            ClientNetworkConfig {
+                pool_idle_timeout: Duration::from_millis(20),
+                ..ClientNetworkConfig::default()
+            }
+            .build_client()
+            .unwrap()
+        };
+        let response = client
+            .request_with_timeout(
+                hyper::Request::builder()
+                    .uri(format!("http://{addr}/"))
+                    .body(HttpRequestBody::new())
+                    .unwrap(),
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        response.into_body().collect().await.unwrap();
+        // Keep the client alive: EOF must come from idle expiry, not pool drop.
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("idle socket was not reclaimed")
+            .unwrap();
+        drop(client);
     }
 
     #[tokio::test]
