@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 2
-- **Last Active**: 2026-09-09
+- **Total Sessions**: 3
+- **Last Active**: 2026-09-12
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~51 | Active |
+| `journal-1.md` | ~73 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 3 | 2026-09-12 | Release v0.2.4 and merge perf branch | `a9ba71b` | `master` |
 | 2 | 2026-09-09 | Continuous requests and confirmed prefix recovery | `be98b02` | `master` |
 | 1 | 2026-09-09 | Fast tail detection | `561e04f` | `master` |
 <!-- @@@/auto:session-history -->

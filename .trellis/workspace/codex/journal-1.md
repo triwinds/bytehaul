@@ -49,3 +49,25 @@ Implemented opt-in contiguous request batching and strong-validator confirmed-pr
 ### Status
 
 [OK] **Completed**
+
+
+## Session 3: Release v0.2.4 and merge perf branch
+
+**Date**: 2026-09-12
+**Task**: Release v0.2.4 and merge perf branch
+**Package**: bytehaul-python
+**Branch**: `master`
+
+### Summary
+
+Bumped the workspace and current release documentation from 0.2.3 to 0.2.4, regenerated Cargo.lock, passed metadata/check/test/doc/clippy/package validation, created annotated tag v0.2.4, and fast-forwarded perf/http-transfer-defaults into master.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `a9ba71b` | (see git log) |
+
+### Status
+
+[OK] **Completed**
