@@ -140,6 +140,10 @@ impl HttpWorker {
         let headers_elapsed = started.elapsed();
         match result {
             Ok(mut response) => {
+                // The request→head time is already measured for logging and
+                // diagnostics; recording it is one branch while the harness has
+                // collection off.
+                crate::bench_stats::record_response_head(headers_elapsed);
                 self.counters.headers.fetch_add(1, Ordering::Relaxed);
                 if response.status().is_success() {
                     self.counters

@@ -9,7 +9,9 @@
 //! Every counter is therefore recorded in production code, guarded by one
 //! relaxed load of [`ENABLED`]. Collection is off unless the harness turns it
 //! on, so a normal download pays a single predictable branch per site and
-//! nothing else; no behaviour depends on any value here.
+//! nothing else; no behaviour depends on any value here. The one site that
+//! cannot ask the clock first — the request→head duration, which the caller
+//! already measured for its own diagnostics — checks [`ENABLED`] itself.
 //!
 //! Recorded states are the only numbers the harness trusts:
 //!
@@ -21,6 +23,13 @@
 //! * `queue_waits` / `queue_micros` — time between task start and the
 //!   concurrency permit (the only "queueing" a download can experience).
 //! * `preallocs` / `prealloc_micros` — output-file creation and preallocation.
+//! * `response_heads` / `response_head_micros` — HTTP requests that received a
+//!   response head, and the request→head time each one took. Redirects, probes
+//!   and retried attempts each count, so the sum exceeds wall time when a
+//!   download made several requests.
+//! * `body_reads` / `body_read_micros` — body reads that waited for bytes, and
+//!   how long they waited. This is the streaming wait of every attempt, without
+//!   the time the caller spends writing what it received.
 //! * `checksums` / `checksum_micros` — post-download verification.
 //! * `driver_threads` — live libcurl driver threads, incremented by the thread
 //!   itself so a leaked driver is visible as a count that never returns to its
@@ -43,6 +52,10 @@ static PREALLOCS: AtomicU64 = AtomicU64::new(0);
 static PREALLOC_MICROS: AtomicU64 = AtomicU64::new(0);
 static CHECKSUMS: AtomicU64 = AtomicU64::new(0);
 static CHECKSUM_MICROS: AtomicU64 = AtomicU64::new(0);
+static RESPONSE_HEADS: AtomicU64 = AtomicU64::new(0);
+static RESPONSE_HEAD_MICROS: AtomicU64 = AtomicU64::new(0);
+static BODY_READS: AtomicU64 = AtomicU64::new(0);
+static BODY_READ_MICROS: AtomicU64 = AtomicU64::new(0);
 static DRIVER_THREADS: AtomicI64 = AtomicI64::new(0);
 
 /// One consistent-enough read of every counter.
@@ -64,6 +77,10 @@ pub(crate) struct Snapshot {
     pub prealloc_micros: u64,
     pub checksums: u64,
     pub checksum_micros: u64,
+    pub response_heads: u64,
+    pub response_head_micros: u64,
+    pub body_reads: u64,
+    pub body_read_micros: u64,
     pub driver_threads: i64,
 }
 
@@ -91,6 +108,10 @@ pub(crate) fn reset() {
         &PREALLOC_MICROS,
         &CHECKSUMS,
         &CHECKSUM_MICROS,
+        &RESPONSE_HEADS,
+        &RESPONSE_HEAD_MICROS,
+        &BODY_READS,
+        &BODY_READ_MICROS,
     ] {
         counter.store(0, Ordering::SeqCst);
     }
@@ -110,6 +131,10 @@ pub(crate) fn snapshot() -> Snapshot {
         prealloc_micros: PREALLOC_MICROS.load(Ordering::SeqCst),
         checksums: CHECKSUMS.load(Ordering::SeqCst),
         checksum_micros: CHECKSUM_MICROS.load(Ordering::SeqCst),
+        response_heads: RESPONSE_HEADS.load(Ordering::SeqCst),
+        response_head_micros: RESPONSE_HEAD_MICROS.load(Ordering::SeqCst),
+        body_reads: BODY_READS.load(Ordering::SeqCst),
+        body_read_micros: BODY_READ_MICROS.load(Ordering::SeqCst),
         driver_threads: driver_threads(),
     }
 }
@@ -152,6 +177,25 @@ pub(crate) fn record_prealloc(elapsed: Duration) {
 pub(crate) fn record_checksum(elapsed: Duration) {
     CHECKSUMS.fetch_add(1, Ordering::Relaxed);
     CHECKSUM_MICROS.fetch_add(elapsed.as_micros() as u64, Ordering::Relaxed);
+}
+
+/// One HTTP request that received its response head, and the request→head time.
+///
+/// The caller has already measured that duration for its own diagnostics, so
+/// there is nothing to skip and the enabled check lives here: a disabled run
+/// pays one relaxed load.
+pub(crate) fn record_response_head(elapsed: Duration) {
+    if !enabled() {
+        return;
+    }
+    RESPONSE_HEADS.fetch_add(1, Ordering::Relaxed);
+    RESPONSE_HEAD_MICROS.fetch_add(elapsed.as_micros() as u64, Ordering::Relaxed);
+}
+
+/// One body read, and the time it waited for the next bytes.
+pub(crate) fn record_body_read(elapsed: Duration) {
+    BODY_READS.fetch_add(1, Ordering::Relaxed);
+    BODY_READ_MICROS.fetch_add(elapsed.as_micros() as u64, Ordering::Relaxed);
 }
 
 /// Live libcurl driver threads.
@@ -268,6 +312,33 @@ mod tests {
         set_enabled(true);
         record_phase(phase_start(), record_prealloc);
         assert_eq!(snapshot().preallocs, 1);
+        set_enabled(false);
+    }
+
+    /// The request and body recorders are reached by other tests in this binary
+    /// (worker tests drive `send_request`, body tests read a real transport), so
+    /// this asserts the deltas it caused instead of absolute totals.
+    #[test]
+    fn response_head_and_body_recorders_accumulate_their_own_time() {
+        let _guard = lock();
+        set_enabled(true);
+
+        let before = snapshot();
+        record_response_head(Duration::from_micros(1_200));
+        record_body_read(Duration::from_micros(800));
+        let after = snapshot();
+
+        assert_eq!(after.response_heads - before.response_heads, 1);
+        assert_eq!(
+            after.response_head_micros - before.response_head_micros,
+            1_200
+        );
+        assert_eq!(after.body_reads - before.body_reads, 1);
+        assert_eq!(after.body_read_micros - before.body_read_micros, 800);
+
+        reset();
+        assert_eq!(snapshot().response_heads, 0);
+        assert_eq!(snapshot().body_reads, 0);
         set_enabled(false);
     }
 }

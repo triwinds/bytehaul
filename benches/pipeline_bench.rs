@@ -54,8 +54,10 @@ const SPLIT_BYTES: usize = 12 * 1024 * 1024;
 const SMALL_BYTES: usize = 256 * 1024;
 /// The largest end-to-end shape.
 const LARGE_BYTES: usize = 64 * 1024 * 1024;
-/// Longest a single measured download may take before the harness gives up.
+/// Longest a single measured download may take before the harness stops it.
 const ROUND_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long a cancelled round may still take to finalize.
+const CANCEL_GRACE: Duration = Duration::from_secs(30);
 
 // ──────────────────────────────────────────────────────────────
 //  Command line
@@ -65,6 +67,9 @@ struct Config {
     rounds: usize,
     filter: Option<String>,
     out_dir: PathBuf,
+    /// A directory outside `target` that the report and the per-round samples
+    /// are copied to, so the numbers a document cites can be committed.
+    archive: Option<PathBuf>,
     list: bool,
 }
 
@@ -74,6 +79,7 @@ impl Config {
             rounds: 10,
             filter: None,
             out_dir: default_out_dir(),
+            archive: None,
             list: false,
         };
         let mut args = std::env::args().skip(1);
@@ -92,9 +98,16 @@ impl Config {
                         config.out_dir = PathBuf::from(dir);
                     }
                 }
+                "--archive" => {
+                    if let Some(dir) = args.next() {
+                        config.archive = Some(PathBuf::from(dir));
+                    }
+                }
                 "--list" => config.list = true,
                 "-h" | "--help" => {
-                    println!("pipeline_bench [--rounds N] [--filter SUBSTR] [--out DIR] [--list]");
+                    println!(
+                        "pipeline_bench [--rounds N] [--filter SUBSTR] [--out DIR] [--archive DIR] [--list]"
+                    );
                     std::process::exit(0);
                 }
                 other => eprintln!("ignoring unknown argument: {other}"),
@@ -295,14 +308,25 @@ where
     }
     println!("running {} x{}", scenario.name, config.rounds);
     for round_index in 0..config.rounds {
+        let cpu_before = cpu_seconds();
         let started = Instant::now();
         let outcome = body(round_index).await;
         let elapsed = started.elapsed();
+        let mut round = outcome;
+        // CPU is measured over the whole round body, the same window as
+        // `millis`, because that is what the process really spent: the fixture,
+        // the downloader's threads and the harness's own verification all count.
+        if let (Some(before), Some(after)) = (cpu_before, cpu_seconds()) {
+            let cpu_ms = (after - before) * 1000.0;
+            round = round
+                .metric("cpu_ms", cpu_ms)
+                .metric("cpu_percent", cpu_ms * 100.0 / millis(elapsed).max(0.001));
+        }
         scenario.samples.push(Sample {
             round: round_index,
             millis: millis(elapsed),
-            metrics: outcome.metrics,
-            note: outcome.note,
+            metrics: round.metrics,
+            note: round.note,
         });
     }
     if let Some(sample) = scenario.samples.first() {
@@ -332,12 +356,45 @@ struct FixtureShape {
     /// Delay before the response head, for the delayed-response shape.
     head_delay: Option<Duration>,
     /// Hold every body until the fixture is released.
-    gate: Option<Arc<Semaphore>>,
+    gate: Option<Arc<Gate>>,
     /// Send at most this many bytes per response while announcing the full
     /// range length: the cut-stream shape.
     cut_bytes: Option<usize>,
     /// Drip the tail: `(from_byte, chunk_size, delay)`.
     tail: Option<(usize, usize, Duration)>,
+}
+
+/// The gate a fixture holds its response bodies on.
+///
+/// It can be re-armed, because a gate that stayed open after one round's
+/// release would let every later round's body through: the scenario would stop
+/// measuring the blocking it exists for.
+struct Gate {
+    permits: Mutex<Arc<Semaphore>>,
+}
+
+impl Gate {
+    fn new() -> Self {
+        Self {
+            permits: Mutex::new(Arc::new(Semaphore::new(0))),
+        }
+    }
+
+    /// Installs a fresh closed gate for the next round.
+    fn arm(&self) {
+        *self.permits.lock().unwrap() = Arc::new(Semaphore::new(0));
+    }
+
+    /// The gate the current round's bodies wait on. Read per response, so a
+    /// re-armed gate only affects requests that arrive after it.
+    fn current(&self) -> Arc<Semaphore> {
+        self.permits.lock().unwrap().clone()
+    }
+
+    /// Lets every body held by the current gate continue.
+    fn release(&self) {
+        self.current().add_permits(4096);
+    }
 }
 
 impl FixtureShape {
@@ -369,7 +426,7 @@ impl FixtureShape {
     }
 
     fn gated(mut self) -> Self {
-        self.gate = Some(Arc::new(Semaphore::new(0)));
+        self.gate = Some(Arc::new(Gate::new()));
         self
     }
 
@@ -384,12 +441,15 @@ impl FixtureShape {
     }
 }
 
-/// The fixture's own view of one round: requests, ranges and bytes served.
+/// The fixture's own view of one round: requests, ranges, bytes served and the
+/// bytes it had to send again for a position it had already sent.
 #[derive(Debug, Clone, Copy, Default)]
 struct FixtureDelta {
     requests: usize,
     distinct_ranges: usize,
     served_bytes: u64,
+    /// Bytes this round sent for file positions this same round already sent.
+    duplicate_bytes: u64,
 }
 
 struct ServerGuard(tokio::task::JoinHandle<()>);
@@ -408,7 +468,10 @@ struct Fixture {
     requests: Arc<AtomicUsize>,
     served_bytes: Arc<AtomicU64>,
     ranges: Arc<Mutex<Vec<String>>>,
-    gate: Option<Arc<Semaphore>>,
+    /// One `(start, bytes actually sent)` entry per response, in completion
+    /// order. Retransmission is measured by overlapping a round's entries.
+    sent: Arc<Mutex<Vec<(usize, usize)>>>,
+    gate: Option<Arc<Gate>>,
     _server: Arc<ServerGuard>,
 }
 
@@ -422,90 +485,111 @@ impl Fixture {
         let requests = Arc::new(AtomicUsize::new(0));
         let served_bytes = Arc::new(AtomicU64::new(0));
         let ranges = Arc::new(Mutex::new(Vec::new()));
+        let sent = Arc::new(Mutex::new(Vec::new()));
         let gate = shape.gate.clone();
 
         let route = warp::path(path)
             .and(warp::header::optional::<String>("range"))
-            .map({
+            .and_then({
                 let data = data.clone();
                 let requests = requests.clone();
                 let served_bytes = served_bytes.clone();
                 let ranges = ranges.clone();
+                let sent = sent.clone();
                 let shape = shape.clone();
                 move |range_header: Option<String>| {
-                    requests.fetch_add(1, Ordering::SeqCst);
-                    ranges
-                        .lock()
-                        .unwrap()
-                        .push(range_header.clone().unwrap_or_else(|| "full".to_string()));
-
-                    let total = data.len();
-                    let ranged = if shape.ranges {
-                        range_header.as_deref()
-                    } else {
-                        None
-                    };
-                    let (start, end) = match ranged {
-                        Some(header) => parse_range(header, total),
-                        None => (0, total.saturating_sub(1)),
-                    };
-                    let range_len = end.saturating_sub(start) + 1;
-
-                    let (mut sender, body) = warp::hyper::Body::channel();
-                    let task_shape = shape.clone();
                     let data = data.clone();
-                    let served = served_bytes.clone();
-                    tokio::spawn(async move {
-                        let shape = task_shape;
+                    let requests = requests.clone();
+                    let served_bytes = served_bytes.clone();
+                    let ranges = ranges.clone();
+                    let sent = sent.clone();
+                    let shape = shape.clone();
+                    async move {
+                        requests.fetch_add(1, Ordering::SeqCst);
+                        ranges
+                            .lock()
+                            .unwrap()
+                            .push(range_header.clone().unwrap_or_else(|| "full".to_string()));
+
+                        let total = data.len();
+                        let ranged = if shape.ranges {
+                            range_header.as_deref()
+                        } else {
+                            None
+                        };
+                        let (start, end) = match ranged {
+                            Some(header) => parse_range(header, total),
+                            None => (0, total.saturating_sub(1)),
+                        };
+                        let range_len = end.saturating_sub(start) + 1;
+
+                        let mut response = warp::http::Response::builder()
+                            .status(if ranged.is_some() { 206 } else { 200 });
+                        if ranged.is_some() {
+                            response = response
+                                .header("content-range", format!("bytes {start}-{end}/{total}"));
+                        }
+                        if shape.ranges {
+                            response = response
+                                .header("accept-ranges", "bytes")
+                                .header("etag", "\"pipeline-bench\"")
+                                .header("last-modified", "Sat, 01 Jan 2026 00:00:00 GMT");
+                        }
+                        // The unknown-length shape announces nothing and streams.
+                        if shaped_length_is_announced(&shape, ranged.is_some()) {
+                            response = response.header("content-length", range_len.to_string());
+                        }
+
+                        // The delayed-response shape delays the head itself.
+                        // Delaying the body task instead would let the client
+                        // see headers immediately and measure a slow body.
                         if let Some(delay) = shape.head_delay {
                             tokio::time::sleep(delay).await;
                         }
-                        if let Some(gate) = &shape.gate {
-                            let _held = gate.acquire().await;
-                        }
-                        let send_limit =
-                            shape.cut_bytes.map_or(range_len, |cut| cut.min(range_len));
-                        let mut offset = 0usize;
-                        while offset < send_limit {
-                            // `tail` is expressed in file positions, so it is
-                            // compared against the absolute position: a request
-                            // for a later range has to be the one that drips.
-                            let (chunk, delay) = match shape.tail {
-                                Some((from, chunk, delay)) if start + offset >= from => {
-                                    (chunk, Some(delay))
-                                }
-                                _ => (shape.chunk_size.max(1), None),
-                            };
-                            let chunk_end = (offset + chunk).min(send_limit);
-                            let slice = data[start + offset..start + chunk_end].to_vec();
-                            if sender.send_data(slice.into()).await.is_err() {
-                                return;
-                            }
-                            served.fetch_add((chunk_end - offset) as u64, Ordering::Relaxed);
-                            offset = chunk_end;
-                            if let Some(delay) = delay {
-                                tokio::time::sleep(delay).await;
-                            }
-                        }
-                    });
 
-                    let mut response = warp::http::Response::builder()
-                        .status(if ranged.is_some() { 206 } else { 200 });
-                    if ranged.is_some() {
-                        response = response
-                            .header("content-range", format!("bytes {start}-{end}/{total}"));
+                        let (mut sender, body) = warp::hyper::Body::channel();
+                        let task_shape = shape.clone();
+                        let data = data.clone();
+                        let served = served_bytes.clone();
+                        let sent = sent.clone();
+                        let gate = shape.gate.clone();
+                        tokio::spawn(async move {
+                            let shape = task_shape;
+                            if let Some(gate) = &gate {
+                                // Read per response: the harness re-arms the
+                                // gate for the next round.
+                                let held = gate.current();
+                                let _permit = held.acquire().await;
+                            }
+                            let send_limit =
+                                shape.cut_bytes.map_or(range_len, |cut| cut.min(range_len));
+                            let mut offset = 0usize;
+                            while offset < send_limit {
+                                // `tail` is expressed in file positions, so it is
+                                // compared against the absolute position: a request
+                                // for a later range has to be the one that drips.
+                                let (chunk, delay) = match shape.tail {
+                                    Some((from, chunk, delay)) if start + offset >= from => {
+                                        (chunk, Some(delay))
+                                    }
+                                    _ => (shape.chunk_size.max(1), None),
+                                };
+                                let chunk_end = (offset + chunk).min(send_limit);
+                                let slice = data[start + offset..start + chunk_end].to_vec();
+                                if sender.send_data(slice.into()).await.is_err() {
+                                    break;
+                                }
+                                served.fetch_add((chunk_end - offset) as u64, Ordering::Relaxed);
+                                offset = chunk_end;
+                                if let Some(delay) = delay {
+                                    tokio::time::sleep(delay).await;
+                                }
+                            }
+                            sent.lock().unwrap().push((start, offset));
+                        });
+
+                        Ok::<_, std::convert::Infallible>(response.body(body).unwrap())
                     }
-                    if shape.ranges {
-                        response = response
-                            .header("accept-ranges", "bytes")
-                            .header("etag", "\"pipeline-bench\"")
-                            .header("last-modified", "Sat, 01 Jan 2026 00:00:00 GMT");
-                    }
-                    // The unknown-length shape announces nothing and streams.
-                    if shaped_length_is_announced(&shape, ranged.is_some()) {
-                        response = response.header("content-length", range_len.to_string());
-                    }
-                    response.body(body).unwrap()
                 }
             });
 
@@ -516,6 +600,7 @@ impl Fixture {
             requests,
             served_bytes,
             ranges,
+            sent,
             gate,
             _server: Arc::new(ServerGuard(tokio::spawn(server))),
         }
@@ -526,31 +611,69 @@ impl Fixture {
         self.data.clone()
     }
 
-    fn counters(&self) -> (usize, u64, usize) {
+    fn counters(&self) -> (usize, u64, usize, usize) {
         (
             self.requests.load(Ordering::SeqCst),
             self.served_bytes.load(Ordering::Relaxed),
             self.ranges.lock().unwrap().len(),
+            self.sent.lock().unwrap().len(),
         )
     }
 
-    fn delta_since(&self, before: (usize, u64, usize)) -> FixtureDelta {
+    fn delta_since(&self, before: (usize, u64, usize, usize)) -> FixtureDelta {
         let now = self.counters();
         let ranges = self.ranges.lock().unwrap();
         let fresh = &ranges[before.2.min(ranges.len())..];
         let distinct: HashSet<&String> = fresh.iter().collect();
+        let sent = self.sent.lock().unwrap();
+        // Duplicates are measured inside this round, against responses this
+        // same round already sent. Comparing with an earlier round would call
+        // every byte of a re-download a duplicate, which is what a fresh round
+        // does by design.
+        let window = &sent[before.3.min(sent.len())..];
+        let duplicate_bytes = window
+            .iter()
+            .enumerate()
+            .map(|(index, (start, len))| overlap_with_earlier(&window[..index], *start, *len))
+            .sum();
         FixtureDelta {
             requests: now.0.saturating_sub(before.0),
             distinct_ranges: distinct.len(),
             served_bytes: now.1.saturating_sub(before.1),
+            duplicate_bytes,
+        }
+    }
+
+    /// Closes the gate again, so the next round starts blocked.
+    fn arm_gate(&self) {
+        if let Some(gate) = &self.gate {
+            gate.arm();
         }
     }
 
     fn release(&self) {
         if let Some(gate) = &self.gate {
-            gate.add_permits(4096);
+            gate.release();
         }
     }
+}
+
+/// Bytes of `[start, start + len)` an earlier response already sent.
+fn overlap_with_earlier(earlier: &[(usize, usize)], start: usize, len: usize) -> u64 {
+    let end = start + len;
+    let mut intervals: Vec<(usize, usize)> = earlier.to_vec();
+    intervals.sort_by_key(|(other_start, _)| *other_start);
+    let mut covered = 0u64;
+    let mut reach = start;
+    for (other_start, other_len) in intervals {
+        let from = other_start.max(start).max(reach);
+        let to = (other_start + other_len).min(end);
+        if to > from {
+            covered += (to - from) as u64;
+            reach = to;
+        }
+    }
+    covered
 }
 
 /// A range response always announces its length — that is what makes a cut
@@ -594,12 +717,88 @@ struct ProcessMemoryCounters {
 #[cfg(windows)]
 #[link(name = "psapi")]
 extern "system" {
-    fn GetCurrentProcess() -> *mut std::ffi::c_void;
     fn GetProcessMemoryInfo(
         process: *mut std::ffi::c_void,
         counters: *mut ProcessMemoryCounters,
         cb: u32,
     ) -> i32;
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct FileTime {
+    low: u32,
+    high: u32,
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetCurrentProcess() -> *mut std::ffi::c_void;
+    fn GetProcessTimes(
+        process: *mut std::ffi::c_void,
+        creation: *mut FileTime,
+        exit: *mut FileTime,
+        kernel: *mut FileTime,
+        user: *mut FileTime,
+    ) -> i32;
+}
+
+#[cfg(windows)]
+fn file_time_ticks(time: FileTime) -> u64 {
+    ((time.high as u64) << 32) | time.low as u64
+}
+
+/// CPU time this process has consumed (user + kernel), in seconds.
+///
+/// Every thread counts, including the fixture's and the libcurl driver's, so a
+/// round that spins shows up as CPU time even when it is waiting on nothing.
+#[cfg(windows)]
+fn cpu_seconds() -> Option<f64> {
+    let mut creation = unsafe { std::mem::zeroed::<FileTime>() };
+    let mut exit = unsafe { std::mem::zeroed::<FileTime>() };
+    let mut kernel = unsafe { std::mem::zeroed::<FileTime>() };
+    let mut user = unsafe { std::mem::zeroed::<FileTime>() };
+    let ok = unsafe {
+        GetProcessTimes(
+            GetCurrentProcess(),
+            &mut creation,
+            &mut exit,
+            &mut kernel,
+            &mut user,
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    // `GetProcessTimes` reports 100 ns units.
+    Some((file_time_ticks(kernel) + file_time_ticks(user)) as f64 / 10_000_000.0)
+}
+
+/// CPU time this process has consumed (user + kernel), in seconds.
+#[cfg(target_os = "linux")]
+fn cpu_seconds() -> Option<f64> {
+    extern "C" {
+        fn sysconf(name: i32) -> i64;
+    }
+    // `_SC_CLK_TCK`: the number of `utime`/`stime` ticks per second.
+    const SC_CLK_TCK: i32 = 2;
+    let ticks_per_second = unsafe { sysconf(SC_CLK_TCK) };
+    if ticks_per_second <= 0 {
+        return None;
+    }
+    let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+    // Field 2 is the command name and may contain spaces, so parsing starts
+    // after its closing parenthesis: index 0 is field 3 (the state).
+    let fields: Vec<&str> = stat.rsplit_once(')')?.1.split_whitespace().collect();
+    let user: u64 = fields.get(11)?.parse().ok()?;
+    let system: u64 = fields.get(12)?.parse().ok()?;
+    Some((user + system) as f64 / ticks_per_second as f64)
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn cpu_seconds() -> Option<f64> {
+    None
 }
 
 /// Process memory as `(current working set, peak working set)`.
@@ -855,32 +1054,50 @@ async fn measure_download(
     let handle = downloader.download(spec);
     let started = Instant::now();
 
-    // The progress channel is observed from this task, in the same `select!`
-    // that awaits `wait()`. A callback task would be scheduled independently
-    // and could miss every snapshot of a short download, which is exactly the
-    // shape this harness has to measure.
+    // The progress channel is observed from this task, and the download is
+    // followed through it rather than through `wait()`. `wait()` consumes the
+    // handle, and dropping it does not cancel anything, so a round that has to
+    // be stopped needs the handle to stay callable — and the next round must not
+    // start measuring process-wide counters while this download still runs.
     let mut progress = handle.subscribe_progress();
-    let mut wait = Box::pin(tokio::time::timeout(ROUND_TIMEOUT, handle.wait()));
-    let (result, timed_out) = loop {
-        tokio::select! {
-            result = &mut wait => break match result {
-                Ok(result) => (result, false),
-                Err(_) => (
-                    Err(bytehaul::DownloadError::Internal(
-                        "harness round timeout".into(),
-                    )),
-                    true,
-                ),
-            },
-            changed = progress.changed() => {
-                if changed.is_ok() {
-                    let snapshot = progress.borrow().clone();
-                    timeline.observe(started, snapshot.downloaded, snapshot.state);
-                }
-            }
+    let deadline = tokio::time::Instant::now() + ROUND_TIMEOUT;
+    let mut cancel_started: Option<Instant> = None;
+    let mut timed_out = false;
+    loop {
+        if is_terminal(progress.borrow().state) {
+            break;
         }
-    };
+        let waiting_until = match cancel_started {
+            // After a cancel the task only has the grace period left: if it
+            // still has not published a terminal state, the round is reported
+            // as one that never finished.
+            Some(cancelled_at) if Instant::now() >= cancelled_at + CANCEL_GRACE => break,
+            Some(cancelled_at) => tokio::time::Instant::from_std(cancelled_at + CANCEL_GRACE),
+            None => deadline,
+        };
+        match tokio::time::timeout_at(waiting_until, progress.changed()).await {
+            Ok(Ok(())) => {
+                let snapshot = progress.borrow().clone();
+                timeline.observe(started, snapshot.downloaded, snapshot.state);
+            }
+            // The task dropped its sender without publishing a terminal state;
+            // `wait()` below returns whatever it produced.
+            Ok(Err(_)) => break,
+            Err(_) if cancel_started.is_none() => {
+                timed_out = true;
+                cancel_started = Some(Instant::now());
+                handle.cancel();
+            }
+            Err(_) => break,
+        }
+    }
     let elapsed_millis = millis(started.elapsed());
+    let result = match tokio::time::timeout(CANCEL_GRACE, handle.wait()).await {
+        Ok(result) => result,
+        Err(_) => Err(bytehaul::DownloadError::Internal(
+            "harness round timeout: the download did not finalize after cancel".into(),
+        )),
+    };
     let counters = bench_counters_snapshot();
     let fixture = fixture.delta_since(before);
     let file_bytes = std::fs::metadata(output)
@@ -900,8 +1117,10 @@ async fn measure_download(
     }
 }
 
-fn download_round(outcome: &DownloadOutcome, expected_bytes: u64, expect_failure: bool) -> Round {
+fn download_round(outcome: &DownloadOutcome, expect_failure: bool) -> Round {
     let counters = outcome.counters;
+    let served = outcome.fixture.served_bytes;
+    let duplicate = outcome.fixture.duplicate_bytes.min(served);
     let mut round = outcome
         .timeline
         .clone()
@@ -909,7 +1128,9 @@ fn download_round(outcome: &DownloadOutcome, expected_bytes: u64, expect_failure
         .metric("file_bytes", outcome.file_bytes as f64)
         .metric("requests", outcome.fixture.requests as f64)
         .metric("distinct_ranges", outcome.fixture.distinct_ranges as f64)
-        .metric("served_bytes", outcome.fixture.served_bytes as f64)
+        .metric("served_bytes", served as f64)
+        .metric("duplicate_bytes", duplicate as f64)
+        .metric("unique_bytes", served.saturating_sub(duplicate) as f64)
         .metric("verified", f64::from(outcome.verified))
         .metric("failed", f64::from(outcome.result.is_err()))
         .metric("writer_blocks", counters.writer_blocks as f64)
@@ -927,17 +1148,20 @@ fn download_round(outcome: &DownloadOutcome, expected_bytes: u64, expect_failure
         .metric("fsync_calls", counters.fsync_calls as f64)
         .metric("fsync_ms", counters.fsync_micros as f64 / 1000.0)
         .metric("prealloc_ms", counters.prealloc_micros as f64 / 1000.0)
-        .metric("checksum_ms", counters.checksum_micros as f64 / 1000.0)
+        .metric("response_heads", counters.response_heads as f64)
         .metric(
-            "duplicate_bytes",
-            outcome.fixture.served_bytes.saturating_sub(expected_bytes) as f64,
-        );
+            "response_head_ms",
+            counters.response_head_micros as f64 / 1000.0,
+        )
+        .metric("body_reads", counters.body_reads as f64)
+        .metric("body_wait_ms", counters.body_read_micros as f64 / 1000.0)
+        .metric("checksum_ms", counters.checksum_micros as f64 / 1000.0);
 
     // A failure the shape deliberately provokes is a result, not a problem:
     // it is reported through `failed`, and only an unexpected one is noted.
     if let Err(error) = &outcome.result {
         if outcome.timed_out {
-            round = round.note("harness round timeout");
+            round = round.note("harness round timeout (the download was cancelled)");
         } else if !expect_failure {
             round = round.note(error.to_string());
         }
@@ -1147,7 +1371,7 @@ async fn run_writer(config: &Config, dir: &Path) -> Vec<Scenario> {
                         true,
                     )
                     .await;
-                    let round = download_round(&outcome, bytes as u64, false);
+                    let round = download_round(&outcome, false);
                     let _ = std::fs::remove_file(&output);
                     drop(downloader);
                     round
@@ -1265,6 +1489,10 @@ async fn run_client(config: &Config, dir: &Path) -> Vec<Scenario> {
                     else {
                         return Round::new().note("client build failed");
                     };
+                    // A fresh closed gate per round: the previous round's
+                    // release would otherwise let both downloads through and
+                    // stop measuring the queueing this scenario is about.
+                    fixture.arm_gate();
                     bench_counters_reset();
                     let session_started = Instant::now();
                     let spec = |name: &str| {
@@ -1494,7 +1722,7 @@ async fn run_driver(config: &Config, dir: &Path) -> Vec<Scenario> {
                     )
                     .await;
                     let stats = bench_driver_stats(&downloader);
-                    let round = driver_round(stats).merge(download_round(&outcome, 0, false));
+                    let round = driver_round(stats).merge(download_round(&outcome, false));
                     let _ = std::fs::remove_file(&output);
                     drop(downloader);
                     round
@@ -1663,8 +1891,15 @@ async fn run_driver(config: &Config, dir: &Path) -> Vec<Scenario> {
                     handle.cancel();
                     let result = handle.wait().await;
                     let cancel_ms = millis(cancel_started.elapsed());
+                    // Let the stalled bodies finish, then close the gate again:
+                    // the next round has to start stalled like this one did.
+                    fixture.release();
+                    fixture.arm_gate();
                     let _ = std::fs::remove_file(&output);
-                    let round = driver_round(bench_driver_stats(&downloader))
+                    // The measured operation of this scenario is the cancel
+                    // itself, so `total` is that latency.
+                    let round = timed(cancel_ms)
+                        .merge(driver_round(bench_driver_stats(&downloader)))
                         .metric("cancel_ms", cancel_ms)
                         .metric(
                             "cancelled",
@@ -1751,6 +1986,10 @@ async fn run_driver(config: &Config, dir: &Path) -> Vec<Scenario> {
                     handle.cancel();
                     let result = handle.wait().await;
                     let cancel_ms = millis(cancel_started.elapsed());
+                    // Let the stalled bodies finish, then close the gate again:
+                    // the next round has to start stalled like this one did.
+                    stalled.release();
+                    stalled.arm_gate();
                     let _ = std::fs::remove_file(&output);
                     let round = timed(held_millis)
                         .merge(driver_round(bench_driver_stats(&downloader)))
@@ -1885,7 +2124,6 @@ async fn run_end_to_end(config: &Config, dir: &Path) -> Vec<Scenario> {
     let mut scenarios = Vec::new();
 
     for shape in end_to_end_shapes() {
-        let bytes = shape.fixture.bytes;
         let fixture = Fixture::spawn("e2e", shape.fixture);
         let expected = fixture.expected();
         let out_dir = dir.join(shape.name.replace('/', "_"));
@@ -1938,7 +2176,7 @@ async fn run_end_to_end(config: &Config, dir: &Path) -> Vec<Scenario> {
                     )
                     .await;
                     let (rss_after, rss_peak) = memory_bytes();
-                    let mut round = download_round(&outcome, bytes as u64, expect_failure);
+                    let mut round = download_round(&outcome, expect_failure);
                     if let (Some(before), Some(after)) = (rss_before, rss_after) {
                         round = round.metric("rss_delta_bytes", after as f64 - before as f64);
                     }
@@ -1968,6 +2206,7 @@ fn summary_columns(group: &str) -> &'static [&'static str] {
         "scheduler" => &[
             "pieces",
             "total",
+            "cpu_ms",
             "requests",
             "micros_per_request",
             "boundary_scans",
@@ -1978,6 +2217,7 @@ fn summary_columns(group: &str) -> &'static [&'static str] {
         "writer" => &[
             "bytes",
             "total",
+            "cpu_ms",
             "writer_blocks",
             "avg_block_bytes",
             "cache_copied_bytes",
@@ -1987,6 +2227,7 @@ fn summary_columns(group: &str) -> &'static [&'static str] {
         ],
         "client" => &[
             "total",
+            "cpu_ms",
             "cache_entries",
             "driver_threads",
             "driver_threads_after_drop",
@@ -1999,6 +2240,8 @@ fn summary_columns(group: &str) -> &'static [&'static str] {
         "driver" => &[
             "bytes",
             "total",
+            "cpu_ms",
+            "cpu_percent",
             "loops",
             "idle_loops",
             "idle_loops_per_sec",
@@ -2014,10 +2257,16 @@ fn summary_columns(group: &str) -> &'static [&'static str] {
         "e2e" => &[
             "bytes",
             "total",
+            "cpu_ms",
             "to_first_report",
             "report_span",
             "finalize",
+            "response_heads",
+            "response_head_ms",
+            "body_reads",
+            "body_wait_ms",
             "requests",
+            "served_bytes",
             "duplicate_bytes",
             "checksum_ms",
             "rss_delta_bytes",
@@ -2121,6 +2370,14 @@ fn render_report(
         "| libcurl / TLS | {} |",
         features.unwrap_or("not captured").trim()
     );
+    if let Some(archive) = &config.archive {
+        let _ = writeln!(
+            out,
+            "| archived copy | {}/report.md, {}/samples.csv |",
+            archive.display(),
+            archive.display()
+        );
+    }
     let _ = writeln!(out);
     let _ = writeln!(out, "## Timing boundaries");
     let _ = writeln!(out);
@@ -2130,7 +2387,7 @@ fn render_report(
     );
     let _ = writeln!(
         out,
-        "* `total` — the measured operation: `DownloadHandle::wait()` for a download, the planning run for a scheduler round."
+        "* `total` — the measured operation: the download for a download round (until its task published a terminal state and `wait()` returned), the planning run for a scheduler round."
     );
     let _ = writeln!(
         out,
@@ -2142,15 +2399,23 @@ fn render_report(
     );
     let _ = writeln!(
         out,
-        "* `finalize` — that last running report until `wait()` returned: writer flush and sync, cleanup, and verification."
+        "* `finalize` — that last running report until the round ended: writer flush and sync, cleanup, and verification."
     );
     let _ = writeln!(
         out,
-        "* `running_reports` — how many running progress samples the round observed. These boundaries come from the progress channel: the multi-connection monitor publishes on a 200 ms ticker (plus forced reports at phase boundaries), so a transfer that finishes inside one tick gives `running_reports = 1`, `report_span = 0`, and its whole body inside `to_first_report`. Only `total`, the counters and `prealloc_ms`/`fsync_ms`/`checksum_ms` resolve finer than that."
+        "* `running_reports` — how many running progress samples the round observed. These boundaries come from the progress channel: the multi-connection monitor publishes on a 200 ms ticker (plus forced reports at phase boundaries), so a transfer that finishes inside one tick gives `running_reports = 1`, `report_span = 0`, and its whole body inside `to_first_report`. Only `total`, the counters and `prealloc_ms`/`fsync_ms`/`checksum_ms`/`response_head_ms`/`body_wait_ms` resolve finer than that."
     );
     let _ = writeln!(
         out,
-        "* `prealloc_ms`, `fsync_ms`, `checksum_ms` — recorded inside the library, so they split `to_first_report` and `finalize` further."
+        "* `response_head_ms`, `body_wait_ms` — recorded inside the library, summed over every HTTP request and body read of the download (redirects, probes and retried attempts each count), so a 4-connection download sums four waits. `response_head_ms` is request→response-head; `body_wait_ms` is the time `next_chunk` waited for bytes, which excludes the caller's writing. `response_heads` and `body_reads` are the matching counts. A delayed-response shape must show its delay here."
+    );
+    let _ = writeln!(
+        out,
+        "* `prealloc_ms`, `fsync_ms`, `checksum_ms` — also recorded inside the library, so they split `to_first_report` and `finalize` further. Together with `queue_ms` they are the six separately recorded phases: queueing, preallocation, response head, body, final sync and verification."
+    );
+    let _ = writeln!(
+        out,
+        "* `cpu_ms`, `cpu_percent` — process CPU time (user + kernel) over the same window as `millis`, so the fixture, the downloader's threads and the harness's own verification are all included and `cpu_percent` above 100 means several threads were busy. It is an upper bound on the download's own CPU, and comparable between rounds of the same scenario."
     );
     let _ = writeln!(
         out,
@@ -2158,7 +2423,7 @@ fn render_report(
     );
     let _ = writeln!(
         out,
-        "* `duplicate_bytes` = bytes the fixture served minus the expected file size, so a retried range shows up."
+        "* `duplicate_bytes` = bytes the fixture sent for file positions this same round had already sent, measured by overlapping the ranges each response actually delivered. `unique_bytes` is the rest of what it served. A retried or re-requested range shows up here even when the total served stays below the file size."
     );
     let _ = writeln!(
         out,
@@ -2372,6 +2637,19 @@ async fn main() {
     let report = render_report(&config, features.as_deref(), &scenarios, &csv_path);
     let report_path = config.out_dir.join("report.md");
     std::fs::write(&report_path, &report).expect("report.md must be writable");
+
+    // `target` is ignored, so a run that only ever writes there cannot be cited
+    // by anything durable. `--archive` puts the same two files where a document
+    // can point at them.
+    if let Some(archive) = &config.archive {
+        std::fs::create_dir_all(archive).expect("the archive directory must be creatable");
+        let archived_report = archive.join("report.md");
+        let archived_csv = archive.join("samples.csv");
+        std::fs::copy(&report_path, &archived_report).expect("report.md must be archivable");
+        std::fs::copy(&csv_path, &archived_csv).expect("samples.csv must be archivable");
+        println!("archived: {}", archived_report.display());
+        println!("archived: {}", archived_csv.display());
+    }
 
     println!();
     println!("{report}");

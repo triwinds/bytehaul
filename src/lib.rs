@@ -195,6 +195,15 @@ pub mod bench {
         pub checksums: u64,
         /// Time spent verifying.
         pub checksum_micros: u64,
+        /// HTTP requests that received a response head (redirects, probes and
+        /// retried attempts each count).
+        pub response_heads: u64,
+        /// Summed request→response-head time over those requests.
+        pub response_head_micros: u64,
+        /// Body reads that waited for bytes.
+        pub body_reads: u64,
+        /// Summed wait for body bytes.
+        pub body_read_micros: u64,
         /// Live libcurl driver threads.
         pub driver_threads: i64,
     }
@@ -214,6 +223,10 @@ pub mod bench {
                 prealloc_micros: snapshot.prealloc_micros,
                 checksums: snapshot.checksums,
                 checksum_micros: snapshot.checksum_micros,
+                response_heads: snapshot.response_heads,
+                response_head_micros: snapshot.response_head_micros,
+                body_reads: snapshot.body_reads,
+                body_read_micros: snapshot.body_read_micros,
                 driver_threads: snapshot.driver_threads,
             }
         }

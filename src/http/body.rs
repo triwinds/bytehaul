@@ -26,14 +26,22 @@ pub(crate) enum HttpBody {
 
 impl HttpBody {
     /// Await the next data chunk, skipping non-data frames such as trailers.
+    ///
+    /// The wait is what the pipeline harness reports as body time: it is the
+    /// time the transport took to deliver bytes, without the time the caller
+    /// spent writing the previous chunk. Collection is off by default, so this
+    /// costs one relaxed branch per read.
     pub(crate) async fn next_chunk(
         &mut self,
         read_timeout: Duration,
     ) -> Result<Option<Bytes>, DownloadError> {
-        match self {
+        let started = crate::bench_stats::phase_start();
+        let result = match self {
             #[cfg(feature = "curl-backend")]
             Self::Curl(body) => body.next_chunk(read_timeout).await,
-        }
+        };
+        crate::bench_stats::record_phase(started, crate::bench_stats::record_body_read);
+        result
     }
 }
 

@@ -9,7 +9,9 @@
 //!
 //! 1. with collection disabled a real download records nothing at all;
 //! 2. with collection enabled the same download reports the writer, cache,
-//!    output-file, fsync and verification work the default path really did;
+//!    output-file, fsync, verification and transport work the default path
+//!    really did — including the request→head and body-read waits the harness
+//!    reports separately from the progress-channel timeline;
 //! 3. preallocation and concurrency queueing are recorded as their own phases;
 //! 4. releasing every client returns the driver-thread count to its baseline,
 //!    which is the residual-resource measurement P2 builds on.
@@ -259,6 +261,22 @@ async fn the_pipeline_counters_observe_the_default_download_path() {
     assert!(counters.fsync_calls >= 1, "{counters:?}");
     assert!(counters.checksums == 1, "{counters:?}");
     assert!(counters.checksum_micros > 0, "{counters:?}");
+    assert!(
+        counters.response_heads >= 2,
+        "the probe and every range request receive a response head: {counters:?}"
+    );
+    assert!(
+        counters.response_head_micros > 0,
+        "a local origin still takes measurable time to answer: {counters:?}"
+    );
+    assert!(
+        counters.body_reads >= 1,
+        "the body is read through the shared transport seam: {counters:?}"
+    );
+    assert!(
+        counters.body_read_micros > 0,
+        "waiting for {LARGE_BYTES} bytes of body takes measurable time: {counters:?}"
+    );
 
     let stats = bench_driver_stats(&downloader).expect("the client has a driver");
     assert!(
