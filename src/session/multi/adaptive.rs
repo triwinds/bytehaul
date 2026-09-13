@@ -1,3 +1,4 @@
+mod recovery;
 mod request;
 use request::{checked_response, primary, BodyActivity, RequestContext, RequestStream};
 
@@ -1540,43 +1541,22 @@ async fn run_attempt(
                     }
                 }
             },
-            _ = ticker.tick() => {
-                if ctx.recovery.policy.mode == SlowTransferMode::Disabled { ctx.decision("disabled", None); continue; }
+            _ = ticker.tick(), if ctx.recovery.policy.mode != SlowTransferMode::Disabled => {
                 let now = Instant::now();
-                let baseline = ctx.recovery.baseline(ctx.segment.lease_key(), now);
-                let len = ctx.segment.end-ctx.segment.start;
-                let tail_baseline = if !matches!(ctx.speed, SpeedLimit::Limited(_))
-                    && ctx.recovery.tail_eligible(len, ctx.scheduler.lock().has_available()) {
-                    ctx.recovery.sample_baseline(ctx.segment.lease_key(), now, true)
-                } else { None };
-                let (ordinary, tail) = {
-                    let mut observation = ctx.observation.lock();
-                    (observation.should_recover(now, baseline, &ctx.recovery.policy, len),
-                     observation.should_recover_tail(now, tail_baseline, &ctx.recovery.policy, len))
+                let (baseline, tail, hedge_eligible) = match recovery::recommend(ctx, challenger.is_some(), now) {
+                    recovery::Advice::Continue { reason, baseline } => {
+                        ctx.decision(reason, baseline);
+                        continue;
+                    }
+                    recovery::Advice::Recover { baseline, tail, hedge_eligible } => (baseline, tail, hedge_eligible),
                 };
-                let eligible = ordinary || tail;
-                // A user cap deliberately couples all request rates. Keep
-                // observing phases but conservatively suppress speculative
-                // performance work while that cap is active.
-                if matches!(ctx.speed, SpeedLimit::Limited(_)) {
-                    ctx.decision("rate_limit", baseline);
-                    continue;
-                }
-                if challenger.is_some() { ctx.decision("challenger_active", baseline); continue; }
-                if !eligible {
-                    let phase = ctx.observation.lock().phase;
-                    let reason = if phase != Phase::Reading { "not_reading" }
-                        else if baseline.is_none() && ctx.recovery.policy.absolute.is_none() { "no_healthy_baseline" }
-                        else { "slow_threshold_or_benefit" };
-                    ctx.decision(reason, baseline);
-                    continue;
-                }
-                let len = ctx.segment.end-ctx.segment.start;
-                let mut slot = None;
-                if ctx.request_end == ctx.segment.end && ctx.validator.is_some() && ctx.recovery.policy.mode == SlowTransferMode::AdaptiveWithHedging && len <= MAX_HEDGE
-                    && !ctx.scheduler.lock().has_available() {
-                    slot = ctx.recovery.slots.clone().try_acquire_owned().ok();
-                }
+                // The executor, never the policy, acquires slots and charges
+                // lineage/action/traffic budgets. A declined hedge can still
+                // fall back to cancel-before-resume under the same guards.
+                let len = ctx.segment.end - ctx.segment.start;
+                let mut slot = if hedge_eligible {
+                    ctx.recovery.slots.clone().try_acquire_owned().ok()
+                } else { None };
                 let mut hedge = slot.is_some();
                 // This task owns the primary future. Once selected it is dropped
                 // before another body poll; no producer can race this snapshot.

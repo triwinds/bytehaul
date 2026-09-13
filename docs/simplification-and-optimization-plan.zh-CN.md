@@ -142,7 +142,7 @@ P1 的测量结果、复现命令与判据见[默认路径与资源基线](pipel
 
 ### P3：统一多连接传输循环
 
-状态：实施中；步骤 1 模式矩阵与步骤 2 普通请求消费抽取已完成。
+状态：实施中；步骤 1–3 已完成，继续转发组件复用与旧循环删除。
 
 改动位置：[multi.rs](../src/session/multi.rs)、[adaptive.rs](../src/session/multi/adaptive.rs)、[scheduler.rs](../src/scheduler.rs)、[flow.rs](../src/session/flow.rs)、[retry.rs](../src/session/retry.rs)。
 
@@ -365,3 +365,9 @@ P2 实现已完成。以上分组不改变公开签名；缓存上限与请求�
 - 新增 `multi/adaptive/request.rs`，集中有限 Range 响应校验、probe 响应消费、frame 后缀保留、长度检查与 writer 转发。`RequestContext` 显式接收请求几何、超时、身份约束、写入资源和观测数据，不持有恢复协调器。
 - 普通请求与 challenger 复用同一响应校验；是否要求响应必须回显 validator 由执行层传入，保持原有 hedging 身份规则。旧 producer 被丢弃后才进入 writer 确认的次序不变。
 - 重构后模式矩阵 12 组合、慢速恢复 11 项通过。全量命令 lib 通过，随后 `http_header_timeout::header_deadline_includes_tls_handshake` 出现已记录的间歇失败；该测试直接调用传输层，不经过本步调整的多连接模块。fmt、doc test、workspace rustdoc 通过；Clippy 仍为两项既有告警。Linux 覆盖率未执行。
+
+### P3 步骤 3：恢复建议与执行结算分离（2026-09-14）
+
+- `multi/adaptive/recovery.rs` 根据读取阶段、健康基线、慢尾条件、限速状态和 challenger 状态返回 `Advice`。策略不获取 slot、不续签 lease、不修改重试或流量预算。
+- 执行层继续负责并发名额、预留/退款、hedge 预算不足后的回收降级、pending range 的 lineage、Retry-After 退避，以及旧 producer 停止后的 writer 屏障。Disabled 模式不再轮询性能恢复定时器。
+- fmt、模式矩阵 12 组合与慢速恢复 11 项通过，包含 released batch 继承重试预算/Retry-After、小预算下首/中/末 piece 恢复、竞速双方完成与失败、对象变化和限速抑制。全量 Rust 检查已启动，最终结果随阶段验证汇总记录；Linux 覆盖率未执行。
