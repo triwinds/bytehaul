@@ -480,14 +480,23 @@ pub(super) async fn run_single_with_retry(
                     // durable barrier.
                     writer.close().await?;
                     if use_control {
-                        persist_single_control_snapshot(
+                        if let Err(save_error) = persist_single_control_snapshot(
                             ControlSaveReason::Terminal,
                             writer.written_bytes.load(Ordering::Acquire),
                             None,
                             &mut control_save_tracker,
                             &control_ctx,
                         )
-                        .await;
+                        .await
+                        {
+                            // No checkpoint means no resumable stop: reporting
+                            // `Paused` (or `Cancelled`) here would promise a
+                            // resume point that does not exist, so the storage
+                            // error leaves as the task's result instead.
+                            log_error!(log_level, download_id = download_id, error = %save_error,
+                                "the stop checkpoint could not be saved; failing instead of reporting a stopped download");
+                            return Err(save_error);
+                        }
                     }
                     return Err(error);
                 }
@@ -785,7 +794,10 @@ async fn stream_single_attempt(
                     Instant::now(),
                 );
                 if let Some((cp, tmpl)) = &control {
-                    persist_single_control_snapshot(
+                    // Best effort here: the caller's terminal save repeats this
+                    // attempt (and propagates its failure) once the writer has
+                    // closed, so a failure recorded now is not lost.
+                    let _ = persist_single_control_snapshot(
                         ControlSaveReason::Terminal,
                         downloaded,
                         Some(write_tx),
@@ -808,7 +820,9 @@ async fn stream_single_attempt(
 
             _ = save_ticker.tick(), if control.is_some() => {
                 if let Some((cp, tmpl)) = &control {
-                    persist_single_control_snapshot(
+                    // An autosave may fail without failing the transfer: the
+                    // next tick and the terminal save both retry it.
+                    let _ = persist_single_control_snapshot(
                         ControlSaveReason::Autosave,
                         downloaded,
                         Some(write_tx),
@@ -926,13 +940,21 @@ async fn stream_single_attempt(
     }
 }
 
+/// Writes the control snapshot for one reason, and reports whether it is now
+/// on disk.
+///
+/// A failure here is a real storage error: the bytes the caller believes are
+/// durable have no checkpoint. The caller decides what that means — an autosave
+/// is best effort because the transfer continues and the terminal save is the
+/// barrier, while a terminal save is the difference between a resumable pause
+/// and one that would silently resume from nothing, so it must fail the task.
 async fn persist_single_control_snapshot(
     reason: ControlSaveReason,
     current_downloaded: u64,
     write_tx: Option<&mpsc::Sender<WriterCommand>>,
     control_save_tracker: &mut ControlSaveTracker,
     ctx: &SingleControlSaveContext<'_>,
-) {
+) -> Result<(), DownloadError> {
     if !control_save_tracker.should_save(reason, current_downloaded, ctx.autosave_sync_every) {
         if matches!(reason, ControlSaveReason::Autosave)
             && current_downloaded > control_save_tracker.last_saved_downloaded_bytes()
@@ -947,7 +969,7 @@ async fn persist_single_control_snapshot(
                 "control snapshot deferred"
             );
         }
-        return;
+        return Ok(());
     }
 
     let flush_stats = match write_tx {
@@ -956,7 +978,7 @@ async fn persist_single_control_snapshot(
             Err(error) => {
                 log_warn!(ctx.log_level, download_id = ctx.download_id, checkpoint = reason.label(),
                     error = %error, "control snapshot flush failed");
-                return;
+                return Err(error);
             }
         },
         None => None,
@@ -964,7 +986,7 @@ async fn persist_single_control_snapshot(
     let persisted_prefix_bytes =
         flush_stats.map_or(current_downloaded, |stats| stats.written_bytes);
     if persisted_prefix_bytes <= control_save_tracker.last_saved_downloaded_bytes() {
-        return;
+        return Ok(());
     }
 
     let mut snapshot = ctx.snap_template.clone();
@@ -987,14 +1009,21 @@ async fn persist_single_control_snapshot(
                 control_save_ms = save_started.elapsed().as_millis() as u64,
                 "control snapshot saved"
             );
+            Ok(())
         }
         Err(error) => {
             log_warn!(ctx.log_level, download_id = ctx.download_id, checkpoint = reason.label(),
                 error = %error, "control snapshot save failed");
+            Err(error)
         }
     }
 }
 
+/// Best-effort checkpoint for the retry barrier.
+///
+/// The attempt continues after this call, so a failure is logged and left to
+/// the terminal save: that one is the barrier a caller's result depends on. Its
+/// own snapshot path stays `()` so a stop request cannot be reported from here.
 async fn save_single_control_snapshot_at(
     persisted_prefix_bytes: u64,
     control_save_tracker: &mut ControlSaveTracker,
@@ -1469,14 +1498,16 @@ mod tests {
         };
 
         persist_single_control_snapshot(ControlSaveReason::Autosave, 256, None, &mut tracker, &ctx)
-            .await;
+            .await
+            .unwrap();
 
         assert!(!control_path.exists());
         assert_eq!(tracker.last_saved_downloaded_bytes(), 0);
         assert_eq!(tracker.pending_autosaves(), 1);
 
         persist_single_control_snapshot(ControlSaveReason::Autosave, 512, None, &mut tracker, &ctx)
-            .await;
+            .await
+            .unwrap();
 
         let loaded = ControlSnapshot::load(&control_path).await.unwrap();
         assert_eq!(loaded.downloaded_bytes, 512);
@@ -1485,7 +1516,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_persist_single_control_snapshot_returns_on_flush_failure() {
+    async fn test_persist_single_control_snapshot_reports_flush_failure() {
         let dir = tempfile::tempdir().unwrap();
         let control_path = dir.path().join("single-failed.bytehaul");
         let snapshot = snapshot_template();
@@ -1500,15 +1531,17 @@ mod tests {
         let (write_tx, write_rx) = mpsc::channel(1);
         drop(write_rx);
 
-        persist_single_control_snapshot(
+        let error = persist_single_control_snapshot(
             ControlSaveReason::Terminal,
             256,
             Some(&write_tx),
             &mut tracker,
             &ctx,
         )
-        .await;
+        .await
+        .unwrap_err();
 
+        assert!(matches!(error, DownloadError::ChannelClosed), "{error:?}");
         assert!(!control_path.exists());
         assert_eq!(tracker.last_saved_downloaded_bytes(), 0);
     }
@@ -1528,9 +1561,11 @@ mod tests {
         };
 
         persist_single_control_snapshot(ControlSaveReason::Terminal, 256, None, &mut tracker, &ctx)
-            .await;
+            .await
+            .unwrap();
         persist_single_control_snapshot(ControlSaveReason::Terminal, 256, None, &mut tracker, &ctx)
-            .await;
+            .await
+            .unwrap();
 
         let loaded = ControlSnapshot::load(&control_path).await.unwrap();
         assert_eq!(loaded.downloaded_bytes, 256);
@@ -1538,9 +1573,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_persist_single_control_snapshot_ignores_save_failure() {
+    async fn test_persist_single_control_snapshot_reports_save_failure() {
         let dir = tempfile::tempdir().unwrap();
-        let control_path = dir.path().join("missing").join("single.bytehaul");
+        // A directory at the checkpoint path makes every save fail.
+        let control_path = dir.path().join("single.bytehaul");
+        std::fs::create_dir(&control_path).unwrap();
         let snapshot = snapshot_template();
         let mut tracker = ControlSaveTracker::new(0);
         let ctx = SingleControlSaveContext {
@@ -1551,11 +1588,23 @@ mod tests {
             download_id: 4,
         };
 
-        persist_single_control_snapshot(ControlSaveReason::Terminal, 256, None, &mut tracker, &ctx)
-            .await;
+        let error = persist_single_control_snapshot(
+            ControlSaveReason::Terminal,
+            256,
+            None,
+            &mut tracker,
+            &ctx,
+        )
+        .await
+        .unwrap_err();
 
-        assert!(!control_path.exists());
-        assert_eq!(tracker.last_saved_downloaded_bytes(), 0);
+        assert!(matches!(error, DownloadError::Io(_)), "{error:?}");
+        assert!(control_path.is_dir());
+        assert_eq!(
+            tracker.last_saved_downloaded_bytes(),
+            0,
+            "a checkpoint that was not written must not be marked saved"
+        );
     }
 
     #[tokio::test]
@@ -1573,7 +1622,8 @@ mod tests {
         };
 
         persist_single_control_snapshot(ControlSaveReason::Terminal, 256, None, &mut tracker, &ctx)
-            .await;
+            .await
+            .unwrap();
 
         assert!(!control_path.exists());
         assert_eq!(tracker.last_saved_downloaded_bytes(), 256);

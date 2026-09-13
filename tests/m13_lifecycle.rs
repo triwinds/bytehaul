@@ -9,9 +9,17 @@
 //!   checksum mismatch cannot follow a `Completed` snapshot;
 //! * a stop request ends a queued task without another download releasing its
 //!   permit, and a task that never started creates no output or checkpoint;
-//! * dropping a handle neither cancels a download nor wedges it.
+//! * dropping a handle neither cancels a download nor wedges it;
+//! * a terminal control-file failure — a checkpoint that cannot be written on a
+//!   stop, or a completed download whose checkpoint cannot be removed — is the
+//!   task's result, so `Paused` and `Completed` never describe state on disk
+//!   that does not exist.
+//!
+//! The tests below use a control path that is a directory: every control-file
+//! write and delete against it fails on every platform.
 
 use std::convert::Infallible;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -533,6 +541,231 @@ async fn multi_connection_download_publishes_one_completed_state() {
     assert_eq!(progress.borrow().downloaded, size as u64);
     assert_eq!(std::fs::read(&output_path).unwrap(), expected);
     assert_single_terminal_state(&states, DownloadState::Completed).await;
+
+    server.abort();
+}
+
+// ──────────────────────────────────────────────────────────────
+//  Terminal control-file failures must not be reported as success
+// ──────────────────────────────────────────────────────────────
+
+/// A range-capable fixture that serves the first `first_chunk` bytes of every
+/// response and withholds the rest until the returned gate is released.
+///
+/// `first_chunk` is deliberately larger than the progress reporter's 256 KiB
+/// byte threshold: the client's own snapshot then proves the transfer is under
+/// way, so a test can stop it mid-transfer without waiting for a fixed time.
+fn spawn_held_range_server(
+    path: &'static str,
+    total: usize,
+    first_chunk: usize,
+) -> (
+    String,
+    Arc<AtomicUsize>,
+    Arc<tokio::sync::Semaphore>,
+    tokio::task::JoinHandle<()>,
+) {
+    let data: Arc<Vec<u8>> = Arc::new((0..total as u32).map(|index| (index % 251) as u8).collect());
+    let requests = Arc::new(AtomicUsize::new(0));
+    let observed = requests.clone();
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let route = warp::path(path)
+        .and(warp::header::optional::<String>("range"))
+        .map({
+            let gate = gate.clone();
+            move |range: Option<String>| {
+                observed.fetch_add(1, Ordering::SeqCst);
+                let total = data.len();
+                let (start, end) = match range.as_deref() {
+                    Some(value) => {
+                        let value = value.strip_prefix("bytes=").unwrap();
+                        let (start, end) = value.split_once('-').unwrap();
+                        (
+                            start.parse::<usize>().unwrap(),
+                            end.parse::<usize>().unwrap().min(total - 1),
+                        )
+                    }
+                    None => (0, total - 1),
+                };
+                let len = end - start + 1;
+                let first = first_chunk.min(len.saturating_sub(1));
+                let held = data[start..start + first].to_vec();
+                let rest = data[start + first..=end].to_vec();
+                let gate = gate.clone();
+                let stream = futures::stream::once(async move { Ok::<_, Infallible>(held) }).chain(
+                    futures::stream::once(async move {
+                        let _permit = gate.acquire().await;
+                        Ok::<_, Infallible>(rest)
+                    }),
+                );
+                let mut response = warp::http::Response::builder()
+                    .status(if range.is_some() { 206 } else { 200 })
+                    .header("content-length", len)
+                    .header("etag", "\"lifecycle-held\"")
+                    .header("accept-ranges", "bytes");
+                if range.is_some() {
+                    response =
+                        response.header("content-range", format!("bytes {start}-{end}/{total}"));
+                }
+                response
+                    .body(warp::hyper::Body::wrap_stream(stream))
+                    .unwrap()
+            }
+        });
+    let (addr, server) = warp::serve(route).bind_ephemeral(([127, 0, 0, 1], 0));
+    let handle = tokio::spawn(server);
+    (format!("http://{addr}/{path}"), requests, gate, handle)
+}
+
+/// Wait until the client's own progress snapshot reports `bytes` received.
+async fn wait_until_received(handle: &DownloadHandle, bytes: u64) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let received = handle.progress().downloaded;
+        if received >= bytes {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the download never reported {bytes} bytes, saw {received}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// Wait until the fixture has answered `count` requests.
+async fn wait_until_requests(requests: &AtomicUsize, count: usize) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let seen = requests.load(Ordering::SeqCst);
+        if seen >= count {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the fixture never saw {count} requests, saw {seen}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// Create the checkpoint path as a directory, so no control file can be written
+/// or removed there.
+fn unusable_checkpoint(output_path: &std::path::Path) -> std::path::PathBuf {
+    let mut path = output_path.as_os_str().to_os_string();
+    path.push(".bytehaul");
+    let control_path = std::path::PathBuf::from(path);
+    std::fs::create_dir(&control_path).unwrap();
+    control_path
+}
+
+#[tokio::test]
+async fn paused_download_without_a_writable_checkpoint_fails() {
+    let (url, _requests, gate, server) =
+        spawn_held_range_server("held-single", 1024 * 1024, 512 * 1024);
+    let dir = tempfile::tempdir().unwrap();
+    let output_path = dir.path().join("paused.bin");
+    let control_path = unusable_checkpoint(&output_path);
+
+    let downloader = Downloader::builder().build().unwrap();
+    let handle = downloader.download(
+        DownloadSpec::new(url)
+            .output_path(output_path.clone())
+            .file_allocation(FileAllocation::None)
+            .read_timeout(Duration::from_secs(30))
+            .resume(true),
+    );
+    let states = collect_states(&handle);
+    let progress = handle.subscribe_progress();
+    wait_until_received(&handle, 256 * 1024).await;
+    handle.pause();
+    let result = handle.wait().await;
+
+    assert!(
+        !matches!(result, Ok(()) | Err(DownloadError::Paused)),
+        "a pause that could not store its checkpoint must not be reported as a pause: {result:?}"
+    );
+    assert_eq!(progress.borrow().state, DownloadState::Failed);
+    assert_single_terminal_state(&states, DownloadState::Failed).await;
+    assert!(
+        control_path.is_dir(),
+        "the unusable checkpoint path must be untouched"
+    );
+
+    gate.add_permits(64);
+    server.abort();
+}
+
+#[tokio::test]
+async fn paused_multi_connection_download_without_a_writable_checkpoint_fails() {
+    let (url, requests, gate, server) =
+        spawn_held_range_server("held-multi", 4 * 1024 * 1024, 512 * 1024);
+    let dir = tempfile::tempdir().unwrap();
+    let output_path = dir.path().join("multi-paused.bin");
+    let control_path = unusable_checkpoint(&output_path);
+
+    let downloader = Downloader::builder().build().unwrap();
+    let handle = downloader.download(
+        DownloadSpec::new(url)
+            .output_path(output_path.clone())
+            .file_allocation(FileAllocation::None)
+            .read_timeout(Duration::from_secs(30))
+            .resume(true)
+            .max_connections(4)
+            .min_split_size(1),
+    );
+    let states = collect_states(&handle);
+    let progress = handle.subscribe_progress();
+    wait_until_running(&handle).await;
+    wait_until_requests(&requests, 1).await;
+    handle.pause();
+    let result = handle.wait().await;
+
+    assert!(
+        !matches!(result, Ok(()) | Err(DownloadError::Paused)),
+        "a multi-connection pause that could not store its piece map must not be reported as a pause: {result:?}"
+    );
+    assert_eq!(progress.borrow().state, DownloadState::Failed);
+    assert_single_terminal_state(&states, DownloadState::Failed).await;
+    assert!(control_path.is_dir());
+
+    gate.add_permits(64);
+    server.abort();
+}
+
+#[tokio::test]
+async fn multi_connection_cleanup_failure_does_not_report_completed() {
+    let size = 4 * 1024 * 1024;
+    let body: Vec<u8> = (0..size).map(|index| (index % 251) as u8).collect();
+    let expected = body.clone();
+    let (url, server) = spawn_range_server("multi-cleanup", body);
+    let dir = tempfile::tempdir().unwrap();
+    let output_path = dir.path().join("multi-cleanup.bin");
+    let control_path = unusable_checkpoint(&output_path);
+
+    let downloader = Downloader::builder().build().unwrap();
+    let handle = downloader.download(
+        DownloadSpec::new(url)
+            .output_path(output_path.clone())
+            .file_allocation(FileAllocation::None)
+            .resume(true)
+            .max_connections(4)
+            .min_split_size(1),
+    );
+    let states = collect_states(&handle);
+    let progress = handle.subscribe_progress();
+    let result = handle.wait().await;
+
+    assert!(
+        result.is_err(),
+        "a download whose checkpoint could not be removed must not report success: {result:?}"
+    );
+    assert_eq!(progress.borrow().state, DownloadState::Failed);
+    assert_single_terminal_state(&states, DownloadState::Failed).await;
+    // The bytes themselves are complete: only the leftover checkpoint failed to
+    // go away, and that is what the result reports.
+    assert_eq!(std::fs::read(&output_path).unwrap(), expected);
+    assert!(control_path.is_dir());
 
     server.abort();
 }

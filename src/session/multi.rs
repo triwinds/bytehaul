@@ -251,19 +251,37 @@ pub(super) async fn run_multi_worker(
                 );
                 progress_reporter.force_report(progress_tx, update, now);
                 if spec.resume {
-                    persist_multi_control_snapshot(
+                    match persist_multi_control_snapshot(
                         ControlSaveReason::Terminal,
                         Some(&save_write_tx),
                         &mut control_save_tracker,
                         &control_save_ctx,
-                    ).await;
+                    )
+                    .await
+                    {
+                        // The stop request reported is a resumable pause only
+                        // when its piece map is on disk. If the checkpoint
+                        // could not be written, that storage error is the task's
+                        // result: `Paused` would promise a resume point that
+                        // does not exist.
+                        Ok(()) => download_error = Some(error),
+                        Err(save_error) => {
+                            log_error!(log_level, download_id = download_id, error = %save_error,
+                                "the stop checkpoint could not be saved; failing instead of reporting a stopped download");
+                            download_error = Some(save_error);
+                        }
+                    }
+                } else {
+                    download_error = Some(error);
                 }
-                download_error = Some(error);
                 break;
             }
 
             _ = save_ticker.tick(), if spec.resume => {
-                persist_multi_control_snapshot(
+                // An autosave may fail without failing the transfer: the next
+                // tick retries it, and the terminal path is what a stop request
+                // depends on.
+                let _ = persist_multi_control_snapshot(
                     ControlSaveReason::Autosave,
                     Some(&save_write_tx),
                     &mut control_save_tracker,
@@ -357,13 +375,20 @@ pub(super) async fn run_multi_worker(
     if let Some(e) = download_error {
         // A closed writer is a durability barrier only when its final sync succeeded.
         if spec.resume && writer_succeeded {
-            persist_multi_control_snapshot(
+            // The task already fails with `e`, so a checkpoint that also could
+            // not be written only has to be visible: the root cause stays the
+            // reported error.
+            if let Err(error) = persist_multi_control_snapshot(
                 ControlSaveReason::Terminal,
                 None,
                 &mut control_save_tracker,
                 &control_save_ctx,
             )
-            .await;
+            .await
+            {
+                log_error!(log_level, download_id = download_id, error = %error,
+                    "the failure checkpoint could not be saved");
+            }
         }
         if !matches!(e, DownloadError::Cancelled | DownloadError::Paused) {
             let now = Instant::now();
@@ -382,13 +407,19 @@ pub(super) async fn run_multi_worker(
 
     if !scheduler.lock().all_done() {
         if spec.resume {
-            persist_multi_control_snapshot(
+            // Incomplete is reported as a failure either way; a missing
+            // checkpoint is logged next to the root cause.
+            if let Err(error) = persist_multi_control_snapshot(
                 ControlSaveReason::Terminal,
                 None,
                 &mut control_save_tracker,
                 &control_save_ctx,
             )
-            .await;
+            .await
+            {
+                log_error!(log_level, download_id = download_id, error = %error,
+                    "the incomplete checkpoint could not be saved");
+            }
         }
         let now = Instant::now();
         let update = sampled_progress_update(
@@ -406,7 +437,10 @@ pub(super) async fn run_multi_worker(
         return Err(DownloadError::Internal("download incomplete".into()));
     }
 
-    let _ = ControlSnapshot::delete(control_path).await;
+    // The download is complete only when its checkpoint is gone: a failed
+    // delete leaves a snapshot that would describe a finished file as partial,
+    // so it is the same class of storage error as a failed save.
+    ControlSnapshot::delete(control_path).await?;
     // Final progress update. The completed state itself is published by the
     // task-level exit once the whole task has succeeded.
     let received_bytes = received_bytes.load(Ordering::Relaxed);
@@ -440,12 +474,20 @@ fn sampled_progress_update(
     ProgressUpdate::new(received_bytes, speed, eta_secs)
 }
 
+/// Writes the control snapshot for one reason, and reports whether it is now
+/// on disk.
+///
+/// The same contract as the single-connection path: a failure is a real storage
+/// error, and whether it ends the download is the caller's decision. A stop
+/// request that could not persist its piece map is not a resumable stop, so the
+/// monitor turns that failure into the task's result instead of publishing
+/// `Paused`.
 async fn persist_multi_control_snapshot(
     reason: ControlSaveReason,
     write_tx: Option<&mpsc::Sender<WriterCommand>>,
     control_save_tracker: &mut ControlSaveTracker,
     ctx: &MultiControlSaveContext<'_>,
-) {
+) -> Result<(), DownloadError> {
     let completed_bytes = ctx.scheduler.lock().completed_bytes();
     let force_terminal_snapshot = matches!(reason, ControlSaveReason::Terminal);
     if !force_terminal_snapshot
@@ -464,7 +506,7 @@ async fn persist_multi_control_snapshot(
                 "control snapshot deferred"
             );
         }
-        return;
+        return Ok(());
     }
 
     // Freeze both completed bits and advisory hints before the writer barrier.
@@ -487,7 +529,7 @@ async fn persist_multi_control_snapshot(
     if !force_terminal_snapshot
         && snap.downloaded_bytes <= control_save_tracker.last_saved_downloaded_bytes()
     {
-        return;
+        return Ok(());
     }
 
     let flush_stats = match write_tx {
@@ -496,7 +538,7 @@ async fn persist_multi_control_snapshot(
             Err(error) => {
                 log_warn!(ctx.log_level, download_id = ctx.download_id, checkpoint = reason.label(),
                     error = %error, "control snapshot flush failed");
-                return;
+                return Err(error);
             }
         },
         None => None,
@@ -528,10 +570,12 @@ async fn persist_multi_control_snapshot(
                 control_save_ms = save_started.elapsed().as_millis() as u64,
                 "control snapshot saved"
             );
+            Ok(())
         }
         Err(error) => {
             log_warn!(ctx.log_level, download_id = ctx.download_id, checkpoint = reason.label(),
                 error = %error, "control snapshot save failed");
+            Err(error)
         }
     }
 }
@@ -1229,7 +1273,7 @@ mod coverage_tests {
             // a worker completes a lease written after that barrier.
             assert!(scheduler.lock().complete(pending.lease_key()));
         };
-        tokio::join!(
+        let (saved, ()) = tokio::join!(
             persist_multi_control_snapshot(
                 ControlSaveReason::Autosave,
                 Some(&tx),
@@ -1238,6 +1282,7 @@ mod coverage_tests {
             ),
             barrier,
         );
+        saved.unwrap();
         let (snapshot, hints) = ControlSnapshot::load_with_hints(&path).await.unwrap();
         assert_eq!(snapshot.downloaded_bytes, 256);
         assert_eq!(snapshot.completed_bitset, vec![1]);
@@ -1269,14 +1314,18 @@ mod coverage_tests {
         let mut tracker = ControlSaveTracker::new(0);
 
         complete_one_piece(&scheduler);
-        persist_multi_control_snapshot(ControlSaveReason::Autosave, None, &mut tracker, &ctx).await;
+        persist_multi_control_snapshot(ControlSaveReason::Autosave, None, &mut tracker, &ctx)
+            .await
+            .unwrap();
 
         assert!(!control_path.exists());
         assert_eq!(tracker.last_saved_downloaded_bytes(), 0);
         assert_eq!(tracker.pending_autosaves(), 1);
 
         complete_one_piece(&scheduler);
-        persist_multi_control_snapshot(ControlSaveReason::Autosave, None, &mut tracker, &ctx).await;
+        persist_multi_control_snapshot(ControlSaveReason::Autosave, None, &mut tracker, &ctx)
+            .await
+            .unwrap();
 
         let loaded = ControlSnapshot::load(&control_path).await.unwrap();
         assert_eq!(loaded.downloaded_bytes, 512);
@@ -1286,7 +1335,7 @@ mod coverage_tests {
     }
 
     #[tokio::test]
-    async fn test_persist_multi_control_snapshot_returns_on_flush_failure() {
+    async fn test_persist_multi_control_snapshot_reports_flush_failure() {
         let dir = tempfile::tempdir().unwrap();
         let control_path = dir.path().join("multi-failed.bytehaul");
         let scheduler = build_scheduler(1024, 256);
@@ -1307,29 +1356,36 @@ mod coverage_tests {
         };
         let mut tracker = ControlSaveTracker::new(0);
         complete_one_piece(&scheduler);
-        persist_multi_control_snapshot(ControlSaveReason::Terminal, None, &mut tracker, &ctx).await;
+        persist_multi_control_snapshot(ControlSaveReason::Terminal, None, &mut tracker, &ctx)
+            .await
+            .unwrap();
         let previous_file = tokio::fs::read(&control_path).await.unwrap();
         assert_eq!(tracker.last_saved_downloaded_bytes(), 256);
 
+        // A closed writer cannot answer the barrier: the save must report the
+        // failure instead of a checkpoint that was never written.
         let (write_tx, write_rx) = mpsc::channel(1);
         drop(write_rx);
 
         complete_one_piece(&scheduler);
-        persist_multi_control_snapshot(
+        let error = persist_multi_control_snapshot(
             ControlSaveReason::Terminal,
             Some(&write_tx),
             &mut tracker,
             &ctx,
         )
-        .await;
+        .await
+        .unwrap_err();
+        assert!(matches!(error, DownloadError::ChannelClosed), "{error:?}");
 
         assert_eq!(tokio::fs::read(&control_path).await.unwrap(), previous_file);
         assert_eq!(tracker.last_saved_downloaded_bytes(), 256);
 
         // A writer that accepts the barrier but fails during flush/sync drops
-        // its acknowledgement. That failure must preserve the same checkpoint.
+        // its acknowledgement. That failure must preserve the same checkpoint
+        // and be reported.
         let (write_tx, mut write_rx) = mpsc::channel(1);
-        tokio::join!(
+        let (error, ()) = tokio::join!(
             persist_multi_control_snapshot(
                 ControlSaveReason::Terminal,
                 Some(&write_tx),
@@ -1344,6 +1400,10 @@ mod coverage_tests {
                 assert!(sync_data);
                 drop(ack);
             },
+        );
+        assert!(
+            matches!(error, Err(DownloadError::ChannelClosed)),
+            "{error:?}"
         );
         assert_eq!(tokio::fs::read(&control_path).await.unwrap(), previous_file);
         let snapshot = ControlSnapshot::load(&control_path).await.unwrap();
@@ -1376,8 +1436,12 @@ mod coverage_tests {
         let mut tracker = ControlSaveTracker::new(0);
 
         complete_one_piece(&scheduler);
-        persist_multi_control_snapshot(ControlSaveReason::Terminal, None, &mut tracker, &ctx).await;
-        persist_multi_control_snapshot(ControlSaveReason::Terminal, None, &mut tracker, &ctx).await;
+        persist_multi_control_snapshot(ControlSaveReason::Terminal, None, &mut tracker, &ctx)
+            .await
+            .unwrap();
+        persist_multi_control_snapshot(ControlSaveReason::Terminal, None, &mut tracker, &ctx)
+            .await
+            .unwrap();
 
         let loaded = ControlSnapshot::load(&control_path).await.unwrap();
         assert_eq!(loaded.downloaded_bytes, 256);
@@ -1406,7 +1470,9 @@ mod coverage_tests {
         };
         let mut tracker = ControlSaveTracker::new(0);
 
-        persist_multi_control_snapshot(ControlSaveReason::Terminal, None, &mut tracker, &ctx).await;
+        persist_multi_control_snapshot(ControlSaveReason::Terminal, None, &mut tracker, &ctx)
+            .await
+            .unwrap();
 
         let loaded = ControlSnapshot::load(&control_path).await.unwrap();
         assert_eq!(loaded.downloaded_bytes, 0);
@@ -1444,7 +1510,9 @@ mod coverage_tests {
             assert_eq!(inflight.piece_id, 0);
         }
 
-        persist_multi_control_snapshot(ControlSaveReason::Terminal, None, &mut tracker, &ctx).await;
+        persist_multi_control_snapshot(ControlSaveReason::Terminal, None, &mut tracker, &ctx)
+            .await
+            .unwrap();
 
         let (loaded, hints) = ControlSnapshot::load_with_hints(&control_path)
             .await
@@ -1960,12 +2028,18 @@ mod coverage_tests {
             download_id: 0,
         };
         let mut tracker = ControlSaveTracker::new(0);
-        persist_multi_control_snapshot(ControlSaveReason::Autosave, None, &mut tracker, &ctx).await;
+        // The first attempt cannot write: its failure is reported and the
+        // tracker stays pending, so the next autosave repeats the write.
+        persist_multi_control_snapshot(ControlSaveReason::Autosave, None, &mut tracker, &ctx)
+            .await
+            .unwrap_err();
         assert_eq!(tracker.last_saved_downloaded_bytes(), 0);
         assert_eq!(tokio::fs::read(&blocker).await.unwrap(), b"preserve");
         tokio::fs::remove_file(&blocker).await.unwrap();
         tokio::fs::create_dir(&blocker).await.unwrap();
-        persist_multi_control_snapshot(ControlSaveReason::Autosave, None, &mut tracker, &ctx).await;
+        persist_multi_control_snapshot(ControlSaveReason::Autosave, None, &mut tracker, &ctx)
+            .await
+            .unwrap();
         assert_eq!(tracker.last_saved_downloaded_bytes(), 256);
         assert_eq!(
             ControlSnapshot::load(&control)
