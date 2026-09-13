@@ -265,7 +265,9 @@ handle.cancel();
 let result = handle.wait().await; // returns Err(DownloadError::Cancelled)
 ```
 
-`Cancelled`, `Paused`, and `Completed` are distinct end states. Both `cancel()` and `pause()` end the current task and attempt to preserve resumable state when resume is enabled. A write or synchronization failure leaves the previous durable checkpoint in place. Normal completion attempts to remove the control file; single-connection cleanup failure is an error, while multi-connection cleanup is best effort.
+`Cancelled`, `Paused`, and `Completed` are distinct end states. Both `cancel()` and `pause()` end the current task and attempt to preserve resumable state when resume is enabled; a task that is still waiting for a concurrency permit ends without starting, so it creates no output file or checkpoint. A write or synchronization failure leaves the previous durable checkpoint in place. Normal completion attempts to remove the control file; single-connection cleanup failure is an error, while multi-connection cleanup is best effort.
+
+The terminal progress state always matches what `wait()` returns: `Completed` only when the whole task succeeded, including any configured checksum verification, and `Cancelled` / `Paused` / `Failed` otherwise. The bytes reported for a stopped task are those received before the stop; the durable checkpoint, not the reported byte count, is what a later resume relies on.
 
 ### Request response-headers deadline
 

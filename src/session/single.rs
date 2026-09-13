@@ -9,8 +9,8 @@ use tokio::sync::{mpsc, watch};
 use super::flow::MemoryBudget;
 
 use super::{
-    flush_all_and_wait, stop_signal_error, stop_signal_state, ControlSaveReason,
-    ControlSaveTracker, StopSignal, MIN_SPEED_SAMPLE_SPAN, SPEED_ESTIMATE_WINDOW,
+    flush_all_and_wait, wait_for_stop, ControlSaveReason, ControlSaveTracker, StopSignal,
+    MIN_SPEED_SAMPLE_SPAN, SPEED_ESTIMATE_WINDOW,
 };
 use crate::config::{DownloadSpec, LogLevel};
 use crate::error::{DownloadError, TransportError, TransportErrorKind};
@@ -205,6 +205,10 @@ impl SingleWriterRuntime {
 
 /// Run a single transfer with one retry budget spanning body, Range requests,
 /// response validation, and safe from-zero restarts.
+///
+/// This reports progress and returns its result; it never publishes a public
+/// terminal state. Stop requests, storage failures and checksum verification are
+/// resolved into exactly one terminal snapshot by the task-level exit.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_single_with_retry(
     worker: HttpWorker,
@@ -222,7 +226,6 @@ pub(super) async fn run_single_with_retry(
     log_level: LogLevel,
     download_id: u64,
 ) -> Result<(), DownloadError> {
-    let mark_error = |error: &DownloadError| mark_single_error_progress(progress_tx, error);
     let mut offset = start_offset;
     let mut total_size = initial_total_size;
     let mut baseline = meta.clone();
@@ -234,9 +237,7 @@ pub(super) async fn run_single_with_retry(
         spec.retry_max_delay,
         spec.max_retry_elapsed,
     );
-    let mut writer = SingleWriterRuntime::start(output_path, offset, spec, total_size)
-        .await
-        .inspect_err(mark_error)?;
+    let mut writer = SingleWriterRuntime::start(output_path, offset, spec, total_size).await?;
     let mut use_control = spec.resume && total_size.is_some();
     let mut control_save_tracker = ControlSaveTracker::new(offset);
     let mut snap_template = single_snapshot_template(request_url, total_size, offset, &baseline);
@@ -259,8 +260,7 @@ pub(super) async fn run_single_with_retry(
                 Ok(response) => response,
                 Err(error) => match retry_state.decide(error) {
                     RetryDecision::Stop(error) => {
-                        mark_single_terminal_progress(progress_tx, DownloadState::Failed);
-                        writer.close().await.inspect_err(mark_error)?;
+                        writer.close().await?;
                         return Err(error);
                     }
                     RetryDecision::Retry {
@@ -283,8 +283,7 @@ pub(super) async fn run_single_with_retry(
                             None,
                         );
                         if let Err(stop_error) = sleep_with_backoff(backoff, &mut cancel_rx).await {
-                            mark_single_error_progress(progress_tx, &stop_error);
-                            writer.close().await.inspect_err(mark_error)?;
+                            writer.close().await?;
                             return Err(stop_error);
                         }
                         continue;
@@ -345,8 +344,7 @@ pub(super) async fn run_single_with_retry(
                 };
                 match retry_state.decide_restart(error) {
                     RetryDecision::Stop(error) => {
-                        mark_single_terminal_progress(progress_tx, DownloadState::Failed);
-                        writer.close().await.inspect_err(mark_error)?;
+                        writer.close().await?;
                         return Err(error);
                     }
                     RetryDecision::Retry {
@@ -369,21 +367,15 @@ pub(super) async fn run_single_with_retry(
                             Some("range_or_metadata_mismatch"),
                         );
                         if let Err(stop_error) = sleep_with_backoff(backoff, &mut cancel_rx).await {
-                            mark_single_error_progress(progress_tx, &stop_error);
-                            writer.close().await.inspect_err(mark_error)?;
+                            writer.close().await?;
                             return Err(stop_error);
                         }
                         // The replacement object's size is not known until a
                         // fresh GET arrives; do not preallocate using the old
                         // object's size or a smaller replacement could leave
                         // stale trailing bytes in the output file.
-                        writer
-                            .reset(output_path, spec, None)
-                            .await
-                            .inspect_err(mark_error)?;
-                        ControlSnapshot::delete(control_path)
-                            .await
-                            .inspect_err(mark_error)?;
+                        writer.reset(output_path, spec, None).await?;
+                        ControlSnapshot::delete(control_path).await?;
                         offset = 0;
                         total_size = None;
                         use_control = false;
@@ -420,10 +412,7 @@ pub(super) async fn run_single_with_retry(
                 // A restart may have had to recreate the file before the new
                 // response revealed its size. Recreate once more with the
                 // discovered size so pre-allocation remains effective.
-                writer
-                    .reset(output_path, spec, total_size)
-                    .await
-                    .inspect_err(mark_error)?;
+                writer.reset(output_path, spec, total_size).await?;
             }
         }
 
@@ -486,13 +475,10 @@ pub(super) async fn run_single_with_retry(
                 if matches!(error, DownloadError::Cancelled | DownloadError::Paused)
                     || !error.is_retryable()
                 {
-                    let state = match &error {
-                        DownloadError::Cancelled => DownloadState::Cancelled,
-                        DownloadError::Paused => DownloadState::Paused,
-                        _ => DownloadState::Failed,
-                    };
-                    mark_single_terminal_progress(progress_tx, state);
-                    writer.close().await.inspect_err(mark_error)?;
+                    // The writer still finishes its required work before the
+                    // error leaves this function: a stop request must not skip a
+                    // durable barrier.
+                    writer.close().await?;
                     if use_control {
                         persist_single_control_snapshot(
                             ControlSaveReason::Terminal,
@@ -506,7 +492,7 @@ pub(super) async fn run_single_with_retry(
                     return Err(error);
                 }
 
-                let stats = writer.flush().await.inspect_err(mark_error)?;
+                let stats = writer.flush().await?;
                 offset = stats.written_bytes;
                 progress_tx.send_modify(|progress| {
                     progress.downloaded = offset;
@@ -525,8 +511,7 @@ pub(super) async fn run_single_with_retry(
 
                 match retry_state.decide(error) {
                     RetryDecision::Stop(error) => {
-                        mark_single_terminal_progress(progress_tx, DownloadState::Failed);
-                        writer.close().await.inspect_err(mark_error)?;
+                        writer.close().await?;
                         return Err(error);
                     }
                     RetryDecision::Retry {
@@ -560,18 +545,12 @@ pub(super) async fn run_single_with_retry(
                             restart_from_zero.then_some(restart_reason),
                         );
                         if let Err(stop_error) = sleep_with_backoff(backoff, &mut cancel_rx).await {
-                            mark_single_error_progress(progress_tx, &stop_error);
-                            writer.close().await.inspect_err(mark_error)?;
+                            writer.close().await?;
                             return Err(stop_error);
                         }
                         if restart_from_zero {
-                            writer
-                                .reset(output_path, spec, None)
-                                .await
-                                .inspect_err(mark_error)?;
-                            ControlSnapshot::delete(control_path)
-                                .await
-                                .inspect_err(mark_error)?;
+                            writer.reset(output_path, spec, None).await?;
+                            ControlSnapshot::delete(control_path).await?;
                             offset = 0;
                             total_size = None;
                             use_control = false;
@@ -591,8 +570,12 @@ pub(super) async fn run_single_with_retry(
     }
 }
 
-/// Publish completion only after both the flush barrier and writer shutdown
+/// Finish the transfer only after both the flush barrier and writer shutdown
 /// succeed. A storage error must leave any previous durable checkpoint intact.
+///
+/// The final byte counts are reported here, but the completed state is not: the
+/// task-level exit publishes it only once the whole task — including any
+/// configured checksum verification — has succeeded.
 async fn complete_single_transfer(
     writer: &mut SingleWriterRuntime,
     final_offset: u64,
@@ -607,30 +590,20 @@ async fn complete_single_transfer(
         progress.downloaded = final_offset;
         progress.speed_bytes_per_sec = speed_bytes_per_sec;
     });
-    let mark_error = |error: &DownloadError| mark_single_error_progress(progress_tx, error);
-    let stats = writer.flush().await.inspect_err(mark_error)?;
+    let stats = writer.flush().await?;
     if stats.written_bytes != final_offset || total_size.is_some_and(|total| final_offset != total)
     {
         let error = DownloadError::Internal(format!(
             "single writer persisted {} bytes but attempt completed at {}",
             stats.written_bytes, final_offset
         ));
-        mark_error(&error);
-        writer.close().await.inspect_err(mark_error)?;
+        writer.close().await?;
         return Err(error);
     }
-    writer.close().await.inspect_err(mark_error)?;
+    writer.close().await?;
     if let Some(control_path) = control_path {
-        ControlSnapshot::delete(control_path)
-            .await
-            .inspect_err(mark_error)?;
+        ControlSnapshot::delete(control_path).await?;
     }
-    progress_tx.send_modify(|progress| {
-        progress.downloaded = final_offset;
-        progress.speed_bytes_per_sec = speed_bytes_per_sec;
-        progress.state = DownloadState::Completed;
-        progress.eta_secs = Some(0.0);
-    });
     Ok(())
 }
 
@@ -699,28 +672,6 @@ fn log_single_retry(
         elapsed_ms = elapsed.as_millis() as u64,
         "single-connection transfer retry"
     );
-}
-
-fn mark_single_terminal_progress(
-    progress_tx: &watch::Sender<ProgressSnapshot>,
-    state: DownloadState,
-) {
-    progress_tx.send_modify(|progress| {
-        progress.state = state;
-        progress.eta_secs = None;
-    });
-}
-
-fn mark_single_error_progress(
-    progress_tx: &watch::Sender<ProgressSnapshot>,
-    error: &DownloadError,
-) {
-    let state = match error {
-        DownloadError::Cancelled => DownloadState::Cancelled,
-        DownloadError::Paused => DownloadState::Paused,
-        _ => DownloadState::Failed,
-    };
-    mark_single_terminal_progress(progress_tx, state);
 }
 
 /// Stream a single HTTP response body to the writer channel.
@@ -823,40 +774,36 @@ async fn stream_single_attempt(
         tokio::select! {
             biased;
 
-            result = cancel_rx.changed() => {
-                if result.is_ok() {
-                    let signal = *cancel_rx.borrow_and_update();
-                    if let Some(error) = stop_signal_error(signal) {
-                        if let Some(state) = stop_signal_state(signal) {
-                            progress_reporter.force_report(
-                                progress_tx,
-                                ProgressUpdate::new(downloaded, last_speed, last_eta_secs)
-                                    .with_state(state),
-                                Instant::now(),
-                            );
-                        }
-                        if let Some((cp, tmpl)) = &control {
-                            persist_single_control_snapshot(
-                                ControlSaveReason::Terminal,
-                                downloaded,
-                                Some(write_tx),
-                                control_save_tracker,
-                                &SingleControlSaveContext {
-                                    control_path: cp,
-                                    snap_template: tmpl,
-                                    autosave_sync_every,
-                                    log_level,
-                                    download_id,
-                                },
-                            )
-                            .await;
-                        }
-                        return SingleAttemptOutcome::Failed {
-                            error,
-                            received_in_attempt,
-                        };
-                    }
+            error = wait_for_stop(&mut cancel_rx) => {
+                // Report the bytes received so far without declaring the
+                // task stopped: the requested terminal state is published
+                // by the task-level exit, after this attempt's durable
+                // checkpoint below has been written.
+                progress_reporter.force_report(
+                    progress_tx,
+                    ProgressUpdate::new(downloaded, last_speed, last_eta_secs),
+                    Instant::now(),
+                );
+                if let Some((cp, tmpl)) = &control {
+                    persist_single_control_snapshot(
+                        ControlSaveReason::Terminal,
+                        downloaded,
+                        Some(write_tx),
+                        control_save_tracker,
+                        &SingleControlSaveContext {
+                            control_path: cp,
+                            snap_template: tmpl,
+                            autosave_sync_every,
+                            log_level,
+                            download_id,
+                        },
+                    )
+                    .await;
                 }
+                return SingleAttemptOutcome::Failed {
+                    error,
+                    received_in_attempt,
+                };
             }
 
             _ = save_ticker.tick(), if control.is_some() => {
@@ -894,8 +841,7 @@ async fn stream_single_attempt(
                             ));
                             progress_reporter.force_report(
                                 progress_tx,
-                                ProgressUpdate::new(downloaded, last_speed, last_eta_secs)
-                                    .with_state(DownloadState::Failed),
+                                ProgressUpdate::new(downloaded, last_speed, last_eta_secs),
                                 Instant::now(),
                             );
                             return SingleAttemptOutcome::Failed {
@@ -912,12 +858,7 @@ async fn stream_single_attempt(
                         ).await {
                             progress_reporter.force_report(
                                 progress_tx,
-                                ProgressUpdate::new(downloaded, last_speed, last_eta_secs)
-                                    .with_state(match error {
-                                        DownloadError::Cancelled => DownloadState::Cancelled,
-                                        DownloadError::Paused => DownloadState::Paused,
-                                        _ => DownloadState::Failed,
-                                    }),
+                                ProgressUpdate::new(downloaded, last_speed, last_eta_secs),
                                 Instant::now(),
                             );
                             return SingleAttemptOutcome::Failed { error, received_in_attempt };
@@ -945,8 +886,7 @@ async fn stream_single_attempt(
                     Err(error) => {
                         progress_reporter.force_report(
                             progress_tx,
-                            ProgressUpdate::new(downloaded, last_speed, last_eta_secs)
-                                .with_state(DownloadState::Failed),
+                            ProgressUpdate::new(downloaded, last_speed, last_eta_secs),
                             Instant::now(),
                         );
                         return SingleAttemptOutcome::Failed {
@@ -971,8 +911,7 @@ async fn stream_single_attempt(
             ));
             progress_reporter.force_report(
                 progress_tx,
-                ProgressUpdate::new(downloaded, last_speed, last_eta_secs)
-                    .with_state(DownloadState::Failed),
+                ProgressUpdate::new(downloaded, last_speed, last_eta_secs),
                 Instant::now(),
             );
             return SingleAttemptOutcome::Failed {
@@ -1214,6 +1153,29 @@ mod tests {
             .unwrap();
     }
 
+    /// Assert the new lifecycle split: the transfer path reports progress only,
+    /// and the task-level exit derives the one public terminal state from the
+    /// result the transfer returned.
+    fn assert_deferred_terminal_state(
+        progress_tx: &watch::Sender<ProgressSnapshot>,
+        result: Result<(), DownloadError>,
+        expected: DownloadState,
+    ) {
+        assert_eq!(
+            crate::progress::terminal_state_for(&result),
+            expected,
+            "the task-level exit must derive {expected:?} from the transfer result"
+        );
+        let observed = progress_tx.borrow().state;
+        assert!(
+            matches!(
+                observed,
+                DownloadState::Pending | DownloadState::Downloading
+            ),
+            "the transfer path must not publish a terminal state, got {observed:?}"
+        );
+    }
+
     fn snapshot_template() -> ControlSnapshot {
         ControlSnapshot {
             url: "https://example.com/single.bin".into(),
@@ -1266,7 +1228,7 @@ mod tests {
         assert!(matches!(err, DownloadError::Transport(_)));
         let loaded = ControlSnapshot::load(&control_path).await.unwrap();
         assert_eq!(loaded.downloaded_bytes, 4);
-        assert_eq!(progress_tx.borrow().state, DownloadState::Failed);
+        assert_deferred_terminal_state(&progress_tx, Err(err), DownloadState::Failed);
     }
 
     #[tokio::test]
@@ -1313,8 +1275,7 @@ mod tests {
         assert_eq!(tokio::fs::read(&output_path).await.unwrap(), b"done");
         let snapshot = progress_tx.borrow().clone();
         assert_eq!(snapshot.downloaded, 4);
-        assert_eq!(snapshot.state, DownloadState::Completed);
-        assert_eq!(snapshot.eta_secs, Some(0.0));
+        assert_deferred_terminal_state(&progress_tx, Ok(()), DownloadState::Completed);
     }
 
     #[tokio::test]
@@ -1407,7 +1368,7 @@ mod tests {
         assert!(matches!(err, DownloadError::Paused));
         let loaded = ControlSnapshot::load(&control_path).await.unwrap();
         assert_eq!(loaded.downloaded_bytes, 1);
-        assert_eq!(progress_tx.borrow().state, DownloadState::Paused);
+        assert_deferred_terminal_state(&progress_tx, Err(err), DownloadState::Paused);
     }
 
     #[tokio::test]
@@ -1680,18 +1641,18 @@ mod tests {
         match stop {
             Some(StopSignal::Pause) => {
                 assert!(matches!(error, DownloadError::Paused), "got {error:?}");
-                assert_eq!(progress_tx.borrow().state, DownloadState::Paused);
+                assert_deferred_terminal_state(&progress_tx, Err(error), DownloadState::Paused);
             }
             Some(StopSignal::Cancel) => {
                 assert!(matches!(error, DownloadError::Cancelled), "got {error:?}");
-                assert_eq!(progress_tx.borrow().state, DownloadState::Cancelled);
+                assert_deferred_terminal_state(&progress_tx, Err(error), DownloadState::Cancelled);
             }
             None => {
                 assert!(
                     matches!(error, DownloadError::HttpStatus { status: 403, .. }),
                     "got {error:?}"
                 );
-                assert_eq!(progress_tx.borrow().state, DownloadState::Failed);
+                assert_deferred_terminal_state(&progress_tx, Err(error), DownloadState::Failed);
             }
             Some(StopSignal::Running) => unreachable!(),
         }
@@ -1778,11 +1739,11 @@ mod tests {
                 panic!("invalid body length must not complete");
             };
             assert_eq!(received_in_attempt, expected_written.len() as u64);
-            let DownloadError::Transport(error) = error else {
+            let DownloadError::Transport(transport_error) = &error else {
                 panic!("expected body transport error");
             };
-            assert_eq!(error.kind(), TransportErrorKind::Body);
-            let source = std::error::Error::source(&error)
+            assert_eq!(transport_error.kind(), TransportErrorKind::Body);
+            let source = std::error::Error::source(transport_error)
                 .unwrap()
                 .downcast_ref::<std::io::Error>()
                 .unwrap();
@@ -1791,7 +1752,7 @@ mod tests {
                 tokio::fs::read(&output_path).await.unwrap(),
                 expected_written
             );
-            assert_eq!(progress_tx.borrow().state, DownloadState::Failed);
+            assert_deferred_terminal_state(&progress_tx, Err(error), DownloadState::Failed);
             assert_eq!(
                 progress_tx.borrow().downloaded,
                 expected_written.len() as u64
@@ -1830,7 +1791,7 @@ mod tests {
                 matches!(error, DownloadError::Internal(ref message) if message.contains("single writer persisted 0 bytes")),
                 "got {error:?}"
             );
-            assert_eq!(progress_tx.borrow().state, DownloadState::Failed);
+            assert_deferred_terminal_state(&progress_tx, Err(error), DownloadState::Failed);
             assert_eq!(
                 tokio::fs::read(&control_path).await.unwrap(),
                 previous_control
@@ -1906,17 +1867,15 @@ mod tests {
             .unwrap()
             .unwrap_err();
 
-            match error {
-                DownloadError::Io(error) => {
-                    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
-                    assert_eq!(error.to_string(), "injected final writer failure");
+            match &error {
+                DownloadError::Io(io_error) => {
+                    assert_eq!(io_error.kind(), std::io::ErrorKind::PermissionDenied);
+                    assert_eq!(io_error.to_string(), "injected final writer failure");
                 }
                 other => panic!("expected original storage error, got {other:?}"),
             }
-            let progress = progress_tx.borrow();
-            assert_eq!(progress.state, DownloadState::Failed);
-            assert_eq!(progress.downloaded, 4);
-            assert_eq!(progress.eta_secs, None);
+            assert_deferred_terminal_state(&progress_tx, Err(error), DownloadState::Failed);
+            assert_eq!(progress_tx.borrow().downloaded, 4);
             assert!(writer.writer_handle.is_none(), "writer must be joined");
             assert!(writer.write_tx.is_none(), "writer channel must be closed");
             if let Some(previous_control) = previous_control {
@@ -1986,8 +1945,9 @@ mod tests {
 
         assert!(matches!(err, DownloadError::Io(_)), "got: {err:?}");
         let snapshot = progress_tx.borrow().clone();
-        assert_eq!(snapshot.state, DownloadState::Failed);
         assert_eq!(snapshot.downloaded, 4);
+        drop(snapshot);
+        assert_deferred_terminal_state(&progress_tx, Err(err), DownloadState::Failed);
         assert!(
             !control_path.exists(),
             "failed writes must not create a checkpoint from received bytes"

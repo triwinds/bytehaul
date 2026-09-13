@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
 
-use super::{stop_signal_error, StopSignal};
+use super::{stop_signal_error, wait_for_stop, StopSignal};
 use crate::error::DownloadError;
 
 /// A retry policy's state for one logical operation.
@@ -125,36 +125,22 @@ fn retry_backoff(
 }
 
 /// Sleep for a retry delay while observing pause/cancel signals.
+///
+/// The wait uses the same stop signal handling as every other resource wait
+/// (rate limit, memory budget, writer channel, concurrency permit), so a stop
+/// request is observed identically in all of them. A dropped signal sender means
+/// no stop request can arrive, and the backoff then completes normally instead
+/// of hanging or reporting a stop.
 pub(crate) async fn sleep_with_backoff(
     backoff: Duration,
     cancel_rx: &mut watch::Receiver<StopSignal>,
 ) -> Result<(), DownloadError> {
-    if let Some(error) = stop_signal_error(*cancel_rx.borrow()) {
-        return Err(error);
-    }
-
     let sleep = tokio::time::sleep(backoff);
     tokio::pin!(sleep);
-    loop {
-        tokio::select! {
-            biased;
-            result = cancel_rx.changed() => {
-                match result {
-                    Ok(()) => {
-                        if let Some(error) = stop_signal_error(*cancel_rx.borrow_and_update()) {
-                            return Err(error);
-                        }
-                    }
-                    // A dropped signal sender means no future stop request;
-                    // finish the already selected backoff normally.
-                    Err(_) => {
-                        sleep.as_mut().await;
-                        return Ok(());
-                    }
-                }
-            }
-            _ = &mut sleep => return Ok(()),
-        }
+    tokio::select! {
+        biased;
+        error = wait_for_stop(cancel_rx) => Err(error),
+        _ = &mut sleep => Ok(()),
     }
 }
 

@@ -22,7 +22,7 @@ use super::range_validate::{
 use super::retry::{sleep_with_backoff, RetryDecision, RetryState};
 use super::{
     begin_lease_and_wait, discard_lease_and_wait, flush_all_and_wait, flush_lease_and_wait,
-    stop_signal_error, stop_signal_label, stop_signal_state, ControlSaveReason, ControlSaveTracker,
+    stop_signal_error, stop_signal_label, wait_for_stop, ControlSaveReason, ControlSaveTracker,
     StopSignal, MIN_SPEED_SAMPLE_SPAN, MULTI_PROGRESS_INTERVAL, SPEED_ESTIMATE_WINDOW,
 };
 use crate::config::{DownloadSpec, LogLevel, RangeSchedulingMode};
@@ -54,6 +54,11 @@ struct MultiControlSaveContext<'a> {
     download_id: u64,
 }
 
+/// Run the multi-connection transfer for one object.
+///
+/// This reports progress and returns its result; it never publishes a public
+/// terminal state. Stop requests and worker failures are resolved into exactly
+/// one terminal snapshot by the task-level exit, after the writer has closed.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_multi_worker(
     client: BytehaulClient,
@@ -223,40 +228,38 @@ pub(super) async fn run_multi_worker(
         tokio::select! {
             biased;
 
-            result = cancel_rx.changed() => {
-                if result.is_ok() {
-                    let signal = *cancel_rx.borrow_and_update();
-                    if let Some(error) = stop_signal_error(signal) {
-                        log_info!(
-                            log_level,
-                            download_id = download_id,
-                            stop = stop_signal_label(signal),
-                            "multi-worker download stopped"
-                        );
-                        for ah in &abort_handles { ah.abort(); }
-                        if let Some(state) = stop_signal_state(signal) {
-                            let now = Instant::now();
-                            let update = sampled_progress_update(
-                                &mut eta_estimator,
-                                received_bytes.load(Ordering::Relaxed),
-                                total_size,
-                                now,
-                            )
-                            .with_state(state);
-                            progress_reporter.force_report(progress_tx, update, now);
-                        }
-                        if spec.resume {
-                            persist_multi_control_snapshot(
-                                ControlSaveReason::Terminal,
-                                Some(&save_write_tx),
-                                &mut control_save_tracker,
-                                &control_save_ctx,
-                            ).await;
-                        }
-                        download_error = Some(error);
-                        break;
-                    }
+            // A dropped `DownloadHandle` leaves no signal sender; `wait_for_stop`
+            // then stays pending, so this biased branch cannot keep resolving on
+            // a closed channel and starve the workers, tickers and writer below.
+            error = wait_for_stop(&mut cancel_rx) => {
+                log_info!(
+                    log_level,
+                    download_id = download_id,
+                    stop = %error,
+                    "multi-worker download stopped"
+                );
+                for ah in &abort_handles { ah.abort(); }
+                // Report the bytes received so far, but leave the requested
+                // terminal state to the task-level exit: this monitor still has
+                // to persist the stop checkpoint.
+                let now = Instant::now();
+                let update = sampled_progress_update(
+                    &mut eta_estimator,
+                    received_bytes.load(Ordering::Relaxed),
+                    total_size,
+                    now,
+                );
+                progress_reporter.force_report(progress_tx, update, now);
+                if spec.resume {
+                    persist_multi_control_snapshot(
+                        ControlSaveReason::Terminal,
+                        Some(&save_write_tx),
+                        &mut control_save_tracker,
+                        &control_save_ctx,
+                    ).await;
                 }
+                download_error = Some(error);
+                break;
             }
 
             _ = save_ticker.tick(), if spec.resume => {
@@ -369,8 +372,7 @@ pub(super) async fn run_multi_worker(
                 received_bytes.load(Ordering::Relaxed),
                 total_size,
                 now,
-            )
-            .with_state(DownloadState::Failed);
+            );
             progress_reporter.force_report(progress_tx, update, now);
         }
         log_error!(log_level, download_id = download_id, error = %e,
@@ -394,8 +396,7 @@ pub(super) async fn run_multi_worker(
             received_bytes.load(Ordering::Relaxed),
             total_size,
             now,
-        )
-        .with_state(DownloadState::Failed);
+        );
         progress_reporter.force_report(progress_tx, update, now);
         log_error!(
             log_level,
@@ -406,11 +407,11 @@ pub(super) async fn run_multi_worker(
     }
 
     let _ = ControlSnapshot::delete(control_path).await;
-    // Final progress update
+    // Final progress update. The completed state itself is published by the
+    // task-level exit once the whole task has succeeded.
     let received_bytes = received_bytes.load(Ordering::Relaxed);
     let now = Instant::now();
-    let update = sampled_progress_update(&mut eta_estimator, received_bytes, total_size, now)
-        .with_state(DownloadState::Completed);
+    let update = sampled_progress_update(&mut eta_estimator, received_bytes, total_size, now);
     log_info!(
         log_level,
         download_id = download_id,
@@ -937,12 +938,11 @@ async fn stream_segment(
         tokio::select! {
             biased;
 
-            result = cancel_rx.changed() => {
-                if result.is_ok() {
-                    if let Some(error) = stop_signal_error(*cancel_rx.borrow_and_update()) {
-                        return Err((error, bytes_read));
-                    }
-                }
+            // `wait_for_stop` stays pending once every signal sender is gone, so
+            // a dropped `DownloadHandle` neither stops the segment nor keeps this
+            // biased branch ready — which would starve the body below.
+            error = wait_for_stop(cancel_rx) => {
+                return Err((error, bytes_read));
             }
 
             chunk = next_data_chunk(&mut body, read_timeout) => {
@@ -993,6 +993,29 @@ async fn stream_segment(
 mod coverage_tests {
     use super::*;
     use warp::Filter;
+
+    /// Assert the new lifecycle split: the multi-worker transfer reports progress
+    /// only, and the task-level exit derives the one public terminal state from
+    /// the result it returned.
+    fn assert_deferred_terminal_state(
+        progress_tx: &watch::Sender<ProgressSnapshot>,
+        result: Result<(), DownloadError>,
+        expected: DownloadState,
+    ) {
+        assert_eq!(
+            crate::progress::terminal_state_for(&result),
+            expected,
+            "the task-level exit must derive {expected:?} from the transfer result"
+        );
+        let observed = progress_tx.borrow().state;
+        assert!(
+            matches!(
+                observed,
+                DownloadState::Pending | DownloadState::Downloading
+            ),
+            "the transfer path must not publish a terminal state, got {observed:?}"
+        );
+    }
 
     fn worker_for(url: String) -> HttpWorker {
         let mut spec = DownloadSpec::new(url).output_path("unused.bin");
@@ -1604,8 +1627,8 @@ mod coverage_tests {
         .unwrap_err();
 
         assert!(matches!(err, DownloadError::Paused));
-        assert_eq!(progress_tx.borrow().state, DownloadState::Paused);
         assert!(control_path.exists());
+        assert_deferred_terminal_state(&progress_tx, Err(err), DownloadState::Paused);
     }
 
     #[tokio::test]
@@ -1665,7 +1688,7 @@ mod coverage_tests {
             "{error:?}"
         );
         assert_eq!(requests.load(Ordering::SeqCst), 1, "403 must not retry");
-        assert_eq!(progress.borrow().state, DownloadState::Failed);
+        assert_deferred_terminal_state(&progress, Err(error), DownloadState::Failed);
         assert_eq!(progress.borrow().downloaded, 256);
         assert_eq!(tokio::fs::read(output).await.unwrap(), vec![0xAC; 256]);
         let (saved, hints) = ControlSnapshot::load_with_hints(&control).await.unwrap();
@@ -2006,7 +2029,7 @@ mod coverage_tests {
         .unwrap_err();
         server.abort();
         assert!(matches!(error, DownloadError::Io(_)), "{error:?}");
-        assert_eq!(progress.borrow().state, DownloadState::Failed);
+        assert_deferred_terminal_state(&progress, Err(error), DownloadState::Failed);
         assert_eq!(tokio::fs::read(&control).await.unwrap(), original);
         assert_eq!(
             ControlSnapshot::load(&control)
@@ -2105,8 +2128,8 @@ mod coverage_tests {
             let downloaded = std::fs::read(&output_path).unwrap();
             let expected: Vec<u8> = (0..1024).map(|offset| (offset % 251) as u8).collect();
             assert_eq!(downloaded, expected);
+            assert_deferred_terminal_state(&progress_tx, Ok(()), DownloadState::Completed);
             let progress = progress_tx.borrow();
-            assert_eq!(progress.state, DownloadState::Completed);
             assert_eq!(progress.downloaded, 1024);
             assert_eq!(progress.total_size, Some(1024));
         }

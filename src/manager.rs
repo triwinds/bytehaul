@@ -11,7 +11,7 @@ use crate::config::{DownloadSpec, LogLevel};
 use crate::error::DownloadError;
 use crate::logging::next_download_id;
 use crate::network::{BytehaulClient, ClientNetworkConfig};
-use crate::progress::{DownloadState, ProgressSnapshot};
+use crate::progress::{publish_terminal_state, DownloadState, ProgressSnapshot};
 use crate::session;
 
 /// Top-level downloader that manages shared resources (e.g. HTTP client).
@@ -147,9 +147,15 @@ impl DownloaderBuilder {
     /// Build the [`Downloader`] instance.
     ///
     /// Returns an error if the HTTP client cannot be constructed
-    /// (e.g. an invalid proxy URL).
+    /// (e.g. an invalid proxy URL), or if a configured concurrency limit is
+    /// zero, which could never run a download (B4).
     pub fn build(self) -> Result<Downloader, DownloadError> {
         let log_level = self.log_level;
+        if self.max_concurrent_downloads == Some(0) {
+            return Err(DownloadError::InvalidConfig(
+                "max_concurrent_downloads must be >= 1".into(),
+            ));
+        }
         let client = self.client_config.build_client()?;
         let client_cache = Arc::new(Mutex::new(HashMap::from([(
             self.client_config.clone(),
@@ -196,25 +202,9 @@ impl Downloader {
         let (cancel_tx, cancel_rx) = watch::channel(session::StopSignal::Running);
         let log_level = self.log_level;
         let download_id = next_download_id();
-
-        if let Err(error) = spec.validate() {
-            log_error!(
-                log_level,
-                download_id,
-                url = %spec.url,
-                error = %error,
-                "download task rejected due to invalid configuration"
-            );
-            let task = tokio::spawn(async move { Err(error) });
-            return DownloadHandle {
-                progress_rx,
-                cancel_tx,
-                task,
-            };
-        }
-
         let client_cache = self.client_cache.clone();
         let client_config = self.client_config.clone();
+        let concurrency_limit = self.concurrency_limit.clone();
         let output = spec
             .output_path
             .as_ref()
@@ -231,21 +221,50 @@ impl Downloader {
             "download task created"
         );
 
-        let concurrency_limit = self.concurrency_limit.clone();
         let task = tokio::spawn(async move {
-            // Acquire a concurrency permit if a limit is configured.
-            // The permit is held for the lifetime of this download task.
-            let _permit =
-                match &concurrency_limit {
-                    Some(sem) => Some(sem.acquire().await.map_err(|_| {
-                        DownloadError::Internal("concurrency semaphore closed".into())
-                    })?),
+            let mut cancel_rx = cancel_rx;
+            // One exit owns the whole task: configuration validation, waiting
+            // for a concurrency permit, client construction, the transfer, the
+            // writer's finalization and the configured verification. The result
+            // returned here is the single source of the public terminal state,
+            // and no sub-step publishes one of its own (B1, B2).
+            let result = async {
+                spec.validate().inspect_err(|error| {
+                    log_error!(
+                        log_level,
+                        download_id,
+                        url = %spec.url,
+                        error = %error,
+                        "download task rejected due to invalid configuration"
+                    );
+                })?;
+
+                // Held for the lifetime of this task; a download that is still
+                // queued must observe stop requests instead of waiting for
+                // another download to release its permit (B3).
+                let _permit = match &concurrency_limit {
+                    Some(semaphore) => {
+                        Some(acquire_download_permit(semaphore, &mut cancel_rx).await?)
+                    }
                     None => None,
                 };
-            let requested_config = requested_client_config_for_spec(&client_config, &spec);
-            let client = cached_client_for_config(&client_cache, requested_config)?;
-            session::run_download(client, spec, log_level, download_id, progress_tx, cancel_rx)
+
+                let requested_config = requested_client_config_for_spec(&client_config, &spec);
+                let client = cached_client_for_config(&client_cache, requested_config)?;
+                session::run_download(
+                    client,
+                    spec,
+                    log_level,
+                    download_id,
+                    &progress_tx,
+                    cancel_rx,
+                )
                 .await
+            }
+            .await;
+
+            publish_terminal_state(&progress_tx, &result);
+            result
         });
 
         DownloadHandle {
@@ -253,6 +272,26 @@ impl Downloader {
             cancel_tx,
             task,
         }
+    }
+}
+
+/// Acquire a concurrency permit while continuing to observe stop requests.
+///
+/// The stop check comes first in a biased `select!`, so a request that was
+/// already issued when this download was queued wins over an available permit.
+/// Dropping the progress handle does not close the stop channel's sender
+/// meaningfully here: `wait_for_stop` stays pending, and the download proceeds
+/// exactly as it does today.
+async fn acquire_download_permit<'a>(
+    semaphore: &'a Semaphore,
+    cancel_rx: &mut watch::Receiver<session::StopSignal>,
+) -> Result<tokio::sync::SemaphorePermit<'a>, DownloadError> {
+    tokio::select! {
+        biased;
+        error = session::wait_for_stop(cancel_rx) => Err(error),
+        permit = semaphore.acquire() => permit.map_err(|_| {
+            DownloadError::Internal("concurrency semaphore closed".into())
+        }),
     }
 }
 
@@ -543,6 +582,145 @@ mod tests {
     fn test_downloader_builder_no_concurrency_limit_by_default() {
         let d = Downloader::builder().build().unwrap();
         assert!(d.concurrency_limit.is_none());
+    }
+
+    #[test]
+    fn test_downloader_builder_rejects_zero_concurrency_limit() {
+        // B4: a limit of zero could never run a download, so building the
+        // downloader must fail instead of queueing every task forever.
+        let error = match Downloader::builder().max_concurrent_downloads(0).build() {
+            Ok(_) => panic!("a zero concurrency limit must be rejected"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, DownloadError::InvalidConfig(ref message) if message.contains("max_concurrent_downloads")),
+            "got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_invalid_config_fails_without_touching_the_network_or_disk() {
+        // B2: a rejected configuration must end as Failed, not stay Pending.
+        let downloader = Downloader::builder().build().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let output_path = dir.path().join("invalid.bin");
+        let spec = DownloadSpec::new("")
+            .output_path(output_path.clone())
+            .resume(true);
+
+        let handle = downloader.download(spec);
+        let progress = handle.subscribe_progress();
+        let error = handle.wait().await.unwrap_err();
+
+        assert!(
+            matches!(error, DownloadError::InvalidConfig(_)),
+            "got {error:?}"
+        );
+        let snapshot = progress.borrow().clone();
+        assert_eq!(snapshot.state, DownloadState::Failed);
+        assert_eq!(snapshot.downloaded, 0);
+        assert!(!output_path.exists(), "no output for a rejected config");
+        assert!(
+            !dir.path().join("invalid.bin.bytehaul").exists(),
+            "a task that never started must not create a checkpoint"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_queued_download_stops_without_waiting_for_a_permit() {
+        // B3: a download waiting for a concurrency permit must still observe
+        // stop requests. The only permit is held by this test, which is exactly
+        // what a running download would do, and it is never released.
+        let downloader = Downloader::builder()
+            .max_concurrent_downloads(1)
+            .build()
+            .unwrap();
+        let semaphore = downloader.concurrency_limit.clone().unwrap();
+        let _held = semaphore.clone().acquire_owned().await.unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let queued_spec = |name: &str| {
+            DownloadSpec::new("http://127.0.0.1:1/nonexistent")
+                .output_path(dir.path().join(name))
+                .resume(true)
+        };
+
+        let cancelled = downloader.download(queued_spec("queued-cancel.bin"));
+        let paused = downloader.download(queued_spec("queued-pause.bin"));
+        let cancelled_progress = cancelled.subscribe_progress();
+        let paused_progress = paused.subscribe_progress();
+
+        // Neither task may have started while the permit is held.
+        assert_eq!(cancelled.progress().state, DownloadState::Pending);
+        assert_eq!(paused.progress().state, DownloadState::Pending);
+
+        cancelled.cancel();
+        paused.pause();
+
+        let cancel_error = tokio::time::timeout(Duration::from_secs(5), cancelled.wait())
+            .await
+            .expect("a queued download must not wait for another download to release a permit")
+            .unwrap_err();
+        let pause_error = tokio::time::timeout(Duration::from_secs(5), paused.wait())
+            .await
+            .expect("a queued pause must end the task directly")
+            .unwrap_err();
+
+        assert!(matches!(cancel_error, DownloadError::Cancelled));
+        assert!(matches!(pause_error, DownloadError::Paused));
+        assert_eq!(cancelled_progress.borrow().state, DownloadState::Cancelled);
+        assert_eq!(paused_progress.borrow().state, DownloadState::Paused);
+
+        for name in ["queued-cancel.bin", "queued-pause.bin"] {
+            assert!(
+                !dir.path().join(name).exists(),
+                "a stopped queued task must not create its output file"
+            );
+            assert!(
+                !dir.path().join(format!("{name}.bytehaul")).exists(),
+                "a stopped queued task must not create a checkpoint"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_dropping_the_handle_neither_cancels_nor_wedges_a_queued_download() {
+        // The unified stop-wait stays pending once every signal sender is gone,
+        // so dropping a handle keeps the existing semantics: the download is not
+        // cancelled, and a queued download still receives its permit.
+        let route = warp::any().map(|| warp::http::Response::new(b"payload".to_vec()));
+        let (addr, server) = warp::serve(route).bind_ephemeral(([127, 0, 0, 1], 0));
+        tokio::spawn(server);
+
+        let downloader = Downloader::builder()
+            .max_concurrent_downloads(1)
+            .build()
+            .unwrap();
+        let semaphore = downloader.concurrency_limit.clone().unwrap();
+        let held = semaphore.clone().acquire_owned().await.unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let output_path = dir.path().join("after-handle-drop.bin");
+        let spec = DownloadSpec::new(format!("http://{addr}/file"))
+            .output_path(output_path.clone())
+            .resume(false);
+        let handle = downloader.download(spec);
+        let progress = handle.subscribe_progress();
+        drop(handle);
+        drop(held);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if progress.borrow().state == DownloadState::Completed {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a queued download must proceed after its handle is dropped"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(std::fs::read(&output_path).unwrap(), b"payload");
     }
 
     #[test]

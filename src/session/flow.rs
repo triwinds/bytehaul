@@ -90,7 +90,10 @@ impl MemoryBudget {
     }
 }
 
-pub(super) async fn wait_for_stop(cancel_rx: &mut watch::Receiver<StopSignal>) -> DownloadError {
+/// Wait until this task receives a stop request, re-exported by `session` as the
+/// single stop-wait used by every resource wait (rate limit, memory budget,
+/// writer channel and the downloader's concurrency permit).
+pub(crate) async fn wait_for_stop(cancel_rx: &mut watch::Receiver<StopSignal>) -> DownloadError {
     loop {
         if let Some(error) = stop_signal_error(*cancel_rx.borrow_and_update()) {
             return error;

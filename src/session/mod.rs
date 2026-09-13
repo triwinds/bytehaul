@@ -18,12 +18,22 @@ use crate::http::response::ResponseMeta;
 use crate::http::worker::HttpWorker;
 use crate::http::{BodyBudget, HttpResponse};
 use crate::network::BytehaulClient;
-use crate::progress::{DownloadState, ProgressSnapshot};
+use crate::progress::ProgressSnapshot;
 use crate::rate_limiter::SpeedLimit;
 use crate::storage::control::ControlSnapshot;
 use crate::storage::segment::LeaseKey;
 use crate::storage::writer::{FlushAllStats, WriterCommand};
 
+/// Wait until this task receives a stop request.
+///
+/// One implementation serves every resource wait in a download (request,
+/// rate limit, memory budget, writer channel and the concurrency permit), so a
+/// stop request cannot be observed in one place and missed in another. A
+/// dropped signal sender means no stop request can ever arrive: the returned
+/// future stays pending instead of reporting a stop, which is what keeps
+/// dropping a [`DownloadHandle`](crate::DownloadHandle) from cancelling the
+/// download.
+pub(crate) use self::flow::wait_for_stop;
 use self::multi::run_multi_worker;
 use self::range_validate::{
     validate_range_response, ExpectedRange, FreshRangeFallbackReason, RangeValidationDecision,
@@ -107,14 +117,6 @@ fn stop_signal_error(signal: StopSignal) -> Option<DownloadError> {
         StopSignal::Running => None,
         StopSignal::Cancel => Some(DownloadError::Cancelled),
         StopSignal::Pause => Some(DownloadError::Paused),
-    }
-}
-
-fn stop_signal_state(signal: StopSignal) -> Option<DownloadState> {
-    match signal {
-        StopSignal::Running => None,
-        StopSignal::Cancel => Some(DownloadState::Cancelled),
-        StopSignal::Pause => Some(DownloadState::Paused),
     }
 }
 
@@ -436,40 +438,43 @@ async fn run_fresh_from_response(
     Ok(output_path.to_path_buf())
 }
 
+/// Transfer the object and run the configured verification.
+///
+/// This is the transfer half of one download task. It reports progress but
+/// deliberately publishes no terminal state: the task-level exit in
+/// `Downloader::download` is the only place that turns the returned result into
+/// the public terminal snapshot, so a checksum mismatch cannot be reported
+/// after a `Completed` snapshot has already been published (B1).
 pub(crate) async fn run_download(
     client: BytehaulClient,
     spec: DownloadSpec,
     log_level: LogLevel,
     download_id: u64,
-    progress_tx: watch::Sender<ProgressSnapshot>,
+    progress_tx: &watch::Sender<ProgressSnapshot>,
     cancel_rx: watch::Receiver<StopSignal>,
 ) -> Result<(), DownloadError> {
     let checksum = spec.checksum.clone();
-    let result = run_download_inner(
+    let cancel_rx = cancel_rx;
+    let output_path = match run_download_inner(
         client,
         spec,
         log_level,
         download_id,
-        &progress_tx,
-        cancel_rx,
+        progress_tx,
+        cancel_rx.clone(),
     )
-    .await;
-
-    let output_path = match result {
+    .await
+    {
         Ok(output_path) => output_path,
-        Err(e) => {
-            if !matches!(e, DownloadError::Cancelled | DownloadError::Paused) {
-                progress_tx.send_modify(|progress| {
-                    progress.state = DownloadState::Failed;
-                    progress.eta_secs = None;
-                });
-            }
-            log_error!(log_level, download_id, error = %e, "download failed");
-            return Err(e);
+        Err(error) => {
+            log_error!(log_level, download_id, error = %error, "download failed");
+            return Err(error);
         }
     };
 
-    // Post-download checksum verification
+    // Post-download checksum verification runs before the task is allowed to
+    // report success, and keeps observing stop requests: hashing a large file
+    // is long enough that a caller must still be able to cancel it.
     if let Some(ref expected) = checksum {
         log_info!(
             log_level,
@@ -477,13 +482,17 @@ pub(crate) async fn run_download(
             algorithm = "sha256",
             "checksum verification started"
         );
-        match verify_checksum(&output_path, expected).await {
+        match verify_checksum(&output_path, expected, || {
+            stop_signal_error(*cancel_rx.borrow())
+        })
+        .await
+        {
             Ok(()) => {
                 log_info!(log_level, download_id, "checksum verification passed");
             }
-            Err(e) => {
-                log_error!(log_level, download_id, error = %e, "checksum verification failed");
-                return Err(e);
+            Err(error) => {
+                log_error!(log_level, download_id, error = %error, "checksum verification failed");
+                return Err(error);
             }
         }
     }
@@ -1172,19 +1181,6 @@ mod tests {
             stop_signal_error(StopSignal::Pause),
             Some(DownloadError::Paused)
         ));
-    }
-
-    #[test]
-    fn test_stop_signal_state() {
-        assert!(stop_signal_state(StopSignal::Running).is_none());
-        assert_eq!(
-            stop_signal_state(StopSignal::Cancel),
-            Some(DownloadState::Cancelled)
-        );
-        assert_eq!(
-            stop_signal_state(StopSignal::Pause),
-            Some(DownloadState::Paused)
-        );
     }
 
     #[test]
