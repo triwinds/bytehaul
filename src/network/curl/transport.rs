@@ -140,7 +140,7 @@ impl CurlTransport {
     ) -> Result<HttpResponse, DownloadError> {
         let started = Instant::now();
         let mut options = self.options_for(&req, head_deadline)?;
-        let connect_budget = self.connect_timeout.min(head_deadline);
+        let connect_budget = options.connect_timeout.min(head_deadline);
 
         options.resolve = self
             .resolve_for(&options, connect_budget.saturating_sub(started.elapsed()))
@@ -189,7 +189,10 @@ impl CurlTransport {
         }
 
         let mut options = RequestOptions::new(uri.to_string());
-        options.connect_timeout = self.connect_timeout;
+        options.connect_timeout = req
+            .extensions()
+            .get::<crate::network::ConnectTimeout>()
+            .map_or(self.connect_timeout, |timeout| timeout.0);
         options.head_timeout = head_timeout;
         options.forbid_connection_reuse = self.forbid_connection_reuse;
         options.proxy = self.proxy_for(scheme).map(|endpoint| endpoint.url.clone());
@@ -924,6 +927,45 @@ mod tests {
             started.elapsed()
         );
         keeper.abort();
+    }
+
+    #[tokio::test]
+    async fn shared_transport_honors_concurrent_request_connect_budgets() {
+        use crate::network::ConnectTimeout;
+        let (dns_addr, _queries, dns_server) =
+            crate::network::dns::spawn_dns_test_server_with_delay(60, Duration::from_millis(150))
+                .await;
+        let server = super::super::test_support::scripted_http_server(b"shared".to_vec()).await;
+        let transport = transport(&ClientNetworkConfig {
+            dns_servers: vec![dns_addr],
+            enable_ipv6: false,
+            ..Default::default()
+        });
+        let mut short = request(
+            &format!("http://short-budget.test:{}/file", server.port),
+            &[],
+        );
+        short
+            .extensions_mut()
+            .insert(ConnectTimeout(Duration::from_millis(30)));
+        let mut long = request(
+            &format!("http://long-budget.test:{}/file", server.port),
+            &[],
+        );
+        long.extensions_mut()
+            .insert(ConnectTimeout(Duration::from_secs(2)));
+        let (short, long) = tokio::join!(
+            transport.request(short, Duration::from_secs(5)),
+            transport.request(long, Duration::from_secs(5)),
+        );
+        assert!(
+            matches!(short, Err(DownloadError::Transport(ref error)) if error.kind() == crate::error::TransportErrorKind::Timeout)
+        );
+        assert!(
+            long.is_ok(),
+            "long request must retain its own budget: {long:?}"
+        );
+        dns_server.abort();
     }
 
     /// A lookup that answers late leaves libcurl only the rest of the connect

@@ -491,8 +491,8 @@ mod tests {
         let distinct_count = bench_cached_client_lookup(&downloader, Duration::from_secs(3), 1);
 
         assert_eq!(cached_count, 1);
-        assert_eq!(distinct_count, 2);
-        assert_eq!(bench_cached_client_count(&downloader), 2);
+        assert_eq!(distinct_count, 1);
+        assert_eq!(bench_cached_client_count(&downloader), 1);
     }
 
     #[test]

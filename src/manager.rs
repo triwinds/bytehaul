@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,7 +16,7 @@ use crate::session;
 
 /// Top-level downloader that manages shared resources (e.g. HTTP client).
 pub struct Downloader {
-    client_cache: Arc<Mutex<HashMap<ClientNetworkConfig, BytehaulClient>>>,
+    client_cache: Arc<Mutex<ClientCache>>,
     client_config: ClientNetworkConfig,
     log_level: LogLevel,
     concurrency_limit: Option<Arc<Semaphore>>,
@@ -157,10 +157,11 @@ impl DownloaderBuilder {
             ));
         }
         let client = self.client_config.build_client()?;
-        let client_cache = Arc::new(Mutex::new(HashMap::from([(
-            self.client_config.clone(),
-            client,
-        )])));
+        let client_cache = Arc::new(Mutex::new(ClientCache::default()));
+        client_cache.lock().entries.push_back((
+            ClientKey::new(self.client_config.clone()),
+            Arc::new(Mutex::new(Some(client))),
+        ));
         log_debug!(
             log_level,
             log_level = %log_level,
@@ -256,6 +257,7 @@ impl Downloader {
                 };
 
                 let requested_config = requested_client_config_for_spec(&client_config, &spec);
+                let spec = spec.connect_timeout(requested_config.connect_timeout);
                 let client = cached_client_for_config(&client_cache, requested_config)?;
                 session::run_download(
                     client,
@@ -308,20 +310,66 @@ fn requested_client_config_for_spec(
     spec.resolve_network_config(base_config)
 }
 
+// Bounds retained references, including the default client, not active downloads.
+const CLIENT_CACHE_CAPACITY: usize = 16;
+
+#[derive(Clone, PartialEq, Eq)]
+struct ClientKey(ClientNetworkConfig);
+impl ClientKey {
+    fn new(mut config: ClientNetworkConfig) -> Self {
+        // Connection deadlines belong to easy handles, not shared pools.
+        config.connect_timeout = Duration::from_secs(30);
+        Self(config)
+    }
+}
+
+type ClientEntry = Arc<Mutex<Option<BytehaulClient>>>;
+
+#[derive(Default)]
+struct ClientCache {
+    // Least recently used first. A small fixed capacity keeps lookup bounded.
+    entries: VecDeque<(ClientKey, ClientEntry)>,
+}
+impl ClientCache {
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
 fn cached_client_for_config(
-    client_cache: &Arc<Mutex<HashMap<ClientNetworkConfig, BytehaulClient>>>,
+    client_cache: &Arc<Mutex<ClientCache>>,
     requested_config: ClientNetworkConfig,
 ) -> Result<BytehaulClient, DownloadError> {
-    if let Some(client) = client_cache.lock().get(&requested_config).cloned() {
-        return Ok(client);
+    let key = ClientKey::new(requested_config);
+    let (entry, evicted) = {
+        let mut cache = client_cache.lock();
+        if let Some(index) = cache
+            .entries
+            .iter()
+            .position(|(existing, _)| existing == &key)
+        {
+            let existing = cache.entries.remove(index).expect("located cache entry");
+            let entry = existing.1.clone();
+            cache.entries.push_back(existing);
+            (entry, None)
+        } else {
+            let entry = Arc::new(Mutex::new(None));
+            let evicted = if cache.len() == CLIENT_CACHE_CAPACITY {
+                cache.entries.pop_front()
+            } else {
+                None
+            };
+            cache.entries.push_back((key.clone(), entry.clone()));
+            (entry, evicted)
+        }
+    };
+    // Driver shutdown and construction never run under the global cache lock.
+    drop(evicted);
+    let mut client = entry.lock();
+    if client.is_none() {
+        *client = Some(key.0.build_client()?);
     }
-
-    let client = requested_config.build_client()?;
-    let mut cache = client_cache.lock();
-    Ok(cache
-        .entry(requested_config)
-        .or_insert_with(|| client.clone())
-        .clone())
+    Ok(client.as_ref().expect("initialized client").clone())
 }
 
 impl Downloader {
@@ -725,7 +773,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_download_rebuilds_client_for_spec_timeout_override() {
+    async fn test_download_reuses_client_for_spec_timeout_override() {
         let server = spawn_forbidden_server();
         let dir = tempfile::tempdir().unwrap();
         let downloader = Downloader::builder().build().unwrap();
@@ -735,7 +783,7 @@ mod tests {
 
         assert_eq!(downloader.client_cache.lock().len(), 1);
         assert_forbidden(downloader.download(spec)).await;
-        assert_eq!(downloader.client_cache.lock().len(), 2);
+        assert_eq!(downloader.client_cache.lock().len(), 1);
     }
 
     #[tokio::test]
@@ -749,10 +797,10 @@ mod tests {
 
         assert_eq!(downloader.client_cache.lock().len(), 1);
         assert_forbidden(downloader.download(spec.clone())).await;
-        assert_eq!(downloader.client_cache.lock().len(), 2);
+        assert_eq!(downloader.client_cache.lock().len(), 1);
 
         assert_forbidden(downloader.download(spec)).await;
-        assert_eq!(downloader.client_cache.lock().len(), 2);
+        assert_eq!(downloader.client_cache.lock().len(), 1);
     }
 
     #[tokio::test]
@@ -872,6 +920,161 @@ mod tests {
     }
 
     #[test]
+    fn environment_proxy_is_resolved_on_client_creation_not_cache_hits() {
+        const CHILD: &str = "BYTEHAUL_PROXY_CACHE_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let downloader = Downloader::builder().build().unwrap();
+            let first = downloader.bench_default_client().unwrap();
+            // This test runs alone in a subprocess; no parallel test sees this.
+            std::env::set_var("ALL_PROXY", "socks5://127.0.0.1:9");
+            let reused = cached_client_for_config(
+                &downloader.client_cache,
+                ClientNetworkConfig {
+                    connect_timeout: Duration::from_secs(1),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert!(same_transport(&first, &reused));
+            let miss = cached_client_for_config(
+                &downloader.client_cache,
+                ClientNetworkConfig {
+                    pool_max_idle_per_host: 19,
+                    ..Default::default()
+                },
+            );
+            assert!(matches!(miss, Err(DownloadError::InvalidConfig(_))));
+            return;
+        }
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command.args([
+            "--exact",
+            "manager::tests::environment_proxy_is_resolved_on_client_creation_not_cache_hits",
+        ]);
+        command.env(CHILD, "1");
+        for key in [
+            "ALL_PROXY",
+            "all_proxy",
+            "HTTP_PROXY",
+            "http_proxy",
+            "HTTPS_PROXY",
+            "https_proxy",
+        ] {
+            command.env_remove(key);
+        }
+        assert!(command.status().unwrap().success());
+    }
+
+    #[tokio::test]
+    async fn evicted_client_and_its_response_can_finish() {
+        use crate::http::next_data_chunk;
+        let server = spawn_forbidden_server();
+        let downloader = Downloader::builder().build().unwrap();
+        let client = downloader.bench_default_client().unwrap();
+        let response = client
+            .request(
+                http::Request::get(server)
+                    .body(crate::http::HttpRequestBody::new())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        for idle in 100..100 + CLIENT_CACHE_CAPACITY {
+            cached_client_for_config(
+                &downloader.client_cache,
+                ClientNetworkConfig {
+                    pool_max_idle_per_host: idle,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        }
+        assert!(!same_transport(
+            &client,
+            &downloader.bench_default_client().unwrap()
+        ));
+        drop(client);
+        let mut body = response.into_body();
+        while next_data_chunk(&mut body, Duration::from_secs(2))
+            .await
+            .unwrap()
+            .is_some()
+        {}
+    }
+
+    fn same_transport(left: &BytehaulClient, right: &BytehaulClient) -> bool {
+        match (left, right) {
+            (BytehaulClient::Curl(left), BytehaulClient::Curl(right)) => Arc::ptr_eq(left, right),
+        }
+    }
+
+    #[test]
+    fn cache_is_lru_bounded_and_eviction_does_not_drop_active_clients() {
+        let downloader = Downloader::builder().build().unwrap();
+        let default = downloader.bench_default_client().unwrap();
+        let config = |idle| ClientNetworkConfig {
+            pool_max_idle_per_host: idle,
+            ..Default::default()
+        };
+        let first = cached_client_for_config(&downloader.client_cache, config(100)).unwrap();
+        for idle in 101..100 + CLIENT_CACHE_CAPACITY {
+            cached_client_for_config(&downloader.client_cache, config(idle)).unwrap();
+        }
+        assert_eq!(
+            downloader.bench_cached_client_count(),
+            CLIENT_CACHE_CAPACITY
+        );
+        let reused = cached_client_for_config(&downloader.client_cache, config(100)).unwrap();
+        assert!(same_transport(&first, &reused));
+        // Refreshing 100 evicts 101 on the next miss, rather than 100.
+        cached_client_for_config(&downloader.client_cache, config(200)).unwrap();
+        assert!(same_transport(
+            &first,
+            &cached_client_for_config(&downloader.client_cache, config(100)).unwrap()
+        ));
+        assert!(!same_transport(
+            &default,
+            &downloader.bench_default_client().unwrap()
+        ));
+        // The evicted default remains usable while this caller holds it.
+        assert!(default.driver_stats().is_some());
+    }
+
+    #[test]
+    fn concurrent_cache_misses_share_one_transport_and_timeouts_do_not_split_it() {
+        let downloader = Downloader::builder().build().unwrap();
+        let gate = Arc::new(std::sync::Barrier::new(8));
+        let clients = std::thread::scope(|scope| {
+            let tasks: Vec<_> = (0..8)
+                .map(|index| {
+                    let cache = downloader.client_cache.clone();
+                    let gate = gate.clone();
+                    scope.spawn(move || {
+                        gate.wait();
+                        cached_client_for_config(
+                            &cache,
+                            ClientNetworkConfig {
+                                connect_timeout: Duration::from_secs(index + 1),
+                                pool_max_idle_per_host: 17,
+                                ..Default::default()
+                            },
+                        )
+                        .unwrap()
+                    })
+                })
+                .collect();
+            tasks
+                .into_iter()
+                .map(|task| task.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(downloader.bench_cached_client_count(), 2);
+        assert!(clients
+            .iter()
+            .all(|client| same_transport(client, &clients[0])));
+    }
+
+    #[test]
     fn test_cached_client_lookup_reuses_existing_entry() {
         let downloader = Downloader::builder().build().unwrap();
 
@@ -883,12 +1086,12 @@ mod tests {
         downloader
             .bench_cached_client_lookup(Duration::from_secs(10))
             .unwrap();
-        assert_eq!(downloader.bench_cached_client_count(), 2);
+        assert_eq!(downloader.bench_cached_client_count(), 1);
 
         downloader
             .bench_cached_client_lookup(Duration::from_secs(10))
             .unwrap();
-        assert_eq!(downloader.bench_cached_client_count(), 2);
+        assert_eq!(downloader.bench_cached_client_count(), 1);
     }
 
     #[tokio::test]

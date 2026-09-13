@@ -58,6 +58,7 @@ pub(crate) struct HttpWorker {
     url: String,
     headers: HashMap<String, String>,
     timeout: Duration,
+    connect_timeout: Duration,
     final_url: Arc<Mutex<Option<String>>>,
     counters: Arc<RequestCounters>,
     attempt: Option<(usize, usize, u64)>,
@@ -75,6 +76,7 @@ impl HttpWorker {
             url: spec.url.clone(),
             headers: spec.headers.clone(),
             timeout: spec.request_headers_timeout.unwrap_or(spec.read_timeout),
+            connect_timeout: spec.get_connect_timeout(),
             final_url: Arc::new(Mutex::new(None)),
             counters: Arc::new(RequestCounters::default()),
             attempt: None,
@@ -112,6 +114,8 @@ impl HttpWorker {
         if let Some(budget) = self.body_budget {
             req.extensions_mut().insert(BodyBudget(budget));
         }
+        req.extensions_mut()
+            .insert(crate::network::ConnectTimeout(self.connect_timeout));
         let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
         let started = Instant::now();
         self.counters.started.fetch_add(1, Ordering::Relaxed);

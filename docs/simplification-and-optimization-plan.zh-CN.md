@@ -125,7 +125,7 @@ P1 的测量结果、复现命令与判据见[默认路径与资源基线](pipel
 
 ### P2：收敛配置并限制共享 client 资源
 
-状态：实施中；网络覆盖解析步骤已完成，资源复用及其余配置收敛继续实施。
+状态：实施中；网络覆盖解析与资源复用已完成，其余配置收敛继续实施。
 
 改动位置：[config.rs](../src/config.rs)、[manager.rs](../src/manager.rs)、[network.rs](../src/network.rs)、[transport.rs](../src/network/curl/transport.rs)、[Python 绑定](../bindings/python/src/lib.rs)。
 
@@ -328,3 +328,11 @@ P1 由测量本身暴露并修复的三处缺陷：
 - 保留公开 getter 的默认值、显式设置默认值覆盖 downloader、代理整组替换、TLS 路径逐项继承，以及禁用连接池时继承 downloader idle timeout 的语义。增加 setter 顺序与显式默认值回归测试。Python 参数和校验顺序本步未变。
 - macOS / Rust 1.96：fmt、doc test、workspace rustdoc（`-D warnings`）通过；清除子进程代理变量后 lib 523 通过、1 失败、3 忽略。失败的 `a_pool_that_may_not_reuse_connections_keeps_none_idle` 在 `git archive HEAD` 的原始源码上独立复现。集成测试 102 通过，慢尾竞速一项首次失败、独立复测通过，原始源码的慢速恢复 11 项全部通过。
 - 全量 `--all-targets --no-fail-fast` 已执行测试并进入 42 场景基准；基准耗时不作为本步结构变更的性能结论。Clippy 被既有 `driver/mod.rs` 的平台类型转换和 `scheduler.rs` 的 checked division 两项告警阻挡。本步不宣称全量检查通过；Linux 95% 覆盖率未执行。
+
+### P2 步骤 2：请求连接期限与有界 client 缓存（2026-09-14）
+
+- manager 先解析生效连接期限，`HttpWorker` 为每个请求（含重定向）附加 `ConnectTimeout`；传输层继续将 DNS 与 libcurl 建连置于同一期限，DNS 用掉的时间从建连剩余时间扣除。共享 `ClientKey` 排除连接超时，保留代理、TLS、DNS、IPv6 与 pool 字段。内部直接构建 transport 的测试入口仍保留默认期限。
+- 使用容量 **16** 的 LRU，默认 client 计入容量且可被淘汰；每个条目有独立初始化锁，同 key 的并发 miss 只创建一个 transport。全局锁仅管理条目，构建及淘汰资源的释放在锁外执行。构建失败的条目可重试，仍计入容量。
+- 淘汰不取消活动请求；调用方及响应持有资源直到退出。容量限制的是缓存引用，不是活动下载的线程/socket 硬上限。环境代理保持“client 创建时解析、缓存命中不重读”；超时变化现在属于命中，需改变网络配置或重建 downloader 才重读代理。独立子进程测试固定这一解析时机。
+- macOS 本机前后各十轮：32 种超时由 33 条目 / 33 驱动线程降为 1 / 1，释放后每轮均为 0。数据见 [P2 原始样本](p2-client-run/samples.csv)、[同机修改前样本](p2-client-run/before-samples.csv) 与[报告](p2-client-run/report.md)。不同于 P1 的 Windows 基线，此处只比较同机资源数量，不宣称跨平台吞吐收益。
+- 验证：新增并发 miss、LRU 顺序与容量、淘汰后响应完成、环境代理时机，以及同 transport 同时使用 30 ms / 2 s DNS 期限的回归测试通过。manager 34 项、HTTP header 10 项、flow control 4 项、pipeline counters 1 项通过；lib 528 通过、1 项既有空闲池失败、3 忽略。fmt、doc test、workspace rustdoc 通过；Clippy 仍被步骤 1 记录的两项既有告警阻挡。Linux 覆盖率未执行。步骤 1 的全量基准已结束，测试失败仍仅为已记录的空闲池与首次慢尾竞速两项。

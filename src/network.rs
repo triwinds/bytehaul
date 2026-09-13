@@ -19,6 +19,10 @@ use crate::http::{HttpRequestBody, HttpResponse};
 #[cfg(feature = "curl-backend")]
 use self::curl::CurlTransport;
 
+/// Per-request connection budget, including DNS resolution.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ConnectTimeout(pub Duration);
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct ClientNetworkConfig {
     pub connect_timeout: Duration,
