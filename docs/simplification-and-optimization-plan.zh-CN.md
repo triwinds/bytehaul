@@ -393,3 +393,11 @@ P2 实现已完成。以上分组不改变公开签名；缓存上限与请求�
 - 最终源码的 fmt、workspace Clippy（`-D warnings`）、doc test、workspace rustdoc（`-D warnings`）通过，Rust lib 527 / 集成 105 全部通过、3 项忽略；Python 重新构建后 157 项通过。此前步骤中异步全量命令与后续编辑交叠的检查结果不作为最终证据，以这次固定源码复验为准。
 - P2 资源报告的 profile 标注已校正为实际运行的 `cargo test --bench` debug 配置，未把它当作 release 吞吐数据。32 种超时的条目/线程数量与释放结果不受此标注影响。
 - 完整 `--all-targets` 基准与 Ubuntu 24.04 x86_64 容器中的固定版本覆盖率入口仍在最终验证中，结果另行追加；不把尚未得到的 Linux 95% 门槛结果标为通过。
+
+### P2/P3 macOS 最终全量验证与样本归档（2026-09-14）
+
+生产源码对应 `b748d3e`。最终 `cargo test -p bytehaul --locked --all-targets` **退出码 0**：lib 527、集成 105 通过，3 项忽略，基准/示例目标执行完毕；fmt、Clippy、doc test 和 workspace rustdoc 均通过。最终 Python 扩展重新构建后 157 项全部通过。
+
+42 场景基准每场十轮完整结束；七类端到端前后原始样本与中位耗时对照见 [P2/P3 本机端到端回归样本](p3-execution-run/report.zh-CN.md)。没有超过 10% 的中位耗时回退，但该 debug、共享主机测量不支持 release 吞吐或 CPU 提升结论。断流场景保持既有失败与重复流量，不把基准命令成功当作每个下载成功。
+
+Ubuntu 24.04 x86_64 覆盖率入口已在本机 QEMU 容器中调用 `python3 scripts/coverage.py --install`。容器只有 2 GB 内存、2 CPU；为避免此前工具安装日志中的 SIGKILL，在临时容器的 Cargo 配置中仅对安装工具使用 release `lto=false`、`codegen-units=16`、`opt-level=1`。固定 Rust 1.98.1、Tarpaulin 0.37.2、LLVM engine 与 95% 阈值不变；该结果仍在等待，暂不宣称 Linux 覆盖率通过。
