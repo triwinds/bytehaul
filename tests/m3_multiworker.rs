@@ -1,8 +1,12 @@
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use bytehaul::{DownloadSpec, DownloadState, Downloader, FileAllocation, LogLevel};
+use bytehaul::{
+    DownloadSpec, DownloadState, Downloader, FileAllocation, LogLevel, RangeSchedulingMode,
+};
+use futures::StreamExt;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
@@ -12,6 +16,7 @@ use warp::Filter;
 struct RequestEvent {
     connection_id: usize,
     range_header: Option<String>,
+    truncated: bool,
 }
 
 #[derive(Debug, Default)]
@@ -26,9 +31,23 @@ impl RequestLog {
     }
 
     fn record(&self, connection_id: usize, range_header: Option<String>) {
+        self.record_with_status(connection_id, range_header, false);
+    }
+
+    fn record_truncated(&self, connection_id: usize, range_header: Option<String>) {
+        self.record_with_status(connection_id, range_header, true);
+    }
+
+    fn record_with_status(
+        &self,
+        connection_id: usize,
+        range_header: Option<String>,
+        truncated: bool,
+    ) {
         self.events.lock().unwrap().push(RequestEvent {
             connection_id,
             range_header,
+            truncated,
         });
     }
 
@@ -361,16 +380,65 @@ fn truncated_once_range_server(
     data: Vec<u8>,
     truncate_start: usize,
 ) -> (std::net::SocketAddr, impl std::future::Future<Output = ()>) {
+    truncated_once_range_server_if(path_segment, data, move |start, _end| {
+        start == truncate_start
+    })
+}
+
+fn truncated_once_large_range_server(
+    path_segment: &'static str,
+    data: Vec<u8>,
+    piece_size: usize,
+) -> (
+    std::net::SocketAddr,
+    Arc<RequestLog>,
+    impl std::future::Future<Output = ()>,
+) {
+    truncated_once_range_server_if_with_log(path_segment, data, move |start, end| {
+        end.saturating_sub(start).saturating_add(1) > piece_size
+    })
+}
+
+fn truncated_once_range_server_if<F>(
+    path_segment: &'static str,
+    data: Vec<u8>,
+    should_truncate: F,
+) -> (std::net::SocketAddr, impl std::future::Future<Output = ()>)
+where
+    F: Fn(usize, usize) -> bool + Send + Sync + 'static,
+{
+    let (addr, _request_log, server) =
+        truncated_once_range_server_if_with_log(path_segment, data, should_truncate);
+    (addr, server)
+}
+
+fn truncated_once_range_server_if_with_log<F>(
+    path_segment: &'static str,
+    data: Vec<u8>,
+    should_truncate: F,
+) -> (
+    std::net::SocketAddr,
+    Arc<RequestLog>,
+    impl std::future::Future<Output = ()>,
+)
+where
+    F: Fn(usize, usize) -> bool + Send + Sync + 'static,
+{
     let data = Arc::new(data);
     let truncated = Arc::new(AtomicUsize::new(0));
+    let predicate = Arc::new(should_truncate);
+    let request_log = Arc::new(RequestLog::default());
     let d = data.clone();
     let t = truncated.clone();
+    let p = predicate.clone();
+    let l = request_log.clone();
 
     let route = warp::path(path_segment)
         .and(warp::header::optional::<String>("range"))
         .map(move |range_header: Option<String>| {
             let data = d.clone();
             let total = data.len();
+            let logged_range = range_header.clone();
 
             match range_header {
                 Some(range) => {
@@ -387,7 +455,12 @@ fn truncated_once_range_server(
                     };
                     let slice = &data[start as usize..=end as usize];
                     let should_truncate =
-                        start as usize == truncate_start && t.fetch_add(1, Ordering::SeqCst) == 0;
+                        p(start as usize, end as usize) && t.fetch_add(1, Ordering::SeqCst) == 0;
+                    if should_truncate {
+                        l.record_truncated(0, logged_range);
+                    } else {
+                        l.record(0, logged_range);
+                    }
                     let body = if should_truncate {
                         slice[..slice.len() / 2].to_vec()
                     } else {
@@ -405,13 +478,70 @@ fn truncated_once_range_server(
                         .body(body)
                         .unwrap()
                 }
-                None => warp::http::Response::builder()
-                    .status(200)
-                    .header("content-length", total.to_string())
-                    .header("accept-ranges", "bytes")
-                    .body(data.to_vec())
-                    .unwrap(),
+                None => {
+                    l.record(0, None);
+                    warp::http::Response::builder()
+                        .status(200)
+                        .header("content-length", total.to_string())
+                        .header("accept-ranges", "bytes")
+                        .body(data.to_vec())
+                        .unwrap()
+                }
             }
+        });
+
+    let (addr, server) = warp::serve(route).bind_ephemeral(([127, 0, 0, 1], 0));
+    (addr, request_log, server)
+}
+
+fn delayed_range_server(
+    path_segment: &'static str,
+    data: Vec<u8>,
+    slow_start: usize,
+    slow_delay: Duration,
+    normal_delay: Duration,
+) -> (std::net::SocketAddr, impl std::future::Future<Output = ()>) {
+    let data = Arc::new(data);
+    let d = data.clone();
+    let route = warp::path(path_segment)
+        .and(warp::header::optional::<String>("range"))
+        .map(move |range_header: Option<String>| {
+            let data = d.clone();
+            let total = data.len();
+            let (start, end) = range_header
+                .as_deref()
+                .and_then(|range| parse_range_header(range, total))
+                .unwrap_or((0, total - 1));
+            let delay = if start == slow_start {
+                slow_delay
+            } else {
+                normal_delay
+            };
+            let slice = data[start..=end].to_vec();
+            let chunks: Vec<Result<Vec<u8>, std::convert::Infallible>> = slice
+                .chunks(8 * 1024)
+                .map(|chunk| Ok(chunk.to_vec()))
+                .collect();
+            let stream = futures::stream::iter(chunks).then(move |chunk| async move {
+                tokio::time::sleep(delay).await;
+                chunk
+            });
+            let body = warp::hyper::Body::wrap_stream(stream);
+            let is_range = range_header.is_some();
+            let status = if is_range { 206 } else { 200 };
+            let mut response = warp::http::Response::builder()
+                .status(status)
+                .header("content-length", slice.len().to_string())
+                .header("accept-ranges", "bytes")
+                .header("etag", "\"delayed-multitest\"")
+                .header("last-modified", "Sat, 01 Jan 2026 00:00:00 GMT");
+            if is_range {
+                response = response.header(
+                    "content-range",
+                    format!("bytes {}-{}/{}", start, end, total),
+                );
+            }
+            response.body(body).unwrap()
         });
 
     warp::serve(route).bind_ephemeral(([127, 0, 0, 1], 0))
@@ -491,6 +621,7 @@ async fn test_multi_worker_range_requests_use_distinct_connections() {
         .piece_size(piece_size as u64)
         .min_split_size(1)
         .request_batch_size(0)
+        .range_scheduling_mode(RangeSchedulingMode::Fixed)
         .disable_http_idle_pool();
 
     let handle = downloader.download(spec);
@@ -523,7 +654,7 @@ async fn test_multi_worker_range_requests_use_distinct_connections() {
 }
 
 #[tokio::test]
-async fn test_multi_worker_defaults_batch_ranges_and_reuse_connections() {
+async fn test_multi_worker_fixed_batch_ranges_and_reuse_connections() {
     let piece_size = 64 * 1024usize;
     let piece_count = 128usize;
     let size = piece_size * piece_count;
@@ -541,7 +672,8 @@ async fn test_multi_worker_defaults_batch_ranges_and_reuse_connections() {
         .file_allocation(FileAllocation::None)
         .max_connections(4)
         .piece_size(piece_size as u64)
-        .min_split_size(1);
+        .min_split_size(1)
+        .range_scheduling_mode(RangeSchedulingMode::Fixed);
 
     let handle = downloader.download(spec);
     handle.wait().await.unwrap();
@@ -573,7 +705,102 @@ async fn test_multi_worker_defaults_batch_ranges_and_reuse_connections() {
 }
 
 #[tokio::test]
-async fn test_multi_worker_dynamic_split_issues_subranges_with_single_piece() {
+async fn test_multi_worker_dynamic_ranges_ignore_fixed_batch_and_keep_piece_boundaries() {
+    let piece_size = 64 * 1024usize;
+    let piece_count = 32usize;
+    let size = piece_size * piece_count;
+    let content: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+
+    let (addr, request_log, shutdown_tx, server) =
+        spawn_connection_counting_range_server("dynamic-ranges", content.clone());
+
+    let dir = tempfile::tempdir().unwrap();
+    let output_path = dir.path().join("dynamic-ranges.bin");
+    let downloader = Downloader::builder().build().unwrap();
+    let spec = DownloadSpec::new(format!("http://{addr}/dynamic-ranges"))
+        .output_path(output_path.clone())
+        .file_allocation(FileAllocation::None)
+        .max_connections(4)
+        .piece_size(piece_size as u64)
+        .min_split_size(1)
+        .request_batch_size(piece_size as u64)
+        .range_scheduling_mode(RangeSchedulingMode::Dynamic)
+        .dynamic_min_split_size(piece_size as u64)
+        .dynamic_max_request_size((piece_size * 2) as u64)
+        .slow_transfer_mode(bytehaul::SlowTransferMode::Disabled);
+
+    downloader.download(spec).wait().await.unwrap();
+    let _ = shutdown_tx.send(());
+    server.await.unwrap();
+
+    assert_eq!(std::fs::read(&output_path).unwrap(), content);
+
+    let mut ranges: Vec<_> = request_log
+        .snapshot()
+        .into_iter()
+        .filter_map(|event| event.range_header)
+        .filter_map(|range| parse_range_header(&range, size))
+        .collect();
+    ranges.sort_unstable();
+    ranges.dedup();
+    assert!(
+        ranges.iter().all(|(start, end)| start % piece_size == 0
+            && (end + 1 == size || (end + 1) % piece_size == 0)),
+        "dynamic ranges crossed piece boundaries: {ranges:?}"
+    );
+    assert!(
+        ranges.windows(2).all(|pair| pair[0].1 < pair[1].0),
+        "dynamic ranges overlap: {ranges:?}"
+    );
+    assert!(
+        ranges
+            .iter()
+            .any(|(start, end)| end + 1 - start == piece_size * 2),
+        "dynamic mode did not use its independent request cap: {ranges:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_multi_worker_dynamic_handles_slow_range_and_writer_backpressure() {
+    let piece_size = 32 * 1024usize;
+    let size = 64 * piece_size;
+    let content: Vec<u8> = (0..size).map(|i| (i % 239) as u8).collect();
+    let expected = content.clone();
+    let (addr, server) = delayed_range_server(
+        "dynamic-slow",
+        content,
+        piece_size,
+        Duration::from_millis(15),
+        Duration::from_millis(1),
+    );
+    tokio::spawn(server);
+
+    let dir = tempfile::tempdir().unwrap();
+    let output_path = dir.path().join("dynamic-slow.bin");
+    let downloader = Downloader::builder().build().unwrap();
+    let spec = DownloadSpec::new(format!("http://{addr}/dynamic-slow"))
+        .output_path(output_path.clone())
+        .file_allocation(FileAllocation::None)
+        .max_connections(4)
+        .piece_size(piece_size as u64)
+        .min_split_size(1)
+        .request_batch_size(1)
+        .range_scheduling_mode(RangeSchedulingMode::Dynamic)
+        .dynamic_min_split_size(piece_size as u64)
+        .dynamic_max_request_size((piece_size * 4) as u64)
+        .channel_buffer(1)
+        .memory_budget(64 * 1024)
+        .slow_transfer_mode(bytehaul::SlowTransferMode::Disabled);
+
+    let result = tokio::time::timeout(Duration::from_secs(20), downloader.download(spec).wait())
+        .await
+        .expect("dynamic slow/backpressure download timed out");
+    result.unwrap();
+    assert_eq!(std::fs::read(&output_path).unwrap(), expected);
+}
+
+#[tokio::test]
+async fn test_multi_worker_fixed_probe_keeps_first_piece_whole() {
     let size = 256 * 1024usize;
     let content: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
 
@@ -601,15 +828,6 @@ async fn test_multi_worker_dynamic_split_issues_subranges_with_single_piece() {
     let downloaded = std::fs::read(&output_path).unwrap();
     assert_eq!(downloaded, content);
 
-    let expected_ranges: HashSet<_> = [
-        format!("bytes=0-{}", size / 4 - 1),
-        format!("bytes={}-{}", size / 4, size / 2 - 1),
-        format!("bytes={}-{}", size / 2, size * 3 / 4 - 1),
-        format!("bytes={}-{}", size * 3 / 4, size - 1),
-    ]
-    .into_iter()
-    .collect();
-
     let observed_ranges: HashSet<_> = request_log
         .snapshot()
         .into_iter()
@@ -617,10 +835,11 @@ async fn test_multi_worker_dynamic_split_issues_subranges_with_single_piece() {
         .collect();
 
     assert!(
-        expected_ranges.is_subset(&observed_ranges),
-        "dynamic split did not issue all expected subranges: {:?}",
+        observed_ranges.contains(&format!("bytes=0-{}", size - 1)),
+        "the initial probe should be consumed as one exact piece: {:?}",
         observed_ranges
     );
+    assert_eq!(observed_ranges.len(), 1);
 }
 
 #[tokio::test]
@@ -737,6 +956,76 @@ async fn test_multi_worker_retries_truncated_segment_without_overcounting_progre
 
     let downloaded = std::fs::read(&output_path).unwrap();
     assert_eq!(downloaded, expected);
+}
+
+#[tokio::test]
+async fn test_multi_worker_dynamic_retries_interrupted_large_range() {
+    let piece_size = 64 * 1024usize;
+    let size = 16 * piece_size;
+    let content: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+    let expected = content.clone();
+    let (addr, request_log, server) =
+        truncated_once_large_range_server("dynamic-retry", content, piece_size);
+    tokio::spawn(server);
+
+    let dir = tempfile::tempdir().unwrap();
+    let output_path = dir.path().join("dynamic-retry.bin");
+    let downloader = Downloader::builder().build().unwrap();
+    let spec = DownloadSpec::new(format!("http://{addr}/dynamic-retry"))
+        .output_path(output_path.clone())
+        .file_allocation(FileAllocation::None)
+        .max_connections(2)
+        .piece_size(piece_size as u64)
+        .min_split_size(1)
+        // Dynamic scheduling must still form a large request when the
+        // compatibility batch field is zero.
+        .request_batch_size(0)
+        .range_scheduling_mode(RangeSchedulingMode::Dynamic)
+        .dynamic_min_split_size(piece_size as u64)
+        .dynamic_max_request_size((piece_size * 4) as u64)
+        .slow_transfer_mode(bytehaul::SlowTransferMode::Disabled)
+        .max_retries(2);
+
+    downloader.download(spec).wait().await.unwrap();
+    assert_eq!(std::fs::read(&output_path).unwrap(), expected);
+
+    let events = request_log.snapshot();
+    assert!(
+        !events.is_empty(),
+        "expected recorded requests, got {events:?}"
+    );
+    let ranges = events
+        .iter()
+        .filter_map(|event| event.range_header.as_deref())
+        .filter_map(|range| parse_range_header(range, size).map(|(start, end)| end - start + 1))
+        .collect::<Vec<_>>();
+    assert!(
+        !ranges.is_empty(),
+        "expected recorded range requests: {events:?}"
+    );
+    assert!(ranges.len() >= 4, "expected retry requests, got {ranges:?}");
+    assert!(
+        ranges.iter().any(|length| *length > piece_size),
+        "expected an initial multi-piece range, got {ranges:?}"
+    );
+    assert!(ranges.iter().all(|length| *length >= piece_size));
+    assert!(
+        ranges.iter().all(|length| *length % piece_size == 0),
+        "recovery must preserve whole-piece request boundaries: {ranges:?}"
+    );
+    let truncated_index = events
+        .iter()
+        .position(|event| event.truncated)
+        .expect("the server must truncate one multi-piece request");
+    assert!(
+        events
+            .iter()
+            .skip(truncated_index + 1)
+            .filter_map(|event| event.range_header.as_deref())
+            .filter_map(|range| parse_range_header(range, size).map(|(start, end)| end - start + 1))
+            .any(|length| length > piece_size),
+        "unconsumed suffix should be rebatched after interruption: {ranges:?}"
+    );
 }
 
 #[tokio::test]
@@ -1002,7 +1291,11 @@ async fn test_multi_worker_resume_after_cancel() {
         .file_allocation(FileAllocation::Prealloc)
         .max_connections(4)
         .piece_size(1024 * 1024)
-        .min_split_size(10 * 1024 * 1024);
+        .min_split_size(10 * 1024 * 1024)
+        .request_batch_size(0)
+        .range_scheduling_mode(RangeSchedulingMode::Dynamic)
+        .dynamic_min_split_size(1024 * 1024)
+        .dynamic_max_request_size(2 * 1024 * 1024);
 
     let handle = downloader.download(spec.clone());
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;

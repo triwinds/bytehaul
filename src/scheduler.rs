@@ -4,12 +4,15 @@ use std::{cmp, collections::BTreeMap};
 use bitvec::prelude::*;
 use parking_lot::Mutex;
 
+use crate::config::RangeSchedulingMode;
 use crate::storage::control::ControlHints;
 use crate::storage::piece_map::PieceMap;
 use crate::storage::segment::{LeaseKey, Segment};
 
 /// Shared scheduler handle.
 pub(crate) type Scheduler = Arc<Mutex<SchedulerState>>;
+/// Maximum number of piece leases that one HTTP request may own.
+pub(crate) const MAX_REQUEST_LEASES: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ByteRange {
@@ -20,6 +23,109 @@ struct ByteRange {
 impl ByteRange {
     fn new(start: u64, end: u64) -> Option<Self> {
         (start < end).then_some(Self { start, end })
+    }
+}
+
+/// The leases issued for one ordinary HTTP request.
+///
+/// A request owns one slot, while the returned vector may contain several
+/// piece leases. Keeping this result together makes the scheduler decision
+/// atomic: no other worker can claim the gap between the first lease and the
+/// rest of the request.
+#[derive(Debug)]
+pub(crate) struct RequestAssignment {
+    pub(crate) segments: Vec<Segment>,
+    pub(crate) candidate_start: u64,
+    pub(crate) candidate_end: u64,
+    pub(crate) candidate_boundary_scanned: bool,
+    pub(crate) candidate_slots: usize,
+    pub(crate) target_end: u64,
+    pub(crate) candidate_shares: Option<Vec<DynamicCandidateShare>>,
+    pub(crate) final_start: u64,
+    pub(crate) final_end: u64,
+    pub(crate) available_request_slots: usize,
+    pub(crate) occupied_requests: usize,
+    pub(crate) planned_ranges: usize,
+    pub(crate) truncation_reason: &'static str,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DynamicCandidateShare {
+    pub(crate) start: u64,
+    pub(crate) end: u64,
+    pub(crate) slots: usize,
+    pub(crate) share_bytes: u64,
+}
+
+impl RequestAssignment {
+    pub(crate) fn single(
+        segment: Segment,
+        available_request_slots: usize,
+        occupied_requests: usize,
+    ) -> Self {
+        Self {
+            candidate_start: segment.start,
+            candidate_end: segment.end,
+            candidate_boundary_scanned: false,
+            candidate_slots: 1,
+            target_end: segment.end,
+            candidate_shares: None,
+            final_start: segment.start,
+            final_end: segment.end,
+            segments: vec![segment],
+            available_request_slots,
+            occupied_requests,
+            planned_ranges: 1,
+            truncation_reason: "none",
+        }
+    }
+
+    pub(crate) fn from_segments(
+        segments: Vec<Segment>,
+        available_request_slots: usize,
+        occupied_requests: usize,
+        truncation_reason: &'static str,
+    ) -> Option<Self> {
+        let first = segments.first()?;
+        let last = segments.last()?;
+        Some(Self {
+            candidate_start: first.start,
+            candidate_end: last.end,
+            candidate_boundary_scanned: false,
+            candidate_slots: 1,
+            target_end: last.end,
+            candidate_shares: None,
+            final_start: first.start,
+            final_end: last.end,
+            segments,
+            available_request_slots,
+            occupied_requests,
+            planned_ranges: 1,
+            truncation_reason,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AllocationCandidate {
+    start: u64,
+    end: u64,
+    first_piece: usize,
+    end_piece: usize,
+}
+
+#[derive(Debug)]
+struct DynamicPlan {
+    candidate: AllocationCandidate,
+    candidate_slots: usize,
+    planned_ranges: usize,
+    candidate_shares: Option<Vec<DynamicCandidateShare>>,
+}
+
+impl AllocationCandidate {
+    fn len(self) -> u64 {
+        self.end.saturating_sub(self.start)
     }
 }
 
@@ -249,6 +355,7 @@ impl SchedulerState {
     /// Assign using occupied HTTP requests rather than reserved piece leases
     /// when deciding whether to split work for spare request slots.
     /// `occupied_requests` excludes the request currently seeking an assignment.
+    #[allow(dead_code)]
     pub fn assign_to_with_request_split(
         &mut self,
         worker_id: usize,
@@ -263,6 +370,246 @@ impl SchedulerState {
                 .saturating_add(available_request_slots),
             min_segment_size,
         )
+    }
+
+    /// Atomically assign all piece leases that will be consumed by one new
+    /// ordinary HTTP request.
+    ///
+    /// `occupied_requests` counts requests that already hold a slot and does
+    /// not count the request being created. The caller must reserve that slot
+    /// before entering the scheduler lock. The scheduler never waits for a
+    /// permit or performs I/O while constructing this result.
+    #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn assign_request(
+        &mut self,
+        worker_id: usize,
+        max_requests: usize,
+        min_segment_size: u64,
+        occupied_requests: usize,
+        mode: RangeSchedulingMode,
+        request_batch_size: u64,
+        dynamic_min_split_size: u64,
+        dynamic_max_request_size: u64,
+        allow_batch: bool,
+    ) -> Option<RequestAssignment> {
+        self.assign_request_with_diagnostics(
+            worker_id,
+            max_requests,
+            min_segment_size,
+            occupied_requests,
+            mode,
+            request_batch_size,
+            dynamic_min_split_size,
+            dynamic_max_request_size,
+            allow_batch,
+            true,
+        )
+    }
+
+    /// Atomically assign a request, optionally collecting the full fixed-mode
+    /// candidate boundary used only by debug diagnostics. The ordinary path
+    /// does not need that boundary to issue its bounded request.
+    #[allow(clippy::too_many_arguments)]
+    pub fn assign_request_with_diagnostics(
+        &mut self,
+        worker_id: usize,
+        max_requests: usize,
+        min_segment_size: u64,
+        occupied_requests: usize,
+        mode: RangeSchedulingMode,
+        request_batch_size: u64,
+        dynamic_min_split_size: u64,
+        dynamic_max_request_size: u64,
+        allow_batch: bool,
+        collect_diagnostics: bool,
+    ) -> Option<RequestAssignment> {
+        self.assign_request_with_trace(
+            worker_id,
+            max_requests,
+            min_segment_size,
+            occupied_requests,
+            mode,
+            request_batch_size,
+            dynamic_min_split_size,
+            dynamic_max_request_size,
+            allow_batch,
+            collect_diagnostics,
+            false,
+        )
+    }
+
+    /// Variant of [`Self::assign_request_with_diagnostics`] that also retains
+    /// the complete dynamic candidate-share table for TRACE logging.
+    #[allow(clippy::too_many_arguments)]
+    pub fn assign_request_with_trace(
+        &mut self,
+        worker_id: usize,
+        max_requests: usize,
+        min_segment_size: u64,
+        occupied_requests: usize,
+        mode: RangeSchedulingMode,
+        request_batch_size: u64,
+        dynamic_min_split_size: u64,
+        dynamic_max_request_size: u64,
+        allow_batch: bool,
+        collect_diagnostics: bool,
+        collect_candidate_shares: bool,
+    ) -> Option<RequestAssignment> {
+        let available_request_slots = max_requests.saturating_sub(occupied_requests);
+        if available_request_slots == 0 || self.available_range_count == 0 {
+            return None;
+        }
+
+        // A fresh probe must never be made part of a newly planned multi-piece
+        // request. It covers the first whole piece exactly, so all modes use
+        // the exact single-lease path here. Fixed mode retains its legacy
+        // underutilized-piece split for ordinary requests without a probe.
+        // Recovery assignments use their own lineage path and do not call
+        // this method.
+        if !allow_batch {
+            let segment = self.assign_to(worker_id)?;
+            return Some(RequestAssignment::single(
+                segment,
+                available_request_slots,
+                occupied_requests,
+            ));
+        }
+
+        match mode {
+            RangeSchedulingMode::Fixed => self.assign_fixed_request(
+                worker_id,
+                max_requests,
+                min_segment_size,
+                occupied_requests,
+                request_batch_size,
+                available_request_slots,
+                collect_diagnostics,
+            ),
+            RangeSchedulingMode::Dynamic => self.assign_dynamic_request(
+                worker_id,
+                occupied_requests,
+                available_request_slots,
+                dynamic_min_split_size,
+                dynamic_max_request_size,
+                collect_candidate_shares,
+            ),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn assign_fixed_request(
+        &mut self,
+        worker_id: usize,
+        max_requests: usize,
+        min_segment_size: u64,
+        occupied_requests: usize,
+        request_batch_size: u64,
+        available_request_slots: usize,
+        collect_diagnostics: bool,
+    ) -> Option<RequestAssignment> {
+        let max_active_leases = self
+            .active_lease_count
+            .saturating_add(available_request_slots);
+        let first = self.assign_to_with_split(worker_id, max_active_leases, min_segment_size)?;
+        let batch_allowed = first.attempt == 1;
+        let scan_candidate_boundary = collect_diagnostics
+            && batch_allowed
+            && request_batch_size > first.end.saturating_sub(first.start)
+            && self.is_fresh_whole_lease(&first);
+        let candidate_end = if scan_candidate_boundary {
+            self.fresh_run_end(first.piece_id)
+        } else {
+            first.end
+        };
+        let mut segments = vec![first];
+        let (additional, truncation_reason) = if batch_allowed {
+            self.extend_batch_with_occupied(
+                &segments[0],
+                worker_id,
+                max_requests,
+                occupied_requests,
+                request_batch_size,
+            )
+        } else {
+            (Vec::new(), "recovered_or_retried")
+        };
+        segments.extend(additional);
+        let final_end = segments.last().map_or(0, |segment| segment.end);
+        Some(RequestAssignment {
+            final_start: segments[0].start,
+            final_end,
+            candidate_start: segments[0].start,
+            candidate_end,
+            candidate_boundary_scanned: scan_candidate_boundary,
+            candidate_slots: 1,
+            target_end: candidate_end,
+            candidate_shares: None,
+            available_request_slots,
+            occupied_requests,
+            planned_ranges: available_request_slots
+                .min(self.available_range_count + segments.len()),
+            truncation_reason,
+            segments,
+        })
+    }
+
+    fn assign_dynamic_request(
+        &mut self,
+        worker_id: usize,
+        occupied_requests: usize,
+        available_request_slots: usize,
+        dynamic_min_split_size: u64,
+        dynamic_max_request_size: u64,
+        collect_candidate_shares: bool,
+    ) -> Option<RequestAssignment> {
+        let candidates = self.dynamic_candidates();
+        if candidates.is_empty() {
+            // Touched pieces (including recovered suffixes and fragmented
+            // holes) stay on the exact single-lease path. This keeps the
+            // dynamic planner's invariants limited to complete piece runs,
+            // while still allowing the download to finish when no untouched
+            // run remains.
+            return self.assign_to(worker_id).map(|segment| {
+                RequestAssignment::single(segment, available_request_slots, occupied_requests)
+            });
+        }
+
+        let min_split_size = self.aligned_dynamic_min_split_size(dynamic_min_split_size);
+        let plan = self.plan_dynamic_share(
+            candidates,
+            available_request_slots,
+            min_split_size,
+            collect_candidate_shares,
+        )?;
+        let desired_end_piece =
+            self.dynamic_share_end_piece(plan.candidate, plan.candidate_slots, min_split_size);
+        let target_end = self.piece_map.piece_range(desired_end_piece - 1).1;
+        let (final_end, truncation_reason) = self.dynamic_request_end(
+            plan.candidate,
+            desired_end_piece,
+            min_split_size,
+            dynamic_max_request_size,
+        );
+        let segments = self.issue_dynamic_candidate(plan.candidate, final_end, worker_id)?;
+        let final_start = segments.first()?.start;
+        let final_end = segments.last()?.end;
+
+        Some(RequestAssignment {
+            segments,
+            candidate_start: plan.candidate.start,
+            candidate_end: plan.candidate.end,
+            candidate_boundary_scanned: true,
+            candidate_slots: plan.candidate_slots,
+            target_end,
+            candidate_shares: plan.candidate_shares,
+            final_start,
+            final_end,
+            available_request_slots,
+            occupied_requests,
+            planned_ranges: plan.planned_ranges,
+            truncation_reason,
+        })
     }
 
     pub fn assign_to_with_split(
@@ -316,6 +663,388 @@ impl SchedulerState {
         Some(segment)
     }
 
+    fn is_untouched_piece(&self, piece_id: usize) -> bool {
+        piece_id < self.piece_map.piece_count()
+            && self.available_pieces[piece_id]
+            && !self.piece_map.is_complete(piece_id)
+            && !self.pieces.contains_key(&piece_id)
+    }
+
+    fn is_fresh_whole_lease(&self, segment: &Segment) -> bool {
+        if self.piece_map.piece_range(segment.piece_id) != (segment.start, segment.end) {
+            return false;
+        }
+        let Some(piece) = self.pieces.get(&segment.piece_id) else {
+            return false;
+        };
+        piece.active_leases.len() == 1
+            && !piece.has_completed_ranges
+            && piece
+                .active_leases
+                .get(&segment.lease_id)
+                .is_some_and(|lease| {
+                    lease.range
+                        == ByteRange {
+                            start: segment.start,
+                            end: segment.end,
+                        }
+                })
+            && piece.missing_ranges.ranges.is_empty()
+    }
+
+    fn fresh_run_end(&self, first_piece: usize) -> u64 {
+        let mut end_piece = first_piece + 1;
+        while end_piece < self.piece_map.piece_count() && self.is_untouched_piece(end_piece) {
+            end_piece += 1;
+        }
+        self.piece_map.piece_range(end_piece - 1).1
+    }
+
+    /// Build independent allocation candidates from untouched complete pieces.
+    /// Touched pieces are deliberately left to the exact single-lease path so
+    /// recovery suffixes and fragmented holes cannot be merged by the dynamic
+    /// planner. The availability bitset finds whole runs in word-sized scans;
+    /// only sparse runtime pieces need to be visited to cut those runs apart.
+    fn dynamic_candidates(&self) -> Vec<AllocationCandidate> {
+        let mut candidates = Vec::new();
+        let piece_count = self.piece_map.piece_count();
+        let mut search_from = 0;
+        while search_from < piece_count {
+            let Some(offset) = self.available_pieces[search_from..].first_one() else {
+                break;
+            };
+            let first_available = search_from + offset;
+            let available_end = self.available_pieces[first_available..]
+                .first_zero()
+                .map_or(piece_count, |offset| first_available + offset);
+
+            let mut first_piece = first_available;
+            for &touched_piece in self
+                .pieces
+                .range(first_available..available_end)
+                .map(|(piece_id, _)| piece_id)
+            {
+                if first_piece < touched_piece {
+                    let (start, _) = self.piece_map.piece_range(first_piece);
+                    let (_, end) = self.piece_map.piece_range(touched_piece - 1);
+                    candidates.push(AllocationCandidate {
+                        start,
+                        end,
+                        first_piece,
+                        end_piece: touched_piece,
+                    });
+                }
+                first_piece = touched_piece.saturating_add(1);
+            }
+            if first_piece < available_end {
+                let (start, _) = self.piece_map.piece_range(first_piece);
+                let (_, end) = self.piece_map.piece_range(available_end - 1);
+                candidates.push(AllocationCandidate {
+                    start,
+                    end,
+                    first_piece,
+                    end_piece: available_end,
+                });
+            }
+            search_from = available_end;
+        }
+        candidates
+    }
+
+    fn aligned_dynamic_min_split_size(&self, configured: u64) -> u64 {
+        crate::config::effective_dynamic_min_split_size(self.piece_map.piece_size(), configured)
+    }
+
+    fn dynamic_legal_split_bounds(
+        &self,
+        candidate: AllocationCandidate,
+        min_split_size: u64,
+    ) -> Option<(usize, usize)> {
+        if candidate.end_piece <= candidate.first_piece + 1
+            || min_split_size == 0
+            || candidate.len() / min_split_size < 2
+        {
+            return None;
+        }
+
+        let piece_size = self.piece_map.piece_size().max(1);
+        let min_pieces = usize::try_from(min_split_size.div_ceil(piece_size)).ok()?;
+        let first_legal_piece = candidate.first_piece.checked_add(min_pieces)?;
+        let last_legal_piece =
+            usize::try_from(candidate.end.saturating_sub(min_split_size) / piece_size)
+                .ok()?
+                .min(candidate.end_piece.saturating_sub(1));
+        (first_legal_piece <= last_legal_piece).then_some((first_legal_piece, last_legal_piece))
+    }
+
+    fn max_dynamic_slots(&self, candidate: AllocationCandidate, min_split_size: u64) -> usize {
+        let piece_count = candidate.end_piece - candidate.first_piece;
+        let by_minimum = if min_split_size == 0 {
+            piece_count
+        } else {
+            usize::try_from(candidate.len() / min_split_size)
+                .unwrap_or(usize::MAX)
+                .max(1)
+        };
+        if by_minimum < 2
+            || self
+                .dynamic_legal_split_bounds(candidate, min_split_size)
+                .is_none()
+        {
+            return 1;
+        }
+        piece_count.min(by_minimum).max(1)
+    }
+
+    fn compare_dynamic_shares(
+        left: AllocationCandidate,
+        left_slots: usize,
+        right: AllocationCandidate,
+        right_slots: usize,
+    ) -> cmp::Ordering {
+        // Compare `left.len() / left_slots` with
+        // `right.len() / right_slots` without losing precision.
+        let left_share = u128::from(left.len()) * right_slots as u128;
+        let right_share = u128::from(right.len()) * left_slots as u128;
+        left_share
+            .cmp(&right_share)
+            .then_with(|| right.start.cmp(&left.start))
+    }
+
+    /// Allocate virtual slots to independent ranges, then choose the range
+    /// with the largest current share. This avoids materializing a fresh set
+    /// of ephemeral splits on every request and keeps a single range close to
+    /// `remaining_bytes / available_slots` as requests are issued in order.
+    fn plan_dynamic_share(
+        &self,
+        candidates: Vec<AllocationCandidate>,
+        requested_ranges: usize,
+        min_split_size: u64,
+        collect_candidate_shares: bool,
+    ) -> Option<DynamicPlan> {
+        if requested_ranges == 0 || candidates.is_empty() {
+            return None;
+        }
+
+        // When there are at least as many candidates as request slots, every
+        // candidate has one nominal slot and only the largest candidate is
+        // needed for this request. Do not sort or allocate a slot-count table
+        // for all fragmented runs.
+        if candidates.len() >= requested_ranges {
+            let chosen = (0..candidates.len()).max_by(|&left, &right| {
+                Self::compare_dynamic_shares(candidates[left], 1, candidates[right], 1)
+            })?;
+            let candidate_shares = collect_candidate_shares.then(|| {
+                candidates
+                    .iter()
+                    .map(|candidate| DynamicCandidateShare {
+                        start: candidate.start,
+                        end: candidate.end,
+                        slots: 1,
+                        share_bytes: candidate.len(),
+                    })
+                    .collect()
+            });
+            return Some(DynamicPlan {
+                candidate: candidates[chosen],
+                candidate_slots: 1,
+                planned_ranges: requested_ranges,
+                candidate_shares,
+            });
+        }
+
+        let mut slot_counts = vec![1usize; candidates.len()];
+        let mut extra_slots = requested_ranges.saturating_sub(candidates.len());
+        while extra_slots != 0 {
+            let index = (0..candidates.len())
+                .filter(|&index| {
+                    slot_counts[index] < self.max_dynamic_slots(candidates[index], min_split_size)
+                })
+                .max_by(|&left, &right| {
+                    Self::compare_dynamic_shares(
+                        candidates[left],
+                        slot_counts[left],
+                        candidates[right],
+                        slot_counts[right],
+                    )
+                });
+            let Some(index) = index else { break };
+            slot_counts[index] += 1;
+            extra_slots -= 1;
+        }
+
+        let chosen = (0..candidates.len()).max_by(|&left, &right| {
+            Self::compare_dynamic_shares(
+                candidates[left],
+                slot_counts[left],
+                candidates[right],
+                slot_counts[right],
+            )
+        })?;
+        let candidate_shares = collect_candidate_shares.then(|| {
+            candidates
+                .iter()
+                .zip(slot_counts.iter().copied())
+                .map(|(candidate, slots)| DynamicCandidateShare {
+                    start: candidate.start,
+                    end: candidate.end,
+                    slots,
+                    share_bytes: candidate.len().div_ceil(slots as u64),
+                })
+                .collect()
+        });
+        Some(DynamicPlan {
+            candidate: candidates[chosen],
+            candidate_slots: slot_counts[chosen],
+            planned_ranges: slot_counts.iter().sum(),
+            candidate_shares,
+        })
+    }
+
+    fn dynamic_share_end_piece(
+        &self,
+        candidate: AllocationCandidate,
+        slots: usize,
+        min_split_size: u64,
+    ) -> usize {
+        if slots <= 1 {
+            return candidate.end_piece;
+        }
+
+        let Some((first_legal_piece, last_legal_piece)) =
+            self.dynamic_legal_split_bounds(candidate, min_split_size)
+        else {
+            return candidate.end_piece;
+        };
+        let piece_size = self.piece_map.piece_size().max(1);
+        let target_end = candidate.start + candidate.len().div_ceil(slots as u64);
+        let target_piece = target_end / piece_size;
+        let target_remainder = target_end % piece_size;
+        let ideal_piece = target_piece.saturating_add(if target_remainder > piece_size / 2 {
+            1
+        } else {
+            0
+        });
+        usize::try_from(ideal_piece)
+            .unwrap_or(last_legal_piece)
+            .clamp(first_legal_piece, last_legal_piece)
+    }
+
+    fn dynamic_request_end(
+        &self,
+        candidate: AllocationCandidate,
+        desired_end_piece: usize,
+        min_split_size: u64,
+        configured_max_request_size: u64,
+    ) -> (u64, &'static str) {
+        let piece_size = self.piece_map.piece_size().max(1);
+        let max_request_size = configured_max_request_size.max(piece_size).max(1);
+        let byte_bound = candidate.start.saturating_add(max_request_size);
+        let desired_end_piece = desired_end_piece
+            .max(candidate.first_piece.saturating_add(1))
+            .min(candidate.end_piece);
+        let byte_end_piece = if byte_bound >= candidate.end {
+            candidate.end_piece
+        } else {
+            usize::try_from(byte_bound / piece_size)
+                .unwrap_or(candidate.first_piece)
+                .max(candidate.first_piece.saturating_add(1))
+                .min(candidate.end_piece)
+        };
+        let lease_end_piece = candidate
+            .first_piece
+            .saturating_add(MAX_REQUEST_LEASES)
+            .min(desired_end_piece);
+        let raw_end_piece = desired_end_piece
+            .min(byte_end_piece)
+            .min(lease_end_piece)
+            .max(candidate.first_piece.saturating_add(1))
+            .min(candidate.end_piece);
+        let mut end_piece = raw_end_piece;
+        let mut min_split_adjusted = false;
+        let mut min_split_conflict = false;
+        if end_piece < candidate.end_piece {
+            if let Some((first_legal_piece, last_legal_piece)) =
+                self.dynamic_legal_split_bounds(candidate, min_split_size)
+            {
+                if end_piece >= first_legal_piece {
+                    let legal_end_piece = end_piece.min(last_legal_piece);
+                    min_split_adjusted = legal_end_piece < end_piece;
+                    end_piece = legal_end_piece;
+                } else {
+                    // A hard byte/lease cap below the first legal boundary
+                    // wins; retain the reason so this deliberate exception is
+                    // visible in diagnostics.
+                    min_split_conflict = true;
+                }
+            }
+        }
+        let byte_limited = desired_end_piece > byte_end_piece;
+        let lease_limited = desired_end_piece > lease_end_piece;
+        let reason = match (byte_limited, lease_limited) {
+            (true, true) => match (min_split_adjusted, min_split_conflict) {
+                (true, false) => "max_request_bytes_and_lease_limit_and_min_split",
+                (false, true) => "max_request_bytes_and_lease_limit_and_min_split_conflict",
+                _ => "max_request_bytes_and_lease_limit",
+            },
+            (true, false) => match (min_split_adjusted, min_split_conflict) {
+                (true, false) => "max_request_bytes_and_min_split",
+                (false, true) => "max_request_bytes_and_min_split_conflict",
+                _ => "max_request_bytes",
+            },
+            (false, true) => match (min_split_adjusted, min_split_conflict) {
+                (true, false) => "lease_limit_and_min_split",
+                (false, true) => "lease_limit_and_min_split_conflict",
+                _ => "lease_limit",
+            },
+            (false, false) => match (min_split_adjusted, min_split_conflict) {
+                (true, false) => "min_split_boundary",
+                (false, true) => "min_split_conflict",
+                _ => "none",
+            },
+        };
+        (
+            self.piece_map
+                .piece_range(end_piece - 1)
+                .1
+                .min(candidate.end),
+            reason,
+        )
+    }
+
+    fn issue_dynamic_candidate(
+        &mut self,
+        candidate: AllocationCandidate,
+        end: u64,
+        worker_id: usize,
+    ) -> Option<Vec<Segment>> {
+        if self.stopped || end <= candidate.start {
+            return None;
+        }
+        let mut segments: Vec<Segment> = Vec::new();
+        for piece_id in candidate.first_piece..candidate.end_piece {
+            let (start, piece_end) = self.piece_map.piece_range(piece_id);
+            if piece_end > end {
+                break;
+            }
+            let Some(segment) = self.issue_lease(
+                piece_id,
+                ByteRange {
+                    start,
+                    end: piece_end,
+                },
+                worker_id,
+            ) else {
+                for issued in segments.iter().rev() {
+                    self.reclaim(issued.lease_key());
+                }
+                return None;
+            };
+            segments.push(segment);
+        }
+        (!segments.is_empty()).then_some(segments)
+    }
+
     #[allow(dead_code)]
     pub fn assign_subrange(
         &mut self,
@@ -335,10 +1064,65 @@ impl SchedulerState {
         self.issue_lease(piece_id, range, worker_id)
     }
 
+    pub fn is_whole_piece_segment(&self, segment: &Segment) -> bool {
+        segment.piece_id < self.piece_map.piece_count()
+            && self.piece_map.piece_range(segment.piece_id) == (segment.start, segment.end)
+    }
+
+    /// Atomically issue a contiguous set of already planned recovery leases.
+    ///
+    /// Recovery keeps whole pieces together so an interrupted multi-piece
+    /// request can be submitted again without manufacturing a smaller split
+    /// for every queued piece. The caller still owns one request slot; this
+    /// method only changes scheduler state and rolls back all leases if any
+    /// member is no longer available.
+    pub fn assign_recovery_batch(
+        &mut self,
+        pieces: &[(usize, u64, u64)],
+        worker_id: usize,
+    ) -> Option<Vec<Segment>> {
+        if pieces.is_empty() || pieces.len() > MAX_REQUEST_LEASES {
+            return None;
+        }
+
+        let mut previous: Option<(usize, u64)> = None;
+        for &(piece_id, start, end) in pieces {
+            if piece_id >= self.piece_map.piece_count() {
+                return None;
+            }
+            let (piece_start, piece_end) = self.piece_map.piece_range(piece_id);
+            if start >= end
+                || start < piece_start
+                || end > piece_end
+                || self.piece_map.is_complete(piece_id)
+                || previous.is_some_and(|(previous_piece, previous_end)| {
+                    piece_id != previous_piece.saturating_add(1) || start != previous_end
+                })
+            {
+                return None;
+            }
+            previous = Some((piece_id, end));
+        }
+
+        let mut segments: Vec<Segment> = Vec::with_capacity(pieces.len());
+        for &(piece_id, start, end) in pieces {
+            let Some(segment) = self.issue_lease(piece_id, ByteRange { start, end }, worker_id)
+            else {
+                for issued in segments.iter().rev() {
+                    self.reclaim(issued.lease_key());
+                }
+                return None;
+            };
+            segments.push(segment);
+        }
+        Some(segments)
+    }
+
     /// Reserve contiguous untouched pieces after an existing whole-piece lease.
     /// The returned leases exclude `first`; the byte and 64-lease limits include it.
     /// Leave independent ranges for the other configured request workers, without
     /// treating reserved piece leases as occupied HTTP request slots.
+    #[allow(dead_code)]
     pub fn extend_batch(
         &mut self,
         first: &Segment,
@@ -346,43 +1130,67 @@ impl SchedulerState {
         max_connections: usize,
         byte_cap: u64,
     ) -> Vec<Segment> {
+        self.extend_batch_with_occupied(first, worker_id, max_connections, 0, byte_cap)
+            .0
+    }
+
+    fn extend_batch_with_occupied(
+        &mut self,
+        first: &Segment,
+        worker_id: usize,
+        max_connections: usize,
+        occupied_requests: usize,
+        byte_cap: u64,
+    ) -> (Vec<Segment>, &'static str) {
         let mut additional = Vec::new();
         let Some(piece) = self.pieces.get(&first.piece_id) else {
-            return additional;
+            return (additional, "first_lease_not_found");
         };
         let Some(active) = piece.active_leases.get(&first.lease_id) else {
-            return additional;
+            return (additional, "first_lease_not_found");
         };
         let (start, end) = self.piece_map.piece_range(first.piece_id);
         if first.owner_worker_id != worker_id
             || (first.start, first.end) != (start, end)
             || active.range != (ByteRange { start, end })
         {
-            return additional;
+            return (additional, "first_lease_not_whole");
         }
-        let reserved_for_peers = max_connections.saturating_sub(1);
+        if byte_cap == 0 {
+            return (additional, "batch_disabled");
+        }
+        let reserved_for_peers =
+            max_connections.saturating_sub(occupied_requests.saturating_add(1));
+        let mut truncation_reason = "candidate_exhausted";
         let mut request_end = first.end;
         for piece_id in first.piece_id + 1..self.piece_map.piece_count() {
-            if additional.len() == 63
-                || self.available_range_count <= reserved_for_peers
-                || !self.available_pieces[piece_id]
-                || self.pieces.contains_key(&piece_id)
-            {
+            if additional.len() + 1 >= MAX_REQUEST_LEASES {
+                truncation_reason = "lease_limit";
+                break;
+            }
+            if self.available_range_count <= reserved_for_peers {
+                truncation_reason = "request_slots_reserved";
+                break;
+            }
+            if !self.available_pieces[piece_id] || self.pieces.contains_key(&piece_id) {
+                truncation_reason = "candidate_boundary";
                 break;
             }
             let (start, end) = self.piece_map.piece_range(piece_id);
             if start != request_end || end - first.start > byte_cap {
+                truncation_reason = "max_request_bytes";
                 break;
             }
             let Some(segment) = self.issue_lease(piece_id, ByteRange { start, end }, worker_id)
             else {
+                truncation_reason = "lease_issue_failed";
                 break;
             };
             additional.push(segment);
             request_end = end;
             self.next_candidate = (piece_id + 1) % self.piece_map.piece_count();
         }
-        additional
+        (additional, truncation_reason)
     }
 
     /// Retain a writer-confirmed prefix in runtime state, leaving the same lease
@@ -744,6 +1552,455 @@ mod tests {
             (sched.active_lease_count, sched.available_range_count),
             (1, 4)
         );
+    }
+
+    #[test]
+    fn atomic_fixed_assignment_owns_the_whole_request_batch() {
+        let mut sched = SchedulerState::new(PieceMap::new(10_000, 1_000));
+        let assignment = sched
+            .assign_request(
+                0,
+                4,
+                256,
+                0,
+                RangeSchedulingMode::Fixed,
+                3_500,
+                1_000,
+                64 * 1024 * 1024,
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            assignment
+                .segments
+                .iter()
+                .map(|segment| (segment.start, segment.end))
+                .collect::<Vec<_>>(),
+            vec![(0, 1_000), (1_000, 2_000), (2_000, 3_000)]
+        );
+        assert_eq!(assignment.candidate_end, 10_000);
+        assert_eq!(assignment.final_end, 3_000);
+        assert_eq!(assignment.truncation_reason, "max_request_bytes");
+
+        // A second worker sees the first request's complete lease set, so it
+        // starts after the batch rather than taking its adjacent pieces.
+        let next = sched
+            .assign_request(
+                1,
+                4,
+                256,
+                1,
+                RangeSchedulingMode::Fixed,
+                3_500,
+                1_000,
+                64 * 1024 * 1024,
+                true,
+            )
+            .unwrap();
+        assert_eq!(next.segments[0].start, 3_000);
+    }
+
+    #[test]
+    fn fresh_probe_assignment_keeps_the_first_piece_exact() {
+        let mut sched = SchedulerState::new(PieceMap::new(2_000, 1_000));
+        let assignment = sched
+            .assign_request(
+                0,
+                4,
+                256,
+                0,
+                RangeSchedulingMode::Fixed,
+                4_000,
+                1_000,
+                64 * 1_024,
+                false,
+            )
+            .unwrap();
+
+        assert_eq!(assignment.segments.len(), 1);
+        assert_eq!((assignment.final_start, assignment.final_end), (0, 1_000));
+        assert_eq!(
+            (assignment.segments[0].start, assignment.segments[0].end),
+            (0, 1_000)
+        );
+    }
+
+    #[test]
+    fn fixed_retries_keep_their_single_lease_recovery_path() {
+        let mut sched = SchedulerState::new(PieceMap::new(4_000, 1_000));
+        let first = sched.assign_to(0).unwrap();
+        assert!(sched.reclaim(first.lease_key()));
+
+        let assignment = sched
+            .assign_request(
+                1,
+                4,
+                256,
+                0,
+                RangeSchedulingMode::Fixed,
+                4_000,
+                1_000,
+                64 * 1_024,
+                true,
+            )
+            .unwrap();
+        assert_eq!(assignment.segments.len(), 1);
+        assert_eq!(assignment.truncation_reason, "recovered_or_retried");
+        assert_eq!(assignment.segments[0].attempt, 2);
+    }
+
+    #[test]
+    fn recovery_batch_issues_whole_contiguous_pieces_atomically() {
+        let mut sched = SchedulerState::new(PieceMap::new(4_000, 1_000));
+        let pieces = (0..4)
+            .map(|piece| (piece, piece as u64 * 1_000, (piece as u64 + 1) * 1_000))
+            .collect::<Vec<_>>();
+        let segments = sched.assign_recovery_batch(&pieces, 7).unwrap();
+        assert_eq!(segments.len(), 4);
+        assert!(segments
+            .iter()
+            .all(|segment| segment.end - segment.start == 1_000));
+        assert_eq!(sched.active_lease_count, 4);
+        for segment in segments {
+            assert!(sched.complete(segment.lease_key()));
+        }
+        assert!(sched.all_done());
+    }
+
+    #[test]
+    fn dynamic_assignment_balances_remaining_share_for_available_slots() {
+        let mut sched = SchedulerState::new(PieceMap::new(64 * 1_024, 1_024));
+        let first = sched
+            .assign_request(
+                0,
+                8,
+                256,
+                0,
+                RangeSchedulingMode::Dynamic,
+                4 * 1_024 * 1_024,
+                1_024,
+                64 * 1_024,
+                true,
+            )
+            .unwrap();
+        assert_eq!(first.planned_ranges, 8);
+        assert_eq!(first.segments.len(), 8);
+        assert_eq!((first.final_start, first.final_end), (0, 8 * 1_024));
+        assert_eq!(first.truncation_reason, "none");
+
+        let second = sched
+            .assign_request(
+                1,
+                8,
+                256,
+                1,
+                RangeSchedulingMode::Dynamic,
+                4 * 1_024 * 1_024,
+                1_024,
+                64 * 1_024,
+                true,
+            )
+            .unwrap();
+        assert_eq!(second.final_end - second.final_start, 8 * 1_024);
+        assert_eq!(second.planned_ranges, 7);
+        assert!(second.final_start >= first.final_end || second.final_end <= first.final_start);
+
+        let mut assignments = vec![first, second];
+        for worker_id in 2..8 {
+            let assignment = sched
+                .assign_request(
+                    worker_id,
+                    8,
+                    256,
+                    worker_id,
+                    RangeSchedulingMode::Dynamic,
+                    4 * 1_024 * 1_024,
+                    1_024,
+                    64 * 1_024,
+                    true,
+                )
+                .unwrap();
+            assert_eq!(assignment.final_end - assignment.final_start, 8 * 1_024);
+            assignments.push(assignment);
+        }
+        assert_eq!(
+            assignments.iter().map(|a| a.segments.len()).sum::<usize>(),
+            64
+        );
+        assert_eq!(sched.available_range_count, 0);
+    }
+
+    #[test]
+    fn dynamic_assigns_extra_slots_by_current_byte_share() {
+        let mut piece_map = PieceMap::new(19_000, 1_000);
+        piece_map.mark_complete(10);
+        let mut sched = SchedulerState::new(piece_map);
+        let assignment = sched
+            .assign_request(
+                0,
+                3,
+                256,
+                0,
+                RangeSchedulingMode::Dynamic,
+                0,
+                1_000,
+                64 * 1_024,
+                true,
+            )
+            .unwrap();
+
+        // The 10-piece range receives two virtual slots and the 8-piece
+        // range one. Its current shares are therefore 5 KiB and 8 KiB, so
+        // the first request must serve the latter range.
+        assert_eq!(
+            (assignment.final_start, assignment.final_end),
+            (11_000, 19_000)
+        );
+        assert_eq!(assignment.planned_ranges, 3);
+    }
+
+    #[test]
+    fn dynamic_trace_diagnostics_include_target_and_all_candidate_shares() {
+        let mut piece_map = PieceMap::new(19_000, 1_000);
+        piece_map.mark_complete(10);
+        let mut sched = SchedulerState::new(piece_map);
+        let assignment = sched
+            .assign_request_with_trace(
+                0,
+                3,
+                256,
+                0,
+                RangeSchedulingMode::Dynamic,
+                0,
+                1_000,
+                64 * 1_024,
+                true,
+                true,
+                true,
+            )
+            .unwrap();
+
+        assert_eq!(assignment.candidate_slots, 1);
+        assert_eq!(assignment.target_end, 19_000);
+        let shares = assignment.candidate_shares.unwrap();
+        assert_eq!(shares.len(), 2);
+        assert_eq!(shares[0].slots, 2);
+        assert_eq!(shares[0].share_bytes, 5_000);
+        assert_eq!(shares[1].slots, 1);
+        assert_eq!(shares[1].share_bytes, 8_000);
+    }
+
+    #[test]
+    fn dynamic_max_request_prefers_a_legal_minimum_split_boundary() {
+        let mut sched = SchedulerState::new(PieceMap::new(9_000, 1_000));
+        let assignment = sched
+            .assign_request(
+                0,
+                1,
+                1,
+                0,
+                RangeSchedulingMode::Dynamic,
+                0,
+                4_000,
+                6_000,
+                true,
+            )
+            .unwrap();
+
+        // A raw six-piece cap would leave a three-piece tail. The nearest
+        // legal boundary below that cap is five pieces, leaving four.
+        assert_eq!((assignment.final_start, assignment.final_end), (0, 5_000));
+        assert_eq!(assignment.segments.len(), 5);
+        assert_eq!(
+            assignment.truncation_reason,
+            "max_request_bytes_and_min_split"
+        );
+    }
+
+    #[test]
+    fn dynamic_hard_cap_wins_when_it_is_below_the_first_legal_boundary() {
+        let mut sched = SchedulerState::new(PieceMap::new(9_000, 1_000));
+        let assignment = sched
+            .assign_request(
+                0,
+                1,
+                1,
+                0,
+                RangeSchedulingMode::Dynamic,
+                0,
+                4_000,
+                3_000,
+                true,
+            )
+            .unwrap();
+
+        assert_eq!((assignment.final_start, assignment.final_end), (0, 3_000));
+        assert_eq!(
+            assignment.truncation_reason,
+            "max_request_bytes_and_min_split_conflict"
+        );
+    }
+
+    #[test]
+    fn dynamic_lease_cap_also_avoids_a_short_tail_when_possible() {
+        let mut sched = SchedulerState::new(PieceMap::new(67_000, 1_000));
+        let assignment = sched
+            .assign_request(
+                0,
+                1,
+                1,
+                0,
+                RangeSchedulingMode::Dynamic,
+                0,
+                4_000,
+                u64::MAX,
+                true,
+            )
+            .unwrap();
+
+        // The 64-lease hard cap would leave three pieces. Move back one
+        // legal boundary so both sides remain at least four pieces.
+        assert_eq!((assignment.final_start, assignment.final_end), (0, 63_000));
+        assert_eq!(assignment.segments.len(), 63);
+        assert_eq!(assignment.truncation_reason, "lease_limit_and_min_split");
+    }
+
+    #[test]
+    fn fixed_assignment_skips_unneeded_candidate_boundary_scan() {
+        let mut sched = SchedulerState::new(PieceMap::new(10_000, 1_000));
+        let assignment = sched
+            .assign_request_with_diagnostics(
+                0,
+                4,
+                256,
+                0,
+                RangeSchedulingMode::Fixed,
+                3_500,
+                1_000,
+                64 * 1_024 * 1_024,
+                true,
+                false,
+            )
+            .unwrap();
+        assert!(!assignment.candidate_boundary_scanned);
+        assert_eq!(assignment.candidate_end, 1_000);
+        assert_eq!(assignment.final_end, 3_000);
+    }
+
+    #[test]
+    fn dynamic_planning_limits_independent_ranges_to_available_slots() {
+        let piece_map = PieceMap::from_bitset(8_000, 1_000, &[0b1010_1010], 8);
+        let mut sched = SchedulerState::new(piece_map);
+        let assignment = sched
+            .assign_request(
+                0,
+                2,
+                256,
+                0,
+                RangeSchedulingMode::Dynamic,
+                0,
+                1_000,
+                64 * 1_024,
+                true,
+            )
+            .unwrap();
+        assert_eq!(assignment.planned_ranges, 2);
+        assert_eq!(assignment.segments[0].piece_id, 0);
+    }
+
+    #[test]
+    fn dynamic_minimum_is_piece_aligned_and_maximum_keeps_one_piece() {
+        let mut sched = SchedulerState::new(PieceMap::new(16_000, 1_000));
+        let assignment = sched
+            .assign_request(
+                0,
+                4,
+                256,
+                0,
+                RangeSchedulingMode::Dynamic,
+                0,
+                1_500,
+                64 * 1_024,
+                true,
+            )
+            .unwrap();
+        assert_eq!(assignment.segments.len(), 4);
+        assert_eq!(assignment.final_end - assignment.final_start, 4_000);
+        assert!(assignment
+            .segments
+            .iter()
+            .all(|segment| segment.end - segment.start == 1_000));
+
+        let mut tiny = SchedulerState::new(PieceMap::new(2_000, 1_000));
+        let assignment = tiny
+            .assign_request(
+                0,
+                1,
+                256,
+                0,
+                RangeSchedulingMode::Dynamic,
+                0,
+                1_000,
+                128,
+                true,
+            )
+            .unwrap();
+        assert_eq!(assignment.segments.len(), 1);
+        assert_eq!((assignment.final_start, assignment.final_end), (0, 1_000));
+    }
+
+    #[test]
+    fn dynamic_leaves_touched_pieces_to_the_single_lease_path() {
+        let mut sched = SchedulerState::new(PieceMap::new(4_000, 1_000));
+        let touched = sched.assign_subrange(0, 128, 512, 7).unwrap();
+
+        let untouched = sched
+            .assign_request(
+                0,
+                1,
+                256,
+                0,
+                RangeSchedulingMode::Dynamic,
+                0,
+                1_000,
+                64 * 1_024,
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            untouched
+                .segments
+                .iter()
+                .map(|segment| segment.piece_id)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        for segment in untouched.segments {
+            assert!(sched.complete(segment.lease_key()));
+        }
+
+        // Once the untouched runs are exhausted, dynamic scheduling still
+        // makes progress, but does not turn the fragmented piece into a
+        // multi-piece dynamic request.
+        let recovered = sched
+            .assign_request(
+                1,
+                1,
+                256,
+                0,
+                RangeSchedulingMode::Dynamic,
+                0,
+                1_000,
+                64 * 1_024,
+                true,
+            )
+            .unwrap();
+        assert_eq!(recovered.segments.len(), 1);
+        assert_eq!(
+            (recovered.segments[0].piece_id, recovered.segments[0].start),
+            (0, 0)
+        );
+        assert!(sched.complete(touched.lease_key()));
     }
 
     #[test]

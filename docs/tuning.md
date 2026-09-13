@@ -23,7 +23,8 @@ The piece size determines the granularity of multi-connection downloading and re
 
 ## `request_batch_size`
 
-**Default:** 4 MiB; zero disables grouping.
+**Field default:** 4 MiB in fixed mode; zero disables grouping. Dynamic mode
+is the default scheduler and ignores this field.
 
 This is the HTTP request byte cap for known-size multi-connection downloads,
 independent of `piece_size` and checkpoint
@@ -37,8 +38,43 @@ Use the deterministic matrix in
 [`http_efficiency_compare`](../examples/http_efficiency_compare.rs) to compare
 0/4/8/16 MiB with pooling enabled and a 4 MiB unpooled control. Measure tail
 completion, requests, extra body data and memory alongside total elapsed time.
-The default remains 4 MiB; a faster healthy case alone does not justify a larger
-default. Fixture heap peaks include server/runtime allocations and are not RSS.
+The fixed-mode default remains 4 MiB; a faster healthy case alone does not
+justify a larger fixed-mode default. Fixture heap peaks include server/runtime
+allocations and are not RSS.
+
+## `range_scheduling_mode`
+
+**Default:** `dynamic`
+
+`dynamic` selects currently free contiguous, piece-aligned ranges for the
+available request slots. `fixed` is the explicit compatibility mode:
+`request_batch_size` is the request grouping cap, and zero disables grouping.
+Each independent range starts with one virtual slot; spare slots are
+distributed by the largest current byte share, so a single range is served in
+roughly `remaining_bytes / available_slots` pieces instead of repeatedly
+creating a fresh set of ephemeral splits. A split is allowed only when both
+sides meet `dynamic_min_split_size`.
+
+Dynamic requests use `dynamic_max_request_size` as their independent byte cap
+and still have a maximum of 64 piece leases per request. Those hard caps take
+priority, but the scheduler backs up to the nearest legal minimum-split boundary
+when that avoids a short tail; an impossible combination is recorded as a
+minimum-split conflict. The minimum is rounded up to a piece boundary; a maximum
+below one piece still permits one complete piece. `request_batch_size` is ignored in dynamic mode, so changing it is not
+an alternative spelling for dynamic scheduling. The defaults are 1 MiB for the
+dynamic minimum and 64 MiB for the dynamic maximum. Enable debug logging to
+review candidate/final ranges, candidate slots, the pre-truncation target,
+actual slot counts, lease counts and truncation reasons before comparing
+performance. The complete candidate-share table is TRACE-only.
+
+```rust
+use bytehaul::{DownloadSpec, RangeSchedulingMode};
+
+let spec = DownloadSpec::new("https://example.com/file.bin")
+    .range_scheduling_mode(RangeSchedulingMode::Dynamic)
+    .dynamic_min_split_size(2 * 1024 * 1024)
+    .dynamic_max_request_size(64 * 1024 * 1024);
+```
 
 ## `memory_budget`
 

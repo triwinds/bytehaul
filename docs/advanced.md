@@ -47,7 +47,7 @@ let spec = DownloadSpec::new("https://example.com/file.bin")
     .http_idle_pool(4, Duration::from_secs(30));
 ```
 
-`request_batch_size` defaults to 4 MiB. Set it to zero to disable grouping. It
+`request_batch_size` defaults to 4 MiB as the fixed-mode compatibility cap. Set it to zero to disable grouping. It
 bounds contiguous request grouping by bytes and an internal maximum of 64
 leases, without changing piece or checkpoint granularity. A value smaller than
 a piece does not split it. Grouping stops at completed, active or partially
@@ -56,6 +56,37 @@ multi-connection downloads, including when slow-transfer recovery is disabled.
 Connection pooling defaults to 4 idle connections per host with a 30-second
 timeout; `disable_http_idle_pool()` or an explicit zero idle limit disables it.
 A server that closes connections cannot benefit from idle pooling.
+
+The range scheduler is explicitly selectable. `RangeSchedulingMode::Dynamic`
+is the default and plans from currently free contiguous ranges and
+the request slots that are actually idle. It gives each independent range a
+virtual slot, distributes spare slots by the largest current byte share, and
+chooses a piece-aligned share for the next request. A split is used only when
+both sides meet `dynamic_min_split_size`. The byte and 64-lease hard caps take
+priority; when a legal minimum-split boundary exists below a cap, the scheduler
+backs up to that boundary to avoid a short tail, and records a conflict when no
+such boundary can fit. In dynamic mode
+`RangeSchedulingMode::Fixed` is the explicit compatibility mode and uses
+`request_batch_size`. In dynamic mode that field is retained only as a
+compatibility/configuration field and is ignored by scheduling; it is not an
+automatic-mode sentinel.
+
+```rust
+use bytehaul::{DownloadSpec, RangeSchedulingMode};
+
+let spec = DownloadSpec::new("https://example.com/file.bin")
+    .max_connections(8)
+    .range_scheduling_mode(RangeSchedulingMode::Dynamic)
+    .dynamic_min_split_size(2 * 1024 * 1024)
+    .dynamic_max_request_size(64 * 1024 * 1024);
+```
+
+Dynamic limits are independent from `min_split_size` and `min_segment_size`.
+The minimum is rounded up to a piece boundary, and a maximum smaller than one
+piece still allows one complete piece. Scheduler debug logs include the
+candidate range, candidate slots, pre-truncation target, actual range, slot
+counts, lease count and truncation reason; the full candidate-share table is
+TRACE-only. The startup log also prints the effective mode and limits.
 
 When a strong ETag and compatible conditional headers protect object identity,
 interrupted multi-worker requests and adaptive reassignment can preserve a

@@ -1,5 +1,5 @@
 use super::*;
-use crate::config::{FileAllocation, SlowTransferMode};
+use crate::config::{FileAllocation, RangeSchedulingMode, SlowTransferMode};
 use std::sync::atomic::AtomicBool;
 use warp::Filter;
 
@@ -129,6 +129,7 @@ async fn run(
         .min_segment_size(PIECE)
         .min_split_size(1)
         .request_batch_size(batch)
+        .range_scheduling_mode(RangeSchedulingMode::Fixed)
         .slow_transfer_mode(mode)
         .max_retries(retries)
         .retry_base_delay(Duration::from_millis(1))

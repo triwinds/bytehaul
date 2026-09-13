@@ -226,6 +226,10 @@ Frozen snapshot of download progress.
 | `max_download_speed`| `int`            | `0` (unlimited)|
 | `checksum_sha256`   | `str \| None`    | `None`        |
 | `log_level`         | `str \| None`    | `None` (`"off"`) |
+| `request_batch_size` | `int` | `4194304` |
+| `range_scheduling_mode` | `"fixed" \| "dynamic"` | `"dynamic"` |
+| `dynamic_min_split_size` | `int` | `1048576` |
+| `dynamic_max_request_size` | `int` | `67108864` |
 
 `max_retries` counts additional retries after the initial request/transfer attempt; `0` disables retries. Single-connection body failures resume from the writer's flushed contiguous prefix, while Range or object-metadata mismatches reset the file before restarting.
 
@@ -242,6 +246,29 @@ APIs, after existing positional parameters. `None` selects the Rust default of
 requests. Completion/checkpoint granularity remains `piece_size`, with at most
 64 leases per batch. Values below a piece do not split it, and grouping stops at
 completed/active/partially processed pieces.
+
+`range_scheduling_mode="dynamic"` is the default and chooses ranges from
+currently free contiguous pieces and actual request slots. Explicit
+`range_scheduling_mode="fixed"` is the compatibility mode and applies
+`request_batch_size`. Dynamic mode
+uses `dynamic_min_split_size` (default 1 MiB, rounded up to a piece boundary)
+and `dynamic_max_request_size` (default 64 MiB) instead. The byte and 64-lease
+limits are hard; when possible the scheduler backs up to a legal minimum-split
+boundary to avoid a short tail and records a conflict otherwise. The latter still
+allows one complete piece when configured below `piece_size`; each request is
+also limited to 64 piece leases. `request_batch_size` is ignored in dynamic
+mode and `0` does not mean automatic scheduling.
+
+```python
+bytehaul.download(
+    "https://example.com/large.bin",
+    output_path="large.bin",
+    max_connections=8,
+    range_scheduling_mode="dynamic",
+    dynamic_min_split_size=2 * 1024 * 1024,
+    dynamic_max_request_size=64 * 1024 * 1024,
+)
+```
 
 Strong-ETag multi-connection transfers can also retain writer-confirmed prefixes
 on interrupted-body retries or adaptive reassignment. Incomplete pieces remain

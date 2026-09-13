@@ -4,8 +4,13 @@ Build the binaries first, for example:
 
     cargo build --release --locked --example public_compare
 
-Run: python scripts/compare_public.py --aria2 PATH_TO_ARIA2C \
-    --bytehaul target/release/examples/public_compare
+Run a low-log strategy matrix:
+
+    python scripts/compare_public.py --aria2 PATH_TO_ARIA2C --matrix --log-level off
+
+Run a separate diagnostic matrix with TRACE allocation evidence:
+
+    python scripts/compare_public.py --aria2 PATH_TO_ARIA2C --matrix --log-level trace
 """
 import argparse
 import csv
@@ -15,6 +20,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import random
 import statistics
 import subprocess
 import time
@@ -23,10 +29,71 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 FILE = "alpine-virt-3.22.1-x86_64.iso"
+PUBLIC_COMPARE_PIECE_SIZE = 1 * 1024 * 1024
+DEFAULT_REQUEST_BATCH_SIZE = 4 * 1024 * 1024
+DEFAULT_DYNAMIC_MIN_SPLIT_SIZE = 1 * 1024 * 1024
+DEFAULT_DYNAMIC_MAX_REQUEST_SIZE = 64 * 1024 * 1024
+MAX_REQUEST_LEASES = 64
 SOURCES = {
     "ustc": f"https://mirrors.ustc.edu.cn/alpine/v3.22/releases/x86_64/{FILE}",
     "alpine_cdn": f"https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/x86_64/{FILE}",
 }
+STRATEGY_PRESETS = {
+    "fixed-4m": ("fixed", 4 * 1024 * 1024, None, None),
+    "fixed-8m": ("fixed", 8 * 1024 * 1024, None, None),
+    "fixed-16m": ("fixed", 16 * 1024 * 1024, None, None),
+    "dynamic": ("dynamic", 0, DEFAULT_DYNAMIC_MIN_SPLIT_SIZE, DEFAULT_DYNAMIC_MAX_REQUEST_SIZE),
+}
+LOG_LEVELS = ("off", "error", "warn", "info", "debug", "trace")
+
+
+def build_strategies(args, parser):
+    if args.matrix and args.strategy:
+        parser.error("--matrix and --strategy cannot be combined")
+    if args.matrix or args.strategy:
+        names = args.strategy or list(STRATEGY_PRESETS)
+        strategies = []
+        for name in names:
+            mode, batch, dynamic_min, dynamic_max = STRATEGY_PRESETS[name]
+            strategies.append({
+                "name": name,
+                "mode": mode,
+                "request_batch_size": batch,
+                "dynamic_min_split_size": dynamic_min or DEFAULT_DYNAMIC_MIN_SPLIT_SIZE,
+                "dynamic_max_request_size": dynamic_max or DEFAULT_DYNAMIC_MAX_REQUEST_SIZE,
+            })
+        return strategies
+    return [{
+        "name": "configured",
+        "mode": args.range_scheduling_mode,
+        "request_batch_size": (args.request_batch_size
+                                if args.request_batch_size is not None
+                                else DEFAULT_REQUEST_BATCH_SIZE),
+        "dynamic_min_split_size": (args.dynamic_min_split_size
+                                    if args.dynamic_min_split_size is not None
+                                    else DEFAULT_DYNAMIC_MIN_SPLIT_SIZE),
+        "dynamic_max_request_size": (args.dynamic_max_request_size
+                                      if args.dynamic_max_request_size is not None
+                                      else DEFAULT_DYNAMIC_MAX_REQUEST_SIZE),
+    }]
+
+
+def effective_strategy(strategy):
+    dynamic_min = max(
+        PUBLIC_COMPARE_PIECE_SIZE,
+        ((max(strategy["dynamic_min_split_size"], PUBLIC_COMPARE_PIECE_SIZE)
+          + PUBLIC_COMPARE_PIECE_SIZE - 1) // PUBLIC_COMPARE_PIECE_SIZE)
+        * PUBLIC_COMPARE_PIECE_SIZE,
+    )
+    return {
+        **strategy,
+        "request_batch_size_effective": (strategy["request_batch_size"]
+                                          if strategy["mode"] == "fixed" else None),
+        "dynamic_min_split_size_effective": dynamic_min,
+        "dynamic_max_request_size_effective": max(
+            strategy["dynamic_max_request_size"], PUBLIC_COMPARE_PIECE_SIZE
+        ),
+    }
 
 
 def main():
@@ -38,9 +105,34 @@ def main():
     parser.add_argument("--timeout", type=int, default=180)
     parser.add_argument("--url", help="Use this URL instead of the default mirrors")
     parser.add_argument("--sha256", help="Trusted expected SHA-256 for --url, if available")
+    parser.add_argument("--connections", type=int, nargs="+", default=[1, 8],
+                        help="Connection counts to test (default: 1 8)")
+    parser.add_argument("--seed", type=int, default=0,
+                        help="Seed for deterministic random interleaving")
+    parser.add_argument("--matrix", action="store_true",
+                        help="Run fixed-4m, fixed-8m, fixed-16m and dynamic in each round")
+    parser.add_argument("--strategy", action="append", choices=tuple(STRATEGY_PRESETS),
+                        help="Select one or more named strategies; repeat the option")
+    parser.add_argument("--range-scheduling-mode", choices=("fixed", "dynamic"), default="dynamic")
+    parser.add_argument("--log-level", choices=LOG_LEVELS, default="off",
+                        help="Bytehaul log level; use trace for a diagnostic round")
+    parser.add_argument("--request-batch-size", type=int,
+                        help="Fixed-mode request cap in bytes; zero disables grouping")
+    parser.add_argument("--dynamic-min-split-size", type=int,
+                        help="Dynamic-mode minimum split side in bytes")
+    parser.add_argument("--dynamic-max-request-size", type=int,
+                        help="Dynamic-mode maximum request size in bytes")
     args = parser.parse_args()
     if args.rounds < 1 or args.timeout < 1:
         parser.error("rounds and timeout must be positive")
+    if not args.connections or any(connection < 1 for connection in args.connections):
+        parser.error("--connections must contain positive integers")
+    if args.request_batch_size is not None and args.request_batch_size < 0:
+        parser.error("--request-batch-size must be non-negative")
+    for name in ("dynamic_min_split_size", "dynamic_max_request_size"):
+        if getattr(args, name) is not None and getattr(args, name) < 1:
+            parser.error(f"--{name.replace('_', '-')} must be positive")
+    strategies = build_strategies(args, parser)
     binaries = {}
     if args.bytehaul:
         binaries["bytehaul"] = Path(args.bytehaul).resolve()
@@ -64,6 +156,23 @@ def main():
            {"http_proxy", "https_proxy", "all_proxy", "no_proxy"}}
     run = ROOT / "target/public-compare" / datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     run.mkdir(parents=True)
+    effective_strategies = [effective_strategy(strategy) for strategy in strategies]
+    aria2_log_level = "debug" if args.log_level in {"debug", "trace"} else "error"
+    scheduling = {
+        "piece_size": PUBLIC_COMPARE_PIECE_SIZE,
+        "max_request_leases": MAX_REQUEST_LEASES,
+        "strategies": effective_strategies,
+    }
+    if len(effective_strategies) == 1:
+        scheduling.update({
+            "mode": effective_strategies[0]["mode"],
+            "request_batch_size_configured": effective_strategies[0]["request_batch_size"],
+            "request_batch_size_effective": effective_strategies[0]["request_batch_size_effective"],
+            "dynamic_min_split_size_configured": effective_strategies[0]["dynamic_min_split_size"],
+            "dynamic_min_split_size_effective": effective_strategies[0]["dynamic_min_split_size_effective"],
+            "dynamic_max_request_size_configured": effective_strategies[0]["dynamic_max_request_size"],
+            "dynamic_max_request_size_effective": effective_strategies[0]["dynamic_max_request_size_effective"],
+        })
     metadata = {"platform": platform.platform(), "created": datetime.datetime.now().astimezone().isoformat(),
                 "revision": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
                 "aria2": subprocess.check_output([aria, "--version"], text=True),
@@ -75,12 +184,19 @@ def main():
                     for label, binary in binaries.items()
                 },
                 "sources": sources, "rounds": args.rounds, "timeout": args.timeout,
+                "connections": args.connections, "seed": args.seed,
+                "strategies": [strategy["name"] for strategy in effective_strategies],
+                "log_level": args.log_level,
+                "range_scheduling": scheduling,
                 "validation": "trusted SHA-256 when supplied/available; otherwise cross-tool SHA-256 agreement plus ZIP CRC checks (not publisher authentication)",
                 "network": "IPv4, no explicit/environment proxy; system routing unchanged",
-                "logging": "bytehaul all-target TRACE + progress; aria2 DEBUG + console DEBUG",
+                "logging": f"bytehaul {args.log_level}; aria2 {aria2_log_level}; progress only at info/debug/trace",
                 "timing": "process wall time including initialization and log writing, excluding SHA-256"}
     (run / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
-    (run / "worktree.patch").write_bytes(subprocess.check_output(["git", "diff", "--", "src", "Cargo.toml", "Cargo.lock"], cwd=ROOT))
+    (run / "worktree.patch").write_bytes(subprocess.check_output(
+        ["git", "diff", "--", "src", "examples", "scripts", "docs", "Cargo.toml", "Cargo.lock"],
+        cwd=ROOT,
+    ))
     (run / "public_compare.rs").write_bytes((ROOT / "examples/public_compare.rs").read_bytes())
     (run / "compare_public.py").write_bytes(Path(__file__).read_bytes())
     rows = []
@@ -101,25 +217,46 @@ def main():
                 candidate = (result.stdout.decode().split() or [""])[0].lower()
                 if len(candidate) == 64 and all(c in "0123456789abcdef" for c in candidate):
                     expected[source] = candidate
-    tools = list(binaries) + ["aria2"]
-    for source, url in sources.items():
-        for connections in [1, 8]:
+    run_specs = [
+        (strategy["name"], strategy, tool)
+        for strategy in effective_strategies
+        for tool in binaries
+    ]
+    run_specs.append(("aria2", None, "aria2"))
+    for source_index, (source, url) in enumerate(sources.items()):
+        for connection_index, connections in enumerate(args.connections):
             for repeat in range(1, args.rounds + 1):
-                order = tools if repeat % 2 else list(reversed(tools))
-                for tool in order:
-                    name = f"{source}-c{connections}-r{repeat}-{tool}"
+                order = list(run_specs)
+                random.Random(
+                    args.seed + source_index * 1_000_003
+                    + connection_index * 10_007 + repeat
+                ).shuffle(order)
+                for strategy_name, strategy, tool in order:
+                    name = f"{source}-c{connections}-r{repeat}-{strategy_name}-{tool}"
                     folder = run / name
                     folder.mkdir()
                     output = folder / filename
                     if tool in binaries:
-                        command = [str(binaries[tool]), url, str(output), str(connections)]
+                        command = [str(binaries[tool]), url, str(output), str(connections),
+                                   "--range-scheduling-mode", strategy["mode"],
+                                   "--log-level", args.log_level]
+                        if strategy["mode"] == "fixed":
+                            command += ["--request-batch-size", str(strategy["request_batch_size"])]
+                        else:
+                            command += [
+                                "--request-batch-size", "0",
+                                "--dynamic-min-split-size", str(strategy["dynamic_min_split_size"]),
+                                "--dynamic-max-request-size", str(strategy["dynamic_max_request_size"]),
+                            ]
                     else:
+                        summary_interval = "1" if args.log_level in {"debug", "trace"} else "0"
                         command = [aria, "--no-conf=true", "--no-netrc=true", "--disable-ipv6=true",
                                    f"--split={connections}", f"--max-connection-per-server={connections}",
                                    "--min-split-size=1M", "--piece-length=1M", "--file-allocation=none",
                                    "--connect-timeout=15", "--timeout=30", "--max-tries=3", "--retry-wait=1",
                                    "--user-agent=public-download-compare/1.0", "--enable-color=false",
-                                   "--summary-interval=1", "--console-log-level=debug", "--log-level=debug",
+                                   f"--summary-interval={summary_interval}",
+                                   f"--console-log-level={aria2_log_level}", f"--log-level={aria2_log_level}",
                                    f"--log={folder / 'aria2.log'}", f"--dir={folder}", f"--out={filename}", url]
                     (folder / "command.json").write_text(json.dumps(command, indent=2), encoding="utf-8")
                     start = time.perf_counter()
@@ -142,8 +279,9 @@ def main():
                             except (zipfile.BadZipFile, RuntimeError, OSError):
                                 zip_ok = False
                     verified = digest is not None and digest == expected.get(source)
-                    row = dict(source=source, connections=connections, repeat=repeat, tool=tool,
-                               status=status, seconds=round(elapsed, 3), bytes=size,
+                    row = dict(source=source, connections=connections, repeat=repeat,
+                               strategy=strategy_name, tool=tool, status=status,
+                               seconds=round(elapsed, 3), bytes=size,
                                mib_s=round(size / elapsed / 1048576, 3) if status == 0 else None,
                                sha256=digest, zip_crc_ok=zip_ok, verified=verified)
                     rows.append(row)
@@ -163,18 +301,27 @@ def main():
         writer = csv.DictWriter(csvfile, fieldnames=list(rows[0]))
         writer.writeheader()
         writer.writerows(rows)
+    strategy_summary = "; ".join(
+        f"`{strategy['name']}` ({strategy['mode']})" for strategy in effective_strategies
+    )
+    run_kind = "diagnostic" if args.log_level in {"debug", "trace"} else "low-log timing"
     lines = ["# Public download comparison", "", f"Run: {run.name}", "",
-             "All logging enabled. Process wall time; hash verification excluded. Fresh output per run.", "",
-             "| Source | Connections | Tool | Verified/attempted | Median seconds | Median MiB/s |",
-             "|---|---:|---|---:|---:|---:|"]
+             f"Strategies: {strategy_summary}; aria2 baseline; lease cap: `{MAX_REQUEST_LEASES}`.",
+             f"Log level: bytehaul `{args.log_level}`, aria2 `{aria2_log_level}`; round type: **{run_kind}**.",
+             "Process wall time includes initialization and configured log writing; hash verification is excluded. Fresh output per run.", "",
+             "| Source | Connections | Strategy | Tool | Verified/attempted | Median seconds | Median MiB/s |",
+             "|---|---:|---|---|---:|---:|---:|"]
+    report_specs = [(strategy["name"], tool) for strategy in effective_strategies for tool in binaries]
+    report_specs.append(("aria2", "aria2"))
     for source in sources:
-        for connections in [1, 8]:
-            for tool in tools:
-                group = [r for r in rows if (r['source'], r['connections'], r['tool']) == (source, connections, tool)]
+        for connections in args.connections:
+            for strategy_name, tool in report_specs:
+                group = [r for r in rows if (r["source"], r["connections"], r["strategy"], r["tool"]) ==
+                         (source, connections, strategy_name, tool)]
                 good = [r for r in group if r["verified"]]
                 seconds = round(statistics.median(r["seconds"] for r in good), 3) if good else "N/A"
                 speed = round(statistics.median(r["mib_s"] for r in good), 3) if good else "N/A"
-                lines.append(f"| {source} | {connections} | {tool} | {len(good)}/{len(group)} | {seconds} | {speed} |")
+                lines.append(f"| {source} | {connections} | {strategy_name} | {tool} | {len(good)}/{len(group)} | {seconds} | {speed} |")
     lines += ["", "Sources and exact commands are preserved in metadata.json and each run directory.",
               "Verification without a trusted digest means cross-tool SHA-256 agreement, plus full ZIP CRC checks for ZIP files; it does not authenticate the publisher.",
               "aria2 option reference: https://aria2.github.io/manual/en/html/aria2c.html",

@@ -3,11 +3,13 @@
 //! stops its producer before the FIFO discard barrier or lease renewal.
 use super::super::flow::wait_for_stop;
 use super::*;
-use crate::config::SlowTransferMode;
+use crate::config::{RangeSchedulingMode, SlowTransferMode};
+use crate::scheduler::{RequestAssignment, MAX_REQUEST_LEASES};
 use crate::storage::segment::LeaseKey;
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
@@ -17,6 +19,93 @@ const MAX_HEDGE: u64 = 1024 * 1024;
 const TAIL_WINDOW: Duration = Duration::from_secs(1);
 const TAIL_GRACE: Duration = Duration::from_secs(1);
 const TAIL_DURATION: Duration = Duration::from_secs(2);
+const UNRECORDED: u64 = u64::MAX;
+
+/// Download-level timing markers used by the public comparison analyzer.
+/// Values are monotonic milliseconds from multi-worker startup; they never
+/// affect scheduling or progress accounting.
+pub(super) struct TimingDiagnostics {
+    started_at: Instant,
+    active_bodies: AtomicUsize,
+    first_multi_body_parallel_ms: AtomicU64,
+    completion_90_ms: AtomicU64,
+    last_body_end_ms: AtomicU64,
+}
+
+impl TimingDiagnostics {
+    fn new(started_at: Instant) -> Self {
+        Self {
+            started_at,
+            active_bodies: AtomicUsize::new(0),
+            first_multi_body_parallel_ms: AtomicU64::new(UNRECORDED),
+            completion_90_ms: AtomicU64::new(UNRECORDED),
+            last_body_end_ms: AtomicU64::new(UNRECORDED),
+        }
+    }
+
+    pub(super) fn elapsed_ms(&self) -> u64 {
+        self.started_at.elapsed().as_millis() as u64
+    }
+
+    fn body_started(&self) {
+        let active_before = self.active_bodies.fetch_add(1, Ordering::Relaxed);
+        if active_before >= 1 {
+            let _ = self.first_multi_body_parallel_ms.compare_exchange(
+                UNRECORDED,
+                self.elapsed_ms(),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+        }
+    }
+
+    fn body_finished(&self) {
+        let _ = self
+            .active_bodies
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |active| {
+                Some(active.saturating_sub(1))
+            });
+        let elapsed = self.elapsed_ms();
+        let _ = self
+            .last_body_end_ms
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
+                Some(if last == UNRECORDED {
+                    elapsed
+                } else {
+                    last.max(elapsed)
+                })
+            });
+    }
+
+    pub(super) fn record_completed_bytes(&self, completed_bytes: u64, total: u64) {
+        if total == 0 || u128::from(completed_bytes) * 100 < u128::from(total) * 90 {
+            return;
+        }
+        let _ = self.completion_90_ms.compare_exchange(
+            UNRECORDED,
+            self.elapsed_ms(),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+    }
+
+    pub(super) fn first_multi_body_parallel_ms(&self) -> Option<u64> {
+        match self.first_multi_body_parallel_ms.load(Ordering::Relaxed) {
+            UNRECORDED => None,
+            elapsed => Some(elapsed),
+        }
+    }
+
+    pub(super) fn completion_90_to_end_ms(&self, final_elapsed_ms: u64) -> Option<u64> {
+        let elapsed = self.completion_90_ms.load(Ordering::Relaxed);
+        (elapsed != UNRECORDED).then(|| final_elapsed_ms.saturating_sub(elapsed))
+    }
+
+    pub(super) fn last_body_to_final_flush_ms(&self, final_elapsed_ms: u64) -> Option<u64> {
+        let elapsed = self.last_body_end_ms.load(Ordering::Relaxed);
+        (elapsed != UNRECORDED).then(|| final_elapsed_ms.saturating_sub(elapsed))
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
@@ -231,7 +320,162 @@ struct Lineage {
     recoveries: u8,
 }
 type SharedLineage = Arc<Mutex<Lineage>>;
-type PendingRange = (usize, u64, u64, usize);
+
+#[derive(Debug, Clone)]
+struct PendingPiece {
+    piece: usize,
+    start: u64,
+    end: u64,
+}
+
+impl PendingPiece {
+    fn len(&self) -> u64 {
+        self.end.saturating_sub(self.start)
+    }
+}
+
+/// A contiguous recovery suffix. Whole queued pieces stay whole here; only a
+/// currently consumed piece can enter recovery as a partial range. The cap is
+/// the original request's byte policy (zero means no batching in Fixed mode).
+#[derive(Debug, Clone)]
+struct PendingRange {
+    pieces: VecDeque<PendingPiece>,
+    request_cap: u64,
+    split_min_size: Option<u64>,
+}
+
+impl PendingRange {
+    fn single(piece: usize, start: u64, end: u64, request_cap: u64) -> Self {
+        let mut pieces = VecDeque::new();
+        pieces.push_back(PendingPiece { piece, start, end });
+        Self {
+            pieces,
+            request_cap,
+            split_min_size: None,
+        }
+    }
+
+    fn from_segments(
+        segments: &[Segment],
+        request_cap: u64,
+        split_min_size: Option<u64>,
+    ) -> Vec<Self> {
+        let mut ranges = Vec::new();
+        for segment in segments {
+            let piece = PendingPiece {
+                piece: segment.piece_id,
+                start: segment.start,
+                end: segment.end,
+            };
+            let append = ranges.last_mut().is_some_and(|range: &mut Self| {
+                range.pieces.back().is_some_and(|last| {
+                    last.piece.saturating_add(1) == piece.piece && last.end == piece.start
+                })
+            });
+            if append {
+                ranges
+                    .last_mut()
+                    .expect("append target was just checked")
+                    .pieces
+                    .push_back(piece);
+            } else {
+                ranges.push(Self::single(
+                    piece.piece,
+                    piece.start,
+                    piece.end,
+                    request_cap,
+                ));
+                if let Some(range) = ranges.last_mut() {
+                    range.split_min_size = split_min_size;
+                }
+            }
+        }
+        ranges
+    }
+
+    fn is_empty(&self) -> bool {
+        self.pieces.is_empty()
+    }
+
+    fn total_len(&self) -> u64 {
+        self.pieces
+            .iter()
+            .fold(0, |total, piece| total.saturating_add(piece.len()))
+    }
+
+    /// Take a whole-piece prefix sized for the currently available request
+    /// slots. A byte cap is honored when it can be; a single piece is always
+    /// allowed so recovery never creates a sub-piece request merely to fit a
+    /// cap. At most the scheduler's per-request lease limit is returned.
+    fn take_prefix(&mut self, available_request_slots: usize) -> Vec<PendingPiece> {
+        if let Some(min_split_size) = self.split_min_size {
+            let Some(piece) = self.pieces.pop_front() else {
+                return Vec::new();
+            };
+            let requested_split = piece
+                .len()
+                .div_ceil(available_request_slots.max(1) as u64)
+                .max(min_split_size.max(1));
+            let cap_limited = self.request_cap != 0 && requested_split > self.request_cap;
+            let split = if self.request_cap == 0 {
+                requested_split
+            } else {
+                requested_split.min(self.request_cap)
+            };
+            if split >= piece.len() || (piece.len() - split < min_split_size && !cap_limited) {
+                return vec![piece];
+            }
+            let selected = PendingPiece {
+                piece: piece.piece,
+                start: piece.start,
+                end: piece.start + split,
+            };
+            self.pieces.push_front(PendingPiece {
+                piece: piece.piece,
+                start: selected.end,
+                end: piece.end,
+            });
+            return vec![selected];
+        }
+        if self.request_cap == 0 {
+            return self.pieces.pop_front().into_iter().collect();
+        }
+        let target = self
+            .total_len()
+            .div_ceil(available_request_slots.max(1) as u64);
+        let mut selected = Vec::new();
+        let mut selected_len: u64 = 0;
+        while selected.len() < MAX_REQUEST_LEASES {
+            let Some(next) = self.pieces.front() else {
+                break;
+            };
+            let next_len = next.len();
+            if !selected.is_empty()
+                && self.request_cap != 0
+                && selected_len.saturating_add(next_len) > self.request_cap
+            {
+                break;
+            }
+            let next = self
+                .pieces
+                .pop_front()
+                .expect("pending piece was checked above");
+            selected_len = selected_len.saturating_add(next.len());
+            selected.push(next);
+            if selected_len >= target {
+                break;
+            }
+        }
+        selected
+    }
+
+    fn prepend(&mut self, pieces: Vec<PendingPiece>) {
+        for piece in pieces.into_iter().rev() {
+            self.pieces.push_front(piece);
+        }
+    }
+}
+
 struct Recovered {
     piece: usize,
     start: u64,
@@ -291,15 +535,30 @@ pub(super) struct Coordinator {
     // Wire counters are diagnostic and never feed effective progress.
     wire: AtomicU64,
     duplicate: AtomicU64,
+    pub(super) timing: Arc<TimingDiagnostics>,
 }
 impl Coordinator {
+    #[allow(dead_code)]
     pub(super) fn new(
         spec: &DownloadSpec,
         meta: &ResponseMeta,
         output: &Path,
         total: u64,
     ) -> Option<Arc<Self>> {
-        if spec.slow_transfer_mode == SlowTransferMode::Disabled && spec.request_batch_size == 0 {
+        Self::new_with_start(spec, meta, output, total, Instant::now())
+    }
+
+    pub(super) fn new_with_start(
+        spec: &DownloadSpec,
+        meta: &ResponseMeta,
+        output: &Path,
+        total: u64,
+        started_at: Instant,
+    ) -> Option<Arc<Self>> {
+        if spec.slow_transfer_mode == SlowTransferMode::Disabled
+            && spec.range_scheduling_mode == RangeSchedulingMode::Fixed
+            && spec.request_batch_size == 0
+        {
             return None;
         }
         let validator = usable_validator(spec, meta);
@@ -338,6 +597,7 @@ impl Coordinator {
             history_limit: (spec.max_connections as usize).saturating_mul(2).max(4),
             wire: AtomicU64::new(0),
             duplicate: AtomicU64::new(0),
+            timing: Arc::new(TimingDiagnostics::new(started_at)),
         }))
     }
     pub(super) fn report(&self, log_level: LogLevel, download_id: u64) {
@@ -513,26 +773,41 @@ impl Coordinator {
             recoveries: 0,
         }))
     }
-    fn recovered(&self, segment: &Segment, lineage: &SharedLineage, max_active_leases: usize) {
+    #[allow(dead_code)]
+    fn recovered(&self, segment: &Segment, lineage: &SharedLineage, request_cap: u64) {
+        self.recovered_batch(std::slice::from_ref(segment), lineage, request_cap);
+    }
+    fn recovered_batch(&self, segments: &[Segment], lineage: &SharedLineage, request_cap: u64) {
+        self.recovered_batch_with_split(segments, lineage, request_cap, None);
+    }
+    fn recovered_batch_with_split(
+        &self,
+        segments: &[Segment],
+        lineage: &SharedLineage,
+        request_cap: u64,
+        split_min_size: Option<u64>,
+    ) {
+        if segments.is_empty() {
+            return;
+        }
         let mut state = self.state.lock();
-        state.pending.push_back((
-            segment.piece_id,
-            segment.start,
-            segment.end,
-            max_active_leases.max(1),
-        ));
-        if !state
-            .recovered
-            .iter()
-            .any(|r| r.piece == segment.piece_id && Arc::ptr_eq(&r.lineage, lineage))
-        {
-            state.recovered.push(Recovered {
-                piece: segment.piece_id,
-                start: segment.start,
-                end: segment.end,
-                remaining: segment.end - segment.start,
-                lineage: lineage.clone(),
-            });
+        for pending in PendingRange::from_segments(segments, request_cap, split_min_size) {
+            state.pending.push_back(pending);
+        }
+        for segment in segments {
+            if !state
+                .recovered
+                .iter()
+                .any(|r| r.piece == segment.piece_id && Arc::ptr_eq(&r.lineage, lineage))
+            {
+                state.recovered.push(Recovered {
+                    piece: segment.piece_id,
+                    start: segment.start,
+                    end: segment.end,
+                    remaining: segment.end - segment.start,
+                    lineage: lineage.clone(),
+                });
+            }
         }
     }
     fn completed(&self, segment: &Segment, lineage: &SharedLineage) {
@@ -552,6 +827,65 @@ impl Coordinator {
         state.blocked_until = state.blocked_until.max(until);
     }
 }
+
+fn recovery_request_cap(cfg: &WorkerConfig) -> u64 {
+    match cfg.range_scheduling_mode {
+        RangeSchedulingMode::Fixed => cfg.request_batch_size,
+        RangeSchedulingMode::Dynamic => cfg.dynamic_max_request_size,
+    }
+}
+
+fn recover_segments(
+    recovery: &Coordinator,
+    scheduler: &Scheduler,
+    segments: &[Segment],
+    lineage: &SharedLineage,
+    request_cap: u64,
+    min_segment_size: u64,
+) {
+    if segments.is_empty() {
+        return;
+    }
+    let mut scheduler = scheduler.lock();
+    let mut groups: Vec<(Vec<Segment>, bool)> = Vec::new();
+    for segment in segments {
+        let whole_piece = scheduler.is_whole_piece_segment(segment);
+        let append = whole_piece
+            && groups.last().is_some_and(|(group, group_is_whole)| {
+                *group_is_whole
+                    && group.last().is_some_and(|last| {
+                        scheduler.is_whole_piece_segment(last)
+                            && last.piece_id.saturating_add(1) == segment.piece_id
+                            && last.end == segment.start
+                    })
+            });
+        if append {
+            groups
+                .last_mut()
+                .expect("append target was just checked")
+                .0
+                .push(segment.clone());
+        } else {
+            groups.push((vec![segment.clone()], whole_piece));
+        }
+    }
+    // Keep the global lock order used by assignment: scheduler before
+    // recovery state. Pending work becomes visible while the scheduler lock
+    // still prevents another worker from trying to claim the unreclaimed
+    // leases.
+    for (group, whole_piece) in groups {
+        recovery.recovered_batch_with_split(
+            &group,
+            lineage,
+            request_cap,
+            (!whole_piece).then_some(min_segment_size),
+        );
+    }
+    for segment in segments {
+        scheduler.reclaim(segment.lease_key());
+    }
+}
+
 pub(super) fn usable_validator(spec: &DownloadSpec, meta: &ResponseMeta) -> Option<String> {
     let conflict = spec.headers.keys().any(|h| {
         [
@@ -646,6 +980,9 @@ pub(super) async fn worker_loop(
         tokio::pin!(notified);
         notified.as_mut().enable();
         let mut backoff_deadline = None;
+        // A probe is a separately reserved response. Do not group a request
+        // before checking whether this worker can consume it exactly.
+        let probe_pending = first_response.lock().await.is_some();
         let assignment = {
             let mut scheduler = scheduler.lock();
             if scheduler.all_done() {
@@ -657,41 +994,61 @@ pub(super) async fn worker_loop(
                 .try_acquire_owned()
                 .ok()
                 .and_then(|permit| {
+                    let occupied_requests = recovery
+                        .slot_capacity
+                        .saturating_sub(recovery.slots.available_permits())
+                        .saturating_sub(1);
+                    let available_request_slots =
+                        recovery.slot_capacity.saturating_sub(occupied_requests);
                     let mut state = recovery.state.lock();
-                    let segment = if state.pending_backoff(Instant::now()).is_some() {
+                    let assignment = if state.pending_backoff(Instant::now()).is_some() {
                         // Capture while deciding not to assign. Rechecking
                         // after unlocking could lose a deadline that expires
                         // between the decision and registering the timer.
                         backoff_deadline = state.blocked_until;
                         None
-                    } else if let Some((piece, start, end, slots)) = state.pending.pop_front() {
-                        let len = end - start;
-                        let split = len.div_ceil(slots as u64).max(cfg.min_segment_size);
-                        let split_end =
-                            if slots > 1 && len.saturating_sub(split) >= cfg.min_segment_size {
-                                start + split
-                            } else {
-                                end
-                            };
-                        if split_end < end {
-                            state.pending.push_front((piece, split_end, end, slots - 1));
+                    } else if let Some(mut pending) = state.pending.pop_front() {
+                        let pending_pieces = pending.take_prefix(available_request_slots);
+                        let ranges = pending_pieces
+                            .iter()
+                            .map(|piece| (piece.piece, piece.start, piece.end))
+                            .collect::<Vec<_>>();
+                        if let Some(assignment) =
+                            scheduler.assign_recovery_batch(&ranges, worker_id)
+                        {
+                            if !pending.is_empty() {
+                                state.pending.push_front(pending);
+                            }
+                            RequestAssignment::from_segments(
+                                assignment,
+                                available_request_slots,
+                                occupied_requests,
+                                "recovered_batch",
+                            )
+                        } else {
+                            pending.prepend(pending_pieces);
+                            state.pending.push_front(pending);
+                            None
                         }
-                        scheduler.assign_subrange(piece, start, split_end, worker_id)
                     } else {
-                        scheduler.assign_to_with_request_split(
+                        scheduler.assign_request_with_trace(
                             worker_id,
-                            cfg.max_active_leases,
+                            recovery.slot_capacity,
                             cfg.min_segment_size,
-                            recovery
-                                .slot_capacity
-                                .saturating_sub(recovery.slots.available_permits())
-                                .saturating_sub(1),
+                            occupied_requests,
+                            cfg.range_scheduling_mode,
+                            cfg.request_batch_size,
+                            cfg.dynamic_min_split_size,
+                            cfg.dynamic_max_request_size,
+                            !probe_pending,
+                            log_level.enabled(tracing::Level::DEBUG),
+                            log_level.enabled(tracing::Level::TRACE),
                         )
                     };
-                    segment.map(|segment| (segment, permit))
+                    assignment.map(|assignment| (assignment, permit))
                 })
         };
-        let Some((mut segment, permit)) = assignment else {
+        let Some((assignment, permit)) = assignment else {
             tokio::select! {
                 _ = &mut notified => {},
                 error = wait_for_stop(&mut stop) => return Err(error),
@@ -699,6 +1056,39 @@ pub(super) async fn worker_loop(
             }
             continue;
         };
+        log_debug!(
+            log_level,
+            download_id,
+            worker_id,
+            scheduler_request_id = assignment.segments.first().map(|segment| segment.lease_id),
+            range_scheduling_mode = %cfg.range_scheduling_mode,
+            candidate_start = assignment.candidate_start,
+            candidate_end = assignment.candidate_end,
+            candidate_boundary_scanned = assignment.candidate_boundary_scanned,
+            candidate_slots = assignment.candidate_slots,
+            target_end = assignment.target_end,
+            final_start = assignment.final_start,
+            final_end = assignment.final_end,
+            available_request_slots = assignment.available_request_slots,
+            occupied_requests = assignment.occupied_requests,
+            planned_ranges = assignment.planned_ranges,
+            lease_count = assignment.segments.len(),
+            truncation_reason = assignment.truncation_reason,
+            "ordinary request range assigned"
+        );
+        if let Some(candidate_shares) = assignment.candidate_shares.as_ref() {
+            log_trace!(
+                log_level,
+                download_id,
+                worker_id,
+                candidate_shares = ?candidate_shares,
+                "dynamic candidate shares"
+            );
+        }
+        let mut assignment_segments = assignment.segments.into_iter();
+        let mut segment = assignment_segments
+            .next()
+            .expect("request assignment must contain its first lease");
         let slot = Slot {
             permit: Some(permit),
             owner: recovery,
@@ -708,20 +1098,10 @@ pub(super) async fn worker_loop(
         // unused live response nor forces a second request for the same bytes.
         let mut initial_response =
             super::take_matching_probe_response(&first_response, &segment).await;
-        // Recovered ranges keep their existing per-piece lineage and splitting.
-        let mut queued: VecDeque<Segment> = if segment.attempt == 1 && initial_response.is_none() {
-            scheduler
-                .lock()
-                .extend_batch(
-                    &segment,
-                    worker_id,
-                    cfg.max_active_leases,
-                    cfg.request_batch_size,
-                )
-                .into()
-        } else {
-            VecDeque::new()
-        };
+        // The remaining leases were signed in the same scheduler critical
+        // section as the first lease. Recovered pending ranges may contain a
+        // whole-piece batch; the exact probe path is still one-element.
+        let mut queued: VecDeque<Segment> = assignment_segments.collect();
         let mut request_end = queued.back().map_or(segment.end, |last| last.end);
         let mut stream = None;
         let mut observation = Arc::new(Mutex::new(Observation::new(
@@ -778,14 +1158,25 @@ pub(super) async fn worker_loop(
                         log_debug!(log_level, download_id, worker_id,
                             request_id = ?sample.request_id, lease = ?segment.lease_key(),
                             start = segment.start, end = segment.end, batch_end = request_end,
+                            body_wire_bytes = sample.wire,
+                            body_enqueued_bytes = sample.enqueued,
+                            body_forwarded_bytes = sample.forwarded,
                             reading_ms = sample.reading.as_millis() as u64,
                             backpressure_ms = sample.backpressure.as_millis() as u64,
                             writer_barrier_ms = sample.writer_barrier.as_millis() as u64,
                             "adaptive piece writer acknowledged");
                     }
-                    if !scheduler.lock().complete(segment.lease_key()) {
+                    let (piece_complete, completed_bytes) = {
+                        let mut scheduler = scheduler.lock();
+                        let piece_complete = scheduler.complete(segment.lease_key());
+                        (piece_complete, scheduler.completed_bytes())
+                    };
+                    if !piece_complete {
                         return Err(DownloadError::Internal("stale adaptive completion".into()));
                     }
+                    recovery
+                        .timing
+                        .record_completed_bytes(completed_bytes, total);
                     recovery.completed(&segment, &lineage);
                     recovery.changed.notify_waiters();
                     if let Some(next) = queued.pop_front() {
@@ -837,6 +1228,9 @@ pub(super) async fn worker_loop(
                             request_id = ?sample.request_id, lease = ?prefix.lease_key(),
                             retained_prefix = retain, forwarded_bytes = forwarded,
                             read_ahead_body_bytes = read_ahead,
+                            body_wire_bytes = sample.wire,
+                            body_enqueued_bytes = sample.enqueued,
+                            body_forwarded_bytes = sample.forwarded,
                             reading_ms = sample.reading.as_millis() as u64,
                             backpressure_ms = sample.backpressure.as_millis() as u64,
                             writer_barrier_ms = sample.writer_barrier.as_millis() as u64,
@@ -848,13 +1242,8 @@ pub(super) async fn worker_loop(
                     if let Some(RetryDecision::Retry { backoff, .. }) = &retry_decision {
                         recovery.backoff(*backoff);
                     }
-                    for unused in queued.drain(..) {
-                        let mut scheduler = scheduler.lock();
-                        if !matches!(&retry_decision, Some(RetryDecision::Stop(_))) {
-                            recovery.recovered(&unused, &lineage, cfg.max_active_leases);
-                            scheduler.reclaim(unused.lease_key());
-                        }
-                    }
+                    let released = queued.drain(..).collect::<Vec<_>>();
+                    let request_cap = recovery_request_cap(cfg);
                     if retain {
                         recovery.completed(&prefix, &lineage);
                     }
@@ -865,10 +1254,37 @@ pub(super) async fn worker_loop(
                     match outcome {
                         Some(Outcome::Recover(mut reservation)) => {
                             reservation.cost = read_ahead + if retain { 0 } else { forwarded };
-                            {
-                                let mut scheduler = scheduler.lock();
-                                recovery.recovered(&segment, &lineage, cfg.max_active_leases);
-                                scheduler.reclaim(segment.lease_key());
+                            if !matches!(&retry_decision, Some(RetryDecision::Stop(_))) {
+                                if retain {
+                                    recover_segments(
+                                        recovery,
+                                        &scheduler,
+                                        std::slice::from_ref(&segment),
+                                        &lineage,
+                                        request_cap,
+                                        cfg.min_segment_size,
+                                    );
+                                    recover_segments(
+                                        recovery,
+                                        &scheduler,
+                                        &released,
+                                        &lineage,
+                                        request_cap,
+                                        cfg.min_segment_size,
+                                    );
+                                } else {
+                                    let mut unconsumed = Vec::with_capacity(1 + released.len());
+                                    unconsumed.push(segment.clone());
+                                    unconsumed.extend(released.iter().cloned());
+                                    recover_segments(
+                                        recovery,
+                                        &scheduler,
+                                        &unconsumed,
+                                        &lineage,
+                                        request_cap,
+                                        cfg.min_segment_size,
+                                    );
+                                }
                             }
                             log_info!(
                                 log_level,
@@ -883,6 +1299,16 @@ pub(super) async fn worker_loop(
                             break;
                         }
                         Some(Outcome::Staged(mut staged)) => {
+                            if !matches!(&retry_decision, Some(RetryDecision::Stop(_))) {
+                                recover_segments(
+                                    recovery,
+                                    &scheduler,
+                                    &released,
+                                    &lineage,
+                                    request_cap,
+                                    cfg.min_segment_size,
+                                );
+                            }
                             segment = scheduler
                                 .lock()
                                 .renew(segment.lease_key(), worker_id)
@@ -912,11 +1338,19 @@ pub(super) async fn worker_loop(
                             recovery
                                 .duplicate
                                 .fetch_sub(segment.end - segment.start, Ordering::Relaxed);
-                            if !scheduler.lock().complete(segment.lease_key()) {
+                            let (piece_complete, completed_bytes) = {
+                                let mut scheduler = scheduler.lock();
+                                let piece_complete = scheduler.complete(segment.lease_key());
+                                (piece_complete, scheduler.completed_bytes())
+                            };
+                            if !piece_complete {
                                 return Err(DownloadError::Internal(
                                     "stale hedge winner completion".into(),
                                 ));
                             }
+                            recovery
+                                .timing
+                                .record_completed_bytes(completed_bytes, total);
                             recovery.completed(&segment, &lineage);
                             recovery.changed.notify_waiters();
                             log_info!(
@@ -939,6 +1373,14 @@ pub(super) async fn worker_loop(
                                     return Err(error);
                                 }
                                 RetryDecision::Retry { backoff, error, .. } => {
+                                    recover_segments(
+                                        recovery,
+                                        &scheduler,
+                                        &released,
+                                        &lineage,
+                                        request_cap,
+                                        cfg.min_segment_size,
+                                    );
                                     recovery.state.lock().retries += 1;
                                     recovery.backoff(backoff);
                                     log_warn!(log_level, download_id, worker_id, attempt = segment.attempt, error = %error, backoff_ms = backoff.as_millis() as u64, "adaptive segment failed, retrying");
@@ -1246,12 +1688,40 @@ async fn checked_response(
     }
     Ok(response)
 }
+struct BodyActivity(Option<Arc<TimingDiagnostics>>);
+
+impl BodyActivity {
+    fn new(timing: Arc<TimingDiagnostics>) -> Self {
+        timing.body_started();
+        Self(Some(timing))
+    }
+
+    fn finish(&mut self) {
+        if let Some(timing) = self.0.take() {
+            timing.body_finished();
+        }
+    }
+}
+
+impl Drop for BodyActivity {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
 struct RequestStream {
     body: crate::http::HttpBody,
     buffered: bytes::Bytes,
     wire: u64,
     expected: u64,
     consumed: u64,
+    body_activity: BodyActivity,
+}
+
+impl RequestStream {
+    fn finish_body(&mut self) {
+        self.body_activity.finish();
+    }
 }
 
 async fn primary(
@@ -1275,6 +1745,7 @@ async fn primary(
             wire: 0,
             consumed: 0,
             expected: ctx.request_end - ctx.segment.start,
+            body_activity: BodyActivity::new(ctx.recovery.timing.clone()),
         });
     }
     let stream = stream.as_mut().expect("initialized request body");
@@ -1299,6 +1770,7 @@ async fn primary(
                         ),
                     )));
                 }
+                stream.finish_body();
                 ctx.observation.lock().phase(Phase::WriterBarrier);
                 return Ok(());
             };
@@ -1450,6 +1922,7 @@ async fn stage(
         )
         .into());
     }
+    let _body_activity = BodyActivity::new(ctx.recovery.timing.clone());
     let mut body = response.into_body();
     let mut wire = 0u64;
     while let Some(mut data) = next_data_chunk(&mut body, ctx.cfg.read_timeout).await? {
@@ -1534,6 +2007,22 @@ mod tests {
         )
         .unwrap()
     }
+
+    #[test]
+    fn timing_diagnostics_record_parallel_body_and_tail_markers() {
+        let timing = TimingDiagnostics::new(Instant::now());
+        timing.record_completed_bytes(90, 100);
+        timing.body_started();
+        timing.body_started();
+        assert!(timing.first_multi_body_parallel_ms().is_some());
+        timing.body_finished();
+        timing.body_finished();
+
+        let final_elapsed = timing.elapsed_ms();
+        assert!(timing.completion_90_to_end_ms(final_elapsed).is_some());
+        assert!(timing.last_body_to_final_flush_ms(final_elapsed).is_some());
+    }
+
     fn lineage() -> SharedLineage {
         Arc::new(Mutex::new(Lineage {
             retries: RetryState::new(2, Duration::ZERO, Duration::ZERO, None),
@@ -1737,6 +2226,9 @@ mod tests {
             max_active_leases: 4,
             min_segment_size: 32,
             request_batch_size: 0,
+            range_scheduling_mode: RangeSchedulingMode::Fixed,
+            dynamic_min_split_size: 32,
+            dynamic_max_request_size: 64 * 1024 * 1024,
             validator: Some("\"v1\"".into()),
             recovery: None,
         };
@@ -1837,6 +2329,71 @@ mod tests {
         assert_eq!(state.recovered[0].piece, 2);
         assert_eq!(state.recovered[0].remaining, 100);
         assert!(Arc::ptr_eq(&state.recovered[0].lineage, &lineage));
+    }
+
+    #[test]
+    fn contiguous_recovery_suffix_is_rebatched_by_actual_request_slots() {
+        let recovery = coordinator(64_469_455);
+        let lineage = lineage();
+        let segments = (0..4)
+            .map(|piece| Segment {
+                piece_id: piece,
+                lease_id: piece as u64 + 1,
+                start: piece as u64 * 100,
+                end: (piece as u64 + 1) * 100,
+                owner_worker_id: 0,
+                attempt: 1,
+            })
+            .collect::<Vec<_>>();
+
+        recovery.recovered_batch(&segments, &lineage, 300);
+        let mut state = recovery.state.lock();
+        assert_eq!(state.pending.len(), 1);
+        assert_eq!(state.recovered.len(), 4);
+
+        let pending = state.pending.front_mut().unwrap();
+        let first = pending.take_prefix(2);
+        assert_eq!(first.len(), 2);
+        assert!(first.iter().all(|piece| piece.len() == 100));
+        assert_eq!(pending.pieces.len(), 2);
+
+        let second = pending.take_prefix(2);
+        assert_eq!(second.len(), 1);
+        assert!(second.iter().all(|piece| piece.len() == 100));
+        let third = pending.take_prefix(2);
+        assert_eq!(third.len(), 1);
+        assert!(third.iter().all(|piece| piece.len() == 100));
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn partial_recovery_keeps_minimum_unless_the_hard_cap_forces_a_short_tail() {
+        let mut range = PendingRange::single(0, 0, 5_000, 9_000);
+        range.split_min_size = Some(4_000);
+        assert_eq!(range.take_prefix(2)[0].len(), 5_000);
+
+        let mut capped = PendingRange::single(0, 0, 5_000, 3_000);
+        capped.split_min_size = Some(4_000);
+        assert_eq!(capped.take_prefix(2)[0].len(), 3_000);
+        assert_eq!(capped.pieces.front().unwrap().len(), 2_000);
+    }
+
+    #[test]
+    fn fixed_recovery_with_batch_disabled_keeps_one_piece_per_request() {
+        let segments = (0..3)
+            .map(|piece| PendingPiece {
+                piece,
+                start: piece as u64 * 100,
+                end: (piece as u64 + 1) * 100,
+            })
+            .collect::<VecDeque<_>>();
+        let mut range = PendingRange {
+            pieces: segments,
+            request_cap: 0,
+            split_min_size: None,
+        };
+        assert_eq!(range.take_prefix(1).len(), 1);
+        assert_eq!(range.pieces.len(), 2);
     }
 
     #[test]
@@ -1991,7 +2548,11 @@ mod tests {
         let permits = recovery.slots.try_acquire_many(4).unwrap();
         assert!(!recovery.tail_eligible(MAX_HEDGE, false));
         drop(permits);
-        recovery.state.lock().pending.push_back((0, 0, 1000, 1));
+        recovery
+            .state
+            .lock()
+            .pending
+            .push_back(PendingRange::single(0, 0, 1000, 1));
         assert!(!recovery.tail_eligible(MAX_HEDGE, false));
         recovery.state.lock().pending.clear();
         let _target_permit = recovery.slots.try_acquire().unwrap();
@@ -2193,7 +2754,7 @@ mod tests {
             None,
             "ordinary work retains its existing policy"
         );
-        state.pending.push_back((0, 0, 1000, 1));
+        state.pending.push_back(PendingRange::single(0, 0, 1000, 1));
         assert_eq!(state.pending_backoff(now), Some(Duration::from_secs(30)));
         assert_eq!(state.pending_backoff(now + Duration::from_secs(31)), None);
         assert_eq!(
@@ -2208,7 +2769,7 @@ mod tests {
         let now = Instant::now();
         let captured = {
             let mut state = recovery.state.lock();
-            state.pending.push_back((0, 0, 1000, 1));
+            state.pending.push_back(PendingRange::single(0, 0, 1000, 1));
             state.blocked_until = Some(now + Duration::from_secs(1));
             assert!(state.pending_backoff(now).is_some());
             state.blocked_until
@@ -2259,7 +2820,8 @@ mod tests {
             &config
                 .clone()
                 .slow_transfer_mode(SlowTransferMode::Disabled)
-                .request_batch_size(0),
+                .request_batch_size(0)
+                .range_scheduling_mode(RangeSchedulingMode::Fixed),
             &meta(None),
             Path::new("file"),
             100

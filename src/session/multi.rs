@@ -25,7 +25,7 @@ use super::{
     stop_signal_error, stop_signal_label, stop_signal_state, ControlSaveReason, ControlSaveTracker,
     StopSignal, MIN_SPEED_SAMPLE_SPAN, MULTI_PROGRESS_INTERVAL, SPEED_ESTIMATE_WINDOW,
 };
-use crate::config::{DownloadSpec, LogLevel};
+use crate::config::{DownloadSpec, LogLevel, RangeSchedulingMode};
 use crate::error::DownloadError;
 use crate::eta::EtaEstimator;
 use crate::http::response::ResponseMeta;
@@ -129,6 +129,13 @@ pub(super) async fn run_multi_worker(
         remaining_pieces = remaining,
         total_size = total_size,
         initial_completed_bytes = initial_completed_bytes,
+        range_scheduling_mode = %spec.range_scheduling_mode,
+        request_batch_size = spec.request_batch_size,
+        dynamic_min_split_size_configured = spec.dynamic_min_split_size,
+        dynamic_min_split_size_effective = spec.get_effective_dynamic_min_split_size(),
+        dynamic_max_request_size_configured = spec.dynamic_max_request_size,
+        dynamic_max_request_size_effective = spec.get_effective_dynamic_max_request_size(),
+        max_request_leases = crate::scheduler::MAX_REQUEST_LEASES,
         "multi-worker download started"
     );
 
@@ -162,9 +169,24 @@ pub(super) async fn run_multi_worker(
         max_active_leases: num_workers,
         min_segment_size: spec.min_segment_size.min(spec.piece_size),
         request_batch_size: spec.request_batch_size,
+        range_scheduling_mode: spec.range_scheduling_mode,
+        dynamic_min_split_size: spec.dynamic_min_split_size,
+        dynamic_max_request_size: spec.dynamic_max_request_size,
         validator: adaptive::usable_validator(spec, meta),
-        recovery: adaptive::Coordinator::new(spec, meta, output_path, total_size),
+        recovery: adaptive::Coordinator::new_with_start(
+            spec,
+            meta,
+            output_path,
+            total_size,
+            start_time,
+        ),
     });
+
+    if let Some(recovery) = &worker_cfg.recovery {
+        recovery
+            .timing
+            .record_completed_bytes(initial_completed_bytes, total_size);
+    }
 
     for worker_id in 0..num_workers {
         let handle = tokio::spawn(worker_loop(
@@ -306,6 +328,23 @@ pub(super) async fn run_multi_worker(
     let writer_result = writer_handle
         .await
         .map_err(|e| DownloadError::TaskFailed(format!("writer panicked: {e}")))?;
+
+    if let Some(recovery) = &worker_cfg.recovery {
+        let final_flush_elapsed_ms = recovery.timing.elapsed_ms();
+        log_info!(
+            log_level,
+            download_id = download_id,
+            first_multi_body_parallel_ms = ?recovery.timing.first_multi_body_parallel_ms(),
+            completion_90_to_end_ms = ?recovery
+                .timing
+                .completion_90_to_end_ms(final_flush_elapsed_ms),
+            last_body_to_final_flush_ms = ?recovery
+                .timing
+                .last_body_to_final_flush_ms(final_flush_elapsed_ms),
+            final_flush_elapsed_ms,
+            "multi-worker timing diagnostics"
+        );
+    }
 
     let writer_succeeded = writer_result.is_ok();
     if let Err(error) = writer_result {
@@ -511,6 +550,9 @@ struct WorkerConfig {
     max_active_leases: usize,
     min_segment_size: u64,
     request_batch_size: u64,
+    range_scheduling_mode: RangeSchedulingMode,
+    dynamic_min_split_size: u64,
+    dynamic_max_request_size: u64,
     validator: Option<String>,
     recovery: Option<Arc<adaptive::Coordinator>>,
 }
@@ -573,12 +615,20 @@ async fn worker_loop(
             return Err(stop_signal_error(signal).expect("stop signal must map to an error"));
         }
 
+        let probe_pending = first_response.lock().await.is_some();
         let assign_started = Instant::now();
-        let segment = match scheduler.lock().assign_to_with_split(
-            worker_id,
-            cfg.max_active_leases,
-            cfg.min_segment_size,
-        ) {
+        let segment = match if probe_pending {
+            // The fresh probe is exactly the first piece. Do not use the
+            // small-file underutilized-piece split while that response is
+            // still available, or it can no longer be consumed.
+            scheduler.lock().assign_to(worker_id)
+        } else {
+            scheduler.lock().assign_to_with_split(
+                worker_id,
+                cfg.max_active_leases,
+                cfg.min_segment_size,
+            )
+        } {
             Some(seg) => seg,
             None => {
                 log_debug!(
@@ -1415,6 +1465,9 @@ mod coverage_tests {
             max_active_leases: 1,
             min_segment_size: 256,
             request_batch_size: 0,
+            range_scheduling_mode: RangeSchedulingMode::Fixed,
+            dynamic_min_split_size: 1024,
+            dynamic_max_request_size: 64 * 1024 * 1024,
             validator: None,
             recovery: None,
         });
@@ -1461,6 +1514,9 @@ mod coverage_tests {
             max_active_leases: 1,
             min_segment_size: 256,
             request_batch_size: 0,
+            range_scheduling_mode: RangeSchedulingMode::Fixed,
+            dynamic_min_split_size: 1024,
+            dynamic_max_request_size: 64 * 1024 * 1024,
             validator: None,
             recovery: None,
         });
@@ -1700,6 +1756,9 @@ mod coverage_tests {
             max_active_leases: 1,
             min_segment_size: 4,
             request_batch_size: 0,
+            range_scheduling_mode: RangeSchedulingMode::Fixed,
+            dynamic_min_split_size: 4,
+            dynamic_max_request_size: 64 * 1024 * 1024,
             validator: None,
             recovery: None,
         })
@@ -1984,14 +2043,16 @@ mod coverage_tests {
                 content_encoding: None,
             };
             let spec = DownloadSpec::new(format!("http://{addr}/{path_segment}"))
-                .piece_size(1024)
+                .piece_size(256)
                 .min_segment_size(min_segment_size)
                 .min_split_size(1)
+                .range_scheduling_mode(RangeSchedulingMode::Dynamic)
+                .dynamic_min_split_size(min_segment_size)
                 .max_connections(4)
                 .max_retries(0)
                 .file_allocation(crate::config::FileAllocation::None)
                 .output_path(output_path.clone());
-            let piece_map = PieceMap::new(1024, 1024);
+            let piece_map = PieceMap::new(1024, 256);
             let (progress_tx, _progress_rx) = watch::channel(ProgressSnapshot::default());
             let (_cancel_tx, cancel_rx) = watch::channel(StopSignal::Running);
             let client = crate::network::ClientNetworkConfig::default()

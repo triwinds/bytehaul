@@ -47,12 +47,34 @@ let spec = DownloadSpec::new("https://example.com/file.bin")
     .http_idle_pool(4, Duration::from_secs(30));
 ```
 
-`request_batch_size` 默认 4 MiB；设置为零可关闭合并。合并同时受字节数和最多 64 个
+`request_batch_size` 字段在 fixed 模式默认 4 MiB；设置为零可关闭合并。合并同时受字节数和最多 64 个
 租约限制，piece 与检查点粒度保持不变；小于 piece 的值不会将它切小。遇到已完成、
 已分配或部分处理过的 piece 时停止合并，并为其他 worker 留出工作。该选项适用于已知
 大小的多连接下载，包括关闭慢请求恢复的模式。连接池默认每个 host 保留最多 4 条空闲
 连接，超时 30 秒；使用 `disable_http_idle_pool()` 或将空闲连接上限设为零可关闭连接池。
 服务端主动关闭连接时，无法获得空闲连接复用的收益。
+
+区间调度策略通过 `RangeSchedulingMode` 显式选择。默认的
+`RangeSchedulingMode::Dynamic` 根据当前未占用的连续区间和实际空闲请求槽位规划范围；
+每个独立区间先获得一个虚拟槽位，剩余槽位按当前字节份额最大的区间分配，下一次请求再
+领取按 piece 对齐的份额。只有拆分后的两侧都满足 `dynamic_min_split_size` 才允许拆分。
+字节上限和最多 64 个 piece 租约是硬上限；如果上限内存在合法的最小拆分边界，调度器会回退到该边界以避免短尾，无法兼顾时会记录冲突原因。在 dynamic 模式中，
+显式 `RangeSchedulingMode::Fixed` 保持 `request_batch_size` 兼容语义；在 dynamic 模式中，
+`request_batch_size` 仅保留为兼容/诊断配置，不参与计算，也不使用 `0` 表示自动模式。
+
+```rust
+use bytehaul::{DownloadSpec, RangeSchedulingMode};
+
+let spec = DownloadSpec::new("https://example.com/file.bin")
+    .max_connections(8)
+    .range_scheduling_mode(RangeSchedulingMode::Dynamic)
+    .dynamic_min_split_size(2 * 1024 * 1024)
+    .dynamic_max_request_size(64 * 1024 * 1024);
+```
+
+动态上下限独立于 `min_split_size` 与 `min_segment_size`。最小拆分长度会向上取整到 piece
+边界；最大请求长度即使小于一个 piece，也仍允许领取一个完整 piece。开启 debug 日志后，
+可以看到候选区间、候选槽位、截断前目标边界、最终区间、槽位计数、租约数量和截断原因；完整候选份额表仅在 TRACE 输出，启动日志也会打印生效模式与限制。
 
 当强 ETag 和兼容的条件请求头能够保护对象一致性时，多连接断流重试和慢请求重新
 分配可保留写入器确认的前缀，只请求剩余后缀。未完成的 piece 不会因此写入检查点
@@ -88,7 +110,7 @@ let spec = DownloadSpec::new("https://example.com/file.bin")
 其他并发槽空闲且存在健康速度历史时，自适应恢复也可接管批次中途的慢请求。
 旧 producer 停止、writer 确认前缀交接之后，才释放尚未开始的分片供重新调度。
 释放的分片共享原有重试次数、时间预算和 Retry-After，不因切批而增加重试机会。
-只有完整且已刷盘的分片会写入断点状态；默认请求批次仍为 4 MiB。
+只有完整且已刷盘的分片会写入断点状态；fixed 模式默认请求批次仍为 4 MiB，默认调度模式为 dynamic。
 
 竞速模式下，如果完整备用范围超出预算，可回落到预算内的安全取消续传。
 先释放暂取的并发槽，再重新检查预算、冷却和重试限制，不会扩大预算。

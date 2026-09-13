@@ -2030,6 +2030,12 @@ fn complete_transfer(
     // Real connections opened by this transfer, which is not the same count as
     // the number of request invocations.
     let connections = transfer.handle.num_connects().unwrap_or(0);
+    let primary_ip = transfer
+        .handle
+        .primary_ip()
+        .ok()
+        .flatten()
+        .map(str::to_owned);
     let terminal = match result {
         Ok(()) => Terminal::Eof,
         Err((code, message)) => Terminal::Failed {
@@ -2072,6 +2078,7 @@ fn complete_transfer(
         transfer = id.0,
         phase = %phase,
         connections,
+        primary_ip = ?primary_ip,
         pauses = sink.pause_count(),
         accepted_bytes = sink.accepted_bytes(),
         "libcurl transfer finished"
@@ -2096,6 +2103,12 @@ fn cancel_transfer(pools: &mut HashMap<PoolKey, Pool>, shared: &Arc<DriverShared
     // The connection count matters for the pool's cache estimate, so it has to
     // be read while the handle is still attached.
     let connections = transfer.handle.num_connects().unwrap_or(0);
+    let primary_ip = transfer
+        .handle
+        .primary_ip()
+        .ok()
+        .flatten()
+        .map(str::to_owned);
     // Cancelling before headers must also fail the request future.
     transfer
         .handle
@@ -2117,6 +2130,14 @@ fn cancel_transfer(pools: &mut HashMap<PoolKey, Pool>, shared: &Arc<DriverShared
         connections,
         TransferExit::Cancelled,
         now,
+    );
+    tracing::debug!(
+        transfer = id.0,
+        connections,
+        primary_ip = ?primary_ip,
+        pauses = sink.pause_count(),
+        accepted_bytes = sink.accepted_bytes(),
+        "libcurl transfer cancelled"
     );
     sink.discard_buffer();
     sink.finish(Terminal::Cancelled);

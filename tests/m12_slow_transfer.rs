@@ -1,4 +1,6 @@
-use bytehaul::{DownloadError, DownloadSpec, DownloadState, Downloader, SlowTransferMode};
+use bytehaul::{
+    DownloadError, DownloadSpec, DownloadState, Downloader, RangeSchedulingMode, SlowTransferMode,
+};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -126,6 +128,7 @@ fn spec(url: &str, path: &std::path::Path, mode: SlowTransferMode) -> DownloadSp
         .max_connections(4)
         .max_retries(0)
         .read_timeout(Duration::from_secs(5))
+        .range_scheduling_mode(RangeSchedulingMode::Fixed)
         .slow_transfer_mode(mode)
         .low_speed_limit(1024 * 1024)
         .slow_start_grace(Duration::from_millis(20))
@@ -177,6 +180,7 @@ async fn default_policy_recovers_tail_in_both_modes() {
                 .max_connections(4)
                 .max_retries(0)
                 .read_timeout(Duration::from_secs(15))
+                .range_scheduling_mode(RangeSchedulingMode::Fixed)
                 .slow_transfer_mode(mode)
                 .request_batch_size(batch);
             let handle = Downloader::builder().build().unwrap().download(config);
@@ -396,6 +400,10 @@ async fn pause_and_cancel_during_hedge_clean_temporary_files() {
 fn configuration_defaults_and_validation_are_public() {
     let config = DownloadSpec::new("http://example.invalid");
     assert_eq!(config.get_slow_transfer_mode(), SlowTransferMode::Adaptive);
+    assert_eq!(
+        config.get_range_scheduling_mode(),
+        RangeSchedulingMode::Dynamic
+    );
     assert_eq!(config.get_low_speed_limit(), None);
     assert_eq!(config.get_low_speed_duration(), Duration::from_secs(15));
     assert_eq!(config.get_slow_start_grace(), Duration::from_secs(5));
@@ -448,6 +456,7 @@ async fn small_budget_recovers_first_middle_and_last_piece_of_early_batch() {
             .min_split_size(1)
             .max_connections(4)
             .max_retries(0)
+            .range_scheduling_mode(RangeSchedulingMode::Fixed)
             .slow_transfer_mode(mode)
             .read_timeout(Duration::from_secs(20))
             .request_batch_size(LARGE_PIECE * 4);
@@ -592,6 +601,7 @@ async fn released_batch_leases_share_retry_budget_and_retry_after() {
         .max_connections(4)
         .max_retries(1)
         .read_timeout(Duration::from_secs(15))
+        .range_scheduling_mode(RangeSchedulingMode::Fixed)
         .request_batch_size(PIECE * 4);
     let handle = Downloader::builder().build().unwrap().download(config);
     let completion = handle.wait();

@@ -1,13 +1,13 @@
 # 基于测速报告的 HTTP 传输改造计划
 
-日期：2026-09-10。状态：P1/P2 已实施为默认值，P3–P5 待实施。
+日期：2026-09-10。状态：P1/P2 已实施；连接池默认启用、Dynamic 为默认范围调度，Fixed/4 MiB 为兼容回退；P3–P5 待实施。
 
 本轮无代理实测与后续慢连接对照见
 [验证报告](http-direct-validation.zh-CN.md)，含逐轮 CSV 和公网未完成轮次的说明。
 
 ## 1. 结论与证据边界
 
-优先解决默认的小请求反复建连和请求聚合。当前已有连接池、跨 piece 请求批处理和受保护的前缀续传能力，本轮已把连接池与 4 MiB 请求批处理设为默认，不重新实现这些机制。响应头等待治理、恢复预算细化属于后续独立改造，不能代替前两项。
+优先解决默认的小请求反复建连和请求聚合。当前已有连接池、跨 piece 请求批处理和受保护的前缀续传能力；连接池保持默认启用，范围调度默认使用 Dynamic，4 MiB 请求批处理保留为 Fixed 兼容模式。响应头等待治理、恢复预算细化属于后续独立改造，不能代替前两项。
 
 本次核实基线：
 
@@ -25,7 +25,7 @@
 | 项目 | 当前 bytehaul | aria2 1.37.0 | 判断及改造含义 |
 | --- | --- | --- | --- |
 | 空闲连接复用 | 默认 `pool_max_idle_per_host=4`、30 秒；已有 `http_idle_pool`，网络层直接配置 hyper pool | keep-alive 默认 true，pipelining 默认 false；完整消费响应后满足条件才 pool socket | 报告的核心机制已落地为默认值；无需自建 socket pool。[A1][A2] |
-| HTTP 请求与 piece | `piece_size=1 MiB`、默认 `request_batch_size=4 MiB`；多个独立 piece lease 共用一个有限 Range 响应 | 请求终点可以扩展至下一已使用 piece 的边界；响应未结束时可以领取相邻 segment 并继续读同一响应 | aria2 内部 piece 不等于请求大小。当前 bytehaul 已用默认有限批次缩小差距，仍不宣称完全等价。[A3][A4] |
+| HTTP 请求与 piece | `piece_size=1 MiB`、fixed 模式默认 `request_batch_size=4 MiB`；默认 dynamic 模式按空闲区间和槽位规划；多个独立 piece lease 共用一个有限 Range 响应 | 请求终点可以扩展至下一已使用 piece 的边界；响应未结束时可以领取相邻 segment 并继续读同一响应 | aria2 内部 piece 不等于请求大小。当前 bytehaul 已用有限 Range 调度缩小差距，仍不宣称完全等价。[A3][A4] |
 | `min_split_size` | fresh 路径主要用 `total_size > min_split_size` 判断是否进入 multi；未分配区间拆分另受 `min_segment_size` 管理 | `--min-split-size` 约束可拆区间，小于两倍阈值的区间不拆；还受 split、每服务器连接数约束 | 同设 4 MiB 不是同一请求策略，不应通过改变此参数含义来追齐 aria2。[A5] |
 | 首个请求 | 多连接先请求 `0..piece_size-1`；精确匹配首个 lease 时直接消费 probe，随后才批处理；小文件、忽略 Range 等另走 fallback | 无 segment 时先发普通 GET，后续下载链可以跨 segment 持续读取 | 报告所述保留初始 GET 与源码机制相符；但不能推导所有 aria2 运行都只有 4 个请求。bytehaul 也不是必然额外丢弃一次 probe。[A3][A4] |
 | 慢速与响应头 | `Observation::advance/sample` 只累计 Reading；Headers 不产生慢速证据；`request_with_timeout` 仍给请求到响应头设置超时 | `DownloadCommand::checkLowestDownloadSpeed` 在下载阶段检查显式低速阈值，默认成员值为 0 | bytehaul 的 Headers 盲区确实存在于自适应检测，不等于完全没有超时；没有证据证明报告中 aria2 靠自适应抢救 Headers 获胜。[A4] |
@@ -88,7 +88,7 @@
 
 ### P2：推广已有请求批处理，必要时改善批次均衡
 
-**已实施：** `request_batch_size` 已暴露于 Rust 和两种 Python 下载入口，默认 4 MiB，设置为 0 时关闭。后续仍可比较 8/16 MiB，不增加 piece_size 来获得大请求。
+**已实施：** `request_batch_size` 已暴露于 Rust 和两种 Python 下载入口，fixed 模式默认 4 MiB，设置为 0 时关闭；默认调度模式为 dynamic。后续仍可比较 8/16 MiB，不增加 piece_size 来获得大请求。
 
 **本轮改动位置：** `src/config.rs` 的默认值、配置单元测试、`tests/m3_multiworker.rs` 的默认行为回归以及 tuning/advanced/Python 文档；scheduler 的批次算法保持不变。只有数据证明默认配置仍不能充分利用并发时，才修改 `src/scheduler.rs::extend_batch` 和 `src/session/multi/adaptive.rs` 的批次分配，并补 `transfer_tests.rs`/scheduler 测试。
 

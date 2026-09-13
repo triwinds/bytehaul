@@ -7,6 +7,8 @@ use crate::error::DownloadError;
 pub(crate) const DEFAULT_HTTP_IDLE_POOL_MAX_PER_HOST: usize = 4;
 pub(crate) const DEFAULT_HTTP_IDLE_POOL_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const DEFAULT_REQUEST_BATCH_SIZE: u64 = 4 * 1024 * 1024;
+pub(crate) const DEFAULT_DYNAMIC_MIN_SPLIT_SIZE: u64 = 1024 * 1024;
+pub(crate) const DEFAULT_DYNAMIC_MAX_REQUEST_SIZE: u64 = 64 * 1024 * 1024;
 
 /// Log verbosity level for download tasks.
 ///
@@ -123,6 +125,56 @@ pub enum SlowTransferMode {
     AdaptiveWithHedging,
 }
 
+/// Strategy used to turn available piece ranges into ordinary HTTP requests.
+///
+/// `Fixed` preserves the `request_batch_size` behaviour. `Dynamic` plans
+/// requests from the currently available ranges and request slots; its
+/// `request_batch_size` value is ignored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum RangeSchedulingMode {
+    /// Preserve the legacy fixed request batch limit.
+    Fixed,
+    /// Dynamically split the largest available contiguous ranges.
+    #[default]
+    Dynamic,
+}
+
+impl std::fmt::Display for RangeSchedulingMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Fixed => "fixed",
+            Self::Dynamic => "dynamic",
+        })
+    }
+}
+
+impl std::str::FromStr for RangeSchedulingMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.to_ascii_lowercase().as_str() {
+            "fixed" => Ok(Self::Fixed),
+            "dynamic" => Ok(Self::Dynamic),
+            _ => Err(format!(
+                "invalid range scheduling mode: '{value}'; expected one of: fixed, dynamic"
+            )),
+        }
+    }
+}
+
+pub(crate) fn effective_dynamic_min_split_size(piece_size: u64, configured: u64) -> u64 {
+    let piece_size = piece_size.max(1);
+    configured
+        .max(piece_size)
+        .div_ceil(piece_size)
+        .saturating_mul(piece_size)
+        .max(piece_size)
+}
+
+pub(crate) fn effective_dynamic_max_request_size(piece_size: u64, configured: u64) -> u64 {
+    configured.max(piece_size.max(1))
+}
+
 /// Specification for a download task.
 #[derive(Debug, Clone)]
 pub struct DownloadSpec {
@@ -159,6 +211,9 @@ pub struct DownloadSpec {
     pub(crate) resume: bool,
     pub(crate) piece_size: u64,
     pub(crate) request_batch_size: u64,
+    pub(crate) range_scheduling_mode: RangeSchedulingMode,
+    pub(crate) dynamic_min_split_size: u64,
+    pub(crate) dynamic_max_request_size: u64,
     pub(crate) min_split_size: u64,
     pub(crate) min_segment_size: u64,
     /// Maximum additional retries per request/transfer scope (0 = no retries).
@@ -183,8 +238,10 @@ impl DownloadSpec {
     /// Create a new download specification for the given URL.
     ///
     /// All other fields are populated with sensible defaults:
-    /// 4 connections, 1 MiB pieces, 4 MiB request batches, a 4-connection
-    /// per-host idle pool, 64 MiB memory budget, resume enabled, etc.
+    /// 4 connections, 1 MiB pieces, dynamic range scheduling with a 1 MiB
+    /// minimum and 64 MiB maximum request, a 4-connection per-host idle pool,
+    /// 64 MiB memory budget, resume enabled, etc. The 4 MiB request batch is
+    /// retained for the explicit fixed compatibility mode.
     pub fn new(url: impl Into<String>) -> Self {
         Self {
             url: url.into(),
@@ -217,6 +274,9 @@ impl DownloadSpec {
             resume: true,
             piece_size: 1024 * 1024, // 1 MiB
             request_batch_size: DEFAULT_REQUEST_BATCH_SIZE,
+            range_scheduling_mode: RangeSchedulingMode::default(),
+            dynamic_min_split_size: DEFAULT_DYNAMIC_MIN_SPLIT_SIZE,
+            dynamic_max_request_size: DEFAULT_DYNAMIC_MAX_REQUEST_SIZE,
             min_split_size: 10 * 1024 * 1024, // 10 MiB
             min_segment_size: 256 * 1024,     // 256 KiB
             max_retries: 5,
@@ -376,6 +436,51 @@ impl DownloadSpec {
     /// Applies only to known-size multi-connection Range downloads.
     pub fn request_batch_size(mut self, bytes: u64) -> Self {
         self.request_batch_size = bytes;
+        self
+    }
+
+    /// Returns the request range scheduling strategy.
+    pub fn get_range_scheduling_mode(&self) -> RangeSchedulingMode {
+        self.range_scheduling_mode
+    }
+
+    /// Select fixed or dynamic request range scheduling (default: dynamic).
+    pub fn range_scheduling_mode(mut self, mode: RangeSchedulingMode) -> Self {
+        self.range_scheduling_mode = mode;
+        self
+    }
+
+    /// Returns the configured minimum dynamic split length in bytes.
+    /// The scheduler rounds it up to a piece boundary before splitting.
+    pub fn get_dynamic_min_split_size(&self) -> u64 {
+        self.dynamic_min_split_size
+    }
+
+    /// Returns the piece-aligned minimum used by the dynamic scheduler.
+    pub fn get_effective_dynamic_min_split_size(&self) -> u64 {
+        effective_dynamic_min_split_size(self.piece_size, self.dynamic_min_split_size)
+    }
+
+    /// Set the minimum length of both sides of a dynamic split.
+    pub fn dynamic_min_split_size(mut self, bytes: u64) -> Self {
+        self.dynamic_min_split_size = bytes;
+        self
+    }
+
+    /// Returns the maximum dynamic HTTP request length in bytes.
+    pub fn get_dynamic_max_request_size(&self) -> u64 {
+        self.dynamic_max_request_size
+    }
+
+    /// Returns the effective dynamic request cap, including the one-piece floor.
+    pub fn get_effective_dynamic_max_request_size(&self) -> u64 {
+        effective_dynamic_max_request_size(self.piece_size, self.dynamic_max_request_size)
+    }
+
+    /// Set the maximum dynamic HTTP request length in bytes.
+    /// A value below one piece still permits one complete piece.
+    pub fn dynamic_max_request_size(mut self, bytes: u64) -> Self {
+        self.dynamic_max_request_size = bytes;
         self
     }
 
@@ -766,6 +871,16 @@ impl DownloadSpec {
                 "min_segment_size must be >= 1".into(),
             ));
         }
+        if self.dynamic_min_split_size == 0 {
+            return Err(DownloadError::InvalidConfig(
+                "dynamic_min_split_size must be >= 1".into(),
+            ));
+        }
+        if self.dynamic_max_request_size == 0 {
+            return Err(DownloadError::InvalidConfig(
+                "dynamic_max_request_size must be >= 1".into(),
+            ));
+        }
         if self.autosave_sync_every == 0 {
             return Err(DownloadError::InvalidConfig(
                 "autosave_sync_every must be >= 1".into(),
@@ -824,6 +939,18 @@ mod tests {
     fn test_download_spec_defaults() {
         let spec = DownloadSpec::new("https://example.com/file");
         assert_eq!(spec.get_request_batch_size(), DEFAULT_REQUEST_BATCH_SIZE);
+        assert_eq!(
+            spec.get_range_scheduling_mode(),
+            RangeSchedulingMode::Dynamic
+        );
+        assert_eq!(
+            spec.get_dynamic_min_split_size(),
+            DEFAULT_DYNAMIC_MIN_SPLIT_SIZE
+        );
+        assert_eq!(
+            spec.get_dynamic_max_request_size(),
+            DEFAULT_DYNAMIC_MAX_REQUEST_SIZE
+        );
         assert_eq!(
             spec.clone()
                 .request_batch_size(4 * 1024 * 1024)
@@ -897,6 +1024,9 @@ mod tests {
             .channel_buffer(8)
             .resume(false)
             .piece_size(2048)
+            .range_scheduling_mode(RangeSchedulingMode::Dynamic)
+            .dynamic_min_split_size(4096)
+            .dynamic_max_request_size(8192)
             .min_split_size(4096)
             .min_segment_size(1024)
             .retry_policy(7, Duration::from_millis(10), Duration::from_millis(50))
@@ -925,6 +1055,9 @@ mod tests {
         assert_eq!(spec.channel_buffer, 8);
         assert!(!spec.resume);
         assert_eq!(spec.piece_size, 2048);
+        assert_eq!(spec.range_scheduling_mode, RangeSchedulingMode::Dynamic);
+        assert_eq!(spec.dynamic_min_split_size, 4096);
+        assert_eq!(spec.dynamic_max_request_size, 8192);
         assert_eq!(spec.min_split_size, 4096);
         assert_eq!(spec.min_segment_size, 1024);
         assert_eq!(spec.max_retries, 7);
@@ -1195,6 +1328,46 @@ mod tests {
             .validate()
             .unwrap_err();
         assert!(err.to_string().contains("min_segment_size"));
+    }
+
+    #[test]
+    fn test_validate_zero_dynamic_range_limits() {
+        let err = DownloadSpec::new("https://x.com")
+            .dynamic_min_split_size(0)
+            .validate()
+            .unwrap_err();
+        assert!(err.to_string().contains("dynamic_min_split_size"));
+
+        let err = DownloadSpec::new("https://x.com")
+            .dynamic_max_request_size(0)
+            .validate()
+            .unwrap_err();
+        assert!(err.to_string().contains("dynamic_max_request_size"));
+    }
+
+    #[test]
+    fn test_range_scheduling_mode_display_and_parse() {
+        assert_eq!(RangeSchedulingMode::Fixed.to_string(), "fixed");
+        assert_eq!(RangeSchedulingMode::Dynamic.to_string(), "dynamic");
+        assert_eq!(
+            "FIXED".parse::<RangeSchedulingMode>().unwrap(),
+            RangeSchedulingMode::Fixed
+        );
+        assert_eq!(
+            "dynamic".parse::<RangeSchedulingMode>().unwrap(),
+            RangeSchedulingMode::Dynamic
+        );
+        assert!("automatic".parse::<RangeSchedulingMode>().is_err());
+    }
+
+    #[test]
+    fn test_effective_dynamic_limits_follow_piece_boundaries() {
+        let spec = DownloadSpec::new("https://example.com/file")
+            .piece_size(2_048)
+            .dynamic_min_split_size(4_097)
+            .dynamic_max_request_size(1_024);
+        assert_eq!(spec.get_effective_dynamic_min_split_size(), 6_144);
+        assert_eq!(spec.get_effective_dynamic_max_request_size(), 2_048);
     }
 
     #[test]

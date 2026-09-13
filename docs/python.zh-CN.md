@@ -254,8 +254,30 @@ except DownloadFailedError as exc:
 | `max_download_speed` | `int` | `0` | 最大下载速度，`0` 表示不限速 |
 | `checksum_sha256` | `str \| None` | `None` | 下载完成后的 SHA-256 校验值 |
 | `log_level` | `str \| None` | `None`（`"off"`） | 日志级别 |
+| `request_batch_size` | `int` | `4194304` | fixed 模式的请求聚合上限，字节；`0` 表示关闭 |
+| `range_scheduling_mode` | `"fixed" \| "dynamic"` | `"dynamic"` | 普通 Range 请求的区间调度策略 |
+| `dynamic_min_split_size` | `int` | `1048576` | dynamic 模式的最小拆分长度，字节 |
+| `dynamic_max_request_size` | `int` | `67108864` | dynamic 模式的单请求最大长度，字节 |
 
 `log_level` 用于便捷函数 `download(...)` 或 `Downloader(...)` 构造器。
+
+`range_scheduling_mode="dynamic"` 是默认策略，根据当前空闲连续区间和实际请求槽位选择范围；每个独立区间先获得一个
+虚拟槽位，剩余槽位按当前字节份额最大的区间分配，下一次请求再按 piece 边界领取该区间的均衡份额。
+只有拆分后的两侧都满足 `dynamic_min_split_size` 时才允许拆分。动态请求独立使用
+`dynamic_max_request_size`，并且最多持有 64 个 piece 租约；硬上限优先，能找到合法边界时会避免短尾，无法兼顾时记录冲突原因。最小值会向上对齐到 piece；最大值小于
+一个 piece 时仍允许领取一个完整 piece。dynamic 模式会忽略 `request_batch_size`，`0` 不表示自动模式。
+显式 `range_scheduling_mode="fixed"` 时，`request_batch_size` 默认 4 MiB，`0` 表示关闭聚合。
+
+```python
+task = bytehaul.download(
+    "https://example.com/large.bin",
+    output_path="large.bin",
+    max_connections=8,
+    range_scheduling_mode="dynamic",
+    dynamic_min_split_size=2 * 1024 * 1024,
+    dynamic_max_request_size=64 * 1024 * 1024,
+)
+```
 
 ## 网络层参数
 

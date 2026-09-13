@@ -289,7 +289,7 @@ struct SegmentLease {
 - 已增加实验性 idle-pool 配置：`DownloaderBuilder::http_idle_pool(...)` 与 `DownloadSpec::http_idle_pool(...)` / `disable_http_idle_pool()` 会进入 `ClientNetworkConfig`，因此也自动进入 `Downloader::client_cache` key，避免不同 pool 参数误复用 client。
 - 默认值现已调整为 `pool_max_idle_per_host = 4`、空闲超时 30 秒；`disable_http_idle_pool()` 和显式零值保留关闭路径。连接池参数仍会进入 client cache key。
 - 低层连接池测试覆盖 keep-alive 复用和 `Connection: close` 后自动重连；多 worker 集成测试分别覆盖默认复用和显式禁用后的独立连接。
-- 本阶段验证：`cargo test --lib test_idle_pool_reuses_keep_alive_connection`；`cargo test --lib test_idle_pool_reconnects_after_connection_close`；`cargo test --lib test_download_rebuilds_client_for_spec_idle_pool_override`；`cargo test --test m3_multiworker test_multi_worker_range_requests_use_distinct_connections`；`cargo test --test m3_multiworker test_multi_worker_defaults_batch_ranges_and_reuse_connections`。
+- 本阶段验证：`cargo test --lib test_idle_pool_reuses_keep_alive_connection`；`cargo test --lib test_idle_pool_reconnects_after_connection_close`；`cargo test --lib test_download_rebuilds_client_for_spec_idle_pool_override`；`cargo test --test m3_multiworker test_multi_worker_range_requests_use_distinct_connections`；`cargo test --test m3_multiworker test_multi_worker_fixed_batch_ranges_and_reuse_connections`。
 
 需要显式关闭 hyper idle pool 时：
 
@@ -326,9 +326,9 @@ builder.pool_max_idle_per_host(0);
 
 - 已新增 `DownloadSpec::min_segment_size`，并让 multi-worker runtime 按 `max_connections` 启动 worker；当当前 missing range 数不足以填满 worker 且 range 足够大时，scheduler 会主动把未分配的 missing range 切成多个 sub-segment。
 - 动态切分只作用于尚未发出的 missing range，不会去拆已经在飞的 active lease；因此不会引入“边下载边改 lease 边界”的重叠计数风险。piece 仍然只在完整覆盖后才 mark complete，控制文件 completed bitset 语义不变。
-- probe response 只有在仍与分配到的 segment 范围精确匹配时才会复用；若动态切分让首个 segment 范围发生变化，则会丢弃 probe response 并发起新的精确 Range 请求。
-- 新增验证同时覆盖正确性和收益：单 piece 也可以被拆成多个 subrange 并正确合并写回；在无可复用 probe response 的条件下，主动切分能显著降低 slow-tail 延迟。
-- 本阶段验证：`cargo test --lib test_scheduler_splits_large_missing_range_when_workers_exceed_work_units`；`cargo test --lib test_scheduler_keeps_full_piece_when_remaining_tail_is_too_small_to_split`；`cargo test --lib test_run_multi_worker_dynamic_split_reduces_tail_latency`；`cargo test --test m3_multiworker test_multi_worker_dynamic_split_issues_subranges_with_single_piece`。
+- probe response 只有在仍与分配到的 segment 范围精确匹配时才会复用；probe 尚未消费时，首个 lease 保持完整 piece，不让普通的小文件拆分改变其边界。
+- 普通无 probe 的 missing range 仍可按 `min_segment_size` 主动拆分；显式 `RangeSchedulingMode::Dynamic` 则按连续候选区间、请求槽位和独立上限规划，并通过 piece 边界写回。
+- 本阶段验证：`cargo test --lib test_scheduler_splits_large_missing_range_when_workers_exceed_work_units`；`cargo test --lib test_scheduler_keeps_full_piece_when_remaining_tail_is_too_small_to_split`；`cargo test --lib test_run_multi_worker_dynamic_split_requests_are_concurrent`；`cargo test --test m3_multiworker test_multi_worker_fixed_probe_keeps_first_piece_whole`；`cargo test --test m3_multiworker test_multi_worker_dynamic_ranges_ignore_fixed_batch_and_keep_piece_boundaries`。
 
 在 M3 / M4 完成后，再考虑动态切分。
 

@@ -24,7 +24,8 @@
 
 ## `request_batch_size`
 
-**默认：** 4 MiB；零表示关闭请求聚合。
+**字段默认：** fixed 模式为 4 MiB；零表示关闭请求聚合。默认调度模式为
+dynamic，且不使用此字段。
 
 它限制已知大小、多连接下载中单次 HTTP 请求的字节数，与 `piece_size` 和断点完成位的粒度分开。
 增大批次可减少响应头往返，但也可能让更多未完成工作被同一慢响应占住。
@@ -35,8 +36,34 @@
 可用 [`http_efficiency_compare`](../examples/http_efficiency_compare.rs) 的
 确定性 matrix 比较开池下的 0/4/8/16 MiB，以及关闭池的 4 MiB 对照。
 同时观察尾部完成、请求数、额外 body 字节与内存，不能只看总耗时。
-默认保持 4 MiB，单个健康场景变快不足以支持增大默认值；fixture 堆峰值包含
+fixed 模式默认保持 4 MiB，单个健康场景变快不足以支持增大 fixed 默认值；fixture 堆峰值包含
 服务端和运行时分配，不是 RSS。
+
+## `range_scheduling_mode`
+
+**默认值：** `dynamic`
+
+`dynamic` 默认从当前空闲的、按 piece 对齐的连续区间中为请求槽位规划份额。
+显式使用 `fixed` 时，`request_batch_size` 是请求聚合上限，设置为零表示关闭聚合；
+每个独立区间先获得一个虚拟槽位，剩余槽位按当前字节份额最大的区间分配，使单一区间的
+请求长度接近 `剩余字节 / 空闲槽位`，而不是每次重新生成一组临时拆分。只有拆分后的两侧
+都满足 `dynamic_min_split_size` 时才允许拆分。
+
+动态请求使用独立的 `dynamic_max_request_size` 字节上限，并且单个请求最多持有 64 个 piece 租约。
+这些是硬上限；如果上限内存在合法的最小拆分边界，调度器会回退到最近边界以避免短尾，无法兼顾时记录最小拆分冲突。最小拆分长度会向上对齐到 piece 边界；即使最大请求长度小于一个 piece，也仍允许领取一个完整 piece。
+dynamic 模式会忽略 `request_batch_size`，因此修改它不能代替启用 dynamic。动态默认最小拆分长度为
+1 MiB，最大请求长度为 64 MiB。开启 debug 日志后，可以检查候选/最终区间、实际槽位数、租约数和截断原因，
+再进行性能对比；完整候选份额表仅在 TRACE 输出。`request_batch_size` 字段默认仍为 4 MiB，
+但默认 dynamic 模式不会使用它。
+
+```rust
+use bytehaul::{DownloadSpec, RangeSchedulingMode};
+
+let spec = DownloadSpec::new("https://example.com/file.bin")
+    .range_scheduling_mode(RangeSchedulingMode::Dynamic)
+    .dynamic_min_split_size(2 * 1024 * 1024)
+    .dynamic_max_request_size(64 * 1024 * 1024);
+```
 
 ## `memory_budget`
 

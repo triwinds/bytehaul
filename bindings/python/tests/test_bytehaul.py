@@ -472,6 +472,7 @@ class TestSlowTransferOptions:
             "slow_transfer_mode", "low_speed_limit", "low_speed_duration",
             "slow_start_grace", "slow_sample_window", "request_batch_size", "request_headers_timeout",
             "ca_info", "ca_path", "client_cert", "client_key",
+            "range_scheduling_mode", "dynamic_min_split_size", "dynamic_max_request_size",
         ]
         api = Downloader().download if object_api else download
         parameters = inspect.signature(api).parameters
@@ -487,7 +488,10 @@ class TestSlowTransferOptions:
         "field,value",
         [
             ("slow_transfer_mode", "fast"),
+            ("range_scheduling_mode", "fast"),
             ("low_speed_limit", 0),
+            ("dynamic_min_split_size", 0),
+            ("dynamic_max_request_size", 0),
             *[
                 (field, value)
                 for field in ("low_speed_duration", "slow_start_grace", "slow_sample_window")
@@ -522,8 +526,11 @@ class TestSlowTransferOptions:
 
     @pytest.mark.parametrize("object_api", [False, True])
     @pytest.mark.parametrize("mode", ["disabled", "adaptive", "adaptive_with_hedging"])
+    @pytest.mark.parametrize("range_scheduling_mode", ["fixed", "dynamic"])
     @pytest.mark.parametrize("request_batch_size", [None, 0, 16384])
-    def test_range_download_with_policy(self, tmp_path, object_api, mode, request_batch_size):
+    def test_range_download_with_policy(
+        self, tmp_path, object_api, mode, range_scheduling_mode, request_batch_size
+    ):
         body = bytes(range(256)) * 128
         ranges = []
 
@@ -548,7 +555,14 @@ class TestSlowTransferOptions:
         try:
             url = f"http://127.0.0.1:{srv.server_address[1]}/file"
             out = tmp_path / "ranges.bin"
-            options = dict(slow_transfer_mode=mode, max_connections=3, piece_size=4096, min_split_size=1, request_batch_size=request_batch_size)
+            options = dict(
+                slow_transfer_mode=mode,
+                range_scheduling_mode=range_scheduling_mode,
+                max_connections=3,
+                piece_size=4096,
+                min_split_size=1,
+                request_batch_size=request_batch_size,
+            )
             if object_api:
                 task = Downloader().download(url, out, **options)
                 task.wait()

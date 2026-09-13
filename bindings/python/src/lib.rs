@@ -4,7 +4,10 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Once, OnceLock};
 use std::time::Duration;
 
-use bytehaul::{Checksum, DownloadError, DownloadSpec, FileAllocation, LogLevel, SlowTransferMode};
+use bytehaul::{
+    Checksum, DownloadError, DownloadSpec, FileAllocation, LogLevel, RangeSchedulingMode,
+    SlowTransferMode,
+};
 use pyo3::create_exception;
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
@@ -196,6 +199,12 @@ fn parse_slow_transfer_mode(value: &str) -> PyResult<SlowTransferMode> {
     }
 }
 
+fn parse_range_scheduling_mode(value: &str) -> PyResult<RangeSchedulingMode> {
+    value
+        .parse::<RangeSchedulingMode>()
+        .map_err(|_| config_error("range_scheduling_mode must be one of: 'fixed', 'dynamic'"))
+}
+
 fn parse_log_level(value: &str) -> PyResult<LogLevel> {
     value.parse::<LogLevel>().map_err(|_| {
         config_error("log_level must be one of: 'off', 'error', 'warn', 'info', 'debug', 'trace'")
@@ -274,6 +283,9 @@ fn build_download_spec(
     ca_path: Option<PathBuf>,
     client_cert: Option<PathBuf>,
     client_key: Option<PathBuf>,
+    range_scheduling_mode: Option<String>,
+    dynamic_min_split_size: Option<u64>,
+    dynamic_max_request_size: Option<u64>,
 ) -> PyResult<DownloadSpec> {
     let mut spec = DownloadSpec::new(url);
     if let Some(seconds) = request_headers_timeout {
@@ -294,6 +306,15 @@ fn build_download_spec(
     }
     if let Some(bytes) = request_batch_size {
         spec = spec.request_batch_size(bytes);
+    }
+    if let Some(mode) = range_scheduling_mode {
+        spec = spec.range_scheduling_mode(parse_range_scheduling_mode(&mode)?);
+    }
+    if let Some(bytes) = dynamic_min_split_size {
+        spec = spec.dynamic_min_split_size(non_zero_u64("dynamic_min_split_size", bytes)?);
+    }
+    if let Some(bytes) = dynamic_max_request_size {
+        spec = spec.dynamic_max_request_size(non_zero_u64("dynamic_max_request_size", bytes)?);
     }
 
     if let Some(output_path) = output_path {
@@ -643,7 +664,10 @@ impl PyDownloader {
             ca_info = None,
             ca_path = None,
             client_cert = None,
-            client_key = None
+            client_key = None,
+            range_scheduling_mode = None,
+            dynamic_min_split_size = None,
+            dynamic_max_request_size = None
         )
     )]
     #[allow(clippy::too_many_arguments)]
@@ -684,6 +708,9 @@ impl PyDownloader {
         ca_path: Option<PathBuf>,
         client_cert: Option<PathBuf>,
         client_key: Option<PathBuf>,
+        range_scheduling_mode: Option<String>,
+        dynamic_min_split_size: Option<u64>,
+        dynamic_max_request_size: Option<u64>,
     ) -> PyResult<PyDownloadTask> {
         let spec = build_download_spec(
             url,
@@ -721,6 +748,9 @@ impl PyDownloader {
             ca_path,
             client_cert,
             client_key,
+            range_scheduling_mode,
+            dynamic_min_split_size,
+            dynamic_max_request_size,
         )?;
         let runtime = shared_runtime()?;
         let _guard = runtime.enter();
@@ -775,7 +805,10 @@ impl PyDownloader {
         ca_info = None,
         ca_path = None,
         client_cert = None,
-        client_key = None
+        client_key = None,
+        range_scheduling_mode = None,
+        dynamic_min_split_size = None,
+        dynamic_max_request_size = None
     )
 )]
 #[allow(clippy::too_many_arguments)]
@@ -820,6 +853,9 @@ fn download(
     ca_path: Option<PathBuf>,
     client_cert: Option<PathBuf>,
     client_key: Option<PathBuf>,
+    range_scheduling_mode: Option<String>,
+    dynamic_min_split_size: Option<u64>,
+    dynamic_max_request_size: Option<u64>,
 ) -> PyResult<()> {
     let level = match &log_level {
         Some(s) => parse_log_level(s)?,
@@ -862,6 +898,9 @@ fn download(
         ca_path.clone(),
         client_cert.clone(),
         client_key.clone(),
+        range_scheduling_mode,
+        dynamic_min_split_size,
+        dynamic_max_request_size,
     )?;
     let runtime = shared_runtime()?;
 
