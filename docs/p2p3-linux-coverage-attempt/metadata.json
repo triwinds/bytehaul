@@ -1,0 +1,22 @@
+{
+  "config": {
+    "rust": "1.98.1",
+    "tarpaulin": "0.37.2",
+    "minimum_lines": 95
+  },
+  "platform": "Linux-6.8.0-117-generic-x86_64-with-glibc2.39",
+  "architecture": "x86_64",
+  "started_utc": "20260913T170954Z-05421d62",
+  "os_release": {
+    "ID": "ubuntu",
+    "VERSION_ID": "24.04",
+    "PRETTY_NAME": "Ubuntu 24.04.4 LTS"
+  },
+  "cargo_build_jobs": "2",
+  "report_dir": "/work/target/coverage/reports/20260913T170954Z-05421d62",
+  "target_dir": "/work/target/coverage/build/20260913T170954Z-05421d62",
+  "revision": "b748d3e48bc281c7e9e7916fe32106ffe02605b5",
+  "dirty": true,
+  "exit_code": 101,
+  "result": "Coverage setup or report generation failed; see run.log."
+}
