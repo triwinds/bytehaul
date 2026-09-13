@@ -1,7 +1,11 @@
-"""Compare release bytehaul and aria2 against public HTTPS mirrors, with full logs.
+"""Compare the libcurl bytehaul transport and aria2 against public HTTPS mirrors.
 
-Build first: cargo build --release --locked --example public_compare
-Run: python scripts/compare_public.py --aria2 PATH_TO_ARIA2C
+Build the binaries first, for example:
+
+    cargo build --release --locked --example public_compare
+
+Run: python scripts/compare_public.py --aria2 PATH_TO_ARIA2C \
+    --bytehaul target/release/examples/public_compare
 """
 import argparse
 import csv
@@ -28,19 +32,34 @@ SOURCES = {
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--aria2", required=True)
-    parser.add_argument("--rounds", type=int, default=3)
+    parser.add_argument("--bytehaul", help="Backward-compatible path for one bytehaul binary")
+    parser.add_argument("--bytehaul-curl", help="Path to the libcurl public_compare binary")
+    parser.add_argument("--rounds", type=int, default=10)
     parser.add_argument("--timeout", type=int, default=180)
     parser.add_argument("--url", help="Use this URL instead of the default mirrors")
     parser.add_argument("--sha256", help="Trusted expected SHA-256 for --url, if available")
     args = parser.parse_args()
     if args.rounds < 1 or args.timeout < 1:
         parser.error("rounds and timeout must be positive")
+    binaries = {}
+    if args.bytehaul:
+        binaries["bytehaul"] = Path(args.bytehaul).resolve()
+    if args.bytehaul_curl:
+        binaries["bytehaul-curl"] = Path(args.bytehaul_curl).resolve()
+    if not binaries:
+        binaries["bytehaul-curl"] = ROOT / "target/release/examples" / (
+            "public_compare.exe" if os.name == "nt" else "public_compare"
+        )
+    for label, binary in binaries.items():
+        if not binary.is_file():
+            parser.error(f"{label} binary does not exist: {binary}")
     sources = {"custom": args.url} if args.url else SOURCES
     filename = Path(urlsplit(args.url).path).name if args.url else FILE
     if not filename or filename in {".", ".."}:
         parser.error("URL must have a filename")
     aria = str(Path(args.aria2).resolve())
-    bytehaul = ROOT / "target/release/examples" / ("public_compare.exe" if os.name == "nt" else "public_compare")
+    if not Path(aria).is_file():
+        parser.error(f"aria2 binary does not exist: {aria}")
     env = {k: v for k, v in os.environ.items() if k.lower() not in
            {"http_proxy", "https_proxy", "all_proxy", "no_proxy"}}
     run = ROOT / "target/public-compare" / datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -48,7 +67,13 @@ def main():
     metadata = {"platform": platform.platform(), "created": datetime.datetime.now().astimezone().isoformat(),
                 "revision": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
                 "aria2": subprocess.check_output([aria, "--version"], text=True),
-                "bytehaul_binary_sha256": hashlib.sha256(bytehaul.read_bytes()).hexdigest(),
+                "bytehaul_binaries": {
+                    label: {
+                        "path": str(binary),
+                        "sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
+                    }
+                    for label, binary in binaries.items()
+                },
                 "sources": sources, "rounds": args.rounds, "timeout": args.timeout,
                 "validation": "trusted SHA-256 when supplied/available; otherwise cross-tool SHA-256 agreement plus ZIP CRC checks (not publisher authentication)",
                 "network": "IPv4, no explicit/environment proxy; system routing unchanged",
@@ -76,17 +101,18 @@ def main():
                 candidate = (result.stdout.decode().split() or [""])[0].lower()
                 if len(candidate) == 64 and all(c in "0123456789abcdef" for c in candidate):
                     expected[source] = candidate
+    tools = list(binaries) + ["aria2"]
     for source, url in sources.items():
         for connections in [1, 8]:
             for repeat in range(1, args.rounds + 1):
-                order = ["bytehaul", "aria2"] if repeat % 2 else ["aria2", "bytehaul"]
+                order = tools if repeat % 2 else list(reversed(tools))
                 for tool in order:
                     name = f"{source}-c{connections}-r{repeat}-{tool}"
                     folder = run / name
                     folder.mkdir()
                     output = folder / filename
-                    if tool == "bytehaul":
-                        command = [str(bytehaul), url, str(output), str(connections)]
+                    if tool in binaries:
+                        command = [str(binaries[tool]), url, str(output), str(connections)]
                     else:
                         command = [aria, "--no-conf=true", "--no-netrc=true", "--disable-ipv6=true",
                                    f"--split={connections}", f"--max-connection-per-server={connections}",
@@ -143,7 +169,7 @@ def main():
              "|---|---:|---|---:|---:|---:|"]
     for source in sources:
         for connections in [1, 8]:
-            for tool in ["bytehaul", "aria2"]:
+            for tool in tools:
                 group = [r for r in rows if (r['source'], r['connections'], r['tool']) == (source, connections, tool)]
                 good = [r for r in group if r["verified"]]
                 seconds = round(statistics.median(r["seconds"] for r in good), 3) if good else "N/A"

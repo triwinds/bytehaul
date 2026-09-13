@@ -1,12 +1,15 @@
-# 按 IP 分组连接池原型
+# 按 IP 分组连接池原型（历史记录）
 
 日期：2026-09-12。对应 [实施计划](multi-ip-connection-plan.zh-CN.md) 的第一阶段。
 
+> 本文记录 P6 之前的 Hyper 原型实验，不代表当前生产实现。原型源码已在 P6
+> 移除；当前生产传输统一使用 libcurl。
+
 ## 当前结论
 
-按 IP 分组的 Hyper HTTP/1.1 client 可以保留原始 URI、Host、TLS SNI 和证书域名验证，也能通过 `Connected::extra` 将真实远端地址、物理连接 ID 带到每次响应。复用同一 socket 时 ID 不变；不同 IP 的组使用不同 socket。
+按 IP 分组的 Hyper HTTP/1.1 client 可以保留原始 URI、Host、TLS SNI 和证书域名验证，也能通过 `Connected::extra` 将真实远端地址、物理连接 ID 带到每次响应。复用同一 socket 时 ID 不变；不同 IP 的组使用不同 socket。以下结论仅属于历史实验。
 
-这一结论仅覆盖连接机制。原型位于 `src/network/multi_ip_prototype.rs`，使用 `cfg(test)` 隔离，尚未接入下载器、公共配置或 Python 绑定。候选选择、吞吐评分、收敛和公网对比均未实现，不能据此声称整个方案已完成。
+这一结论仅覆盖连接机制。原型曾使用 `cfg(test)` 隔离，尚未接入下载器、公共配置或 Python 绑定；其源码现已移除。候选选择、吞吐评分、收敛和公网对比均未实现，不能据此声称整个方案已完成。
 
 ## 已实现的可执行验证
 
@@ -26,11 +29,11 @@
 5. **超时统一包住整个请求。** 包括 DNS、选择、预算等待、TCP/TLS 和响应头。候选切换不能重置期限；429/503 不能触发额外 IP 重试。
 6. **代理保持原路径。** 原型不经过代理；连接归属和评分只能应用于直连源站。
 
-暂时保留分组 Hyper client 作为候选架构，不开始重写连接池。第一阶段仍有任务级完整预算、后台建连竞争和动态组淘汰的验证待完成，因此不标记整个阶段验收通过，也不开放功能开关。
+不保留分组 Hyper client 作为当前实现，也不开放功能开关。第一阶段仍有任务级完整预算、后台建连竞争和动态组淘汰的设计工作待完成；若恢复该方向，应以新的实现方案和验证为准。
 
 ## 验证记录
 
-- `cargo test -p bytehaul --all-targets`：499 项通过，含 4 项原型测试、空闲超时回归和调度器终止测试；benchmark smoke checks 通过。
+- `cargo test -p bytehaul --all-targets`：历史记录中 499 项通过，含 4 项原型测试、空闲超时回归和调度器终止测试；benchmark smoke checks 通过。
 - `cargo test -p bytehaul --doc`：1 项通过。
 - `cargo clippy --workspace --all-targets -- -D warnings`、`cargo fmt --all -- --check`：通过。
 - Linux 门禁使用仓库入口 `python3 scripts/coverage.py`（固定工具通过 `--install` 安装）：**96.37%（4402/4568）**，通过 95% 门槛。报告已复制回 `target/coverage/reports/20260912T085718Z-ef178edf/`。

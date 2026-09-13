@@ -14,13 +14,31 @@ concurrency:
 
 jobs:
   rust-tests:
-    name: Rust tests (${{ matrix.os }})
+    name: Rust tests (${{ matrix.os }}, ${{ matrix.backend }})
     runs-on: ${{ matrix.os }}
 
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            backend: curl-default
+            feature_args: ""
+          - os: ubuntu-latest
+            backend: curl-only
+            feature_args: --no-default-features --features curl-backend
+          - os: windows-latest
+            backend: curl-default
+            feature_args: ""
+          - os: windows-latest
+            backend: curl-only
+            feature_args: --no-default-features --features curl-backend
+          - os: macos-latest
+            backend: curl-default
+            feature_args: ""
+          - os: macos-latest
+            backend: curl-only
+            feature_args: --no-default-features --features curl-backend
 
     steps:
       - name: Check out source
@@ -44,18 +62,18 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-
 
       - name: Run unit tests
-        run: cargo test -p bytehaul --all-targets
+        run: cargo test -p bytehaul --all-targets ${{ matrix.feature_args }}
 
       - name: Run doc tests
-        run: cargo test -p bytehaul --doc
+        run: cargo test -p bytehaul --doc ${{ matrix.feature_args }}
 
       - name: Clippy lint check
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets ${{ matrix.feature_args }} -- -D warnings
 
       - name: Check documentation builds without warnings
         env:
           RUSTDOCFLAGS: "-D warnings"
-        run: cargo doc --no-deps --workspace
+        run: cargo doc --no-deps --workspace ${{ matrix.feature_args }}
 
   coverage:
     name: Coverage gate (≥95%)
@@ -116,7 +134,7 @@ jobs:
 
       - name: Build Python extension (dev)
         working-directory: bindings/python
-        run: uv run maturin develop --bindings pyo3
+        run: uv run maturin develop --bindings pyo3 --no-default-features --features curl-backend
 
       - name: Run Python tests
         working-directory: bindings/python

@@ -63,8 +63,8 @@ impl RuntimeFeatures {
 
 /// Emits the detected libcurl features at debug level.
 ///
-/// The Hyper backend logs the equivalent connector facts when it builds a
-/// client, so this keeps both backends observable from the same place.
+/// Keep the transport's runtime facts observable from one place when a client
+/// is built.
 pub(crate) fn log_runtime_features(log_level: LogLevel) {
     let features = RuntimeFeatures::detect();
     // Coverage builds expand `log_debug!` to a level check only, so keep the

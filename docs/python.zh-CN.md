@@ -259,7 +259,7 @@ except DownloadFailedError as exc:
 
 ## 网络层参数
 
-对象 API 中，`proxy`、`http_proxy`、`https_proxy` 既可用于 `Downloader(...)` 默认值，也可用于 `downloader.download(...)` 的单次覆盖；`dns_servers`、`doh_servers`、`enable_ipv6` 仍通过 `Downloader(...)` 配置。
+对象 API 中，`proxy`、`http_proxy`、`https_proxy` 既可用于 `Downloader(...)` 默认值，也可用于 `downloader.download(...)` 的单次覆盖；`dns_servers`、`doh_servers`、`enable_ipv6` 以及 TLS 凭据也可在 `Downloader(...)` 设置，并可在单次下载中覆盖。
 
 | 参数 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
@@ -269,6 +269,10 @@ except DownloadFailedError as exc:
 | `dns_servers` | `list[str] \| None` | `None` | 自定义 DNS 服务器，支持 `IP` 或 `IP:PORT` |
 | `doh_servers` | `list[str] \| None` | `None` | 自定义 DNS-over-HTTPS 端点，传入 `https://...` URL |
 | `enable_ipv6` | `bool \| None` | `True` | 是否允许解析和连接 IPv6 地址 |
+| `ca_info` | `str \| Path \| None` | `None` | 额外 PEM 信任根；不关闭证书和主机名校验 |
+| `ca_path` | `str \| Path \| None` | `None` | 带哈希证书文件的 CA 目录 |
+| `client_cert` | `str \| Path \| None` | `None` | mTLS 客户端证书 |
+| `client_key` | `str \| Path \| None` | `None` | mTLS 客户端私钥 |
 
 ## 运行测试
 

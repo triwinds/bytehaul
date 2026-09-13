@@ -6,7 +6,7 @@
 
 ## 概览
 
-bytehaul 是一个基于 Tokio、hyper 和 hyper-rustls 构建的异步 HTTP 下载库。它支持多连接并行下载、通过控制文件实现断点续传、回写缓存，以及基于可配置内存预算的背压控制。
+bytehaul 是一个基于 Tokio 和 libcurl 传输驱动构建的异步 HTTP 下载库。它支持多连接并行下载、通过控制文件实现断点续传、回写缓存，以及基于可配置内存预算的背压控制。libcurl 是唯一的生产传输后端，并由默认特性启用。
 
 ## 数据流示意图
 
@@ -56,10 +56,10 @@ graph TD
 
 ### Downloader / DownloaderBuilder
 
-入口对象。它维护 downloader 级别的默认网络配置，以及一组按“生效网络配置”缓存的 `BytehaulClient`（内部基于 hyper client stack，并包含代理、DNS、TLS、超时等设置）。每次调用 `download()` 时，都会把默认值与任务级覆盖项（目前包括超时和代理）合并，复用或派生出匹配的 client，并返回一个 `DownloadHandle`。可选的 `Semaphore` 用于限制并发下载数。
+入口对象。它维护 downloader 级别的默认网络配置，以及一组按“生效网络配置”缓存的 `BytehaulClient`（内部基于 libcurl driver，并包含代理、DNS、TLS、超时和连接池设置）。每次调用 `download()` 时，都会把默认值与任务级覆盖项（目前包括超时和代理）合并，复用或派生出匹配的 client，并返回一个 `DownloadHandle`。可选的 `Semaphore` 用于限制并发下载数。
 
 
-DNS 查询和有容量限制的 TTL 响应缓存由 HTTP connector 内的 Hickory 负责，下载前不再额外执行一次预解析。
+DNS 查询和有容量限制的 TTL 响应缓存由 Hickory 负责；下载前得到的地址通过 `CURLOPT_RESOLVE` 注入 libcurl，同时保留 URL、Host 和 TLS 身份。
 
 ### DownloadHandle
 

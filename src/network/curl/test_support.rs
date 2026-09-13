@@ -112,8 +112,8 @@ pub(crate) fn env_guard() -> &'static std::sync::Mutex<()> {
 /// A proxy that serves only requests carrying `Proxy-Authorization`.
 ///
 /// Credentials in the proxy URL make libcurl send `Proxy-Authorization`
-/// preemptively, exactly like the Hyper connector does, so this fixture accepts
-/// that first attempt and answers `407` otherwise.
+/// preemptively, so this fixture accepts that first attempt and answers `407`
+/// otherwise.
 pub(crate) struct AuthenticatingProxy {
     pub(crate) port: u16,
     heads: Arc<Mutex<Vec<String>>>,

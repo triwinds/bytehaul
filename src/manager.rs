@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -65,6 +66,30 @@ impl DownloaderBuilder {
     /// Individual downloads can override this via [`DownloadSpec::https_proxy`].
     pub fn https_proxy(mut self, proxy: impl Into<String>) -> Self {
         self.client_config.https_proxy = Some(proxy.into());
+        self
+    }
+
+    /// Add a PEM trust bundle for the default libcurl client.
+    pub fn ca_info(mut self, path: impl Into<PathBuf>) -> Self {
+        self.client_config.ca_info = Some(path.into());
+        self
+    }
+
+    /// Use a directory of hashed CA certificates for the default libcurl client.
+    pub fn ca_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.client_config.ca_path = Some(path.into());
+        self
+    }
+
+    /// Configure the client certificate for mutual TLS.
+    pub fn client_cert(mut self, path: impl Into<PathBuf>) -> Self {
+        self.client_config.client_cert = Some(path.into());
+        self
+    }
+
+    /// Configure the private key for mutual TLS.
+    pub fn client_key(mut self, path: impl Into<PathBuf>) -> Self {
+        self.client_config.client_key = Some(path.into());
         self
     }
 
@@ -262,6 +287,19 @@ fn requested_client_config_for_spec(
         if let Some(proxy) = spec.get_https_proxy() {
             requested.https_proxy = Some(proxy.to_owned());
         }
+    }
+
+    if let Some(path) = spec.get_ca_info() {
+        requested.ca_info = Some(path.to_owned());
+    }
+    if let Some(path) = spec.get_ca_path() {
+        requested.ca_path = Some(path.to_owned());
+    }
+    if let Some(path) = spec.get_client_cert() {
+        requested.client_cert = Some(path.to_owned());
+    }
+    if let Some(path) = spec.get_client_key() {
+        requested.client_key = Some(path.to_owned());
     }
 
     requested

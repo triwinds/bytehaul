@@ -6,7 +6,11 @@ This document describes bytehaul's internal data-flow pipeline and the key abstr
 
 ## Overview
 
-bytehaul is an async HTTP download library built on Tokio, hyper, and hyper-rustls. It supports multi-connection parallel downloading, resume via control files, write-back caching, and a configurable memory budget for back-pressure.
+bytehaul is an async HTTP download library built on Tokio and a libcurl
+transport driver. It supports multi-connection parallel downloading, resume
+via control files, write-back cache, and a configurable memory budget for
+back-pressure. libcurl is the sole production transport and is enabled by
+default.
 
 ## Data-Flow Diagram
 
@@ -56,10 +60,17 @@ graph TD
 
 ### Downloader / DownloaderBuilder
 
-Entry point. Holds downloader-wide default network settings plus a cache of `BytehaulClient` instances built from the hyper client stack (proxy, DNS, TLS, timeout). Each call to `download()` combines those defaults with task-level overrides (timeout, connection pooling and proxies), reuses or derives the matching client, and returns a `DownloadHandle`. An optional `Semaphore` limits concurrent downloads.
+Entry point. Holds downloader-wide default network settings plus a cache of
+`BytehaulClient` instances built from the libcurl driver (proxy, DNS, TLS,
+timeout and connection-pool policy). Each call to `download()` combines those
+defaults with task-level overrides (timeout, connection pooling and proxies),
+reuses or derives the matching client, and returns a `DownloadHandle`. An
+optional `Semaphore` limits concurrent downloads.
 
 
-DNS lookup and bounded TTL answer caching are provided by Hickory inside the HTTP connector; downloads do not run a separate preflight lookup.
+DNS lookup and bounded TTL answer caching are provided by Hickory before a
+libcurl transfer; the answer is injected with `CURLOPT_RESOLVE` so the URL,
+Host and TLS identity remain unchanged.
 
 ### DownloadHandle
 

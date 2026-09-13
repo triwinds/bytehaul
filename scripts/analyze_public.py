@@ -15,7 +15,7 @@ def main():
     evidence = []
     for row in rows:
         folder = args.run / f"{row['source']}-c{row['connections']}-r{row['repeat']}-{row['tool']}"
-        bytehaul = row["tool"] == "bytehaul"
+        bytehaul = row["tool"].startswith("bytehaul")
         log = folder / ("stderr.log" if bytehaul else "aria2.log")
         content = log.read_text(encoding="utf-8", errors="replace")
         if bytehaul:

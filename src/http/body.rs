@@ -1,11 +1,9 @@
-//! Backend-neutral response body (P1/P2 of the libcurl migration plan).
+//! Response body owned by the libcurl transport (P1/P2 of the migration plan).
 //!
-//! Sessions read response bytes through this type only, so the transport that
-//! produces them (Hyper or libcurl, whichever the build and configuration
-//! select) stays behind one internal seam instead of leaking
-//! `hyper::body::Incoming` into the download logic.
+//! Sessions read response bytes through this type only, so libcurl stays behind
+//! one internal seam instead of leaking driver handles into the download logic.
 //!
-//! The contract every backend variant must satisfy:
+//! The transport-body contract is:
 //!
 //! - chunks are delivered in order and `Ok(None)` is a clean EOF;
 //! - a transport failure after the headers keeps its original cause instead of
@@ -19,13 +17,9 @@ use std::time::Duration;
 use bytes::Bytes;
 
 use crate::error::DownloadError;
-#[cfg(feature = "hyper-backend")]
-use crate::error::TransportError;
 
-/// Streaming response body shared by all transport backends.
+/// Streaming response body returned by the libcurl transport.
 pub(crate) enum HttpBody {
-    #[cfg(feature = "hyper-backend")]
-    Hyper(hyper::body::Incoming),
     #[cfg(feature = "curl-backend")]
     Curl(crate::network::curl::driver::BodyStream),
 }
@@ -37,8 +31,6 @@ impl HttpBody {
         read_timeout: Duration,
     ) -> Result<Option<Bytes>, DownloadError> {
         match self {
-            #[cfg(feature = "hyper-backend")]
-            Self::Hyper(body) => next_hyper_chunk(body, read_timeout).await,
             #[cfg(feature = "curl-backend")]
             Self::Curl(body) => body.next_chunk(read_timeout).await,
         }
@@ -47,43 +39,9 @@ impl HttpBody {
 
 impl std::fmt::Debug for HttpBody {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // `hyper::body::Incoming` is not `Debug`, and no body state is useful in
-        // a log line; report only which backend owns this body.
         match self {
-            #[cfg(feature = "hyper-backend")]
-            Self::Hyper(_) => formatter.write_str("HttpBody::Hyper"),
             #[cfg(feature = "curl-backend")]
             Self::Curl(_) => formatter.write_str("HttpBody::Curl"),
-        }
-    }
-}
-
-#[cfg(feature = "hyper-backend")]
-impl From<hyper::body::Incoming> for HttpBody {
-    fn from(body: hyper::body::Incoming) -> Self {
-        Self::Hyper(body)
-    }
-}
-
-#[cfg(feature = "hyper-backend")]
-async fn next_hyper_chunk(
-    body: &mut hyper::body::Incoming,
-    read_timeout: Duration,
-) -> Result<Option<Bytes>, DownloadError> {
-    use http_body_util::BodyExt;
-
-    loop {
-        let frame = tokio::time::timeout(read_timeout, body.frame())
-            .await
-            .map_err(|_| DownloadError::timeout("response body timed out"))?;
-
-        match frame {
-            Some(Ok(frame)) => match frame.into_data() {
-                Ok(data) => return Ok(Some(data)),
-                Err(_) => continue,
-            },
-            Some(Err(error)) => return Err(TransportError::body(error).into()),
-            None => return Ok(None),
         }
     }
 }

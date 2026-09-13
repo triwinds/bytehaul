@@ -31,15 +31,13 @@ use crate::network::ClientNetworkConfig;
 
 use super::driver::{DriverConfig, DriverHandle, RequestOptions, ResolveEntry, Transfer};
 
-/// Head deadline used only when a caller does not set its own, so a direct
-/// `BytehaulClient::request` cannot wait forever on a silent server.
+/// Head deadline used by the test-only deadline-less request helper, so it
+/// cannot wait forever on a silent server.
 ///
-/// The session always passes its configured `request_headers_timeout` (falling
-/// back to the body `read_timeout`) through `request_with_timeout`, and that
-/// value is what the driver enforces; this constant must never shorten a
-/// caller's deadline. A libcurl-only build has no deadline-less production
-/// entry point, so the backstop is compiled out there.
-#[cfg(any(feature = "hyper-backend", test))]
+/// Production callers always pass their configured
+/// `request_headers_timeout` (falling back to the body `read_timeout`) through
+/// `request_with_timeout`; this constant must never shorten that deadline.
+#[cfg(test)]
 const HEAD_DEADLINE_BACKSTOP: Duration = Duration::from_secs(300);
 
 /// One proxy endpoint, with the host it has to resolve.
@@ -86,13 +84,17 @@ pub(crate) struct CurlTransport {
     http_proxy: Option<ProxyEndpoint>,
     https_proxy: Option<ProxyEndpoint>,
     all_proxy: Option<ProxyEndpoint>,
+    ca_info: Option<std::path::PathBuf>,
+    ca_path: Option<std::path::PathBuf>,
+    client_cert: Option<std::path::PathBuf>,
+    client_key: Option<std::path::PathBuf>,
 }
 
 impl CurlTransport {
     pub(crate) fn new(config: &ClientNetworkConfig) -> Result<Self, DownloadError> {
         let proxies = config.effective_proxies()?;
-        // The same resolver the Hyper connector uses, so a custom name server,
-        // a DoH endpoint or `enable_ipv6` behaves identically on both backends.
+        // Use the shared resolver so a custom name server, a DoH endpoint or
+        // `enable_ipv6` has one consistent configuration boundary.
         let resolver = Arc::new(config.build_dns_resolver()?);
         Ok(Self {
             driver: DriverHandle::spawn(DriverConfig {
@@ -108,6 +110,10 @@ impl CurlTransport {
             http_proxy: proxy_endpoint(proxies.http_proxy)?,
             https_proxy: proxy_endpoint(proxies.https_proxy)?,
             all_proxy: proxy_endpoint(proxies.all_proxy)?,
+            ca_info: config.ca_info.clone(),
+            ca_path: config.ca_path.clone(),
+            client_cert: config.client_cert.clone(),
+            client_key: config.client_key.clone(),
         })
     }
 
@@ -154,7 +160,7 @@ impl CurlTransport {
     }
 
     /// Start one transfer when the caller has no deadline of its own.
-    #[cfg(any(feature = "hyper-backend", test))]
+    #[cfg(test)]
     pub(crate) async fn request_with_backstop(
         &self,
         req: http::Request<HttpRequestBody>,
@@ -180,6 +186,10 @@ impl CurlTransport {
         options.head_timeout = head_timeout;
         options.forbid_connection_reuse = self.forbid_connection_reuse;
         options.proxy = self.proxy_for(scheme).map(|endpoint| endpoint.url.clone());
+        options.ca_info = self.ca_info.clone();
+        options.ca_path = self.ca_path.clone();
+        options.client_cert = self.client_cert.clone();
+        options.client_key = self.client_key.clone();
 
         for (name, value) in req.headers() {
             let name = name.as_str();
@@ -466,6 +476,40 @@ mod tests {
     }
 
     #[test]
+    fn tls_paths_are_carried_to_each_transfer() {
+        let config = ClientNetworkConfig {
+            ca_info: Some("ca.pem".into()),
+            ca_path: Some("certs".into()),
+            client_cert: Some("client.pem".into()),
+            client_key: Some("client.key".into()),
+            ..ClientNetworkConfig::default()
+        };
+        let options = transport(&config)
+            .options_for(
+                &request("https://example.com/file.bin", &[]),
+                Duration::from_secs(1),
+            )
+            .unwrap();
+
+        assert_eq!(
+            options.ca_info.as_deref(),
+            Some(std::path::Path::new("ca.pem"))
+        );
+        assert_eq!(
+            options.ca_path.as_deref(),
+            Some(std::path::Path::new("certs"))
+        );
+        assert_eq!(
+            options.client_cert.as_deref(),
+            Some(std::path::Path::new("client.pem"))
+        );
+        assert_eq!(
+            options.client_key.as_deref(),
+            Some(std::path::Path::new("client.key"))
+        );
+    }
+
+    #[test]
     fn multi_range_specs_and_case_survive_the_mapping() {
         let transport = transport(&ClientNetworkConfig::default());
         let req = request(
@@ -500,7 +544,7 @@ mod tests {
         let transport = transport(&config);
 
         // Proxy values reach libcurl as normalized URIs, exactly like the
-        // Hyper connector receives them.
+        // the libcurl transfer receives them.
         assert_eq!(
             transport.proxy_for("http").map(|p| p.url.as_str()),
             Some("http://proxy.test:3128/")

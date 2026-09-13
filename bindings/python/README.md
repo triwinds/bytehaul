@@ -76,6 +76,11 @@ bytehaul.download(
 
 `doh_servers` expects HTTPS URLs. If you pass a hostname such as `dns.google`, bytehaul will use the system resolver once during client construction to bootstrap the DoH endpoint addresses.
 
+For the libcurl backend, `ca_info` may point to an additional PEM trust bundle,
+`ca_path` to a directory of hashed CA certificates, and `client_cert` plus
+`client_key` configure mutual TLS. Peer and hostname verification remain
+enabled; these options add credentials rather than disabling verification.
+
 ### Logging
 
 ```python
@@ -156,7 +161,7 @@ Blocking convenience function. Downloads a file and returns when complete.
 - If `output_path` is omitted, bytehaul chooses `Content-Disposition` → URL path → `download`
 - Absolute `output_path` values are still accepted when `output_dir` is omitted
 
-### `Downloader(connect_timeout=None, proxy=None, http_proxy=None, https_proxy=None, dns_servers=None, doh_servers=None, enable_ipv6=None, log_level=None)`
+### `Downloader(connect_timeout=None, proxy=None, http_proxy=None, https_proxy=None, dns_servers=None, doh_servers=None, enable_ipv6=None, log_level=None, ca_info=None, ca_path=None, client_cert=None, client_key=None)`
 
 Reusable downloader instance.
 
@@ -203,6 +208,10 @@ Frozen snapshot of download progress.
 | `connect_timeout`   | `float` (secs)   | `30.0`        |
 | `read_timeout`      | `float` (secs)   | `60.0`        |
 | `request_headers_timeout` | `float` (secs) | `None` (inherit `read_timeout`) |
+| `ca_info`          | `str \| Path \| None` | `None` (additional PEM trust bundle) |
+| `ca_path`          | `str \| Path \| None` | `None` (hashed CA directory) |
+| `client_cert`      | `str \| Path \| None` | `None` (mTLS client certificate) |
+| `client_key`       | `str \| Path \| None` | `None` (mTLS private key) |
 | `memory_budget`     | `int`            | `67108864`    |
 | `file_allocation`   | `"none" \| "prealloc"` | `"prealloc"` |
 | `resume`            | `bool`           | `True`        |
@@ -281,6 +290,10 @@ Use these on `Downloader(...)` to set defaults, or pass `proxy`, `http_proxy`, a
 | `dns_servers`  | `list[str] \| None`| `None`  |
 | `doh_servers`  | `list[str] \| None`| `None`  |
 | `enable_ipv6`  | `bool \| None`     | `True`  |
+| `ca_info`      | `str \| Path \| None` | `None` |
+| `ca_path`      | `str \| Path \| None` | `None` |
+| `client_cert`  | `str \| Path \| None` | `None` |
+| `client_key`   | `str \| Path \| None` | `None` |
 
 ## Running tests
 

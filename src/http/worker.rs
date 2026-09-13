@@ -18,7 +18,7 @@ use crate::network::BytehaulClient;
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Identifies one client invocation, including each redirected hop.
-/// Hyper may transparently resend inside an invocation; this is not a socket count.
+/// A transport may transparently retry inside an invocation; this is not a socket count.
 #[derive(Clone, Debug)]
 pub(crate) struct RequestDiagnostics {
     pub id: u64,
@@ -436,13 +436,10 @@ mod tests {
         HttpWorker::new(client, &spec)
     }
 
-    /// P2 acceptance: the same worker, both backends, one scripted server.
-    /// The response head must arrive before the body does, and the delivered
-    /// bytes must be identical.
-    #[cfg(all(feature = "hyper-backend", feature = "curl-backend"))]
+    /// The response head must arrive before the delayed body, and the delivered
+    /// bytes must be identical to the requested range.
     #[tokio::test]
-    async fn both_backends_publish_headers_first_and_deliver_the_same_range() {
-        use crate::network::TransportBackend;
+    async fn libcurl_publishes_headers_first_and_delivers_the_requested_range() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
 
@@ -453,57 +450,52 @@ mod tests {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            for _ in 0..2 {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                let mut head = Vec::new();
-                let mut buffer = [0u8; 512];
-                while !head.ends_with(b"\r\n\r\n") {
-                    let read = stream.read(&mut buffer).await.unwrap();
-                    assert!(read > 0, "client closed before sending a request");
-                    head.extend_from_slice(&buffer[..read]);
-                }
-                let response = format!(
-                    "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes 0-63/64\r\nConnection: close\r\n\r\n",
-                    payload.len()
-                );
-                stream.write_all(response.as_bytes()).await.unwrap();
-                stream.flush().await.unwrap();
-                // The head is on the wire; the body follows much later.
-                tokio::time::sleep(BODY_DELAY).await;
-                stream.write_all(&payload).await.unwrap();
-                let _ = stream.shutdown().await;
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            let mut buffer = [0u8; 512];
+            while !head.ends_with(b"\r\n\r\n") {
+                let read = stream.read(&mut buffer).await.unwrap();
+                assert!(read > 0, "client closed before sending a request");
+                head.extend_from_slice(&buffer[..read]);
             }
+            let response = format!(
+                "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes 0-63/64\r\nConnection: close\r\n\r\n",
+                payload.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.flush().await.unwrap();
+            // The head is on the wire; the body follows much later.
+            tokio::time::sleep(BODY_DELAY).await;
+            stream.write_all(&payload).await.unwrap();
+            let _ = stream.shutdown().await;
         });
 
-        for backend in [TransportBackend::Hyper, TransportBackend::Curl] {
-            let client = crate::network::ClientNetworkConfig::default()
-                .with_backend(backend)
-                .build_client()
-                .unwrap();
-            let mut spec =
-                DownloadSpec::new(format!("http://{address}/range")).output_path("unused.bin");
-            spec.read_timeout = Duration::from_secs(5);
-            let worker = HttpWorker::new(client, &spec);
+        let client = crate::network::ClientNetworkConfig::default()
+            .build_client()
+            .unwrap();
+        let mut spec =
+            DownloadSpec::new(format!("http://{address}/range")).output_path("unused.bin");
+        spec.read_timeout = Duration::from_secs(5);
+        let worker = HttpWorker::new(client, &spec);
 
-            let started = Instant::now();
-            let (mut response, meta) = worker.send_range(0, 63).await.unwrap();
-            let head_elapsed = started.elapsed();
-            assert!(
-                head_elapsed < BODY_DELAY,
-                "{backend:?} waited for the body before returning headers: {head_elapsed:?}"
-            );
-            assert_eq!(meta.content_range_total, Some(64));
+        let started = Instant::now();
+        let (mut response, meta) = worker.send_range(0, 63).await.unwrap();
+        let head_elapsed = started.elapsed();
+        assert!(
+            head_elapsed < BODY_DELAY,
+            "libcurl waited for the body before returning headers: {head_elapsed:?}"
+        );
+        assert_eq!(meta.content_range_total, Some(64));
 
-            let mut received = Vec::new();
-            while let Some(chunk) =
-                crate::http::next_data_chunk(response.body_mut(), Duration::from_secs(5))
-                    .await
-                    .unwrap()
-            {
-                received.extend_from_slice(&chunk);
-            }
-            assert_eq!(received, expected, "{backend:?} delivered different bytes");
+        let mut received = Vec::new();
+        while let Some(chunk) =
+            crate::http::next_data_chunk(response.body_mut(), Duration::from_secs(5))
+                .await
+                .unwrap()
+        {
+            received.extend_from_slice(&chunk);
         }
+        assert_eq!(received, expected);
 
         server.await.unwrap();
     }

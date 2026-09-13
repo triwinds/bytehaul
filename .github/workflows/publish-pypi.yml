@@ -136,6 +136,8 @@ jobs:
           args: >-
             --release
             --manifest-path bindings/python/Cargo.toml
+            --no-default-features
+            --features curl-backend
             --out dist
             --compatibility pypi
             --interpreter ${{ matrix.interpreter }}
@@ -172,11 +174,41 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  verify-linux-wheel:
+    name: Verify Linux wheel in a clean environment
+    needs: build-wheels
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download wheel artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: python-package-distributions-linux-x86_64
+          path: dist
+          merge-multiple: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.9"
+
+      - name: Install and import the wheel without build dependencies
+        env:
+          RELEASE_VERSION: ${{ github.ref_name }}
+        run: |
+          python -m venv "$RUNNER_TEMP/bytehaul-wheel-check"
+          "$RUNNER_TEMP/bytehaul-wheel-check/bin/python" -m pip install \
+            --no-index --only-binary=:all: --find-links dist \
+            "bytehaul==${RELEASE_VERSION#v}"
+          "$RUNNER_TEMP/bytehaul-wheel-check/bin/python" -c \
+            "import bytehaul; assert bytehaul.__version__ == '${RELEASE_VERSION#v}'"
+
   publish-pypi:
     name: Publish to PyPI
     needs:
       - build-wheels
       - build-sdist
+      - verify-linux-wheel
     runs-on: ubuntu-latest
 
     environment:

@@ -471,6 +471,7 @@ class TestSlowTransferOptions:
         added = [
             "slow_transfer_mode", "low_speed_limit", "low_speed_duration",
             "slow_start_grace", "slow_sample_window", "request_batch_size", "request_headers_timeout",
+            "ca_info", "ca_path", "client_cert", "client_key",
         ]
         api = Downloader().download if object_api else download
         parameters = inspect.signature(api).parameters

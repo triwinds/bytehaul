@@ -52,69 +52,8 @@ impl TransportError {
         )
     }
 
-    /// Classifies a response-body failure. The Hyper adapter maps
-    /// `hyper::Error` here; a libcurl build reports body failures through the
-    /// driver's own `TransportErrorKind` mapping.
-    #[cfg(feature = "hyper-backend")]
-    pub(crate) fn body<E>(source: E) -> Self
-    where
-        E: std::error::Error + Send + Sync + 'static,
-    {
-        Self::new(TransportErrorKind::Body, source)
-    }
-
     pub(crate) fn kind(&self) -> TransportErrorKind {
         self.kind
-    }
-}
-
-#[cfg(feature = "hyper-backend")]
-fn error_chain_has_timeout(error: &(dyn StdError + 'static)) -> bool {
-    let mut current = Some(error);
-    while let Some(source) = current {
-        if let Some(io_error) = source.downcast_ref::<std::io::Error>() {
-            if io_error.kind() == std::io::ErrorKind::TimedOut {
-                return true;
-            }
-        }
-        current = source.source();
-    }
-    false
-}
-
-/// Hyper transport failures. The libcurl adapter classifies `curl::Error`
-/// codes in `network::curl::driver` instead, so these stay behind the feature.
-#[cfg(feature = "hyper-backend")]
-impl From<hyper_util::client::legacy::Error> for TransportError {
-    fn from(error: hyper_util::client::legacy::Error) -> Self {
-        let kind = if error.is_connect() {
-            TransportErrorKind::Connect
-        } else if error_chain_has_timeout(&error) {
-            TransportErrorKind::Timeout
-        } else {
-            TransportErrorKind::Request
-        };
-        Self::new(kind, error)
-    }
-}
-
-#[cfg(feature = "hyper-backend")]
-impl From<hyper::Error> for TransportError {
-    fn from(error: hyper::Error) -> Self {
-        let kind = if error.is_timeout() {
-            TransportErrorKind::Timeout
-        } else if error.is_body_write_aborted()
-            || error.is_incomplete_message()
-            || error.is_closed()
-            || error.is_canceled()
-        {
-            TransportErrorKind::Body
-        } else if error.is_parse() || error.is_user() || error.is_shutdown() {
-            TransportErrorKind::Request
-        } else {
-            TransportErrorKind::Other
-        };
-        Self::new(kind, error)
     }
 }
 
@@ -384,33 +323,5 @@ mod tests {
             std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "body"),
         ));
         assert!(body.is_retryable());
-    }
-
-    #[cfg(feature = "hyper-backend")]
-    #[test]
-    fn test_error_chain_has_timeout_through_nested_io_sources() {
-        #[derive(Debug)]
-        struct Wrapper(std::io::Error);
-
-        impl std::fmt::Display for Wrapper {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("wrapper")
-            }
-        }
-
-        impl StdError for Wrapper {
-            fn source(&self) -> Option<&(dyn StdError + 'static)> {
-                Some(&self.0)
-            }
-        }
-
-        let nested = Wrapper(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            "timed out",
-        ));
-        assert!(error_chain_has_timeout(&nested));
-
-        let other = std::io::Error::other("other");
-        assert!(!error_chain_has_timeout(&other));
     }
 }

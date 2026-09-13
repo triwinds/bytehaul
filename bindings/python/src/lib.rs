@@ -109,6 +109,10 @@ fn apply_client_options(
     dns_servers: Option<Vec<String>>,
     doh_servers: Option<Vec<String>>,
     enable_ipv6: Option<bool>,
+    ca_info: Option<PathBuf>,
+    ca_path: Option<PathBuf>,
+    client_cert: Option<PathBuf>,
+    client_key: Option<PathBuf>,
 ) -> PyResult<bytehaul::DownloaderBuilder> {
     if let Some(connect_timeout) = connect_timeout {
         builder = builder.connect_timeout(duration_from_secs("connect_timeout", connect_timeout)?);
@@ -133,6 +137,18 @@ fn apply_client_options(
     }
     if let Some(enable_ipv6) = enable_ipv6 {
         builder = builder.enable_ipv6(enable_ipv6);
+    }
+    if let Some(ca_info) = ca_info {
+        builder = builder.ca_info(ca_info);
+    }
+    if let Some(ca_path) = ca_path {
+        builder = builder.ca_path(ca_path);
+    }
+    if let Some(client_cert) = client_cert {
+        builder = builder.client_cert(client_cert);
+    }
+    if let Some(client_key) = client_key {
+        builder = builder.client_key(client_key);
     }
 
     Ok(builder)
@@ -254,11 +270,27 @@ fn build_download_spec(
     slow_sample_window: Option<f64>,
     request_batch_size: Option<u64>,
     request_headers_timeout: Option<f64>,
+    ca_info: Option<PathBuf>,
+    ca_path: Option<PathBuf>,
+    client_cert: Option<PathBuf>,
+    client_key: Option<PathBuf>,
 ) -> PyResult<DownloadSpec> {
     let mut spec = DownloadSpec::new(url);
     if let Some(seconds) = request_headers_timeout {
         spec =
             spec.request_headers_timeout(duration_from_secs("request_headers_timeout", seconds)?);
+    }
+    if let Some(ca_info) = ca_info {
+        spec = spec.ca_info(ca_info);
+    }
+    if let Some(ca_path) = ca_path {
+        spec = spec.ca_path(ca_path);
+    }
+    if let Some(client_cert) = client_cert {
+        spec = spec.client_cert(client_cert);
+    }
+    if let Some(client_key) = client_key {
+        spec = spec.client_key(client_key);
     }
     if let Some(bytes) = request_batch_size {
         spec = spec.request_batch_size(bytes);
@@ -530,7 +562,11 @@ impl PyDownloader {
         dns_servers = None,
         doh_servers = None,
         enable_ipv6 = None,
-        log_level = None
+        log_level = None,
+        ca_info = None,
+        ca_path = None,
+        client_cert = None,
+        client_key = None
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -542,6 +578,10 @@ impl PyDownloader {
         doh_servers: Option<Vec<String>>,
         enable_ipv6: Option<bool>,
         log_level: Option<String>,
+        ca_info: Option<PathBuf>,
+        ca_path: Option<PathBuf>,
+        client_cert: Option<PathBuf>,
+        client_key: Option<PathBuf>,
     ) -> PyResult<Self> {
         let level = match &log_level {
             Some(s) => parse_log_level(s)?,
@@ -557,6 +597,10 @@ impl PyDownloader {
             dns_servers,
             doh_servers,
             enable_ipv6,
+            ca_info,
+            ca_path,
+            client_cert,
+            client_key,
         )?;
         builder = builder.log_level(level);
         let inner = builder.build().map_err(map_download_error)?;
@@ -595,7 +639,11 @@ impl PyDownloader {
             slow_start_grace = None,
             slow_sample_window = None,
             request_batch_size = None,
-            request_headers_timeout = None
+            request_headers_timeout = None,
+            ca_info = None,
+            ca_path = None,
+            client_cert = None,
+            client_key = None
         )
     )]
     #[allow(clippy::too_many_arguments)]
@@ -632,6 +680,10 @@ impl PyDownloader {
         slow_sample_window: Option<f64>,
         request_batch_size: Option<u64>,
         request_headers_timeout: Option<f64>,
+        ca_info: Option<PathBuf>,
+        ca_path: Option<PathBuf>,
+        client_cert: Option<PathBuf>,
+        client_key: Option<PathBuf>,
     ) -> PyResult<PyDownloadTask> {
         let spec = build_download_spec(
             url,
@@ -665,6 +717,10 @@ impl PyDownloader {
             slow_sample_window,
             request_batch_size,
             request_headers_timeout,
+            ca_info,
+            ca_path,
+            client_cert,
+            client_key,
         )?;
         let runtime = shared_runtime()?;
         let _guard = runtime.enter();
@@ -715,7 +771,11 @@ impl PyDownloader {
         slow_start_grace = None,
         slow_sample_window = None,
         request_batch_size = None,
-        request_headers_timeout = None
+        request_headers_timeout = None,
+        ca_info = None,
+        ca_path = None,
+        client_cert = None,
+        client_key = None
     )
 )]
 #[allow(clippy::too_many_arguments)]
@@ -756,6 +816,10 @@ fn download(
     slow_sample_window: Option<f64>,
     request_batch_size: Option<u64>,
     request_headers_timeout: Option<f64>,
+    ca_info: Option<PathBuf>,
+    ca_path: Option<PathBuf>,
+    client_cert: Option<PathBuf>,
+    client_key: Option<PathBuf>,
 ) -> PyResult<()> {
     let level = match &log_level {
         Some(s) => parse_log_level(s)?,
@@ -794,6 +858,10 @@ fn download(
         slow_sample_window,
         request_batch_size,
         request_headers_timeout,
+        ca_info.clone(),
+        ca_path.clone(),
+        client_cert.clone(),
+        client_key.clone(),
     )?;
     let runtime = shared_runtime()?;
 
@@ -807,6 +875,10 @@ fn download(
             dns_servers,
             doh_servers,
             enable_ipv6,
+            ca_info,
+            ca_path,
+            client_cert,
+            client_key,
         )?;
         builder = builder.log_level(level);
 

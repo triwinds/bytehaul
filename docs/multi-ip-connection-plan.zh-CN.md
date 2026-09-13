@@ -1,6 +1,9 @@
 # 多 IP 建连与连接复用收敛计划
 
-状态：实现中；第一阶段连接机制原型已落地，完整预算验收待完成。日期：2026-09-12。
+状态：设计中；第一阶段的 Hyper 连接机制原型属于历史记录，完整预算验收待完成。日期：2026-09-12。
+
+> P6 已移除早期 Hyper 原型源码和生产 Hyper 后端。本文保留设计约束与实验结论，
+> 不描述当前生产传输；当前生产传输统一使用 libcurl。
 
 相关调研：[其他下载器的多 IP、镜像选择与连接复用实现](multi-ip-downloader-research.zh-CN.md)。包含 aria2、curl、Axel 和 IDM 的源码/官方资料依据，以及对本计划的建议。
 
@@ -14,17 +17,17 @@ DNS 返回多个候选 IP 时，在正常下载需要建立连接的阶段，将
 
 ## 实现进度
 
-- 第一阶段进行中：新增 `src/network/multi_ip_prototype.rs`，验证定向连接、原域名 TLS、物理连接归属、正文租约、固定组空闲配额及 socket 回收。详见 [原型结论与待验证边界](multi-ip-connection-prototype.zh-CN.md)。
+- 第一阶段历史原型曾验证定向连接、原域名 TLS、物理连接归属、正文租约、固定组空闲配额及 socket 回收；原型源码已在 P6 移除。详见 [原型结论与待验证边界](multi-ip-connection-prototype.zh-CN.md)。
 - 修复 `src/network.rs` 缺少 `pool_timer` 导致空闲连接无法定时回收的问题，并补充真实 socket EOF 回归测试。
 - Linux 验证中发现重试耗尽后立即回收分片可能被其他 worker 重新领取；新增调度器运行期终止标记，在保留恢复记录的同时禁止发放新租约，避免重试预算重置。普通与 adaptive worker 共用这一入口，并补充确定性的调度器回归测试。
 - 尚未验收：任务预算覆盖所有请求路径、Hyper 后台建连竞争、动态分组容量/淘汰。第二至第五阶段尚未开始。
 - Windows 最终验证：`cargo test -p bytehaul --all-targets` 通过（499 项测试，含 4 项原型测试）；`cargo test -p bytehaul --doc`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo fmt --all -- --check` 均通过。
 - Linux 覆盖率：在 WSL 本地隔离副本用相同源码、锁文件和原样 `python3 scripts/coverage.py` 运行，最终 **96.37%（4402/4568）**，通过 95% 门槛。报告：`target/coverage/reports/20260912T085718Z-ef178edf/summary.md`。最终源码已与工作区逐文件核对一致；不将原型通过等同于整个功能验收。
 
-## 当前实现与实验依据
+## P6 前的历史基线与实验依据
 
-- `src/network.rs`：Hickory 解析并按 TTL 缓存候选地址；`lookup_host` 将地址迭代器交给 `HttpConnector`，没有下载性能排序。
-- `BytehaulClient::Direct` 当前持有一个 Hyper legacy client；连接池通过 `pool_max_idle_per_host` 和 `pool_idle_timeout` 配置，没有项目自有的按 IP 选择连接逻辑。
+- `src/network.rs`（P6 前）：Hickory 解析并按 TTL 缓存候选地址；`lookup_host` 将地址迭代器交给 `HttpConnector`，没有下载性能排序。
+- `BytehaulClient::Direct`（P6 前）持有一个 Hyper legacy client；连接池通过 `pool_max_idle_per_host` 和 `pool_idle_timeout` 配置，没有项目自有的按 IP 选择连接逻辑。
 - `src/http/worker.rs` 已有请求 ID、响应头耗时及响应扩展，可作为传输上下文的接入位置；请求 ID 不等于物理连接 ID。
 - `src/session/single.rs`、`src/session/multi/adaptive.rs` 处理响应体与背压；后者已有慢速恢复机制。IP 选择需与这些机制协作，避免重复发起恢复动作。
 - 公网 Citron ZIP 实验中，域名解析到的 IP 会变化，相同 IP 的不同轮次也有明显速度差异。因此使用近期表现、最小样本和迟滞，不能一次测量后永久锁定 IP。

@@ -1,11 +1,8 @@
 //! Shared Hickory-backed name resolution (P3 of the libcurl migration plan).
 //!
-//! Both transport backends resolve through this module: the Hyper connector
-//! consumes it as a `Service<DnsName>` (`hyper-backend` only), and the libcurl
-//! transport injects the same answers with `CURLOPT_RESOLVE`. Sharing one
-//! resolver keeps custom name servers, DoH endpoints, the IPv6 switch and the
-//! TTL cache identical on either backend, which is what the migration plan
-//! requires for P3.
+//! The libcurl transport injects these answers with `CURLOPT_RESOLVE`. Keeping
+//! resolution here makes custom name servers, DoH endpoints, the IPv6 switch
+//! and the TTL cache explicit and testable before each transfer.
 //!
 //! The resolver returns *addresses plus a validity deadline*: the deadline is
 //! what lets the libcurl transport refresh an injected `CURLOPT_RESOLVE` entry
@@ -16,23 +13,12 @@ use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-#[cfg(feature = "hyper-backend")]
-use std::future::Future;
-#[cfg(feature = "hyper-backend")]
-use std::pin::Pin;
-#[cfg(feature = "hyper-backend")]
-use std::task::{Context, Poll};
-
 use hickory_resolver::config::{
     LookupIpStrategy, NameServerConfig, NameServerConfigGroup, ResolverConfig,
 };
 use hickory_resolver::proto::xfer::Protocol;
 use hickory_resolver::{name_server::TokioConnectionProvider, TokioResolver};
-#[cfg(feature = "hyper-backend")]
-use hyper_util::client::legacy::connect::dns::Name as DnsName;
 use parking_lot::Mutex;
-#[cfg(feature = "hyper-backend")]
-use tower_service::Service;
 use url::Url;
 
 use crate::error::{BoxError, DownloadError};
@@ -41,37 +27,30 @@ use crate::error::{BoxError, DownloadError};
 ///
 /// Hickory owns the bounded TTL cache these answers come from, so the deadline
 /// is the authoritative lifetime: a caller that keeps the addresses longer has
-/// to re-resolve. Only the libcurl transport keeps an answer across requests,
-/// so a Hyper-only build reads the addresses and drops the deadline.
+/// to re-resolve. The libcurl transport uses this deadline when refreshing its
+/// `CURLOPT_RESOLVE` entries.
 #[derive(Clone, Debug)]
-#[cfg_attr(not(any(feature = "curl-backend", test)), allow(dead_code))]
 pub(crate) struct DnsAnswer {
     addresses: Vec<IpAddr>,
     valid_until: Instant,
 }
 
 impl DnsAnswer {
-    #[cfg(any(feature = "curl-backend", test))]
     pub(crate) fn addresses(&self) -> &[IpAddr] {
         &self.addresses
     }
 
     /// Time left before this answer must not be used any more.
-    #[cfg(any(feature = "curl-backend", test))]
     pub(crate) fn time_to_live(&self) -> Duration {
         self.valid_until.saturating_duration_since(Instant::now())
     }
 }
 
-/// Hickory-backed resolver shared by both transport backends.
+/// Hickory-backed resolver used by the libcurl transport.
 #[derive(Clone)]
 pub(crate) struct BytehaulDnsResolver {
     resolver: TokioResolver,
 }
-
-#[cfg(feature = "hyper-backend")]
-type ResolverFuture =
-    Pin<Box<dyn Future<Output = Result<std::vec::IntoIter<SocketAddr>, BoxError>> + Send>>;
 
 impl BytehaulDnsResolver {
     pub(crate) fn new(
@@ -144,39 +123,6 @@ impl BytehaulDnsResolver {
         Ok(DnsAnswer {
             addresses,
             valid_until,
-        })
-    }
-
-    /// Port-0 socket addresses, the shape the Hyper connector consumes.
-    #[cfg(any(feature = "hyper-backend", test))]
-    pub(crate) async fn lookup_host(&self, host: String) -> Result<Vec<SocketAddr>, BoxError> {
-        let answer = self.resolve(&host).await?;
-        Ok(answer
-            .addresses
-            .iter()
-            .map(|ip| SocketAddr::new(*ip, 0))
-            .collect())
-    }
-}
-
-#[cfg(feature = "hyper-backend")]
-impl Service<DnsName> for BytehaulDnsResolver {
-    type Response = std::vec::IntoIter<SocketAddr>;
-    type Error = BoxError;
-    type Future = ResolverFuture;
-
-    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn call(&mut self, name: DnsName) -> Self::Future {
-        let resolver = self.clone();
-        let host = name.as_str().to_string();
-        Box::pin(async move {
-            resolver
-                .lookup_host(host)
-                .await
-                .map(|addrs| addrs.into_iter())
         })
     }
 }
@@ -374,7 +320,7 @@ fn resolve_doh_host(host: &str, port: u16) -> std::io::Result<Vec<SocketAddr>> {
     (host, port).to_socket_addrs().map(|addrs| addrs.collect())
 }
 
-/// A scripted UDP DNS server used by the resolver tests of both backends.
+/// A scripted UDP DNS server used by the libcurl resolver tests.
 ///
 /// It answers any name with `127.0.0.<query number>`, so the first lookup of a
 /// fresh resolver yields `127.0.0.1`.
@@ -393,9 +339,8 @@ pub(crate) async fn spawn_dns_test_server(
 ///
 /// A slow resolver is what a connect-phase budget has to survive, so this
 /// variant always answers `127.0.0.1`: a test measuring the connect phase has
-/// to know the address it will end up connecting to. Only the libcurl transport
-/// measures that, hence the narrower gate.
-#[cfg(all(test, feature = "curl-backend"))]
+/// to know the address it will end up connecting to.
+#[cfg(test)]
 pub(crate) async fn spawn_dns_test_server_with_delay(
     ttl: u32,
     delay: std::time::Duration,
@@ -669,20 +614,12 @@ mod tests {
         drop(doh);
     }
 
-    #[cfg(feature = "hyper-backend")]
     #[tokio::test]
     async fn test_dns_resolver_resolves_localhost() {
-        use std::str::FromStr;
+        let resolver = BytehaulDnsResolver::new(&[], &[], false).unwrap();
+        let addrs = resolver.resolve("localhost").await.unwrap();
 
-        let mut resolver = BytehaulDnsResolver::new(&[], &[], false).unwrap();
-        let addrs: Vec<_> = resolver
-            .call(DnsName::from_str("localhost").unwrap())
-            .await
-            .unwrap()
-            .collect();
-
-        assert!(!addrs.is_empty());
-        assert!(addrs.iter().all(|addr| addr.port() == 0));
+        assert!(!addrs.addresses().is_empty());
     }
 
     #[tokio::test]
@@ -712,22 +649,18 @@ mod tests {
         let (addr, queries, server) = spawn_dns_test_server(1).await;
         let resolver = BytehaulDnsResolver::new(&[addr], &[], false).unwrap();
         let name = "cache-test.example.";
-        let first: Vec<_> = resolver.lookup_host(name.to_string()).await.unwrap();
-        assert_eq!(first, vec![SocketAddr::from(([127, 0, 0, 1], 0))]);
+        let first = resolver.resolve(name).await.unwrap();
+        assert_eq!(first.addresses(), [IpAddr::from([127, 0, 0, 1])]);
 
-        let cached: Vec<_> = resolver
-            .clone()
-            .lookup_host(name.to_string())
-            .await
-            .unwrap();
-        assert_eq!(cached, first);
+        let cached = resolver.clone().resolve(name).await.unwrap();
+        assert_eq!(cached.addresses(), first.addresses());
         assert_eq!(queries.load(Ordering::SeqCst), 1);
 
         // Hickory uses std::time::Instant for expiry, so advancing Tokio's
         // paused clock would not exercise the real TTL contract.
         tokio::time::sleep(Duration::from_millis(1100)).await;
-        let refreshed: Vec<_> = resolver.lookup_host(name.to_string()).await.unwrap();
-        assert_eq!(refreshed, vec![SocketAddr::from(([127, 0, 0, 2], 0))]);
+        let refreshed = resolver.resolve(name).await.unwrap();
+        assert_eq!(refreshed.addresses(), [IpAddr::from([127, 0, 0, 2])]);
         assert_eq!(queries.load(Ordering::SeqCst), 2);
         server.abort();
     }

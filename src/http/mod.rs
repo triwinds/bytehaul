@@ -4,11 +4,6 @@ pub(crate) mod response;
 pub(crate) mod worker;
 
 use std::time::Duration;
-#[cfg(feature = "hyper-backend")]
-use std::{
-    pin::Pin,
-    task::{Context, Poll},
-};
 
 use bytes::Bytes;
 
@@ -18,35 +13,13 @@ pub(crate) use body::HttpBody;
 
 /// Request body of every request bytehaul sends: GET/HEAD carry no payload.
 ///
-/// Owning the type keeps the request side neutral as well, so a libcurl-only
-/// build does not need the Hyper adapter's body helpers.
+/// Owning the type keeps the request side independent of libcurl handles.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct HttpRequestBody;
 
 impl HttpRequestBody {
     pub(crate) fn new() -> Self {
         Self
-    }
-}
-
-#[cfg(feature = "hyper-backend")]
-impl hyper::body::Body for HttpRequestBody {
-    type Data = Bytes;
-    type Error = std::io::Error;
-
-    fn poll_frame(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
-        Poll::Ready(None)
-    }
-
-    fn is_end_stream(&self) -> bool {
-        true
-    }
-
-    fn size_hint(&self) -> hyper::body::SizeHint {
-        hyper::body::SizeHint::with_exact(0)
     }
 }
 
@@ -60,8 +33,7 @@ pub(crate) type HttpResponse = http::Response<HttpBody>;
 /// The session derives it from its own `MemoryBudget` (see
 /// `session::flow::MemoryBudget::transport_body_budget`), which is what keeps
 /// the bytes queued inside the transport inside the memory the session promised
-/// to bound. A transport that does not buffer bytes (Hyper streams straight
-/// into the reader) simply ignores the hint.
+/// to bound. The libcurl transport uses the hint to bound its callback queue.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct BodyBudget(pub(crate) usize);
 

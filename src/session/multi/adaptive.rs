@@ -200,8 +200,9 @@ impl Observation {
 }
 
 /// All application-observed bytes not yet enqueued belong to read-ahead,
-/// including the current frame while local forwarding is blocked. Hyper/socket
-/// buffers never handed to this task are outside this body-layer accounting.
+/// including the current frame while local forwarding is blocked. Transport
+/// and socket buffers never handed to this task are outside this body-layer
+/// accounting.
 fn cancellation_cost_bound(sample: &Observation, len: u64, protected: bool) -> u64 {
     let read_ahead = sample.wire.saturating_sub(sample.enqueued);
     if protected {

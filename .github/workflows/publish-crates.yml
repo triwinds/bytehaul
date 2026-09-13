@@ -76,6 +76,11 @@ jobs:
       - name: Verify package contents
         run: cargo package --list -p bytehaul
 
+      - name: Verify production feature builds
+        run: |
+          cargo check -p bytehaul --locked
+          cargo check -p bytehaul --locked --no-default-features --features curl-backend
+
       - name: Dry-run publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}

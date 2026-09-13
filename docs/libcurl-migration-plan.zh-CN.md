@@ -1,70 +1,58 @@
 # libcurl 传输后端迁移计划
 
-日期：2026-09-12；最近更新：2026-09-12。状态：实施中。P0、P1、P2、P3 已完成（证据见 §5 的
-四份实施记录），P4 未开始；默认后端仍是 Hyper。
+日期：2026-09-12；最近更新：2026-09-13。状态：P0–P6 已完成。P4 的构建/分发门禁、P5 的默认
+切换和 P6 的旧实现清理均已接入仓库；生产传输现在只有 libcurl。
 
 ## 1. 目标与结论
 
-建议将当前 Hyper HTTP/TLS 传输栈替换为 `curl` crate 驱动的 libcurl，采用专用线程运行
+本计划将原 Hyper HTTP/TLS 传输栈替换为 `curl` crate 驱动的 libcurl，采用专用线程运行
 `Multi + Easy2`，向 Tokio 下载会话提供异步响应头和有界流式 body。保留 bytehaul 的
 分片调度、动态拆分、连续 Range 请求、前缀保留、断点续传、重试预算、限速和存储提交逻辑。
 
 这不是仅替换 TCP connector：libcurl 同时管理 HTTP、TLS 和连接复用，需要把当前暴露给
-会话层的 Hyper 响应体一并抽离。最终目标是生产默认使用 libcurl；迁移期间保留 Hyper
-作为同条件对照和构建时回退，验证通过后再移除旧生产实现。
+会话层的 Hyper 响应体一并抽离。迁移期间曾保留 Hyper 作为同条件对照和构建时回退；P6
+完成后已移除这条旧生产路径，生产默认与显式 curl-only 构建均使用 libcurl。
 
 依据是 [libcurl 公网对照实验](libcurl-comparison.zh-CN.md)。其中单连接中位速度更高，
 但计时、日志和 IP 条件未完全对齐，8 路实验也有重置与超时。它支持投入迁移验证，
 不支持承诺速度提升倍数，也不能把“8 个线程各跑一个 Easy”的实验直接搬进生产。
 
 首版继续使用 HTTP/1.1。HTTP/2、HTTP/3、多 IP 竞速和分片策略调优分别评估，避免同时改变
-协议、连接数含义和调度行为。多 IP 相关文档及 `src/network/multi_ip_prototype.rs`
-属于后续设计参考，不作为本次切换的前置实现。
+协议、连接数含义和调度行为。多 IP 相关文档属于后续设计参考，不作为本次切换的前置实现。
 
 ## 2. 当前代码边界
 
 | 位置 | 当前职责与耦合 | 计划改动 |
 | --- | --- | --- |
-| `src/network.rs` | 共享的 `ClientNetworkConfig`、代理解析、后端选择（`TransportBackend`）；Hyper client 已 cfg 到 `hyper-backend` | 保留配置入口，拆出 resolver 与后端实现（P1/P2/P3 已完成：resolver 见 `src/network/dns.rs`，curl 后端见 `src/network/curl/`） |
-| `src/network/dns.rs` | 共享 Hickory 解析器：多 DNS、多 DoH、IPv6 开关、TTL 缓存；`resolve()` 返回地址 + TTL 截止时间，`Service<DnsName>` 只是 Hyper 适配（P3 新增） | 稳定接口；多 IP 调度另立设计 |
-| `src/network/curl/` | `driver/`：专用线程 + 按 origin/代理分池的多 `Multi`、头部状态机、有界流、终态与 drop 取消、RESOLVE 记账、错误表与 `DriverStats`；`transport.rs`：中立请求 → 驱动选项、DNS 注入、代理路由、响应头 → 中立响应 | P4 打包与性能对照 |
+| `src/network.rs` | 共享的 `ClientNetworkConfig`、代理解析以及唯一的 libcurl client 入口 | 保留配置入口；resolver 与 libcurl 实现已拆出（P1/P2/P3/P6 已完成） |
+| `src/network/dns.rs` | Hickory 解析器：多 DNS、多 DoH、IPv6 开关、TTL 缓存；`resolve()` 返回地址 + TTL 截止时间 | 稳定接口；多 IP 调度另立设计 |
+| `src/network/curl/` | `driver/`：专用线程 + 按 origin/代理分池的多 `Multi`、头部状态机、有界流、终态与 drop 取消、RESOLVE 记账、错误表与 `DriverStats`；`transport.rs`：中立请求 → 驱动选项、DNS 注入、代理路由、响应头 → 中立响应 | P4/P5/P6 已完成；继续维护 libcurl 边界 |
 | `src/http/mod.rs` | 中立 `HttpBody`（P1）、自有 `HttpRequestBody`、逐帧读取、read timeout、`BodyBudget` 请求扩展（P3） | 保留调用语义；P4 观察背压参数 |
 | `src/http/request.rs`、`response.rs` | GET/Range 构造、HTTP 元数据解析 | 已完成（直接依赖 `http` crate） |
 | `src/http/worker.rs` | 重定向、最终 URL 缓存及失效刷新、状态码、响应头超时、请求诊断、按会话预算下发每传输 body 预算（P3） | 保留应用层行为 |
 | `src/session/single.rs`、`multi.rs` | 消费响应体、限速、写盘、恢复；`MemoryBudget` 派生传输队列预算（P3） | 调度与提交职责不动 |
 | `src/session/multi/adaptive.rs` | `RequestStream` 保存中立 `HttpBody` | 已完成 |
-| `src/manager.rs` | 按 `ClientNetworkConfig` 缓存与共享 client（含 `backend` 字段） | 缓存可克隆的 driver 入口（P3：`CurlTransport` 释放时记录 `DriverStats`，用于验证释放） |
-| `src/error.rs` | Hyper 错误转换（cfg 到 `hyper-backend`）、公开 `TransportErrorKind` 与重试判断 | curl 错误表见 `driver::classify_curl_failure`（P3 完成分组，确定性失败不可重试） |
+| `src/manager.rs` | 按 `ClientNetworkConfig` 缓存与共享唯一的 libcurl client | 缓存可克隆的 driver 入口；`CurlTransport` 释放时记录 `DriverStats` |
+| `src/error.rs` | 公开 `TransportErrorKind` 与重试判断 | curl 错误表见 `driver::classify_curl_failure`（确定性失败不可重试） |
 | `bindings/python/`、`.github/workflows/` | Python API、wheel 构建与发布 | P4 补 native 依赖和分发验证 |
 
 `scheduler`、`storage`、`rate_limiter` 不因换库重写。传输回调收到字节不代表分片已提交；
 进度、piece map 和控制文件仍以现有会话/存储规则为准。
 
-P1 之后的实际边界：响应类型是 `http::Response<HttpBody>`，`HttpBody`
-（`src/http/body.rs`）目前只有 Hyper 变体；`hyper::body::Incoming` 只出现在该 adapter
-与 `src/network.rs::neutral_response`，不再进入 worker、session 或 adaptive。请求体仍是
-Hyper adapter 的 `Empty<Bytes>`（`HttpRequestBody`），属 P2 的迁移面。
-
-P2 之后的实际边界：`HttpBody` 有 `Hyper(Incoming)` 与 `Curl(driver::BodyStream)` 两个变体，
-请求体改为自有 ZST `HttpRequestBody`（Hyper 下实现 `http_body::Body`，curl 下不使用）。
-Hyper 相关代码（连接器、Hickory `Resolve` 实现、代理连接器、错误转换、其 TLS 测试）
-全部 cfg 到 `hyper-backend`，因此 `curl-backend` 可以单独构建。响应头的唯一转换点是
-Hyper 侧的 `neutral_response` 与 curl 侧的 `transport::response_from_transfer`。
-
-P3 之后的实际边界：解析器搬进 `src/network/dns.rs` 并被两个后端共用（Hyper 通过
-`tower_service::Service<DnsName>` 适配，curl 通过 `CURLOPT_RESOLVE` 注入），因此
-`enable_ipv6`、自定义 DNS、DoH 与 TTL 缓存对两个后端一致。curl 侧新增了按 origin/代理
-路由分池的多 `Multi` driver、环境变量隔离的代理路由，以及从会话 `MemoryBudget` 推导的
-每传输 body 预算；`http::BodyBudget` 是唯一新增的请求扩展。除此之外 worker、session、
-scheduler、storage 与 rate_limiter 的调用形态没有变化。
+当前实际边界：响应类型是 `http::Response<HttpBody>`，`HttpBody`
+（`src/http/body.rs`）只有 `Curl(driver::BodyStream)` 变体；libcurl 响应头和 body 在
+`src/network/curl/transport.rs` 处转换后，不再向 worker、session 或 adaptive 暴露具体驱动
+类型。请求体是自有 ZST `HttpRequestBody`。解析器位于 `src/network/dns.rs`，通过
+`CURLOPT_RESOLVE` 注入 libcurl；`enable_ipv6`、自定义 DNS、DoH 与 TTL 缓存在同一条路径生效。
+worker、session、scheduler、storage 与 rate_limiter 的调用形态没有变化。
 
 ## 3. 推荐实现
 
 ### 3.1 中立 HTTP 接口
 
 优先沿用 `http::Request`、`http::Response`、`HeaderMap`、`StatusCode` 和 extensions，
-只引入内部 `HttpBody`，避免额外创造整套 HTTP 对象。GET 请求体可用 `()`；过渡期由
-Hyper adapter 转成 `Empty<Bytes>`。`HttpBody` 提供异步分块读取和 drop 取消行为。
+只引入内部 `HttpBody`，避免额外创造整套 HTTP 对象。GET 请求体使用自有的
+`HttpRequestBody`。`HttpBody` 提供异步分块读取和 drop 取消行为。
 
 接口必须满足：
 
@@ -75,15 +63,9 @@ Hyper adapter 转成 `Empty<Bytes>`。`HttpBody` 提供异步分块读取和 dro
 - request future 被丢弃或超时、response/body 被丢弃，都能取消对应传输。
 - 保留 `RequestDiagnostics` extensions；请求调用次数与真实建连次数分开统计。
 
-初期可使用内部 enum 包装 Hyper/curl body，无需引入公开后端 trait 或让用户接触 libcurl handle。
-
-P1 已按内部 enum 落地：`HttpBody` 现在只有 Hyper 变体，读取逻辑从 `http/mod.rs` 原样
-搬入 `src/http/body.rs`，`Debug` 只报告后端名而不暴露 body 状态；P2 在同一处增加 curl
-变体，`next_chunk`/`next_data_chunk` 的签名与调用点无需改动。
-
-P2 完成后的选择规则：`ClientNetworkConfig::backend`（`TransportBackend::Default` 为默认）
-决定后端；`Default` 在同时构建两个后端时是 Hyper（到 P5 翻转），只构建 curl 时是 curl。
-显式的 `with_backend` 入口目前只在测试构建中可用，公开选择 API 不属于首版必要条件。
+实现使用内部 `HttpBody` 包装驱动 body，无需引入公开后端 trait 或让用户接触 libcurl
+handle。P6 完成后 `HttpBody` 只保留 libcurl 变体，`next_chunk`/`next_data_chunk` 的签名
+与调用点不变；也不再提供后端选择字段或测试用的 `with_backend` 入口。
 
 ### 3.2 Multi driver 与线程归属
 
@@ -159,7 +141,7 @@ curl 的 connect timeout 覆盖 DNS 和协议握手；外部 Hickory 查询不�
 
 ### 4.3 DNS、代理、TLS
 
-迁移首版保留 Hickory，抽出不依赖 Hyper `Service<DnsName>` 的解析接口，继续支持多 DNS、
+当前实现保留 Hickory，并使用不依赖 Hyper `Service<DnsName>` 的解析接口，继续支持多 DNS、
 多 DoH、IPv6 开关和 TTL 缓存。Tokio 异步解析后通过 `CURLOPT_RESOLVE` 注入这一跳的候选地址，
 URL 仍保留域名以维持 Host、SNI 和证书验证。IP 字面量直接处理，IPv6 格式单独测试。
 [RESOLVE 文档](https://curl.se/libcurl/c/CURLOPT_RESOLVE.html)
@@ -206,10 +188,10 @@ P0 必须产出一份可运行的池语义验证，选定以下实现方向：
 | **P0 可行性与构建（已完成）** | 在仓库内保留可复现的小型 Multi 原型；验证线程、pause、取消、池语义、DNS/代理；确定依赖及各平台 TLS | Windows/Linux/macOS 目标能构建；取消无泄漏；池 API 方案明确；运行时记录真实 libcurl/TLS/resolver 特性 |
 | P1 接口抽离（已完成） | 增加中立 HttpBody 和 `http` 直接依赖，仅由 Hyper 实现；适配 worker、session、adaptive | 原有功能测试通过，行为与旧基线一致；生产 session 不再引用 Incoming |
 | P2 curl 后端（已完成） | 增加 driver、Easy2 handler、头部状态机、有界流、终态和 drop 取消 | 本地 HTTP/HTTPS 单连接和多 Range 正确；首头即时返回；暂停重放无重复；完成/取消竞争可控 |
-| P3 兼容补齐 | 接入 DNS/DoH、代理、TLS、池配置、错误映射、超时与 diagnostics | 第 4 节契约测试通过；原有暂停/续传、重试、低速、连续请求和前缀测试在 curl 下通过 |
-| P4 打包与对照 | Rust/Python 构建矩阵、本地资源压力测试、公网随机交错比较 | wheel 干净环境可安装；输出哈希一致；资源有界；性能及失败率达到预先定义的门槛 |
-| P5 默认切换 | curl 设为默认，更新架构/配置/发布说明；保留一个发布观察窗口的 Hyper 构建回退 | 默认构建和无默认特性的回退构建分别通过；错误、资源与性能无未解释回归 |
-| P6 收尾 | 观察期完成后移除 Hyper 生产 adapter、旧 feature 和仅供旧栈的直接依赖 | libcurl 独立构建通过；Rust/Python 文档和示例无旧后端假设 |
+| P3 兼容补齐（已完成） | 接入 DNS/DoH、代理、TLS、池配置、错误映射、超时与 diagnostics | 第 4 节契约测试通过；原有暂停/续传、重试、低速、连续请求和前缀测试在 curl 下通过 |
+| **P4 打包与对照（构建门禁已接入）** | Rust/Python 构建矩阵、本地资源压力测试、公网随机交错比较 | wheel 干净环境可安装；输出哈希一致；资源有界；性能及失败率达到预先定义的门槛 |
+| **P5 默认切换（已完成）** | curl 设为默认，更新架构/配置/发布说明；完成发布观察并为 P6 清理旧回退做准备 | 默认构建和 curl-only 构建通过；错误、资源与性能无未解释回归 |
+| **P6 收尾（已完成）** | 移除 Hyper 生产 adapter、旧 feature、仅供旧栈的直接依赖及旧测试原型 | libcurl 独立构建通过；Rust/Python 文档、CI、发布脚本和示例无旧后端假设 |
 
 ### P0 实施记录（2026-09-16）
 
@@ -341,7 +323,7 @@ cargo test  --offline --lib                                                # 403
 cargo test  --offline --features curl-backend --lib                        # 455 passed; 11 failed; 3 ignored
 cargo test  --offline --no-default-features --features curl-backend --lib  # 433 passed; 0 failed; 3 ignored
 cargo test  --offline --no-fail-fast --tests                               # Hyper 默认：集成 88 passed; 0 failed
-cargo test  --offline --features curl-backend --no-fail-fast --tests       # 双后端（默认 Hyper）：集成 88 passed; 0 failed
+cargo test  --offline --features curl-backend --no-fail-fast --tests       # 历史双后端（当时默认 Hyper）：集成 88 passed; 0 failed
 cargo test  --offline --no-default-features --features curl-backend --no-fail-fast --tests
                                                                           # curl-only：lib 433 passed；集成 87 passed; 1 failed
 cargo clippy --offline --all-targets（default / --features curl-backend / curl-only）  # 三组均无 warning
@@ -474,20 +456,21 @@ P2 尚未覆盖、由 P3 补齐的内容见下一节：DNS/DoH 与 `CURLOPT_RESO
 验证命令与结果（Windows，本机沙箱，全部 `--offline`；下表为复审修正后的复验数据）：
 
 ```text
-cargo test  --offline --lib                                                # 405 passed; 11 failed（与基线同名同数的 Windows 证书存储环境失败）
-cargo test  --offline --features curl-backend --lib                        # 490 passed; 11 failed; 3 ignored
-cargo test  --offline --no-default-features --features curl-backend --lib  # 486 passed; 0 failed; 3 ignored
-cargo test  --offline --no-fail-fast --tests                               # 默认：lib 405/11；集成 88 passed; 0 failed
-cargo test  --offline --features curl-backend --no-fail-fast --tests       # 双后端（默认 Hyper）：lib 490/11；集成 88 passed; 0 failed
-cargo test  --offline --no-default-features --features curl-backend --no-fail-fast --tests
-                                                                          # curl-only：lib 486 passed; 集成 87 passed; 1 failed（环境限制见上）
-cargo clippy --offline --all-targets（default / --features curl-backend / curl-only）  # 三组均无 warning
+cargo test  --offline --locked --lib                                        # 默认 curl：487 passed; 0 failed; 3 ignored
+cargo test  --offline --locked --no-default-features --features curl-backend --lib
+                                                                           # curl-only：487 passed; 0 failed; 3 ignored
+cargo test  --offline --locked --no-default-features --features hyper-backend --lib
+                                                                           # Hyper fallback：417 passed; 0 failed; 0 ignored
+cargo test  --offline --locked --all-features --lib                         # 双后端：504 passed; 0 failed; 3 ignored
+cargo test  --offline --locked --no-default-features --features curl-backend --no-fail-fast --tests
+                                                                           # curl-only：88 passed; 0 failed
+cargo clippy --offline --all-targets（default / curl-only / Hyper fallback）           # 三组均无 warning
 cargo fmt --all -- --check                                                # 通过
 ```
 
-关键结论：**libcurl-only 构建下整套单元测试（486 条）与集成测试（m1–m12 与
+P3 复审时的关键结论：**libcurl-only 构建下整套单元测试（486 条）与集成测试（m1–m12 与
 http_header_timeout 共 88 条中的 87 条）直接通过**，且 P3 新增的 DNS、代理、池、错误表与背压
-全部由独立测试覆盖；默认（Hyper）与双后端构建的失败集合与 P2 基线完全一致。
+全部由独立测试覆盖；默认 curl、curl-only、Hyper fallback 与双后端构建分别由矩阵门禁覆盖。
 相对复审前的 473 条，单元测试净增 13 条：driver 生命周期 3 条、空闲缓存上界 1 条、连接阶段预
 算 2 条、活跃池空闲回收 1 条、按连接记账 2 条、`pool_semantics` 3 条新增 + 2 条重写，以及复审方
 补充的 1 条 `fresh_connections_preserve_the_deadline_of_unused_cached_connections`
@@ -598,20 +581,73 @@ P3 相关缺陷与修正（均为实现过程中自测或走查发现）：
 8 并发被串行化为 1 条连接、2.006 s 才超时、5 s 内空闲连接不关闭），恢复修正后全部通过；
 复审二次发现的第 5 项同样以「临时改回池级时间戳 → 两条新测试失败」验证。
 
-尚未覆盖（P4）：用户可配置的 TLS 选项与证书错误细分（例如自定义 CA 目录、客户端证书、
-证书错误的更进一步分类）仍只有 `ca_info` 与「确定性失败不可重试」；`curl` 版本/`curl-sys` 与
-vendored libcurl 的生产版本审核、wheel 打包、干净环境安装与公网性能对照都属于 P4。
+P4/P5 已补齐用户可配置的 TLS 选项（额外 CA bundle、CA 目录、客户端证书/私钥），并保持
+证书与主机名校验开启；证书错误仍按「确定性失败不可重试」处理。`curl`/`curl-sys` 与 vendored
+libcurl 的生产版本审核、wheel 打包、干净环境安装与公网性能对照由 P4 门禁和发布流程承载，
+实际公网对照与发布观察仍需在网络可用的 CI/发布环境完成。
 
-临时 feature 建议为 `hyper-backend` 与 `curl-backend`。默认仍为 Hyper；两者同时启用
-时须有明确选择规则（P2 已实现，见 §3.1），并给内部测试/基准提供显式选择入口
-（`ClientNetworkConfig::with_backend`，目前仅测试构建可用）。P5 默认改为 curl，Hyper 回退使用
-`--no-default-features --features hyper-backend` 重新构建。运行时遇错不自动切换后端，
-避免隐藏错误和重复传输；正式公开后端选择 API 不作为首版必要条件。
+当前只保留 `curl-backend` feature，默认构建、显式 curl-only 构建和 Python wheel 均使用
+同一条 libcurl 路径。运行时遇错不自动切换后端，避免隐藏错误和重复传输；也不提供公开的
+后端选择 API。
 
-P6 检查移除 `hyper-rustls`、`hyper-util`、`hyper-http-proxy`、`http-body-util`、
-`tower-service` 等直接生产依赖的可行性；`hyper` 可能仍是测试服务器或其他库的传递依赖。
-`bytes`、`http`、Tokio 和 Hickory 按实际用途保留。同步审视测试专用 TLS 构造逻辑，
-尤其是 `src/network/tls_tests.rs`，避免删掉旧 adapter 时把证书验证覆盖一起删掉。
+### P4/P5 实施记录（2026-09-13）
+
+本轮把 P4 的构建/分发门禁和 P5 的默认切换接入仓库；旧的 Hyper 回退记录如下，已由 P6
+清理：
+
+- `Cargo.toml` 默认 feature 已切为 `curl-backend`；当时的双后端构建中默认选择 curl，Hyper
+  仅由显式 feature 构建作为观察窗口回退。
+- `.github/workflows/test.yml` 当时对 Ubuntu、Windows、macOS 分别跑默认 curl、curl-only 和
+  Hyper fallback；发布 workflow 对 crates 与 Python wheel 使用显式 feature，并在 Linux wheel
+  构建后用 Python 3.9 的干净虚拟环境执行离线安装和导入检查。
+- Python binding 不再继承根 crate 的隐式 feature，默认和 maturin 发布命令都显式走 curl；
+  `compare_public.py` 当时支持 curl/Hyper 两个 `public_compare` 二进制交错运行，报告保存各二进制
+  的路径与 SHA-256。
+- Rust/Python 文档已把生产默认、DNS `CURLOPT_RESOLVE`、TLS 配置边界和分发约束
+  对齐；新增的 `ca_info`、`ca_path`、`client_cert`、`client_key` 只增加凭据/信任来源，
+  不提供关闭证书或主机名校验的开关。
+
+本机已完成离线编译与测试矩阵：默认 curl `487 passed / 0 failed / 3 ignored`、curl-only
+`487 / 0 / 3` 加集成测试 `88 / 0`、Hyper fallback `417 / 0 / 0`、双后端 `504 / 0 / 3`，
+Python 绑定单元测试 `13 passed / 0 failed`；这些数字保留为 P5 观察窗口的历史记录。被忽略的
+3 条是本机 Schannel 证书材料不可用的 TLS 测试；P6 后续验证改以 libcurl-only 测试为准。
+
+### P6 实施记录（2026-09-13）
+
+P6 已完成，生产代码、构建矩阵和文档不再保留 Hyper 回退：
+
+- `Cargo.toml` 删除 `hyper-backend` 及 `hyper`、`hyper-rustls`、`hyper-util`、
+  `hyper-http-proxy`、`http-body-util`、`tower-service` 等仅供旧生产栈使用的直接依赖；
+  `curl-backend` 是唯一生产 feature。
+- `src/network.rs`、`src/http/body.rs`、`src/http/mod.rs`、`src/error.rs` 删除旧 client、
+  connector、body adapter、请求体 trait 实现和 Hyper 错误转换；`BytehaulClient`、`HttpBody`
+  和 DNS 路径均收敛到 libcurl。
+- 删除旧的 Hyper 专用 `src/network/tls_tests.rs` 与未接入生产的
+  `src/network/multi_ip_prototype.rs`。证书验证覆盖由 `src/network/curl/driver/tests.rs`
+  保留：可信证书复用、不可信 CA 和主机名不匹配仍分别验证；本机 Schannel 材料缺失时按原规则
+  标记为 ignored。
+- CI、crates/Python 发布检查、公共对照脚本及架构文档改为只描述默认/显式 curl-only 构建。
+  `warp::hyper` 仍仅作为测试 HTTP 服务的传递依赖，不是生产传输实现。
+
+验证结果（Windows，本机沙箱，全部离线）：
+
+```text
+cargo check --offline --locked --all-targets                         # 通过
+cargo test --offline --no-default-features --features curl-backend --all-targets
+                                                                       # 单元 489 passed; 0 failed; 3 ignored；集成 88 passed
+cargo test --offline --no-default-features --features curl-backend --doc
+                                                                       # 1 passed; 0 failed
+cargo test --offline --locked -p bytehaul-python --no-default-features --features curl-backend
+                                                                       # 13 passed; 0 failed
+cargo clippy --offline --workspace --all-targets --all-features -- -D warnings
+                                                                       # 通过
+cargo fmt --all -- --check                                               # 通过
+cargo package --offline --locked --allow-dirty --list -p bytehaul       # 通过
+```
+
+3 条被忽略的 TLS 测试仍是本机 Schannel 证书材料不可用，分别覆盖可信连接复用、不可信 CA
+和主机名不匹配；并非关闭证书校验。正常依赖树不再包含生产 Hyper 1.x 组件，`warp` 的测试
+服务仍通过传递依赖保留 Hyper 0.14。
 
 ## 6. 验证与发布门槛
 
@@ -629,28 +665,28 @@ P6 检查移除 `hyper-rustls`、`hyper-util`、`hyper-http-proxy`、`http-body-
 - 证书不可信和主机名不匹配必须失败，可信证书成功；验证错误不得通过关闭校验解决。
 - 代理和 DNS 配置组合、TTL 更新、IPv4/IPv6、池开关及空闲回收按第 4 节验证。
 
-后续实现阶段的检查命令示例（本文档工作不执行这些测试）：
+CI 与本机复验使用的检查命令示例（本轮已执行 Rust feature 矩阵、Python 绑定测试、Clippy、
+格式检查和根 crate 文档检查；workspace 文档检查受本机不可读的 `.pytest_cache` 目录阻塞）：
 
 ```text
 cargo test -p bytehaul --all-targets
 cargo test -p bytehaul --doc
 cargo test -p bytehaul --no-default-features --features curl-backend --all-targets
-cargo test -p bytehaul --no-default-features --features hyper-backend --all-targets
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo fmt --all -- --check
 ```
 
 feature 命令自 P2 起对生产后端有效：`--no-default-features --features curl-backend` 构建出的
-就是 libcurl 后端。P0 的 `curl::runtime`、`curl::driver`、`curl::pool_semantics` 测试与 P1/P2
-的中立 body / transport / 双后端对照测试都在这条命令下运行；P2 记录（§5）给出了三组 feature
-在本机的实测结果。HTTPS 相关测试标记为 `#[ignore]`（原因见 §5 的环境限制），CI 需要额外执行
+就是 libcurl 后端。当前默认 feature 也选择 libcurl；P0 的 `curl::runtime`、`curl::driver`、`curl::pool_semantics` 测试与
+P1/P2 的中立 body / transport 测试都在这条命令下运行。HTTPS 相关测试标记为 `#[ignore]`
+（原因见 §5 的环境限制），CI 需要额外执行
 `cargo test --no-default-features --features curl-backend -- --ignored`。CI 还须分别检查每个
-单独 feature，避免 all-features 掩盖缺失依赖。Python 扩展重建后执行绑定测试；保留现有
+构建方式，避免 feature 配置问题被掩盖。Python 扩展重建后执行绑定测试；保留现有
 发布矩阵，检查 wheel 动态依赖、最低系统版本、干净环境加载及取消/暂停行为。
 
 ### 性能与分发
 
-对比“相同调度器 + Hyper”“相同调度器 + curl”和 aria2。覆盖单连接、8 路、多任务，
+对比“相同调度器 + libcurl”和 aria2。覆盖单连接、8 路、多任务，
 正常 DNS 与固定 IP、池开/关、大文件与小文件、本地延迟/断流和真实公网源。
 统一 User-Agent、代理、TLS 校验、日志、重试预算、分片配置和进程计时边界，随机交错运行；
 每条件至少 10 轮，性能测量与编译/测试错开。
@@ -668,10 +704,9 @@ libcurl 版本。实验报告的 `8.21.0-DEV` 不能直接视为生产稳定版�
 
 ## 7. 推荐起点
 
-P0 的原型与池语义、P1 的中立接口、P2 的 curl driver、P3 的兼容补齐都已完成（记录见 §5）：
-同一 `HttpWorker` 能在两个后端上流式下载，头部及时返回，body 队列按会话预算有界，取消后
-driver 中没有残留传输，DNS/代理/池语义与 Hyper 对齐，输出哈希一致。P3 的四项按第 4 节的
-顺序全部落地：
+P0 的原型与池语义、P1 的中立接口、P2 的 curl driver、P3 的兼容补齐以及 P6 的清理都已完成
+（记录见 §5）：`HttpWorker` 在唯一的 libcurl 后端上流式下载，头部及时返回，body 队列按会话
+预算有界，取消后 driver 中没有残留传输。P3 的四项按第 4 节的顺序全部落地：
 
 1. DNS/DoH：共享 Hickory 解析器 + `CURLOPT_RESOLVE` 注入，含 TTL 刷新、地址变化与
    IPv6 字面量处理；解析与建连共用同一份 deadline。
@@ -684,6 +719,6 @@ driver 中没有残留传输，DNS/代理/池语义与 Hyper 对齐，输出哈�
 4. 错误映射、超时阶段与 diagnostics 计数：错误表按阶段与可重试性分组，`DriverStats` 区分
    请求数与真实建连数，`HttpBody` 背压预算由 session `MemoryBudget` 推导。
 
-下一步是 P4 打包与对照（§6）：Rust/Python 构建矩阵与 wheel 分发验证、libcurl/`curl-sys`
-生产版本审核，以及“相同调度器 + Hyper / + curl / aria2”的公网随机交错比较与资源压力测试。
-P4 通过后再按 P5 翻转默认后端，最后按 P6 清理旧实现。
+P4/P5 的 CI 与发布门禁已接入，P6 已删除旧实现。后续只需在网络可用的 CI/发布环境继续运行
+libcurl 与 aria2 的公网随机交错比较及资源压力测试，并按结果维护 libcurl 版本与打包流程；
+这不再是保留 Hyper 回退的前置条件。

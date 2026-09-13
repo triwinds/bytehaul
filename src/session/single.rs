@@ -1414,8 +1414,8 @@ mod tests {
     async fn test_stream_single_autosaves_existing_progress_before_body_arrives() {
         // The body is delayed long enough for the pre-body autosave to be
         // observable. How the backend splits "body bytes" from "EOF" differs
-        // (Hyper delivers the whole body in one frame, libcurl delivers
-        // callback-sized chunks plus a terminal message), so a later autosave
+        // (the driver delivers callback-sized chunks plus a terminal message),
+        // so a later autosave
         // tick may legitimately advance the file to the final prefix. The
         // invariant under test is the pre-body autosave of the written prefix.
         let (url, server) =
@@ -1721,7 +1721,7 @@ mod tests {
     #[tokio::test]
     async fn test_stream_rejects_clean_short_and_overlong_bodies() {
         // The wire body is internally valid; expected transfer size differs.
-        // This isolates the session's validation from hyper's framing checks.
+        // This isolates the session's validation from transport framing checks.
         // An expected zero-byte body rejects every nonempty frame, independent
         // of how TCP divides the body into chunks.
         for (body, total, expected_written, expected_error) in [

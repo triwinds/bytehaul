@@ -139,6 +139,13 @@ pub struct DownloadSpec {
     pub(crate) all_proxy: Option<String>,
     pub(crate) http_proxy: Option<String>,
     pub(crate) https_proxy: Option<String>,
+    /// Additional PEM trust bundle for the libcurl backend.
+    pub(crate) ca_info: Option<PathBuf>,
+    /// Directory containing hashed CA certificates for the libcurl backend.
+    pub(crate) ca_path: Option<PathBuf>,
+    /// Optional client certificate and private key for mutual TLS.
+    pub(crate) client_cert: Option<PathBuf>,
+    pub(crate) client_key: Option<PathBuf>,
     pub(crate) read_timeout: Duration,
     pub(crate) request_headers_timeout: Option<Duration>,
     pub(crate) slow_transfer_mode: SlowTransferMode,
@@ -193,6 +200,10 @@ impl DownloadSpec {
             all_proxy: None,
             http_proxy: None,
             https_proxy: None,
+            ca_info: None,
+            ca_path: None,
+            client_cert: None,
+            client_key: None,
             read_timeout: Duration::from_secs(60),
             request_headers_timeout: None,
             slow_transfer_mode: SlowTransferMode::default(),
@@ -273,6 +284,26 @@ impl DownloadSpec {
     /// Returns the proxy applied only to HTTPS requests, if set.
     pub fn get_https_proxy(&self) -> Option<&str> {
         self.https_proxy.as_deref()
+    }
+
+    /// Returns the additional PEM trust bundle for the libcurl backend.
+    pub fn get_ca_info(&self) -> Option<&Path> {
+        self.ca_info.as_deref()
+    }
+
+    /// Returns the CA certificate directory for the libcurl backend.
+    pub fn get_ca_path(&self) -> Option<&Path> {
+        self.ca_path.as_deref()
+    }
+
+    /// Returns the client certificate used for mutual TLS, if configured.
+    pub fn get_client_cert(&self) -> Option<&Path> {
+        self.client_cert.as_deref()
+    }
+
+    /// Returns the client private key used for mutual TLS, if configured.
+    pub fn get_client_key(&self) -> Option<&Path> {
+        self.client_key.as_deref()
     }
 
     /// Returns the per-request read timeout.
@@ -467,6 +498,31 @@ impl DownloadSpec {
     /// Set a proxy applied only to HTTPS requests for this download.
     pub fn https_proxy(mut self, proxy: impl Into<String>) -> Self {
         self.https_proxy = Some(proxy.into());
+        self
+    }
+
+    /// Add a PEM trust bundle for libcurl without disabling certificate or
+    /// hostname verification.
+    pub fn ca_info(mut self, path: impl Into<PathBuf>) -> Self {
+        self.ca_info = Some(path.into());
+        self
+    }
+
+    /// Use a directory of hashed CA certificates for libcurl.
+    pub fn ca_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.ca_path = Some(path.into());
+        self
+    }
+
+    /// Configure the client certificate used for mutual TLS.
+    pub fn client_cert(mut self, path: impl Into<PathBuf>) -> Self {
+        self.client_cert = Some(path.into());
+        self
+    }
+
+    /// Configure the private key used for mutual TLS.
+    pub fn client_key(mut self, path: impl Into<PathBuf>) -> Self {
+        self.client_key = Some(path.into());
         self
     }
 
@@ -789,6 +845,10 @@ mod tests {
         assert_eq!(spec.all_proxy, None);
         assert_eq!(spec.http_proxy, None);
         assert_eq!(spec.https_proxy, None);
+        assert_eq!(spec.ca_info, None);
+        assert_eq!(spec.ca_path, None);
+        assert_eq!(spec.client_cert, None);
+        assert_eq!(spec.client_key, None);
         assert_eq!(spec.read_timeout, Duration::from_secs(60));
         assert_eq!(spec.memory_budget, 64 * 1024 * 1024);
         assert_eq!(spec.file_allocation, FileAllocation::Prealloc);
@@ -827,6 +887,10 @@ mod tests {
             .all_proxy("http://127.0.0.1:8080")
             .http_proxy("http://127.0.0.1:8081")
             .https_proxy("http://127.0.0.1:8443")
+            .ca_info("/tmp/ca.pem")
+            .ca_path("/tmp/certs")
+            .client_cert("/tmp/client.pem")
+            .client_key("/tmp/client.key")
             .read_timeout(Duration::from_secs(20))
             .memory_budget(1024)
             .file_allocation(FileAllocation::None)
@@ -851,6 +915,10 @@ mod tests {
         assert_eq!(spec.all_proxy.as_deref(), Some("http://127.0.0.1:8080"));
         assert_eq!(spec.http_proxy.as_deref(), Some("http://127.0.0.1:8081"));
         assert_eq!(spec.https_proxy.as_deref(), Some("http://127.0.0.1:8443"));
+        assert_eq!(spec.get_ca_info(), Some(Path::new("/tmp/ca.pem")));
+        assert_eq!(spec.get_ca_path(), Some(Path::new("/tmp/certs")));
+        assert_eq!(spec.get_client_cert(), Some(Path::new("/tmp/client.pem")));
+        assert_eq!(spec.get_client_key(), Some(Path::new("/tmp/client.key")));
         assert_eq!(spec.read_timeout, Duration::from_secs(20));
         assert_eq!(spec.memory_budget, 1024);
         assert_eq!(spec.file_allocation, FileAllocation::None);

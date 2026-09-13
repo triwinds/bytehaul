@@ -13,6 +13,9 @@ These examples target **0.2.4**, which improves HTTP connection reuse, contiguou
 
 Version 0.2.4 includes default HTTP pooling and request batching, cooperative cancellation, per-request response-header deadlines, confirmed-prefix reuse, and bounded slow-tail recovery; see [advanced usage](docs/advanced.md).
 
+The Rust and Python builds use the vendored libcurl transport, which is the
+sole production transport and is enabled by default.
+
 ## Documentation
 
 - [简体中文 README](docs/README.zh-CN.md)
@@ -30,7 +33,7 @@ Version 0.2.4 includes default HTTP pooling and request batching, cooperative ca
 - **SHA-256 checksum verification** — post-download integrity check
 - **Cancellation** — cooperative cancel via stop signal
 - **Progress reporting** — real-time speed, ETA, downloaded bytes, and state
-- **Shared network configuration** — proxy, custom DNS servers, DNS-over-HTTPS endpoints, and IPv6 toggle on the downloader client
+- **Shared network configuration** — proxy, custom DNS servers, DNS-over-HTTPS endpoints, IPv6 toggle, and libcurl TLS credentials on the downloader client
 
 ## Installation
 

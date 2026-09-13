@@ -227,8 +227,13 @@ pub(crate) struct RequestOptions {
     /// no proxy configuration.
     pub proxy: Option<String>,
     /// Extra trust anchors (`CURLOPT_CAINFO`). Certificate and hostname
-    /// verification always stay on; P3 wires the user-facing TLS options.
+    /// verification always stay on.
     pub ca_info: Option<std::path::PathBuf>,
+    /// Hashed CA directory (`CURLOPT_CAPATH`).
+    pub ca_path: Option<std::path::PathBuf>,
+    /// Client certificate and private key for mutual TLS.
+    pub client_cert: Option<std::path::PathBuf>,
+    pub client_key: Option<std::path::PathBuf>,
 }
 
 impl RequestOptions {
@@ -243,6 +248,9 @@ impl RequestOptions {
             resolve: None,
             proxy: None,
             ca_info: None,
+            ca_path: None,
+            client_cert: None,
+            client_key: None,
         }
     }
 
@@ -967,7 +975,7 @@ impl DriverHandle {
             Err(_) => {
                 self.shared.sinks.lock().remove(&id);
                 // The caller's request-headers deadline; the message matches
-                // the Hyper adapter so both backends report the same error.
+                // the request timeout contract used by the transport.
                 return Err(DownloadError::timeout("request timed out"));
             }
         };
@@ -1880,6 +1888,15 @@ fn configure_easy(
     if let Some(ca_info) = options.ca_info.as_deref() {
         // Adds trust anchors; it never turns verification off.
         easy.cainfo(ca_info)?;
+    }
+    if let Some(ca_path) = options.ca_path.as_deref() {
+        easy.capath(ca_path)?;
+    }
+    if let Some(client_cert) = options.client_cert.as_deref() {
+        easy.ssl_cert(client_cert)?;
+    }
+    if let Some(client_key) = options.client_key.as_deref() {
+        easy.ssl_key(client_key)?;
     }
     if !options.headers.is_empty() {
         let mut list = List::new();

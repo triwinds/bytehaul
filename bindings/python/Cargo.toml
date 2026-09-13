@@ -13,8 +13,14 @@ documentation = "https://github.com/triwinds/bytehaul/tree/main/bindings/python"
 name = "_bytehaul"
 crate-type = ["cdylib"]
 
+[features]
+# Wheels and source builds must use the same libcurl backend as the Rust
+# package, even if the root package changes its default feature in the future.
+default = ["curl-backend"]
+curl-backend = ["bytehaul/curl-backend"]
+
 [dependencies]
-bytehaul = { path = "../.." }
+bytehaul = { path = "../..", default-features = false }
 pyo3 = { version = "0.23", features = ["abi3-py39", "extension-module"] }
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
