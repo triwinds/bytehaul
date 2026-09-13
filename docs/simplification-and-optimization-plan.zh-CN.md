@@ -142,7 +142,7 @@ P1 的测量结果、复现命令与判据见[默认路径与资源基线](pipel
 
 ### P3：统一多连接传输循环
 
-状态：实施中；步骤 1 模式矩阵已完成。
+状态：实施中；步骤 1 模式矩阵与步骤 2 普通请求消费抽取已完成。
 
 改动位置：[multi.rs](../src/session/multi.rs)、[adaptive.rs](../src/session/multi/adaptive.rs)、[scheduler.rs](../src/scheduler.rs)、[flow.rs](../src/session/flow.rs)、[retry.rs](../src/session/retry.rs)。
 
@@ -359,3 +359,9 @@ P2 实现已完成。以上分组不改变公开签名；缓存上限与请求�
 | 恢复 | 无策略 | 可 Disabled；Adaptive 回收；有条件且有预算时 hedging |
 
 新增 [p3_worker_matrix.rs](../tests/p3_worker_matrix.rs) 在重构前通过全部 **12 组合**：3 恢复模式 × 2 调度模式 × batch=0/4 piece，使用 127 字节预算与跨 piece frame，断言输出、probe 仅接管一次、范围无洞无重复、普通批处理不依赖恢复开启。此前重试、暂停续传、截断、多读、身份变化、writer 错误与慢尾回归继续作为后续迁移验收，未用新矩阵替换。
+
+### P3 步骤 2：抽出普通请求与跨 piece body 消费（2026-09-14）
+
+- 新增 `multi/adaptive/request.rs`，集中有限 Range 响应校验、probe 响应消费、frame 后缀保留、长度检查与 writer 转发。`RequestContext` 显式接收请求几何、超时、身份约束、写入资源和观测数据，不持有恢复协调器。
+- 普通请求与 challenger 复用同一响应校验；是否要求响应必须回显 validator 由执行层传入，保持原有 hedging 身份规则。旧 producer 被丢弃后才进入 writer 确认的次序不变。
+- 重构后模式矩阵 12 组合、慢速恢复 11 项通过。全量命令 lib 通过，随后 `http_header_timeout::header_deadline_includes_tls_handshake` 出现已记录的间歇失败；该测试直接调用传输层，不经过本步调整的多连接模块。fmt、doc test、workspace rustdoc 通过；Clippy 仍为两项既有告警。Linux 覆盖率未执行。
