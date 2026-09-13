@@ -305,49 +305,7 @@ fn requested_client_config_for_spec(
     base_config: &ClientNetworkConfig,
     spec: &DownloadSpec,
 ) -> ClientNetworkConfig {
-    let mut requested = base_config.clone();
-
-    if spec.has_connect_timeout_override() {
-        requested.connect_timeout = spec.get_connect_timeout();
-    }
-
-    if spec.has_pool_override() {
-        requested.pool_max_idle_per_host = spec.get_pool_max_idle_per_host();
-        if requested.pool_max_idle_per_host > 0 {
-            requested.pool_idle_timeout = spec.get_pool_idle_timeout();
-        }
-    }
-
-    if spec.has_proxy_override() {
-        requested.all_proxy = None;
-        requested.http_proxy = None;
-        requested.https_proxy = None;
-
-        if let Some(proxy) = spec.get_all_proxy() {
-            requested.all_proxy = Some(proxy.to_owned());
-        }
-        if let Some(proxy) = spec.get_http_proxy() {
-            requested.http_proxy = Some(proxy.to_owned());
-        }
-        if let Some(proxy) = spec.get_https_proxy() {
-            requested.https_proxy = Some(proxy.to_owned());
-        }
-    }
-
-    if let Some(path) = spec.get_ca_info() {
-        requested.ca_info = Some(path.to_owned());
-    }
-    if let Some(path) = spec.get_ca_path() {
-        requested.ca_path = Some(path.to_owned());
-    }
-    if let Some(path) = spec.get_client_cert() {
-        requested.client_cert = Some(path.to_owned());
-    }
-    if let Some(path) = spec.get_client_key() {
-        requested.client_key = Some(path.to_owned());
-    }
-
-    requested
+    spec.resolve_network_config(base_config)
 }
 
 fn cached_client_for_config(

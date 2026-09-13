@@ -175,6 +175,13 @@ pub(crate) fn effective_dynamic_max_request_size(piece_size: u64, configured: u6
     configured.max(piece_size.max(1))
 }
 
+/// Optional task overrides; absence inherits the downloader configuration.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct NetworkOverrides {
+    pub connect_timeout: Option<Duration>,
+    pub idle_pool: Option<(usize, Duration)>,
+}
+
 /// Specification for a download task.
 #[derive(Debug, Clone)]
 pub struct DownloadSpec {
@@ -183,11 +190,7 @@ pub struct DownloadSpec {
     pub(crate) output_dir: Option<PathBuf>,
     pub(crate) headers: HashMap<String, String>,
     pub(crate) max_connections: u32,
-    pub(crate) connect_timeout: Duration,
-    pub(crate) connect_timeout_overridden: bool,
-    pub(crate) pool_max_idle_per_host: usize,
-    pub(crate) pool_idle_timeout: Duration,
-    pub(crate) pool_config_overridden: bool,
+    pub(crate) network_overrides: NetworkOverrides,
     pub(crate) all_proxy: Option<String>,
     pub(crate) http_proxy: Option<String>,
     pub(crate) https_proxy: Option<String>,
@@ -235,6 +238,55 @@ pub struct DownloadSpec {
 }
 
 impl DownloadSpec {
+    pub(crate) fn resolve_network_config(
+        &self,
+        base_config: &crate::network::ClientNetworkConfig,
+    ) -> crate::network::ClientNetworkConfig {
+        let mut requested = base_config.clone();
+
+        if self.has_connect_timeout_override() {
+            requested.connect_timeout = self.get_connect_timeout();
+        }
+
+        if self.has_pool_override() {
+            requested.pool_max_idle_per_host = self.get_pool_max_idle_per_host();
+            if requested.pool_max_idle_per_host > 0 {
+                requested.pool_idle_timeout = self.get_pool_idle_timeout();
+            }
+        }
+
+        if self.has_proxy_override() {
+            requested.all_proxy = None;
+            requested.http_proxy = None;
+            requested.https_proxy = None;
+
+            if let Some(proxy) = self.get_all_proxy() {
+                requested.all_proxy = Some(proxy.to_owned());
+            }
+            if let Some(proxy) = self.get_http_proxy() {
+                requested.http_proxy = Some(proxy.to_owned());
+            }
+            if let Some(proxy) = self.get_https_proxy() {
+                requested.https_proxy = Some(proxy.to_owned());
+            }
+        }
+
+        if let Some(path) = self.get_ca_info() {
+            requested.ca_info = Some(path.to_owned());
+        }
+        if let Some(path) = self.get_ca_path() {
+            requested.ca_path = Some(path.to_owned());
+        }
+        if let Some(path) = self.get_client_cert() {
+            requested.client_cert = Some(path.to_owned());
+        }
+        if let Some(path) = self.get_client_key() {
+            requested.client_key = Some(path.to_owned());
+        }
+
+        requested
+    }
+
     /// Create a new download specification for the given URL.
     ///
     /// All other fields are populated with sensible defaults:
@@ -249,11 +301,7 @@ impl DownloadSpec {
             output_dir: None,
             headers: HashMap::new(),
             max_connections: 4,
-            connect_timeout: Duration::from_secs(30),
-            connect_timeout_overridden: false,
-            pool_max_idle_per_host: DEFAULT_HTTP_IDLE_POOL_MAX_PER_HOST,
-            pool_idle_timeout: DEFAULT_HTTP_IDLE_POOL_TIMEOUT,
-            pool_config_overridden: false,
+            network_overrides: NetworkOverrides::default(),
             all_proxy: None,
             http_proxy: None,
             https_proxy: None,
@@ -318,7 +366,9 @@ impl DownloadSpec {
 
     /// Returns the TCP connect timeout.
     pub fn get_connect_timeout(&self) -> Duration {
-        self.connect_timeout
+        self.network_overrides
+            .connect_timeout
+            .unwrap_or(Duration::from_secs(30))
     }
 
     /// Returns the proxy applied to all HTTP/HTTPS requests, if set.
@@ -328,12 +378,16 @@ impl DownloadSpec {
 
     /// Returns the maximum idle HTTP connections kept per host.
     pub fn get_pool_max_idle_per_host(&self) -> usize {
-        self.pool_max_idle_per_host
+        self.network_overrides
+            .idle_pool
+            .map_or(DEFAULT_HTTP_IDLE_POOL_MAX_PER_HOST, |pool| pool.0)
     }
 
     /// Returns how long idle pooled HTTP connections are retained.
     pub fn get_pool_idle_timeout(&self) -> Duration {
-        self.pool_idle_timeout
+        self.network_overrides
+            .idle_pool
+            .map_or(DEFAULT_HTTP_IDLE_POOL_TIMEOUT, |pool| pool.1)
     }
 
     /// Returns the proxy applied only to plain HTTP requests, if set.
@@ -388,7 +442,7 @@ impl DownloadSpec {
     }
 
     pub(crate) fn has_connect_timeout_override(&self) -> bool {
-        self.connect_timeout_overridden
+        self.network_overrides.connect_timeout.is_some()
     }
 
     pub(crate) fn has_proxy_override(&self) -> bool {
@@ -396,7 +450,7 @@ impl DownloadSpec {
     }
 
     pub(crate) fn has_pool_override(&self) -> bool {
-        self.pool_config_overridden
+        self.network_overrides.idle_pool.is_some()
     }
 
     /// Returns the memory budget (in bytes) for the write-back cache.
@@ -562,8 +616,7 @@ impl DownloadSpec {
 
     /// Set the TCP connect timeout (default: 30 s).
     pub fn connect_timeout(mut self, connect_timeout: Duration) -> Self {
-        self.connect_timeout = connect_timeout;
-        self.connect_timeout_overridden = true;
+        self.network_overrides.connect_timeout = Some(connect_timeout);
         self
     }
 
@@ -575,16 +628,13 @@ impl DownloadSpec {
     /// than this value closes them as they go idle: keep it at or above
     /// `max_connections` to let concurrent transfers reuse their connections.
     pub fn http_idle_pool(mut self, max_idle_per_host: usize, idle_timeout: Duration) -> Self {
-        self.pool_max_idle_per_host = max_idle_per_host;
-        self.pool_idle_timeout = idle_timeout;
-        self.pool_config_overridden = true;
+        self.network_overrides.idle_pool = Some((max_idle_per_host, idle_timeout));
         self
     }
 
     /// Disable HTTP idle connection reuse for this download even if the downloader enables it.
     pub fn disable_http_idle_pool(mut self) -> Self {
-        self.pool_max_idle_per_host = 0;
-        self.pool_config_overridden = true;
+        self.network_overrides.idle_pool = Some((0, self.get_pool_idle_timeout()));
         self
     }
 
@@ -911,6 +961,38 @@ impl DownloadSpec {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn network_overrides_preserve_explicit_defaults_and_pool_setter_order() {
+        let base = crate::network::ClientNetworkConfig {
+            connect_timeout: Duration::from_secs(7),
+            pool_idle_timeout: Duration::from_secs(9),
+            ..Default::default()
+        };
+        let spec = DownloadSpec::new("https://example.com");
+        assert_eq!(
+            spec.resolve_network_config(&base).connect_timeout,
+            Duration::from_secs(7)
+        );
+        let explicit = spec.clone().connect_timeout(Duration::from_secs(30));
+        assert_eq!(
+            explicit.resolve_network_config(&base).connect_timeout,
+            Duration::from_secs(30)
+        );
+        let disabled = spec
+            .clone()
+            .http_idle_pool(2, Duration::from_secs(3))
+            .disable_http_idle_pool();
+        assert_eq!(disabled.get_pool_idle_timeout(), Duration::from_secs(3));
+        let resolved = disabled.resolve_network_config(&base);
+        assert_eq!(resolved.pool_max_idle_per_host, 0);
+        assert_eq!(resolved.pool_idle_timeout, Duration::from_secs(9));
+        let enabled = disabled.http_idle_pool(5, Duration::from_secs(11));
+        assert_eq!(
+            enabled.resolve_network_config(&base).pool_idle_timeout,
+            Duration::from_secs(11)
+        );
+    }
+
+    #[test]
     fn request_headers_timeout_defaults_and_validation() {
         let spec = super::DownloadSpec::new("https://example.com/file");
         assert_eq!(spec.get_request_headers_timeout(), None);
@@ -961,14 +1043,14 @@ mod tests {
         assert_eq!(spec.output_path, None);
         assert_eq!(spec.output_dir, None);
         assert_eq!(spec.max_connections, 4);
-        assert_eq!(spec.connect_timeout, Duration::from_secs(30));
-        assert!(!spec.connect_timeout_overridden);
+        assert_eq!(spec.get_connect_timeout(), Duration::from_secs(30));
+        assert!(!spec.has_connect_timeout_override());
         assert_eq!(
-            spec.pool_max_idle_per_host,
+            spec.get_pool_max_idle_per_host(),
             DEFAULT_HTTP_IDLE_POOL_MAX_PER_HOST
         );
-        assert_eq!(spec.pool_idle_timeout, DEFAULT_HTTP_IDLE_POOL_TIMEOUT);
-        assert!(!spec.pool_config_overridden);
+        assert_eq!(spec.get_pool_idle_timeout(), DEFAULT_HTTP_IDLE_POOL_TIMEOUT);
+        assert!(!spec.has_pool_override());
         assert_eq!(spec.all_proxy, None);
         assert_eq!(spec.http_proxy, None);
         assert_eq!(spec.https_proxy, None);
@@ -1037,11 +1119,11 @@ mod tests {
 
         assert_eq!(spec.headers, headers);
         assert_eq!(spec.max_connections, 8);
-        assert_eq!(spec.connect_timeout, Duration::from_secs(10));
-        assert!(spec.connect_timeout_overridden);
-        assert_eq!(spec.pool_max_idle_per_host, 3);
-        assert_eq!(spec.pool_idle_timeout, Duration::from_secs(15));
-        assert!(spec.pool_config_overridden);
+        assert_eq!(spec.get_connect_timeout(), Duration::from_secs(10));
+        assert!(spec.has_connect_timeout_override());
+        assert_eq!(spec.get_pool_max_idle_per_host(), 3);
+        assert_eq!(spec.get_pool_idle_timeout(), Duration::from_secs(15));
+        assert!(spec.has_pool_override());
         assert_eq!(spec.all_proxy.as_deref(), Some("http://127.0.0.1:8080"));
         assert_eq!(spec.http_proxy.as_deref(), Some("http://127.0.0.1:8081"));
         assert_eq!(spec.https_proxy.as_deref(), Some("http://127.0.0.1:8443"));

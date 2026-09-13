@@ -1,8 +1,8 @@
 # bytehaul 简化与优化实施计划
 
-日期：2026-09-13。状态：实施中；P0、P1 已完成，并已按评审意见修正（见[P0/P1 评审修正记录](#p0p1-评审修正记录)），其余阶段待实施。审查阶段已完成代码审查和四项行为问题的复现，B1–B4 已在 P0 修复并转为回归测试；P1 已完成默认路径与资源基线归档，并在评审后重新采集。
+日期：2026-09-13。状态：实施中；P0、P1 已完成，并已按评审意见修正（见[P0/P1 评审修正记录](#p0p1-评审修正记录)），P2 实施中，后续阶段待实施。审查阶段已完成代码审查和四项行为问题的复现，B1–B4 已在 P0 修复并转为回归测试；P1 已完成默认路径与资源基线归档，并在评审后重新采集。
 
-审查基线：`2161fd4388bec05ec7183605e88b7e1c2b939164`，bytehaul 0.2.4，Windows。本文件记录后续工作；P1 及之后的阶段尚未执行，不表示下列重构或性能优化已经完成。
+审查基线：`2161fd4388bec05ec7183605e88b7e1c2b939164`，bytehaul 0.2.4，Windows。P0/P1 已完成；后续阶段以各步骤完成记录为准。
 
 ## 1. 目标与判断原则
 
@@ -76,7 +76,7 @@ P1 的测量结果、复现命令与判据见[默认路径与资源基线](pipel
 | --- | --- | --- | --- | --- |
 | P0 | 最高 | 生命周期修复和 B1–B4 回归测试 | 无 | 已完成 |
 | P1 | 高 | 覆盖默认路径的可复现基线 | 可先准备夹具；正式比较使用 P0 后基线 | 已完成 |
-| P2 | 高 | 配置统一解析、请求超时与共享 client 分离、缓存有界 | P0；资源比较使用 P1 | 待实施 |
+| P2 | 高 | 配置统一解析、请求超时与共享 client 分离、缓存有界 | P0；资源比较使用 P1 | 实施中 |
 | P3 | 高 | 多连接传输循环统一，慢速恢复只负责策略 | P0、P1；配置结构复用 P2 | 待实施 |
 | P4 | 中 | 减少预分配与 writer 管线成本 | P0、P1；与 P3 分开提交 | 待实施 |
 | P5 | 中 | 修正多 pool 等待，按测量决定事件机制改造 | P1；在 P2 后验证资源生命周期 | 待实施 |
@@ -124,6 +124,8 @@ P1 的测量结果、复现命令与判据见[默认路径与资源基线](pipel
 验收：现有默认下载实际经过的路径均可测量；结果能够区分减少请求、减少复制和减少磁盘操作带来的收益，不依赖公网速度断言 CI 成败。
 
 ### P2：收敛配置并限制共享 client 资源
+
+状态：实施中；网络覆盖解析步骤已完成，资源复用及其余配置收敛继续实施。
 
 改动位置：[config.rs](../src/config.rs)、[manager.rs](../src/manager.rs)、[network.rs](../src/network.rs)、[transport.rs](../src/network/curl/transport.rs)、[Python 绑定](../bindings/python/src/lib.rs)。
 
@@ -319,3 +321,10 @@ P1 由测量本身暴露并修复的三处缺陷：
 - [CURLOPT_CONNECTTIMEOUT_MS](https://curl.se/libcurl/c/CURLOPT_CONNECTTIMEOUT_MS.html)：连接期限可配置于 easy handle；P2 同时保留本项目在 Tokio 侧 DNS 查询的期限约束。
 - [curl_multi_wait](https://curl.se/libcurl/c/curl_multi_wait.html)：无可等待描述符时立即返回，是 P5 空转风险判断的接口依据。
 - [curl_multi_poll](https://curl.se/libcurl/c/curl_multi_poll.html)：支持无描述符等待和跨线程唤醒；采用前仍需解决本项目多个 Multi 的事件组织。
+
+### P2 步骤 1：网络覆盖解析（2026-09-14）
+
+- `NetworkOverrides` 用 `Option` 保存连接超时与连接池覆盖，删除值与 `overridden` 标志并存的状态。网络生效配置由 `DownloadSpec::resolve_network_config` 统一解析，manager 只调用解析结果。
+- 保留公开 getter 的默认值、显式设置默认值覆盖 downloader、代理整组替换、TLS 路径逐项继承，以及禁用连接池时继承 downloader idle timeout 的语义。增加 setter 顺序与显式默认值回归测试。Python 参数和校验顺序本步未变。
+- macOS / Rust 1.96：fmt、doc test、workspace rustdoc（`-D warnings`）通过；清除子进程代理变量后 lib 523 通过、1 失败、3 忽略。失败的 `a_pool_that_may_not_reuse_connections_keeps_none_idle` 在 `git archive HEAD` 的原始源码上独立复现。集成测试 102 通过，慢尾竞速一项首次失败、独立复测通过，原始源码的慢速恢复 11 项全部通过。
+- 全量 `--all-targets --no-fail-fast` 已执行测试并进入 42 场景基准；基准耗时不作为本步结构变更的性能结论。Clippy 被既有 `driver/mod.rs` 的平台类型转换和 `scheduler.rs` 的 checked division 两项告警阻挡。本步不宣称全量检查通过；Linux 95% 覆盖率未执行。
