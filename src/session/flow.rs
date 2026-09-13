@@ -9,6 +9,14 @@ use crate::rate_limiter::SpeedLimit;
 use crate::storage::segment::LeaseKey;
 use crate::storage::writer::WriterCommand;
 
+/// Local forwarding waits are observed separately from network reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ForwardPhase {
+    RateLimited,
+    MemoryBlocked,
+    ChannelBlocked,
+}
+
 /// Shared geometry for producer chunks and the writer's flush threshold.
 /// Below the threshold there is always room for one maximum-sized chunk.
 pub(super) struct MemoryBudget {
@@ -46,6 +54,30 @@ impl MemoryBudget {
     #[allow(clippy::too_many_arguments)]
     pub async fn forward(
         &self,
+        data: Bytes,
+        offset: u64,
+        lease_key: Option<LeaseKey>,
+        write_tx: &mpsc::Sender<WriterCommand>,
+        cancel_rx: &mut watch::Receiver<StopSignal>,
+        speed_limit: &SpeedLimit,
+        sent: impl FnMut(u64),
+    ) -> Result<(), DownloadError> {
+        self.forward_observed(
+            data,
+            offset,
+            lease_key,
+            write_tx,
+            cancel_rx,
+            speed_limit,
+            sent,
+            |_| {},
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn forward_observed(
+        &self,
         mut data: Bytes,
         mut offset: u64,
         lease_key: Option<LeaseKey>,
@@ -53,11 +85,14 @@ impl MemoryBudget {
         cancel_rx: &mut watch::Receiver<StopSignal>,
         speed_limit: &SpeedLimit,
         mut sent: impl FnMut(u64),
+        mut observe: impl FnMut(ForwardPhase),
     ) -> Result<(), DownloadError> {
         while !data.is_empty() {
             let len = data.len().min(self.max_chunk);
             let send = async {
+                observe(ForwardPhase::RateLimited);
                 speed_limit.acquire(len).await;
+                observe(ForwardPhase::MemoryBlocked);
                 let permit = self
                     .semaphore
                     .acquire_many(len as u32)
@@ -65,6 +100,7 @@ impl MemoryBudget {
                     .map_err(|_| DownloadError::Internal("budget semaphore closed".into()))?;
                 // Reserving the channel slot keeps cancellation from losing a
                 // command after accounting it or leaking its budget permits.
+                observe(ForwardPhase::ChannelBlocked);
                 let slot = write_tx
                     .reserve()
                     .await
@@ -276,8 +312,9 @@ mod tests {
                     .unwrap();
                 }
                 let mut sent = 0;
+                let mut phases = Vec::new();
                 {
-                    let forwarding = budget.forward(
+                    let forwarding = budget.forward_observed(
                         Bytes::from_static(b"abcd"),
                         0,
                         None,
@@ -285,6 +322,7 @@ mod tests {
                         &mut stop_rx,
                         &speed,
                         |n| sent += n,
+                        |phase| phases.push(phase),
                     );
                     tokio::pin!(forwarding);
                     assert!(futures::poll!(&mut forwarding).is_pending());
@@ -303,6 +341,15 @@ mod tests {
                     ));
                 }
                 drop(held);
+                assert_eq!(
+                    phases.last(),
+                    Some(&match wait {
+                        "rate" => ForwardPhase::RateLimited,
+                        "budget" => ForwardPhase::MemoryBlocked,
+                        "channel" => ForwardPhase::ChannelBlocked,
+                        _ => unreachable!(),
+                    })
+                );
                 assert_eq!(sent, 0);
                 assert_eq!(budget.semaphore.available_permits(), 8);
             }

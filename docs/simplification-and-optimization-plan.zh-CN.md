@@ -142,7 +142,7 @@ P1 的测量结果、复现命令与判据见[默认路径与资源基线](pipel
 
 ### P3：统一多连接传输循环
 
-状态：实施中；步骤 1–3 已完成，继续转发组件复用与旧循环删除。
+状态：实施中；步骤 1–4 已完成，继续旧循环删除。
 
 改动位置：[multi.rs](../src/session/multi.rs)、[adaptive.rs](../src/session/multi/adaptive.rs)、[scheduler.rs](../src/scheduler.rs)、[flow.rs](../src/session/flow.rs)、[retry.rs](../src/session/retry.rs)。
 
@@ -371,3 +371,9 @@ P2 实现已完成。以上分组不改变公开签名；缓存上限与请求�
 - `multi/adaptive/recovery.rs` 根据读取阶段、健康基线、慢尾条件、限速状态和 challenger 状态返回 `Advice`。策略不获取 slot、不续签 lease、不修改重试或流量预算。
 - 执行层继续负责并发名额、预留/退款、hedge 预算不足后的回收降级、pending range 的 lineage、Retry-After 退避，以及旧 producer 停止后的 writer 屏障。Disabled 模式不再轮询性能恢复定时器。
 - fmt、模式矩阵 12 组合与慢速恢复 11 项通过，包含 released batch 继承重试预算/Retry-After、小预算下首/中/末 piece 恢复、竞速双方完成与失败、对象变化和限速抑制。全量 Rust 检查已启动，最终结果随阶段验证汇总记录；Linux 覆盖率未执行。
+
+### P3 步骤 4：统一数据转发等待并保留阶段观测（2026-09-14）
+
+- `MemoryBudget::forward_observed` 集中限速、预算获取、channel 预留、停止响应与已发送字节结算；既有 `forward` 是不采集阶段的薄入口，供单连接使用。普通多连接消费也使用这一实现。
+- `ForwardPhase` 分别报告 RateLimited、MemoryBlocked、ChannelBlocked，多连接继续独立报告网络 Reading 和 WriterBarrier；没有把本地背压混入健康网络速度样本。取消前真正入队的字节才计入进度，未入队的预算由 permit 自动归还。
+- fmt、flow 单元测试 4 项、流控集成 4 项、慢速恢复 11 项、模式矩阵 12 组合通过。现有阻塞测试增加各阶段断言，并继续检查停止、writer 关闭、部分发送与 permit 回收。全量检查的最终结果统一列于阶段汇总；Linux 覆盖率未执行。

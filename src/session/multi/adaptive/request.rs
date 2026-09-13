@@ -204,36 +204,31 @@ pub(super) async fn primary(
                 "server overran final piece".into(),
             ));
         }
-        ctx.observation.lock().phase(Phase::RateLimited);
-        ctx.speed.acquire(len).await;
-        ctx.observation.lock().phase(Phase::MemoryBlocked);
-        let permit = ctx
-            .budget
-            .semaphore
-            .acquire_many(len as u32)
-            .await
-            .map_err(|_| DownloadError::ChannelClosed)?;
-        ctx.observation.lock().phase(Phase::ChannelBlocked);
-        let slot = ctx
-            .write_tx
-            .reserve()
-            .await
-            .map_err(|_| DownloadError::ChannelClosed)?;
-        slot.send(WriterCommand::Data {
-            data: stream.buffered.split_to(len),
-            offset: ctx.segment.start + forwarded,
-            lease_key: Some(ctx.segment.lease_key()),
-        });
-        permit.forget();
-        stream.consumed += len as u64;
-        {
-            let mut sample = ctx.observation.lock();
-            sample.forwarded += len as u64;
-            sample.enqueued += len as u64;
-        }
-        ctx.received.fetch_add(len as u64, Ordering::Relaxed);
-        if let Some(error) = stop_signal_error(*stop.borrow()) {
-            return Err(error);
-        }
+        let data = stream.buffered.split_to(len);
+        ctx.budget
+            .forward_observed(
+                data,
+                ctx.segment.start + forwarded,
+                Some(ctx.segment.lease_key()),
+                ctx.write_tx,
+                stop,
+                ctx.speed,
+                |len| {
+                    stream.consumed += len;
+                    let mut sample = ctx.observation.lock();
+                    sample.forwarded += len;
+                    sample.enqueued += len;
+                    ctx.received.fetch_add(len, Ordering::Relaxed);
+                },
+                |phase| {
+                    use crate::session::flow::ForwardPhase;
+                    ctx.observation.lock().phase(match phase {
+                        ForwardPhase::RateLimited => Phase::RateLimited,
+                        ForwardPhase::MemoryBlocked => Phase::MemoryBlocked,
+                        ForwardPhase::ChannelBlocked => Phase::ChannelBlocked,
+                    });
+                },
+            )
+            .await?;
     }
 }
