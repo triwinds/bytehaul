@@ -77,7 +77,7 @@ P1 的测量结果、复现命令与判据见[默认路径与资源基线](pipel
 | P0 | 最高 | 生命周期修复和 B1–B4 回归测试 | 无 | 已完成 |
 | P1 | 高 | 覆盖默认路径的可复现基线 | 可先准备夹具；正式比较使用 P0 后基线 | 已完成 |
 | P2 | 高 | 配置统一解析、请求超时与共享 client 分离、缓存有界 | P0；资源比较使用 P1 | 已实现，验证限制见记录 |
-| P3 | 高 | 多连接传输循环统一，慢速恢复只负责策略 | P0、P1；配置结构复用 P2 | 待实施 |
+| P3 | 高 | 多连接传输循环统一，慢速恢复只负责策略 | P0、P1；配置结构复用 P2 | 实施中 |
 | P4 | 中 | 减少预分配与 writer 管线成本 | P0、P1；与 P3 分开提交 | 待实施 |
 | P5 | 中 | 修正多 pool 等待，按测量决定事件机制改造 | P1；在 P2 后验证资源生命周期 | 待实施 |
 | P6 | 中，低成本 | 清理唯一后端包装和重复 CI | CI 去重可独立提前实施 | 待实施 |
@@ -141,6 +141,8 @@ P1 的测量结果、复现命令与判据见[默认路径与资源基线](pipel
 验收：不同请求超时能够复用相同网络 client，且各自期限准确；不同安全/路由配置保持隔离；顺序使用超过缓存容量的配置后，缓存数量有界，活动任务结束后线程数回落。明确容量限制的是缓存保留引用，不能把它宣传为任意活动下载量下的进程线程或 socket 硬上限。
 
 ### P3：统一多连接传输循环
+
+状态：实施中；步骤 1 模式矩阵已完成。
 
 改动位置：[multi.rs](../src/session/multi.rs)、[adaptive.rs](../src/session/multi/adaptive.rs)、[scheduler.rs](../src/scheduler.rs)、[flow.rs](../src/session/flow.rs)、[retry.rs](../src/session/retry.rs)。
 
@@ -344,3 +346,16 @@ P1 由测量本身暴露并修复的三处缺陷：
 - `uv sync --project bindings/python`、CI 对应的 `maturin develop --bindings pyo3 --no-default-features --features curl-backend` 与 `uv run pytest` 完成，**157 项通过**。workspace 全目标编译、fmt、doc test、workspace rustdoc 通过；本轮 lib **529 项全部通过、3 忽略**（此前空闲池失败存在时序波动），全量命令继续执行集成及基准。Clippy 仍仅有步骤 1 记录的两项既有告警，Linux 覆盖率未执行。
 
 P2 实现已完成。以上分组不改变公开签名；缓存上限与请求期限规则见步骤 2，不增加公开调优参数。
+
+### P3 步骤 1：固定两套 worker 的差异与模式矩阵（2026-09-14）
+
+| 职责 | 旧独立 worker | 现有批处理 worker |
+| --- | --- | --- |
+| 入口 | Disabled + Fixed + batch=0 | 其余组合，包括 Disabled + Dynamic |
+| 分配 | 单 lease，`assign_to/assign_to_with_split`；无可分配范围即退出 | 有限请求 slot、多个 lease、动态/固定规划；等待通知与 pending 退避 |
+| body | 每段独立消费 | 跨 piece 保留 frame 后缀，共享请求流 |
+| 重试 | 段内 RetryState | lineage 共享 RetryState，释放的批次后缀继承预算与退避 |
+| 确认 | Begin/Flush/Discard writer 屏障 | 同样屏障，另有前缀回收与 staged challenger |
+| 恢复 | 无策略 | 可 Disabled；Adaptive 回收；有条件且有预算时 hedging |
+
+新增 [p3_worker_matrix.rs](../tests/p3_worker_matrix.rs) 在重构前通过全部 **12 组合**：3 恢复模式 × 2 调度模式 × batch=0/4 piece，使用 127 字节预算与跨 piece frame，断言输出、probe 仅接管一次、范围无洞无重复、普通批处理不依赖恢复开启。此前重试、暂停续传、截断、多读、身份变化、writer 错误与慢尾回归继续作为后续迁移验收，未用新矩阵替换。
