@@ -452,6 +452,19 @@ struct FixtureDelta {
     duplicate_bytes: u64,
 }
 
+struct ActiveResponse(Arc<AtomicUsize>);
+
+impl Drop for ActiveResponse {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+fn abort_benchmark(message: &str) -> ! {
+    eprintln!("fatal benchmark error: {message}");
+    std::process::exit(1);
+}
+
 struct ServerGuard(tokio::task::JoinHandle<()>);
 
 impl Drop for ServerGuard {
@@ -468,9 +481,10 @@ struct Fixture {
     requests: Arc<AtomicUsize>,
     served_bytes: Arc<AtomicU64>,
     ranges: Arc<Mutex<Vec<String>>>,
-    /// One `(start, bytes actually sent)` entry per response, in completion
+    /// One `(start, bytes actually sent)` entry per response, in request
     /// order. Retransmission is measured by overlapping a round's entries.
     sent: Arc<Mutex<Vec<(usize, usize)>>>,
+    active: Arc<AtomicUsize>,
     gate: Option<Arc<Gate>>,
     _server: Arc<ServerGuard>,
 }
@@ -486,6 +500,7 @@ impl Fixture {
         let served_bytes = Arc::new(AtomicU64::new(0));
         let ranges = Arc::new(Mutex::new(Vec::new()));
         let sent = Arc::new(Mutex::new(Vec::new()));
+        let active = Arc::new(AtomicUsize::new(0));
         let gate = shape.gate.clone();
 
         let route = warp::path(path)
@@ -496,6 +511,7 @@ impl Fixture {
                 let served_bytes = served_bytes.clone();
                 let ranges = ranges.clone();
                 let sent = sent.clone();
+                let active = active.clone();
                 let shape = shape.clone();
                 move |range_header: Option<String>| {
                     let data = data.clone();
@@ -503,8 +519,11 @@ impl Fixture {
                     let served_bytes = served_bytes.clone();
                     let ranges = ranges.clone();
                     let sent = sent.clone();
+                    let active = active.clone();
                     let shape = shape.clone();
                     async move {
+                        active.fetch_add(1, Ordering::SeqCst);
+                        let active_guard = ActiveResponse(active);
                         requests.fetch_add(1, Ordering::SeqCst);
                         ranges
                             .lock()
@@ -522,6 +541,13 @@ impl Fixture {
                             None => (0, total.saturating_sub(1)),
                         };
                         let range_len = end.saturating_sub(start) + 1;
+                        // Reserve in request order, before any asynchronous wait.
+                        let record = {
+                            let mut records = sent.lock().unwrap();
+                            let record = records.len();
+                            records.push((start, 0));
+                            record
+                        };
 
                         let mut response = warp::http::Response::builder()
                             .status(if ranged.is_some() { 206 } else { 200 });
@@ -554,6 +580,7 @@ impl Fixture {
                         let sent = sent.clone();
                         let gate = shape.gate.clone();
                         tokio::spawn(async move {
+                            let _active_guard = active_guard;
                             let shape = task_shape;
                             if let Some(gate) = &gate {
                                 // Read per response: the harness re-arms the
@@ -581,11 +608,11 @@ impl Fixture {
                                 }
                                 served.fetch_add((chunk_end - offset) as u64, Ordering::Relaxed);
                                 offset = chunk_end;
-                                if let Some(delay) = delay {
+                                if let Some(delay) = delay.filter(|_| offset < send_limit) {
                                     tokio::time::sleep(delay).await;
                                 }
                             }
-                            sent.lock().unwrap().push((start, offset));
+                            sent.lock().unwrap()[record] = (start, offset);
                         });
 
                         Ok::<_, std::convert::Infallible>(response.body(body).unwrap())
@@ -601,6 +628,7 @@ impl Fixture {
             served_bytes,
             ranges,
             sent,
+            active,
             gate,
             _server: Arc::new(ServerGuard(tokio::spawn(server))),
         }
@@ -1094,10 +1122,11 @@ async fn measure_download(
     let elapsed_millis = millis(started.elapsed());
     let result = match tokio::time::timeout(CANCEL_GRACE, handle.wait()).await {
         Ok(result) => result,
-        Err(_) => Err(bytehaul::DownloadError::Internal(
-            "harness round timeout: the download did not finalize after cancel".into(),
-        )),
+        Err(_) => abort_benchmark("download did not finalize after cancel; counters are unsafe"),
     };
+    if !wait_until(|| fixture.active.load(Ordering::SeqCst) == 0, CANCEL_GRACE).await {
+        abort_benchmark("fixture responses did not settle; counters are unsafe");
+    }
     let counters = bench_counters_snapshot();
     let fixture = fixture.delta_since(before);
     let file_bytes = std::fs::metadata(output)

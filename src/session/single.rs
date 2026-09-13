@@ -243,25 +243,43 @@ pub(super) async fn run_single_with_retry(
     let mut snap_template = single_snapshot_template(request_url, total_size, offset, &baseline);
 
     loop {
+        let control_ctx = SingleControlSaveContext {
+            control_path,
+            snap_template: &snap_template,
+            autosave_sync_every: spec.autosave_sync_every,
+            log_level,
+            download_id,
+        };
         let (response, response_meta) = if let Some(response) = pending_response.take() {
             response
         } else {
-            let request_result = if offset > 0 {
-                if let Some(total) = total_size {
-                    worker.send_range(offset, total.saturating_sub(1)).await
-                } else {
-                    worker.send_get().await
+            let request_result = tokio::select! {
+                biased;
+                error = wait_for_stop(&mut cancel_rx) => {
+                    return finish_single_error(&mut writer, error, use_control,
+                        &mut control_save_tracker, &control_ctx).await;
                 }
-            } else {
-                worker.send_get().await
+                result = async {
+                    if let (true, Some(total)) = (offset > 0, total_size) {
+                        worker.send_range(offset, total.saturating_sub(1)).await
+                    } else {
+                        worker.send_get().await
+                    }
+                } => result,
             };
 
             match request_result {
                 Ok(response) => response,
                 Err(error) => match retry_state.decide(error) {
                     RetryDecision::Stop(error) => {
-                        writer.close().await?;
-                        return Err(error);
+                        return finish_single_error(
+                            &mut writer,
+                            error,
+                            use_control,
+                            &mut control_save_tracker,
+                            &control_ctx,
+                        )
+                        .await;
                     }
                     RetryDecision::Retry {
                         error,
@@ -283,8 +301,14 @@ pub(super) async fn run_single_with_retry(
                             None,
                         );
                         if let Err(stop_error) = sleep_with_backoff(backoff, &mut cancel_rx).await {
-                            writer.close().await?;
-                            return Err(stop_error);
+                            return finish_single_error(
+                                &mut writer,
+                                stop_error,
+                                use_control,
+                                &mut control_save_tracker,
+                                &control_ctx,
+                            )
+                            .await;
                         }
                         continue;
                     }
@@ -344,8 +368,14 @@ pub(super) async fn run_single_with_retry(
                 };
                 match retry_state.decide_restart(error) {
                     RetryDecision::Stop(error) => {
-                        writer.close().await?;
-                        return Err(error);
+                        return finish_single_error(
+                            &mut writer,
+                            error,
+                            use_control,
+                            &mut control_save_tracker,
+                            &control_ctx,
+                        )
+                        .await;
                     }
                     RetryDecision::Retry {
                         error,
@@ -367,8 +397,14 @@ pub(super) async fn run_single_with_retry(
                             Some("range_or_metadata_mismatch"),
                         );
                         if let Err(stop_error) = sleep_with_backoff(backoff, &mut cancel_rx).await {
-                            writer.close().await?;
-                            return Err(stop_error);
+                            return finish_single_error(
+                                &mut writer,
+                                stop_error,
+                                use_control,
+                                &mut control_save_tracker,
+                                &control_ctx,
+                            )
+                            .await;
                         }
                         // The replacement object's size is not known until a
                         // fresh GET arrives; do not preallocate using the old
@@ -475,30 +511,14 @@ pub(super) async fn run_single_with_retry(
                 if matches!(error, DownloadError::Cancelled | DownloadError::Paused)
                     || !error.is_retryable()
                 {
-                    // The writer still finishes its required work before the
-                    // error leaves this function: a stop request must not skip a
-                    // durable barrier.
-                    writer.close().await?;
-                    if use_control {
-                        if let Err(save_error) = persist_single_control_snapshot(
-                            ControlSaveReason::Terminal,
-                            writer.written_bytes.load(Ordering::Acquire),
-                            None,
-                            &mut control_save_tracker,
-                            &control_ctx,
-                        )
-                        .await
-                        {
-                            // No checkpoint means no resumable stop: reporting
-                            // `Paused` (or `Cancelled`) here would promise a
-                            // resume point that does not exist, so the storage
-                            // error leaves as the task's result instead.
-                            log_error!(log_level, download_id = download_id, error = %save_error,
-                                "the stop checkpoint could not be saved; failing instead of reporting a stopped download");
-                            return Err(save_error);
-                        }
-                    }
-                    return Err(error);
+                    return finish_single_error(
+                        &mut writer,
+                        error,
+                        use_control,
+                        &mut control_save_tracker,
+                        &control_ctx,
+                    )
+                    .await;
                 }
 
                 let stats = writer.flush().await?;
@@ -520,8 +540,14 @@ pub(super) async fn run_single_with_retry(
 
                 match retry_state.decide(error) {
                     RetryDecision::Stop(error) => {
-                        writer.close().await?;
-                        return Err(error);
+                        return finish_single_error(
+                            &mut writer,
+                            error,
+                            use_control,
+                            &mut control_save_tracker,
+                            &control_ctx,
+                        )
+                        .await;
                     }
                     RetryDecision::Retry {
                         error,
@@ -554,8 +580,14 @@ pub(super) async fn run_single_with_retry(
                             restart_from_zero.then_some(restart_reason),
                         );
                         if let Err(stop_error) = sleep_with_backoff(backoff, &mut cancel_rx).await {
-                            writer.close().await?;
-                            return Err(stop_error);
+                            return finish_single_error(
+                                &mut writer,
+                                stop_error,
+                                use_control,
+                                &mut control_save_tracker,
+                                &control_ctx,
+                            )
+                            .await;
                         }
                         if restart_from_zero {
                             writer.reset(output_path, spec, None).await?;
@@ -577,6 +609,28 @@ pub(super) async fn run_single_with_retry(
             }
         }
     }
+}
+
+/// Drain and sync the writer before publishing a durable terminal checkpoint.
+async fn finish_single_error(
+    writer: &mut SingleWriterRuntime,
+    error: DownloadError,
+    use_control: bool,
+    tracker: &mut ControlSaveTracker,
+    ctx: &SingleControlSaveContext<'_>,
+) -> Result<(), DownloadError> {
+    writer.close().await?;
+    if use_control {
+        persist_single_control_snapshot(
+            ControlSaveReason::Terminal,
+            writer.written_bytes.load(Ordering::Acquire),
+            None,
+            tracker,
+            ctx,
+        )
+        .await?;
+    }
+    Err(error)
 }
 
 /// Finish the transfer only after both the flush barrier and writer shutdown
@@ -1727,6 +1781,108 @@ mod tests {
     async fn test_continuation_request_backoff_observes_pause_and_cancel() {
         assert_continuation_request_failure(Some(StopSignal::Pause)).await;
         assert_continuation_request_failure(Some(StopSignal::Cancel)).await;
+    }
+
+    #[tokio::test]
+    async fn test_stop_during_backoff_or_pending_headers_preserves_storage_errors() {
+        for pending_headers in [false, true] {
+            for broken_checkpoint in [false, true] {
+                for signal in [StopSignal::Pause, StopSignal::Cancel] {
+                    let (initial_url, initial_server) =
+                        spawn_single_response_server(8, b"data".to_vec(), Duration::ZERO);
+                    let response = get_response(&initial_url).await;
+                    let (stop_tx, stop_rx) = watch::channel(StopSignal::Running);
+                    let head_entered = Arc::new(tokio::sync::Notify::new());
+                    let entered = head_entered.clone();
+                    let route = warp::any().and_then(move || {
+                        let entered = entered.clone();
+                        async move {
+                            entered.notify_one();
+                            std::future::pending::<()>().await;
+                            Ok::<_, std::convert::Infallible>("")
+                        }
+                    });
+                    let (addr, server) = warp::serve(route).bind_ephemeral(([127, 0, 0, 1], 0));
+                    let server = tokio::spawn(server);
+                    let url = format!("http://{addr}/pending");
+                    let delay = if pending_headers {
+                        Duration::ZERO
+                    } else {
+                        Duration::from_secs(30)
+                    };
+                    let spec = test_spec(&url)
+                        .max_retries(2)
+                        .retry_base_delay(delay)
+                        .retry_max_delay(delay)
+                        .file_allocation(crate::config::FileAllocation::None);
+                    let dir = tempfile::tempdir().unwrap();
+                    let output = dir.path().join("stop.bin");
+                    let control = dir.path().join("stop.bytehaul");
+                    if broken_checkpoint {
+                        std::fs::create_dir(&control).unwrap();
+                    }
+                    let (progress_tx, _) = watch::channel(ProgressSnapshot::default());
+                    let stop = async {
+                        if pending_headers {
+                            head_entered.notified().await;
+                        } else {
+                            // Retry progress is published only after the writer barrier.
+                            while progress_tx.borrow().downloaded != 4 {
+                                tokio::time::sleep(Duration::from_millis(1)).await;
+                            }
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                        }
+                        stop_tx.send(signal).unwrap();
+                    };
+                    let meta = single_response_meta(8);
+                    let run = run_single_connection(
+                        response,
+                        &meta,
+                        &url,
+                        &spec,
+                        &output,
+                        0,
+                        &progress_tx,
+                        stop_rx,
+                        &control,
+                        Some(8),
+                        SpeedLimit::new(0),
+                        LogLevel::Off,
+                        18,
+                    );
+                    let (result, ()) = tokio::time::timeout(Duration::from_millis(500), async {
+                        tokio::join!(run, stop)
+                    })
+                    .await
+                    .expect("stop must interrupt backoff and pending headers");
+                    let error = result.unwrap_err();
+                    if broken_checkpoint {
+                        assert!(matches!(error, DownloadError::Io(_)), "{error:?}");
+                        assert_deferred_terminal_state(
+                            &progress_tx,
+                            Err(error),
+                            DownloadState::Failed,
+                        );
+                    } else {
+                        assert!(matches!(
+                            (signal, error),
+                            (StopSignal::Pause, DownloadError::Paused)
+                                | (StopSignal::Cancel, DownloadError::Cancelled)
+                        ));
+                        assert_eq!(
+                            ControlSnapshot::load(&control)
+                                .await
+                                .unwrap()
+                                .downloaded_bytes,
+                            4
+                        );
+                    }
+                    assert_eq!(tokio::fs::read(&output).await.unwrap(), b"data");
+                    server.abort();
+                    join_server(initial_server).await;
+                }
+            }
+        }
     }
 
     #[tokio::test]
