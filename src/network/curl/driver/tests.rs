@@ -1687,12 +1687,12 @@ async fn pools_are_counted_per_origin() {
 ///
 /// The count is process-wide, so it is compared with `<=`: other tests of this
 /// binary may add driver threads while this one waits.
-async fn wait_for_live_threads(baseline: isize, timeout: Duration) -> isize {
+async fn wait_for_live_threads(baseline: i64, timeout: Duration) -> i64 {
     let deadline = Instant::now() + timeout;
-    let mut live = live_threads::count();
+    let mut live = crate::bench_stats::driver_threads();
     while live > baseline && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(5)).await;
-        live = live_threads::count();
+        live = crate::bench_stats::driver_threads();
     }
     live
 }
@@ -1706,7 +1706,7 @@ async fn wait_for_live_threads(baseline: isize, timeout: Duration) -> isize {
 /// clients accumulated one driver thread per client.
 #[tokio::test]
 async fn the_driver_thread_stops_with_the_last_reference() {
-    let baseline = live_threads::count();
+    let baseline = crate::bench_stats::driver_threads();
     let driver = DriverHandle::spawn(DriverConfig::default());
     let shared = driver.shared.clone();
     assert!(shared.alive.load(Ordering::SeqCst));
@@ -2085,7 +2085,7 @@ async fn a_live_body_stream_keeps_the_driver_running() {
 /// Repeating the lifecycle must not accumulate threads.
 #[tokio::test]
 async fn repeated_driver_lifecycles_do_not_accumulate_threads() {
-    let baseline = live_threads::count();
+    let baseline = crate::bench_stats::driver_threads();
 
     let mut flags = Vec::new();
     for _ in 0..4 {

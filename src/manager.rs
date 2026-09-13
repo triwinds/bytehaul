@@ -244,7 +244,13 @@ impl Downloader {
                 // another download to release its permit (B3).
                 let _permit = match &concurrency_limit {
                     Some(semaphore) => {
-                        Some(acquire_download_permit(semaphore, &mut cancel_rx).await?)
+                        let queued_at = crate::bench_stats::phase_start();
+                        let permit = acquire_download_permit(semaphore, &mut cancel_rx).await?;
+                        crate::bench_stats::record_phase(
+                            queued_at,
+                            crate::bench_stats::record_queue_wait,
+                        );
+                        Some(permit)
                     }
                     None => None,
                 };
@@ -375,6 +381,14 @@ impl Downloader {
 
     pub(crate) fn bench_cached_client_count(&self) -> usize {
         self.client_cache.lock().len()
+    }
+
+    /// The client the downloader's default network configuration resolves to.
+    ///
+    /// Used by the local pipeline harness to read the driver counters of the
+    /// connection the default download path actually uses.
+    pub(crate) fn bench_default_client(&self) -> Result<BytehaulClient, DownloadError> {
+        cached_client_for_config(&self.client_cache, self.client_config.clone())
     }
 }
 

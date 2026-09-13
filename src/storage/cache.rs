@@ -64,6 +64,9 @@ impl WriteBackCache {
         }
         entry.data.extend_from_slice(&data);
         self.total_bytes += data.len();
+        if crate::bench_stats::enabled() {
+            crate::bench_stats::record_cache_copy(data.len());
+        }
         Ok(())
     }
 
@@ -71,6 +74,9 @@ impl WriteBackCache {
         match self.pieces.remove(&lease_key) {
             Some(entry) => {
                 self.total_bytes -= entry.data.len();
+                if crate::bench_stats::enabled() {
+                    crate::bench_stats::record_cache_evict(entry.data.len());
+                }
                 vec![FlushBlock {
                     offset: entry.offset,
                     data: entry.data.freeze(),
@@ -84,6 +90,9 @@ impl WriteBackCache {
         match self.pieces.remove(&lease_key) {
             Some(entry) => {
                 self.total_bytes -= entry.data.len();
+                if crate::bench_stats::enabled() {
+                    crate::bench_stats::record_cache_evict(entry.data.len());
+                }
                 entry.data.len()
             }
             None => 0,
@@ -99,6 +108,9 @@ impl WriteBackCache {
                 data: entry.data.freeze(),
             })
             .collect();
+        if crate::bench_stats::enabled() {
+            crate::bench_stats::record_cache_evict(self.total_bytes);
+        }
         self.total_bytes = 0;
         blocks.sort_unstable_by_key(|block| block.offset);
         blocks

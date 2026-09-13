@@ -29,7 +29,9 @@ use crate::http::{
 use crate::network::dns::BytehaulDnsResolver;
 use crate::network::ClientNetworkConfig;
 
-use super::driver::{DriverConfig, DriverHandle, RequestOptions, ResolveEntry, Transfer};
+use super::driver::{
+    DriverConfig, DriverHandle, DriverStats, RequestOptions, ResolveEntry, Transfer,
+};
 
 /// Head deadline used by the test-only deadline-less request helper, so it
 /// cannot wait forever on a silent server.
@@ -91,6 +93,11 @@ pub(crate) struct CurlTransport {
 }
 
 impl CurlTransport {
+    /// Counters reported by this client's driver thread.
+    pub(crate) fn driver_stats(&self) -> DriverStats {
+        self.driver.stats()
+    }
+
     pub(crate) fn new(config: &ClientNetworkConfig) -> Result<Self, DownloadError> {
         let proxies = config.effective_proxies()?;
         // Use the shared resolver so a custom name server, a DoH endpoint or

@@ -23,6 +23,7 @@ pub(crate) async fn create_output_file(
     }
 
     let path = path.to_path_buf();
+    let started = crate::bench_stats::phase_start();
     let std_file = tokio::task::spawn_blocking(move || -> Result<std::fs::File, DownloadError> {
         let file = std::fs::File::create(&path)?;
 
@@ -36,6 +37,7 @@ pub(crate) async fn create_output_file(
     })
     .await
     .map_err(|e| DownloadError::TaskFailed(format!("spawn_blocking join error: {e}")))??;
+    crate::bench_stats::record_phase(started, crate::bench_stats::record_prealloc);
 
     Ok(tokio::fs::File::from_std(std_file))
 }

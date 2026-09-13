@@ -482,11 +482,13 @@ pub(crate) async fn run_download(
             algorithm = "sha256",
             "checksum verification started"
         );
-        match verify_checksum(&output_path, expected, || {
+        let verification_started = crate::bench_stats::phase_start();
+        let verification = verify_checksum(&output_path, expected, || {
             stop_signal_error(*cancel_rx.borrow())
         })
-        .await
-        {
+        .await;
+        crate::bench_stats::record_phase(verification_started, crate::bench_stats::record_checksum);
+        match verification {
             Ok(()) => {
                 log_info!(log_level, download_id, "checksum verification passed");
             }

@@ -161,8 +161,10 @@ impl WriterTask {
 
         // Final flush of any remaining cached data
         self.flush_all().await?;
+        let started = crate::bench_stats::phase_start();
         self.file.flush().await?;
         self.file.sync_all().await?;
+        crate::bench_stats::record_phase(started, crate::bench_stats::record_fsync);
         Ok(())
     }
 
@@ -193,12 +195,17 @@ impl WriterTask {
     }
 
     async fn sync_file(&mut self) -> Result<(), DownloadError> {
+        let started = crate::bench_stats::phase_start();
         self.file.flush().await?;
         self.file.sync_data().await?;
+        crate::bench_stats::record_phase(started, crate::bench_stats::record_fsync);
         Ok(())
     }
 
     async fn write_block(&mut self, offset: u64, data: &[u8]) -> Result<(), DownloadError> {
+        if crate::bench_stats::enabled() {
+            crate::bench_stats::record_write_block(data.len() as u64);
+        }
         self.file.seek(std::io::SeekFrom::Start(offset)).await?;
         self.file.write_all(data).await?;
         let end = offset + data.len() as u64;

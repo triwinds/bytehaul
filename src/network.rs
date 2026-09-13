@@ -85,6 +85,14 @@ impl BytehaulClient {
             Self::Curl(transport) => transport.request(req, timeout).await,
         }
     }
+
+    /// Counters reported by the transport's driver thread, when it has one.
+    pub(crate) fn driver_stats(&self) -> Option<crate::network::curl::driver::DriverStats> {
+        match self {
+            #[cfg(feature = "curl-backend")]
+            Self::Curl(transport) => Some(transport.driver_stats()),
+        }
+    }
 }
 
 impl Default for ClientNetworkConfig {

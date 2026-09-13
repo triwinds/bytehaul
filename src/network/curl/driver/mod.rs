@@ -341,6 +341,12 @@ pub(crate) struct DriverStats {
     pub connections: u64,
     /// Commands processed by the driver thread.
     pub commands: u64,
+    /// Turns of the driver's main loop.
+    ///
+    /// One turn performs every pool once and then waits; a loop count that
+    /// keeps rising while nothing is in flight is a busy wait, which is what
+    /// the idle-wait paths of the driver are measured against.
+    pub loops: u64,
     /// Pause/unpause round trips caused by body backpressure.
     pub pauses: u64,
     pub resumes: u64,
@@ -363,6 +369,7 @@ struct DriverCounters {
     cancelled: AtomicU64,
     connections: AtomicU64,
     commands: AtomicU64,
+    loops: AtomicU64,
     pauses: AtomicU64,
     resumes: AtomicU64,
     idle_clears: AtomicU64,
@@ -872,6 +879,7 @@ impl DriverShared {
             cancelled: self.counters.cancelled.load(Ordering::SeqCst),
             connections: self.counters.connections.load(Ordering::SeqCst),
             commands: self.counters.commands.load(Ordering::SeqCst),
+            loops: self.counters.loops.load(Ordering::SeqCst),
             pauses: self.counters.pauses.load(Ordering::SeqCst),
             resumes: self.counters.resumes.load(Ordering::SeqCst),
             idle_clears: self.counters.idle_clears.load(Ordering::SeqCst),
@@ -910,11 +918,17 @@ impl DriverHandle {
         // the exit guard watches it weakly, otherwise the count could never
         // reach one and the thread would outlive its last handle.
         let guard_queue = Arc::downgrade(&queue);
+        // The thread counts itself for as long as it runs, so a driver thread
+        // that outlives its last handle is visible as a count that never
+        // returns to its baseline (see `bench_stats`). The guard is created
+        // here rather than inside the closure: a caller that has just spawned
+        // a driver must always see the count it started, not a count that
+        // depends on when the new thread was first scheduled.
+        let live = crate::bench_stats::DriverThreadGuard::new();
         thread::Builder::new()
             .name("bytehaul-libcurl-driver".into())
             .spawn(move || {
-                #[cfg(test)]
-                let _live = live_threads::LiveThreadGuard::new();
+                let _live = live;
                 let guard = ExitGuard {
                     shared: thread_shared.clone(),
                     queue: guard_queue,
@@ -1051,38 +1065,6 @@ impl Drop for ExitGuard {
         if let Some(queue) = self.queue.upgrade() {
             queue.close();
         }
-    }
-}
-
-/// Counts live driver threads so a test can observe that they stop.
-///
-/// `thread::Builder::spawn` offers no way to join or observe the end of the
-/// thread, and the regression this guards against - a driver thread that never
-/// exits because it holds a reference to its own liveness token - is only
-/// visible as a thread count that keeps growing.
-#[cfg(test)]
-mod live_threads {
-    use std::sync::atomic::{AtomicIsize, Ordering};
-
-    static LIVE: AtomicIsize = AtomicIsize::new(0);
-
-    pub(super) struct LiveThreadGuard;
-
-    impl LiveThreadGuard {
-        pub(super) fn new() -> Self {
-            LIVE.fetch_add(1, Ordering::SeqCst);
-            Self
-        }
-    }
-
-    impl Drop for LiveThreadGuard {
-        fn drop(&mut self) {
-            LIVE.fetch_sub(1, Ordering::SeqCst);
-        }
-    }
-
-    pub(super) fn count() -> isize {
-        LIVE.load(Ordering::SeqCst)
     }
 }
 
@@ -1598,6 +1580,7 @@ fn run_driver(queue: Arc<CommandQueue>, shared: Arc<DriverShared>, config: Drive
     let mut shutting_down = false;
 
     while !shutting_down {
+        shared.counters.loops.fetch_add(1, Ordering::SeqCst);
         // 1. Commands first: they are both work and the loop's wakeup source.
         draining.clear();
         queue.drain(&mut draining);
