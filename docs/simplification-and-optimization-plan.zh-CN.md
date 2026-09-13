@@ -1,6 +1,6 @@
 # bytehaul 简化与优化实施计划
 
-日期：2026-09-13。状态：实施中；P0、P1 已完成，其余阶段待实施。审查阶段已完成代码审查和四项行为问题的复现，B1–B4 已在 P0 修复并转为回归测试；P1 已完成默认路径与资源基线归档。
+日期：2026-09-13。状态：实施中；P0、P1 已完成，并已按评审意见修正（见[P0/P1 评审修正记录](#p0p1-评审修正记录)），其余阶段待实施。审查阶段已完成代码审查和四项行为问题的复现，B1–B4 已在 P0 修复并转为回归测试；P1 已完成默认路径与资源基线归档，并在评审后重新采集。
 
 审查基线：`2161fd4388bec05ec7183605e88b7e1c2b939164`，bytehaul 0.2.4，Windows。本文件记录后续工作；P1 及之后的阶段尚未执行，不表示下列重构或性能优化已经完成。
 
@@ -47,12 +47,12 @@ cargo test -p bytehaul --locked --offline --test m6_features --test m8_pause_res
 | --- | --- | --- | --- |
 | client 资源增长 | 完整 `ClientNetworkConfig` 作为无淘汰缓存的 key；不同连接超时可创建不同 client；每个 client 创建 resolver 和驱动线程 | 长期运行时的缓存数量、线程数和复用率 | 已量化：32 个不同超时 = 33 个缓存条目与 33 个驱动线程；同配置 40 次取用 = 1 条 / 1 线程；释放后线程归零 |
 | worker 职责耦合 | `Coordinator::new_with_start` 仅在 `Disabled + Fixed + request_batch_size=0` 时返回 `None`，普通动态调度和批处理也依赖 adaptive 执行路径 | 两套 worker 的维护成本及重构后的行为一致性 | 未测（属结构问题，P3 用行为矩阵而非耗时判断） |
-| 文件写入成本 | Windows 默认预分配先写零并同步；单连接逐块 `seek + write_all`；多连接缓存追加时复制数据 | 启动时间、CPU、文件操作次数和总完成时间 | 已量化：单连接 4 MiB = 257 次写块（平均 16320 字节）且不经写回缓存，split 12 MiB = 12 块 / 1 MiB；1 MiB 预算 = 47.5 块；预分配 12 MiB ≈ 7.7 ms 对按需增长 0.58 ms |
-| driver 等待 | 推进所有 pool，却只等待 `pools.values().next()` 选出的 pool，未保证它有活动请求 | 多 origin 或暂停传输时的空转、命令延迟和事件处理延迟 | 已复现：停滞 pool + 空闲 pool 场景跨进程双峰，静止期 42–437112 次/秒；纯空闲场景 0 次 |
+| 文件写入成本 | Windows 默认预分配先写零并同步；单连接逐块 `seek + write_all`；多连接缓存追加时复制数据 | 启动时间、CPU、文件操作次数和总完成时间 | 已量化：单连接 4 MiB = 256 次写块（平均 16384 字节）且不经写回缓存，split 12 MiB = 12 块 / 1 MiB；1 MiB 预算 = 48.5 块；预分配 12 MiB ≈ 8.0 ms 对按需增长 0.64 ms |
+| driver 等待 | 推进所有 pool，却只等待 `pools.values().next()` 选出的 pool，未保证它有活动请求 | 多 origin 或暂停传输时的空转、命令延迟和事件处理延迟 | 已复现：停滞 pool + 空闲 pool 场景单进程逐轮双峰，静止期 41–47 对 44 万次/秒；纯空闲场景 0 次 |
 | 配置与 CI 重复 | Rust/Python 多处声明和验证选项；唯一后端保留单分支包装；CI 完整运行两个等价 feature 组合 | 配置规则漂移、重复构建与测试时间 | 未测（P2/P6 按规则一致性和 CI 时长判断） |
 | 基准与默认路径不一致 | scheduler 基准主要调用 `assign_to_with_split`，默认下载还经过动态候选与请求规划 | 默认策略的调度开销是否进入现有测量 | 已解决：`bench_scheduler_plan` 按自适应 worker 的方式驱动 `assign_request_with_diagnostics`；默认 Dynamic 与 Fixed 的请求数差异已可测（4096 piece：64 对 1024） |
 
-driver 空转属于代码和接口语义推导，尚未实测：libcurl 在没有可等待描述符时会让 `curl_multi_wait` 立即返回。[官方说明](https://curl.se/libcurl/c/curl_multi_wait.html)
+driver 空转属于代码和接口语义推导，P1 已实测复现，见[基线报告 4.4](pipeline-baseline.zh-CN.md)：libcurl 在没有可等待描述符时会让 `curl_multi_wait` 立即返回。[官方说明](https://curl.se/libcurl/c/curl_multi_wait.html)
 
 P1 的测量结果、复现命令与判据见[默认路径与资源基线](pipeline-baseline.zh-CN.md)。
 
@@ -103,7 +103,7 @@ P1 的测量结果、复现命令与判据见[默认路径与资源基线](pipel
 
 ### P1：建立默认路径与资源基线
 
-状态：已完成（见文末 P1 完成记录与[基线报告](pipeline-baseline.zh-CN.md)）。
+状态：已完成，基线在评审修正后重新采集（见文末 P1 完成记录与[基线报告](pipeline-baseline.zh-CN.md)）。
 
 改动位置：[storage_bench.rs](../benches/storage_bench.rs)、[lib.rs](../src/lib.rs) 的 bench 包装、现有本地 HTTP 夹具和 [公网比较入口](public-comparison.zh-CN.md)。按需要增加专门的本地管线基准。
 
@@ -253,25 +253,25 @@ P0 期间由新测试暴露并修复的两处既有缺陷：
 
 最终行为：
 
-- 新增 [bench_stats.rs](../src/bench_stats.rs)：采集开关默认关闭，每处记录点先做一次 `Relaxed` 读取；打开后记录 writer 写块数与字节数、写回缓存拷贝与释放字节、`flush`+`sync` 次数与耗时、并发排队时长、输出文件创建与预分配耗时、校验和耗时，以及驱动线程数这一实时 gauge。没有行为读取计数器，正常下载只多一次可预测分支。
+- 新增 [bench_stats.rs](../src/bench_stats.rs)：采集开关默认关闭，每处记录点先做一次 `Relaxed` 读取；打开后记录 writer 写块数与字节数、写回缓存拷贝与释放字节、`flush`+`sync` 次数与耗时、并发排队时长、输出文件创建与预分配耗时、请求→响应头耗时、body 等待耗时、校验和耗时，以及驱动线程数这一实时 gauge。没有行为读取计数器，正常下载只多一次可预测分支（唯一例外是请求→响应头耗时：该时长本就为日志与诊断测量，记录点自己读一次开关）。
 - 驱动线程计数改为在 `DriverHandle::spawn` 创建 guard（而不是在线程闭包内），因此刚启动驱动的调用方一定能看到自己启动的线程；测试专用的 `live_threads` 模块与重复计数器被删除。
 - [driver/mod.rs](../src/network/curl/driver/mod.rs) 增加主循环轮次计数 `DriverStats::loops`，用于识别空闲等待退化。
 - [lib.rs](../src/lib.rs) 的 bench 包装新增计数器访问器、client 的驱动计数器、缓存条目数、可由调用方构造 `PieceMap` 的 scheduler，以及 `bench_scheduler_plan`——它按自适应 worker 循环的方式驱动 `assign_request_with_diagnostics`，覆盖了原有 `assign_to_with_split` 基准没有测到的默认路径。
-- 新增 [pipeline_bench.rs](../benches/pipeline_bench.rs)：`harness = false` 的独立基准二进制（不用 criterion），五组共 42 个场景，全部使用本文件内的回环夹具；输出 `report.md` 与 `samples.csv`，记录 commit、工具链、平台、libcurl/TLS 特征、配置与计时边界，并保留逐轮数据。场景本身不作公网断言，也不设通过/失败门槛。
-- 新增 [pipeline_counters.rs](../tests/pipeline_counters.rs)：用真实下载验证计数器——关闭采集时一次完整下载不记录任何东西；打开后写块数、缓存拷贝、预分配、同步与校验耗时与真实字节数一致；每个释放的 client 都让驱动线程数回到基线。
+- 新增 [pipeline_bench.rs](../benches/pipeline_bench.rs)：`harness = false` 的独立基准二进制（不用 criterion），五组共 42 个场景，全部使用本文件内的回环夹具；输出 `report.md` 与 `samples.csv`，记录 commit、工具链、平台、libcurl/TLS 特征、配置与计时边界，并保留逐轮数据。场景本身不作公网断言，也不设通过/失败门槛。`--archive DIR` 把这两份产物复制到 `target` 之外，因为只存在于被忽略目录里的数据无法被文档引用。
+- 新增 [pipeline_counters.rs](../tests/pipeline_counters.rs)：用真实下载验证计数器——关闭采集时一次完整下载不记录任何东西；打开后写块数、缓存拷贝、预分配、同步、响应头与 body 等待、校验耗时与真实字节数一致；每个释放的 client 都让驱动线程数回到基线。
 
 P1 由测量本身暴露并修复的三处缺陷：
 
 1. 基准的 scheduler 指标原先只走 `assign_to_with_split`，与默认下载实际经过的候选扫描和请求规划不同。新增 `bench_scheduler_plan` 后，默认 Dynamic 与 Fixed 的差别（4096 piece 时 64 对 1024 个请求）才真正可测。
-2. 用进度回调任务观测时间边界会漏掉短下载的全部快照（回调任务被独立调度）。改为在同一 `select!` 中同时等待 `wait()` 与进度通道后，各阶段数值才有意义；报告同时输出 `running_reports`，明确这些边界受进度发布节奏限制。
+2. 用进度回调任务观测时间边界会漏掉短下载的全部快照（回调任务被独立调度）。改为在同一任务中同时等待终态与进度通道后，各阶段数值才有意义；报告同时输出 `running_reports`，明确这些边界受进度发布节奏限制。
 3. 慢尾夹具把"范围内偏移"与"文件内位置"混用，导致限速分支从不触发（测得 62 ms，与普通形态无异）。改为按绝对位置判断后为 381 ms，与设计的 256 KiB / 20 ms 一致。
 
 验收结果：
 
-- 42 个场景 × 10 轮的完整结果已归档，见[基线报告](pipeline-baseline.zh-CN.md)。现有默认下载实际经过的路径均可测量：动态请求规划、写回缓存与单连接直写、client 缓存与驱动线程、驱动主循环与取消延迟，以及七种端到端形态。
-- 能够区分"减少请求""减少复制""减少磁盘操作"：Dynamic 对 Fixed 的请求数（64 对 1024）、源侧块大小对写块数无影响但对摄入成本有影响、单连接 257 次写块对 split 的 12 次、1 MiB 预算把块数推到 47.5。
+- 42 个场景 × 10 轮的完整结果已归档到 [docs/pipeline-baseline-run/](pipeline-baseline-run/)（`report.md` 摘要见[基线报告](pipeline-baseline.zh-CN.md)，逐轮原始数据见其中的 `samples.csv`）。现有默认下载实际经过的路径均可测量：动态请求规划、写回缓存与单连接直写、client 缓存与驱动线程、驱动主循环与取消延迟，以及七种端到端形态。
+- 能够区分"减少请求""减少复制""减少磁盘操作"：Dynamic 对 Fixed 的请求数（64 对 1024）、源侧块大小对写块数无影响但对摄入成本有影响、单连接 256 次写块对 split 的 12 次、1 MiB 预算把块数推到 48.5。
 - 结果不依赖公网速度断言：全部夹具在本机回环，CI 未加入任何性能门槛。
-- 验证命令：`cargo fmt --all -- --check`、`cargo clippy --workspace --locked --all-targets -- -D warnings`、`cargo doc --no-deps -p bytehaul --locked`（`RUSTDOCFLAGS=-D warnings`）、`cargo test -p bytehaul --locked --all-targets`（lib 523 项通过 / 3 项忽略，集成 100 项通过，doc 1 项通过）与 `cargo test -p bytehaul --locked --doc`。唯一失败项仍是 P0 已记录的 `http_header_timeout::header_deadline_includes_tls_handshake`（本机 libcurl 报 `SSL connect error`，与改动无关，未修改）。
+- 验证命令：`cargo fmt --all -- --check`、`cargo clippy --workspace --locked --all-targets -- -D warnings`、`cargo doc --no-deps -p bytehaul --locked`（`RUSTDOCFLAGS=-D warnings`）、`cargo test -p bytehaul --locked --all-targets`（lib 524 项通过 / 3 项忽略，集成 103 项通过，doc 1 项通过）与 `cargo test -p bytehaul --locked --doc`。`http_header_timeout::header_deadline_includes_tls_handshake` 在本机间歇失败（单独运行该目标 5 次失败 1 次，整轮并行测试更容易失败；本机 libcurl 报 `SSL connect error`），该现象在 P1 之前的 `2161fd4` 上同样存在，与改动无关，未修改。
 - 未执行 Linux 覆盖率门槛。基线只在 Windows x86_64 上采集，该限制与主机噪声已写入基线报告。
 
 兼容性影响：无公开 API 与行为变化。新增的计数器、循环计数与 guard 均为增量；删除的 `live_threads` 测试辅助由进程级 gauge 取代，两项驱动线程回归测试仍断言原有内容。
@@ -279,11 +279,34 @@ P1 由测量本身暴露并修复的三处缺陷：
 顺便确认的下一阶段判据：
 
 - P2：缓存条目与驱动线程一一对应且无上限（32 个超时 → 33 条 / 33 线程），修复后应在超过容量时保持有界并让线程回落。
-- P4：单连接 4 MiB 的 257 次写块（平均 16320 字节、不经缓存）与 12 MiB 预分配的约 7.7 ms 是两个直接可对照的基线数字。
-- P5：停滞 pool + 空闲 pool 场景的静止期循环数跨进程双峰（42 对 437112 次/秒），修复判据是所有进程都落在 20 ms 一级的一档；纯空闲场景已经是不空转（0 次）。
+- P4：单连接 4 MiB 的 256 次写块（平均 16384 字节、不经缓存）与 12 MiB 预分配的约 8.0 ms 是两个直接可对照的基线数字。
+- P5：停滞 pool + 空闲 pool 场景的静止期循环数在同一进程内逐轮双峰（41–47 对 44 万次/秒），修复判据是每一轮都落在 20 ms 一级的一档；纯空闲场景已经是不空转（0 次）。
 
-- [x] P0：生命周期问题修复并通过回归测试。
-- [x] P1：默认执行路径与资源基线归档。
+### P0/P1 评审修正记录
+
+对 `c49d127` 的评审确认 B1–B4 的修复有效，但发现下列 6 个问题，因此当时**不宜标记 P0/P1 全部完成**。修正分两次提交：`ddf8faf`（P0 错误路径）与 `2b53566`（P1 测量缺陷），基线数据在修正后重新采集（`docs/pipeline-baseline-run/`）。
+
+| # | 级别 | 问题 | 最终行为 | 证据 |
+| --- | --- | --- | --- | --- |
+| 1 | 高（P0） | 断点保存失败仍报告暂停成功：`persist_single_control_snapshot` 与多连接同名函数只记录错误`log_warn`，不向外返回；把断点路径设为目录后暂停，得到 `Err(Paused)`、状态 `Paused`，却没有有效断点 | 两个函数改为返回 `Result<(), DownloadError>`，由调用方决定语义：自动保存（autosave、重试屏障）仍为尽力而为（下一次保存与终态保存都会重试），终止保存失败则返回该存储错误，任务以 `Failed` 结束，不再承诺不存在的恢复点 | [m13_lifecycle.rs](../tests/m13_lifecycle.rs) 的 `paused_download_without_a_writable_checkpoint_fails`、`paused_multi_connection_download_without_a_writable_checkpoint_fails`；修正前这两个测试失败 |
+| 2 | 中（P0） | 多连接完成时丢弃 `ControlSnapshot::delete` 的结果，删除失败仍返回 `Ok(())`、状态 `Completed` | 完成路径改为 `ControlSnapshot::delete(control_path).await?`，与单连接一致：删不掉断点就说明"已完成"的描述与磁盘不符，按存储错误结束 | 同一文件的 `multi_connection_cleanup_failure_does_not_report_completed`；修正前该测试失败 |
+| 3 | 中（P1） | "响应头延迟"实际延迟的是 body：夹具在独立 body 任务里 `sleep`，响应头立即返回（实测响应头约 0.5 ms，首字节约 308 ms） | 夹具改为 `async` 路由并在**返回响应之前**等待；新增库内计数器 `response_head_ms`/`body_wait_ms` 分别记录请求→头与 body 等待。[基线 4.5](pipeline-baseline.zh-CN.md)：4 个请求合计 1238.7 ms 的响应头延迟，body 等待仅 41.9 ms | `tests/pipeline_counters.rs` 断言真实下载的 `response_heads`/`response_head_micros`/`body_reads`/`body_read_micros` 均大于 0 |
+| 4 | 中（P1） | 排队场景在所有轮次间共享同一道闸门，首次 `release()` 后不再复位；三轮实测放行前已接纳任务数为 1、2、2，排队时间 157、1.7、2.0 ms，归档数据同一现象 | 闸门改为可重新上锁（`Gate`），每轮开始前复位；归档运行 10 轮的 `admitted_before_release` 均为 1、`queue_waits` 均为 2、排队中位数 159.4 ms | 归档运行逐轮数据 `docs/pipeline-baseline-run/samples.csv` |
+| 5 | 中（P1） | 重复流量指标用"发送总量 − 完整文件大小"，断流场景重复请求首段、重复发送至少 64 KiB，但总发送量不足 12 MiB，指标恒为 0 | 夹具记录每个响应实际发送的 `(起始位置, 字节数)`，由重叠量统计本轮重复发送；断流形态每轮都是 5 个响应 / 327680 字节，其中 65536 字节重复（5 个响应只覆盖 4–5 个不同 Range），其余形态为 0。旧结论"断流没有重复流量"已撤回 | [基线报告第 7 节](pipeline-baseline.zh-CN.md) |
+| 6 | 中（P1） | 基准超时后下载仍在后台运行：超时只丢弃 `wait()` 的 future，按库语义既不取消也不等待，实测返回后仍有活动请求并污染后续轮次的全局计数与资源数据 | 每轮改由进度通道观察终态；到期先 `cancel()`，再继续等待**同一个**任务收尾（最多 30 s），不再有轮次在存活下载之上开始测量。取消轮会被显式记为 `harness round timeout` | 临时把 `ROUND_TIMEOUT` 设为 100 ms 时该路径被触发且未污染后续轮；用旧写法重跑同一场景，后续轮 `served_bytes` 与 `writer_bytes` 被前一轮的下载计入，可稳定复现污染 |
+
+同时补齐评审指出的三项 P1 缺口：
+
+- **CPU 指标**：每轮以 `cpu_ms` 与 `cpu_percent` 记录进程 CPU 时间（Windows `GetProcessTimes`，Linux `/proc/self/stat`），窗口与 `millis` 相同；报告说明它含夹具与基准自身，是上界。
+- **响应头/body 分别计时**：见问题 3 的 `response_head_ms`/`body_wait_ms`。加上 `queue_ms`、`prealloc_ms`、`fsync_ms`、`checksum_ms`，六个阶段现在各自单独记录。
+- **逐轮原始数据持久归档**：新增 `--archive DIR`，归档产物随文档提交到 [docs/pipeline-baseline-run/](pipeline-baseline-run/)（`report.md` 与 523 KB 的 `samples.csv`），不再只留在被忽略的 `target` 下。
+
+修正后按同样命令复验：`cargo fmt --all -- --check`、`cargo clippy --workspace --locked --all-targets -- -D warnings`、`cargo doc --no-deps -p bytehaul --locked`（`RUSTDOCFLAGS=-D warnings`）、`cargo test -p bytehaul --locked --all-targets --no-fail-fast`（lib 524 项通过 / 3 项忽略，集成 `m13_lifecycle` 12 项等共 103 项通过，doc 1 项通过）。既有的 `http_header_timeout::header_deadline_includes_tls_handshake` 在本机间歇失败（单独运行该目标 5 次失败 1 次，整轮并行测试更容易失败），与本次改动无关。
+
+仍待确认的一次性环境问题（与代码无关）：本机 `.git/objects` 的部分目录缺少当前沙箱的写权限，`git add` 偶发 `insufficient permission for adding an object to repository database`；本会话内以逐次提权提交绕过，若不希望继续逐次提权，需要一次管理员操作：`icacls "D:\project\rust-aria2\.git\objects" /reset /T /C`。
+
+- [x] P0：生命周期问题修复并通过回归测试（含评审修正）。
+- [x] P1：默认执行路径与资源基线归档（含评审修正后重采）。
 - [ ] P2：配置解析统一、超时与 client 身份分离、缓存有界。
 - [ ] P3：多连接普通执行统一，恢复策略独立。
 - [ ] P4：存储实验完成，采用有收益的改动或记录保留原实现的依据。
