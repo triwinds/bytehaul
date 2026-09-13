@@ -779,13 +779,12 @@ impl SchedulerState {
 
     fn max_dynamic_slots(&self, candidate: AllocationCandidate, min_split_size: u64) -> usize {
         let piece_count = candidate.end_piece - candidate.first_piece;
-        let by_minimum = if min_split_size == 0 {
-            piece_count
-        } else {
-            usize::try_from(candidate.len() / min_split_size)
-                .unwrap_or(usize::MAX)
-                .max(1)
-        };
+        let by_minimum = candidate
+            .len()
+            .checked_div(min_split_size)
+            .map_or(piece_count, |count| {
+                usize::try_from(count).unwrap_or(usize::MAX).max(1)
+            });
         if by_minimum < 2
             || self
                 .dynamic_legal_split_bounds(candidate, min_split_size)

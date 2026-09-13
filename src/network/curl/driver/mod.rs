@@ -1626,7 +1626,12 @@ fn run_driver(queue: Arc<CommandQueue>, shared: Arc<DriverShared>, config: Drive
                         completions.push((
                             key.clone(),
                             TransferId(token as u64),
-                            result.map_err(|error| (error.code() as u32, error.to_string())),
+                            result.map_err(|error| {
+                                // CURLcode's integer type varies across platforms.
+                                #[allow(clippy::unnecessary_cast)]
+                                let code = error.code() as u32;
+                                (code, error.to_string())
+                            }),
                         ));
                     }
                 }

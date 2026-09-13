@@ -230,6 +230,11 @@ pub(super) async fn primary(
                 },
             )
             .await?;
+        // Preserve the post-enqueue stop boundary before another body poll,
+        // including a final EOF already buffered by the transport.
+        if let Some(error) = stop_signal_error(*stop.borrow()) {
+            return Err(error);
+        }
     }
 }
 

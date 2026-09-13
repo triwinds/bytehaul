@@ -43,7 +43,7 @@ cargo test -p bytehaul --locked --offline --test m6_features --test m8_pause_res
 
 ### 2.2 代码已确认、收益待测的候选
 
-| 候选 | 当前实现 | 待验证影响 | P1 基线状态 |
+| 候选 | 审查基线实现 | 待验证影响 | P1 基线状态 |
 | --- | --- | --- | --- |
 | client 资源增长 | 完整 `ClientNetworkConfig` 作为无淘汰缓存的 key；不同连接超时可创建不同 client；每个 client 创建 resolver 和驱动线程 | 长期运行时的缓存数量、线程数和复用率 | 已量化：32 个不同超时 = 33 个缓存条目与 33 个驱动线程；同配置 40 次取用 = 1 条 / 1 线程；释放后线程归零 |
 | worker 职责耦合 | `Coordinator::new_with_start` 仅在 `Disabled + Fixed + request_batch_size=0` 时返回 `None`，普通动态调度和批处理也依赖 adaptive 执行路径 | 两套 worker 的维护成本及重构后的行为一致性 | 未测（属结构问题，P3 用行为矩阵而非耗时判断） |
@@ -129,7 +129,7 @@ P1 的测量结果、复现命令与判据见[默认路径与资源基线](pipel
 
 改动位置：[config.rs](../src/config.rs)、[manager.rs](../src/manager.rs)、[network.rs](../src/network.rs)、[transport.rs](../src/network/curl/transport.rs)、[Python 绑定](../bindings/python/src/lib.rs)。
 
-拆成两个可独立审查的提交：先配置解析，再资源复用。
+按独立步骤审查；本轮实际分为网络覆盖解析、资源复用、配置职责分组与绑定共享校验三个提交。
 
 - 内部按网络覆盖、重试、调度、恢复和存储职责组织配置。使用可选覆盖值替代值与 `overridden` 标志并存的状态，统一生成经过验证的生效配置。
 - 保留公开 builder/getter 的现有行为；Python 负责单位、字符串枚举和类型转换，核心规则由 Rust 统一验证。保留现有关键字、位置参数、错误类别和优先级，避免改为无法检查的任意参数字典。
@@ -385,3 +385,11 @@ P2 实现已完成。以上分组不改变公开签名；缓存上限与请求�
 - 迁移回归发现旧批处理路径在重试退避中暂停时遗漏续签 lease 的回收；现在在返回停止错误前归还这一尚未启动 producer 的 lease，原 writer 屏障不变。该行为由迁移后的暂停退避测试固定。
 - 重构后多连接单元测试 **46 项通过**；完整 `cargo test --tests --no-fail-fast` 为 **lib 527 通过 / 3 忽略、集成 105 通过**，包括模式矩阵 12 组合、probe 接管、跨 piece frame、断点空洞、截断/多读/身份变化、重试预算、暂停续传、慢尾和 writer 错误。fmt、doc test、workspace rustdoc 通过。Clippy 仅余已记录的两项工具链告警，随后单独处理；Linux 覆盖率尚待最终验证。
 - 中英文架构文档已同步配置继承、缓存生命周期、统一执行职责与阶段观测。P4/P5/P6 本轮未实施。
+
+### P2/P3 最终工具链与停止边界复核（2026-09-14）
+
+- 保留平台相关的 `CURLcode → u32` 转换，仅对该语句标注跨平台所需的 Clippy 例外；scheduler 使用等价的 `checked_div` 表达零除数分支，消除 Rust 1.96 的两项既有告警。不改变 pool 等待机制或调度结果。
+- 复核后补回多连接每次入队后的停止检查，保留重构前在下一次 body/EOF 读取前观察停止的边界；共享转发的部分发送记账仍先完成。
+- 最终源码的 fmt、workspace Clippy（`-D warnings`）、doc test、workspace rustdoc（`-D warnings`）通过，Rust lib 527 / 集成 105 全部通过、3 项忽略；Python 重新构建后 157 项通过。此前步骤中异步全量命令与后续编辑交叠的检查结果不作为最终证据，以这次固定源码复验为准。
+- P2 资源报告的 profile 标注已校正为实际运行的 `cargo test --bench` debug 配置，未把它当作 release 吞吐数据。32 种超时的条目/线程数量与释放结果不受此标注影响。
+- 完整 `--all-targets` 基准与 Ubuntu 24.04 x86_64 容器中的固定版本覆盖率入口仍在最终验证中，结果另行追加；不把尚未得到的 Linux 95% 门槛结果标为通过。
