@@ -10,6 +10,16 @@ pub(crate) const DEFAULT_REQUEST_BATCH_SIZE: u64 = 4 * 1024 * 1024;
 pub(crate) const DEFAULT_DYNAMIC_MIN_SPLIT_SIZE: u64 = 1024 * 1024;
 pub(crate) const DEFAULT_DYNAMIC_MAX_REQUEST_SIZE: u64 = 64 * 1024 * 1024;
 
+/// Shared scalar validation for language bindings and the Rust specification.
+pub fn require_nonzero(field: &str, value: u128) -> Result<(), DownloadError> {
+    if value == 0 {
+        return Err(DownloadError::InvalidConfig(format!(
+            "{field} must be >= 1"
+        )));
+    }
+    Ok(())
+}
+
 /// Log verbosity level for download tasks.
 ///
 /// The default is `Off`, which means no log events are emitted by the library.
@@ -178,63 +188,80 @@ pub(crate) fn effective_dynamic_max_request_size(piece_size: u64, configured: u6
 /// Optional task overrides; absence inherits the downloader configuration.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct NetworkOverrides {
+    pub all_proxy: Option<String>,
+    pub http_proxy: Option<String>,
+    pub https_proxy: Option<String>,
+    pub ca_info: Option<PathBuf>,
+    pub ca_path: Option<PathBuf>,
+    pub client_cert: Option<PathBuf>,
+    pub client_key: Option<PathBuf>,
     pub connect_timeout: Option<Duration>,
     pub idle_pool: Option<(usize, Duration)>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RetryConfig {
+    /// Maximum additional retries per request/transfer scope (0 = no retries).
+    pub max_retries: u32,
+    /// Base delay for exponential backoff between retries.
+    pub retry_base_delay: Duration,
+    /// Maximum delay cap for exponential backoff.
+    pub retry_max_delay: Duration,
+    /// Optional total elapsed retry budget across retries for one request/transfer scope.
+    pub max_retry_elapsed: Option<Duration>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SchedulingConfig {
+    pub piece_size: u64,
+    pub request_batch_size: u64,
+    pub range_scheduling_mode: RangeSchedulingMode,
+    pub dynamic_min_split_size: u64,
+    pub dynamic_max_request_size: u64,
+    pub min_split_size: u64,
+    pub min_segment_size: u64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RecoveryConfig {
+    pub slow_transfer_mode: SlowTransferMode,
+    pub low_speed_limit: Option<u64>,
+    pub low_speed_duration: Duration,
+    pub slow_start_grace: Duration,
+    pub slow_sample_window: Duration,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct StorageConfig {
+    pub memory_budget: usize,
+    pub file_allocation: FileAllocation,
+    pub channel_buffer: usize,
+    pub resume: bool,
+    /// Optional checksum for post-download verification.
+    pub checksum: Option<Checksum>,
+    /// Interval for periodic control-file saves (default 5 s).
+    pub control_save_interval: Duration,
+    /// Persist a durable autosave every N autosave ticks with unsaved progress.
+    pub autosave_sync_every: u32,
 }
 
 /// Specification for a download task.
 #[derive(Debug, Clone)]
 pub struct DownloadSpec {
+    pub(crate) storage: StorageConfig,
+    pub(crate) recovery: RecoveryConfig,
+    pub(crate) scheduling: SchedulingConfig,
+    pub(crate) retry: RetryConfig,
     pub(crate) url: String,
     pub(crate) output_path: Option<PathBuf>,
     pub(crate) output_dir: Option<PathBuf>,
     pub(crate) headers: HashMap<String, String>,
     pub(crate) max_connections: u32,
     pub(crate) network_overrides: NetworkOverrides,
-    pub(crate) all_proxy: Option<String>,
-    pub(crate) http_proxy: Option<String>,
-    pub(crate) https_proxy: Option<String>,
-    /// Additional PEM trust bundle for the libcurl backend.
-    pub(crate) ca_info: Option<PathBuf>,
-    /// Directory containing hashed CA certificates for the libcurl backend.
-    pub(crate) ca_path: Option<PathBuf>,
-    /// Optional client certificate and private key for mutual TLS.
-    pub(crate) client_cert: Option<PathBuf>,
-    pub(crate) client_key: Option<PathBuf>,
     pub(crate) read_timeout: Duration,
     pub(crate) request_headers_timeout: Option<Duration>,
-    pub(crate) slow_transfer_mode: SlowTransferMode,
-    pub(crate) low_speed_limit: Option<u64>,
-    pub(crate) low_speed_duration: Duration,
-    pub(crate) slow_start_grace: Duration,
-    pub(crate) slow_sample_window: Duration,
-    pub(crate) memory_budget: usize,
-    pub(crate) file_allocation: FileAllocation,
-    pub(crate) channel_buffer: usize,
-    pub(crate) resume: bool,
-    pub(crate) piece_size: u64,
-    pub(crate) request_batch_size: u64,
-    pub(crate) range_scheduling_mode: RangeSchedulingMode,
-    pub(crate) dynamic_min_split_size: u64,
-    pub(crate) dynamic_max_request_size: u64,
-    pub(crate) min_split_size: u64,
-    pub(crate) min_segment_size: u64,
-    /// Maximum additional retries per request/transfer scope (0 = no retries).
-    pub(crate) max_retries: u32,
-    /// Base delay for exponential backoff between retries.
-    pub(crate) retry_base_delay: Duration,
-    /// Maximum delay cap for exponential backoff.
-    pub(crate) retry_max_delay: Duration,
-    /// Optional total elapsed retry budget across retries for one request/transfer scope.
-    pub(crate) max_retry_elapsed: Option<Duration>,
     /// Maximum download speed in bytes/sec. 0 = unlimited.
     pub(crate) max_download_speed: u64,
-    /// Optional checksum for post-download verification.
-    pub(crate) checksum: Option<Checksum>,
-    /// Interval for periodic control-file saves (default 5 s).
-    pub(crate) control_save_interval: Duration,
-    /// Persist a durable autosave every N autosave ticks with unsaved progress.
-    pub(crate) autosave_sync_every: u32,
 }
 
 impl DownloadSpec {
@@ -296,45 +323,46 @@ impl DownloadSpec {
     /// retained for the explicit fixed compatibility mode.
     pub fn new(url: impl Into<String>) -> Self {
         Self {
+            storage: StorageConfig {
+                memory_budget: 64 * 1024 * 1024, // 64 MiB
+                file_allocation: FileAllocation::default(),
+                channel_buffer: 64,
+                resume: true,
+                checksum: None,
+                control_save_interval: Duration::from_secs(5),
+                autosave_sync_every: 2,
+            },
+            recovery: RecoveryConfig {
+                slow_transfer_mode: SlowTransferMode::default(),
+                low_speed_limit: None,
+                low_speed_duration: Duration::from_secs(15),
+                slow_start_grace: Duration::from_secs(5),
+                slow_sample_window: Duration::from_secs(5),
+            },
+            scheduling: SchedulingConfig {
+                piece_size: 1024 * 1024, // 1 MiB
+                request_batch_size: DEFAULT_REQUEST_BATCH_SIZE,
+                range_scheduling_mode: RangeSchedulingMode::default(),
+                dynamic_min_split_size: DEFAULT_DYNAMIC_MIN_SPLIT_SIZE,
+                dynamic_max_request_size: DEFAULT_DYNAMIC_MAX_REQUEST_SIZE,
+                min_split_size: 10 * 1024 * 1024, // 10 MiB
+                min_segment_size: 256 * 1024,     // 256 KiB
+            },
+            retry: RetryConfig {
+                max_retries: 5,
+                retry_base_delay: Duration::from_secs(1),
+                retry_max_delay: Duration::from_secs(30),
+                max_retry_elapsed: None,
+            },
             url: url.into(),
             output_path: None,
             output_dir: None,
             headers: HashMap::new(),
             max_connections: 4,
             network_overrides: NetworkOverrides::default(),
-            all_proxy: None,
-            http_proxy: None,
-            https_proxy: None,
-            ca_info: None,
-            ca_path: None,
-            client_cert: None,
-            client_key: None,
             read_timeout: Duration::from_secs(60),
             request_headers_timeout: None,
-            slow_transfer_mode: SlowTransferMode::default(),
-            low_speed_limit: None,
-            low_speed_duration: Duration::from_secs(15),
-            slow_start_grace: Duration::from_secs(5),
-            slow_sample_window: Duration::from_secs(5),
-            memory_budget: 64 * 1024 * 1024, // 64 MiB
-            file_allocation: FileAllocation::default(),
-            channel_buffer: 64,
-            resume: true,
-            piece_size: 1024 * 1024, // 1 MiB
-            request_batch_size: DEFAULT_REQUEST_BATCH_SIZE,
-            range_scheduling_mode: RangeSchedulingMode::default(),
-            dynamic_min_split_size: DEFAULT_DYNAMIC_MIN_SPLIT_SIZE,
-            dynamic_max_request_size: DEFAULT_DYNAMIC_MAX_REQUEST_SIZE,
-            min_split_size: 10 * 1024 * 1024, // 10 MiB
-            min_segment_size: 256 * 1024,     // 256 KiB
-            max_retries: 5,
-            retry_base_delay: Duration::from_secs(1),
-            retry_max_delay: Duration::from_secs(30),
-            max_retry_elapsed: None,
             max_download_speed: 0,
-            checksum: None,
-            control_save_interval: Duration::from_secs(5),
-            autosave_sync_every: 2,
         }
     }
 
@@ -373,7 +401,7 @@ impl DownloadSpec {
 
     /// Returns the proxy applied to all HTTP/HTTPS requests, if set.
     pub fn get_all_proxy(&self) -> Option<&str> {
-        self.all_proxy.as_deref()
+        self.network_overrides.all_proxy.as_deref()
     }
 
     /// Returns the maximum idle HTTP connections kept per host.
@@ -392,32 +420,32 @@ impl DownloadSpec {
 
     /// Returns the proxy applied only to plain HTTP requests, if set.
     pub fn get_http_proxy(&self) -> Option<&str> {
-        self.http_proxy.as_deref()
+        self.network_overrides.http_proxy.as_deref()
     }
 
     /// Returns the proxy applied only to HTTPS requests, if set.
     pub fn get_https_proxy(&self) -> Option<&str> {
-        self.https_proxy.as_deref()
+        self.network_overrides.https_proxy.as_deref()
     }
 
     /// Returns the additional PEM trust bundle for the libcurl backend.
     pub fn get_ca_info(&self) -> Option<&Path> {
-        self.ca_info.as_deref()
+        self.network_overrides.ca_info.as_deref()
     }
 
     /// Returns the CA certificate directory for the libcurl backend.
     pub fn get_ca_path(&self) -> Option<&Path> {
-        self.ca_path.as_deref()
+        self.network_overrides.ca_path.as_deref()
     }
 
     /// Returns the client certificate used for mutual TLS, if configured.
     pub fn get_client_cert(&self) -> Option<&Path> {
-        self.client_cert.as_deref()
+        self.network_overrides.client_cert.as_deref()
     }
 
     /// Returns the client private key used for mutual TLS, if configured.
     pub fn get_client_key(&self) -> Option<&Path> {
-        self.client_key.as_deref()
+        self.network_overrides.client_key.as_deref()
     }
 
     /// Returns the per-request read timeout.
@@ -446,7 +474,9 @@ impl DownloadSpec {
     }
 
     pub(crate) fn has_proxy_override(&self) -> bool {
-        self.all_proxy.is_some() || self.http_proxy.is_some() || self.https_proxy.is_some()
+        self.network_overrides.all_proxy.is_some()
+            || self.network_overrides.http_proxy.is_some()
+            || self.network_overrides.https_proxy.is_some()
     }
 
     pub(crate) fn has_pool_override(&self) -> bool {
@@ -455,33 +485,33 @@ impl DownloadSpec {
 
     /// Returns the memory budget (in bytes) for the write-back cache.
     pub fn get_memory_budget(&self) -> usize {
-        self.memory_budget
+        self.storage.memory_budget
     }
 
     /// Returns the file allocation strategy.
     pub fn get_file_allocation(&self) -> FileAllocation {
-        self.file_allocation
+        self.storage.file_allocation
     }
 
     /// Returns the internal channel buffer size.
     pub fn get_channel_buffer(&self) -> usize {
-        self.channel_buffer
+        self.storage.channel_buffer
     }
 
     /// Returns whether resume is enabled.
     pub fn get_resume(&self) -> bool {
-        self.resume
+        self.storage.resume
     }
 
     /// Returns the piece size in bytes used for multi-connection splitting.
     pub fn get_piece_size(&self) -> u64 {
-        self.piece_size
+        self.scheduling.piece_size
     }
 
     /// Returns the target byte limit for contiguous multi-piece HTTP requests.
     /// The default is 4 MiB; zero disables batching.
     pub fn get_request_batch_size(&self) -> u64 {
-        self.request_batch_size
+        self.scheduling.request_batch_size
     }
 
     /// Configure contiguous multi-piece HTTP requests, bounded by this byte limit
@@ -489,84 +519,90 @@ impl DownloadSpec {
     /// A value smaller than a piece does not split that piece; zero disables batching.
     /// Applies only to known-size multi-connection Range downloads.
     pub fn request_batch_size(mut self, bytes: u64) -> Self {
-        self.request_batch_size = bytes;
+        self.scheduling.request_batch_size = bytes;
         self
     }
 
     /// Returns the request range scheduling strategy.
     pub fn get_range_scheduling_mode(&self) -> RangeSchedulingMode {
-        self.range_scheduling_mode
+        self.scheduling.range_scheduling_mode
     }
 
     /// Select fixed or dynamic request range scheduling (default: dynamic).
     pub fn range_scheduling_mode(mut self, mode: RangeSchedulingMode) -> Self {
-        self.range_scheduling_mode = mode;
+        self.scheduling.range_scheduling_mode = mode;
         self
     }
 
     /// Returns the configured minimum dynamic split length in bytes.
     /// The scheduler rounds it up to a piece boundary before splitting.
     pub fn get_dynamic_min_split_size(&self) -> u64 {
-        self.dynamic_min_split_size
+        self.scheduling.dynamic_min_split_size
     }
 
     /// Returns the piece-aligned minimum used by the dynamic scheduler.
     pub fn get_effective_dynamic_min_split_size(&self) -> u64 {
-        effective_dynamic_min_split_size(self.piece_size, self.dynamic_min_split_size)
+        effective_dynamic_min_split_size(
+            self.scheduling.piece_size,
+            self.scheduling.dynamic_min_split_size,
+        )
     }
 
     /// Set the minimum length of both sides of a dynamic split.
     pub fn dynamic_min_split_size(mut self, bytes: u64) -> Self {
-        self.dynamic_min_split_size = bytes;
+        self.scheduling.dynamic_min_split_size = bytes;
         self
     }
 
     /// Returns the maximum dynamic HTTP request length in bytes.
     pub fn get_dynamic_max_request_size(&self) -> u64 {
-        self.dynamic_max_request_size
+        self.scheduling.dynamic_max_request_size
     }
 
     /// Returns the effective dynamic request cap, including the one-piece floor.
     pub fn get_effective_dynamic_max_request_size(&self) -> u64 {
-        effective_dynamic_max_request_size(self.piece_size, self.dynamic_max_request_size)
+        effective_dynamic_max_request_size(
+            self.scheduling.piece_size,
+            self.scheduling.dynamic_max_request_size,
+        )
     }
 
     /// Set the maximum dynamic HTTP request length in bytes.
     /// A value below one piece still permits one complete piece.
     pub fn dynamic_max_request_size(mut self, bytes: u64) -> Self {
-        self.dynamic_max_request_size = bytes;
+        self.scheduling.dynamic_max_request_size = bytes;
         self
     }
 
     /// Returns the minimum file size required before the download is split
     /// across multiple connections.
     pub fn get_min_split_size(&self) -> u64 {
-        self.min_split_size
+        self.scheduling.min_split_size
     }
 
     /// Returns the minimum sub-segment size used by dynamic multi-worker splitting.
     pub fn get_min_segment_size(&self) -> u64 {
-        self.min_segment_size
+        self.scheduling.min_segment_size
     }
 
     /// Returns the maximum number of additional retries per request/transfer scope.
     pub fn get_max_retries(&self) -> u32 {
-        self.max_retries
+        self.retry.max_retries
     }
 
     /// Returns the base delay for exponential backoff between retries.
     pub fn get_retry_base_delay(&self) -> Duration {
-        self.retry_base_delay
+        self.retry.retry_base_delay
     }
 
     /// Returns the maximum delay cap for exponential backoff.
     pub fn get_retry_max_delay(&self) -> Duration {
-        self.retry_max_delay
+        self.retry.retry_max_delay
     }
 
     /// Returns the optional total elapsed retry budget.
     pub fn get_max_retry_elapsed(&self) -> Option<Duration> {
-        self.max_retry_elapsed
+        self.retry.max_retry_elapsed
     }
 
     /// Returns the maximum download speed in bytes/sec (0 = unlimited).
@@ -576,17 +612,17 @@ impl DownloadSpec {
 
     /// Returns the checksum used for post-download verification, if set.
     pub fn get_checksum(&self) -> Option<&Checksum> {
-        self.checksum.as_ref()
+        self.storage.checksum.as_ref()
     }
 
     /// Returns the interval for periodic control-file saves.
     pub fn get_control_save_interval(&self) -> Duration {
-        self.control_save_interval
+        self.storage.control_save_interval
     }
 
     /// Returns how many autosave ticks are coalesced into one durable save.
     pub fn get_autosave_sync_every(&self) -> u32 {
-        self.autosave_sync_every
+        self.storage.autosave_sync_every
     }
 
     /// Set the explicit output file path.
@@ -640,44 +676,44 @@ impl DownloadSpec {
 
     /// Set a proxy applied to all HTTP/HTTPS requests for this download only.
     pub fn all_proxy(mut self, proxy: impl Into<String>) -> Self {
-        self.all_proxy = Some(proxy.into());
+        self.network_overrides.all_proxy = Some(proxy.into());
         self
     }
 
     /// Set a proxy applied only to plain HTTP requests for this download.
     pub fn http_proxy(mut self, proxy: impl Into<String>) -> Self {
-        self.http_proxy = Some(proxy.into());
+        self.network_overrides.http_proxy = Some(proxy.into());
         self
     }
 
     /// Set a proxy applied only to HTTPS requests for this download.
     pub fn https_proxy(mut self, proxy: impl Into<String>) -> Self {
-        self.https_proxy = Some(proxy.into());
+        self.network_overrides.https_proxy = Some(proxy.into());
         self
     }
 
     /// Add a PEM trust bundle for libcurl without disabling certificate or
     /// hostname verification.
     pub fn ca_info(mut self, path: impl Into<PathBuf>) -> Self {
-        self.ca_info = Some(path.into());
+        self.network_overrides.ca_info = Some(path.into());
         self
     }
 
     /// Use a directory of hashed CA certificates for libcurl.
     pub fn ca_path(mut self, path: impl Into<PathBuf>) -> Self {
-        self.ca_path = Some(path.into());
+        self.network_overrides.ca_path = Some(path.into());
         self
     }
 
     /// Configure the client certificate used for mutual TLS.
     pub fn client_cert(mut self, path: impl Into<PathBuf>) -> Self {
-        self.client_cert = Some(path.into());
+        self.network_overrides.client_cert = Some(path.into());
         self
     }
 
     /// Configure the private key used for mutual TLS.
     pub fn client_key(mut self, path: impl Into<PathBuf>) -> Self {
-        self.client_key = Some(path.into());
+        self.network_overrides.client_key = Some(path.into());
         self
     }
 
@@ -691,125 +727,125 @@ impl DownloadSpec {
     /// Small trailing ranges with idle capacity and healthy reference speeds
     /// can use a shorter observation period; `Disabled` suppresses both paths.
     pub fn slow_transfer_mode(mut self, value: SlowTransferMode) -> Self {
-        self.slow_transfer_mode = value;
+        self.recovery.slow_transfer_mode = value;
         self
     }
 
     /// Returns the configured slow transfer mode.
     pub fn get_slow_transfer_mode(&self) -> SlowTransferMode {
-        self.slow_transfer_mode
+        self.recovery.slow_transfer_mode
     }
 
     /// Optional absolute minimum reading speed in bytes/second; must be positive.
     pub fn low_speed_limit(mut self, value: u64) -> Self {
-        self.low_speed_limit = Some(value);
+        self.recovery.low_speed_limit = Some(value);
         self
     }
 
     /// Returns the configured low speed limit.
     pub fn get_low_speed_limit(&self) -> Option<u64> {
-        self.low_speed_limit
+        self.recovery.low_speed_limit
     }
 
     /// Ordinary continuous low-speed duration (default: 15 seconds).
     /// Eligible small trailing ranges use at most 2 seconds, with a healthy baseline.
     pub fn low_speed_duration(mut self, value: Duration) -> Self {
-        self.low_speed_duration = value;
+        self.recovery.low_speed_duration = value;
         self
     }
 
     /// Returns the configured low speed duration.
     pub fn get_low_speed_duration(&self) -> Duration {
-        self.low_speed_duration
+        self.recovery.low_speed_duration
     }
 
     /// Initial reading grace period (default: 5 seconds).
     /// Eligible small trailing ranges use at most 1 second.
     pub fn slow_start_grace(mut self, value: Duration) -> Self {
-        self.slow_start_grace = value;
+        self.recovery.slow_start_grace = value;
         self
     }
 
     /// Returns the configured slow start grace.
     pub fn get_slow_start_grace(&self) -> Duration {
-        self.slow_start_grace
+        self.recovery.slow_start_grace
     }
 
     /// Effective network reading sample window (default: 5 seconds).
     /// Eligible small trailing ranges also use a separate window of at most 1 second.
     pub fn slow_sample_window(mut self, value: Duration) -> Self {
-        self.slow_sample_window = value;
+        self.recovery.slow_sample_window = value;
         self
     }
 
     /// Returns the configured slow sample window.
     pub fn get_slow_sample_window(&self) -> Duration {
-        self.slow_sample_window
+        self.recovery.slow_sample_window
     }
 
     /// Set the memory budget in bytes for the write-back cache (default: 64 MiB).
     pub fn memory_budget(mut self, memory_budget: usize) -> Self {
-        self.memory_budget = memory_budget;
+        self.storage.memory_budget = memory_budget;
         self
     }
 
     /// Set the file allocation strategy (default: [`FileAllocation::Prealloc`]).
     pub fn file_allocation(mut self, file_allocation: FileAllocation) -> Self {
-        self.file_allocation = file_allocation;
+        self.storage.file_allocation = file_allocation;
         self
     }
 
     /// Set the internal channel buffer size (default: 64).
     pub fn channel_buffer(mut self, channel_buffer: usize) -> Self {
-        self.channel_buffer = channel_buffer;
+        self.storage.channel_buffer = channel_buffer;
         self
     }
 
     /// Enable or disable resume support (default: `true`).
     pub fn resume(mut self, resume: bool) -> Self {
-        self.resume = resume;
+        self.storage.resume = resume;
         self
     }
 
     /// Set the piece size in bytes for multi-connection splitting (default: 1 MiB).
     pub fn piece_size(mut self, piece_size: u64) -> Self {
-        self.piece_size = piece_size;
+        self.scheduling.piece_size = piece_size;
         self
     }
 
     /// Set the minimum file size before splitting across connections (default: 10 MiB).
     pub fn min_split_size(mut self, min_split_size: u64) -> Self {
-        self.min_split_size = min_split_size;
+        self.scheduling.min_split_size = min_split_size;
         self
     }
 
     /// Set the minimum sub-segment size for dynamic multi-worker splitting.
     pub fn min_segment_size(mut self, min_segment_size: u64) -> Self {
-        self.min_segment_size = min_segment_size;
+        self.scheduling.min_segment_size = min_segment_size;
         self
     }
 
     /// Set the maximum additional retries per request/transfer scope (default: 5).
     pub fn max_retries(mut self, max_retries: u32) -> Self {
-        self.max_retries = max_retries;
+        self.retry.max_retries = max_retries;
         self
     }
 
     /// Set the base delay for exponential backoff (default: 1 s).
     pub fn retry_base_delay(mut self, retry_base_delay: Duration) -> Self {
-        self.retry_base_delay = retry_base_delay;
+        self.retry.retry_base_delay = retry_base_delay;
         self
     }
 
     /// Set the maximum delay cap for exponential backoff (default: 30 s).
     pub fn retry_max_delay(mut self, retry_max_delay: Duration) -> Self {
-        self.retry_max_delay = retry_max_delay;
+        self.retry.retry_max_delay = retry_max_delay;
         self
     }
 
     /// Set the total elapsed retry budget for a single request.
     pub fn max_retry_elapsed(mut self, max_retry_elapsed: Duration) -> Self {
-        self.max_retry_elapsed = Some(max_retry_elapsed);
+        self.retry.max_retry_elapsed = Some(max_retry_elapsed);
         self
     }
 
@@ -820,9 +856,9 @@ impl DownloadSpec {
         retry_base_delay: Duration,
         retry_max_delay: Duration,
     ) -> Self {
-        self.max_retries = max_retries;
-        self.retry_base_delay = retry_base_delay;
-        self.retry_max_delay = retry_max_delay;
+        self.retry.max_retries = max_retries;
+        self.retry.retry_base_delay = retry_base_delay;
+        self.retry.retry_max_delay = retry_max_delay;
         self
     }
 
@@ -834,33 +870,31 @@ impl DownloadSpec {
 
     /// Set the checksum for post-download integrity verification.
     pub fn checksum(mut self, checksum: Checksum) -> Self {
-        self.checksum = Some(checksum);
+        self.storage.checksum = Some(checksum);
         self
     }
 
     /// Set the interval for periodic control-file saves (default: 5 s).
     pub fn control_save_interval(mut self, interval: Duration) -> Self {
-        self.control_save_interval = interval;
+        self.storage.control_save_interval = interval;
         self
     }
 
     /// Save a durable autosave every N autosave ticks that have unsaved progress.
     pub fn autosave_sync_every(mut self, autosave_sync_every: u32) -> Self {
-        self.autosave_sync_every = autosave_sync_every;
+        self.storage.autosave_sync_every = autosave_sync_every;
         self
     }
 
     /// Validate the configuration and return an error if any value is out of range.
     pub fn validate(&self) -> Result<(), DownloadError> {
-        if self.low_speed_limit == Some(0) {
-            return Err(DownloadError::InvalidConfig(
-                "low_speed_limit must be >= 1".into(),
-            ));
+        if let Some(limit) = self.recovery.low_speed_limit {
+            require_nonzero("low_speed_limit", limit.into())?;
         }
         for (name, value) in [
-            ("low_speed_duration", self.low_speed_duration),
-            ("slow_start_grace", self.slow_start_grace),
-            ("slow_sample_window", self.slow_sample_window),
+            ("low_speed_duration", self.recovery.low_speed_duration),
+            ("slow_start_grace", self.recovery.slow_start_grace),
+            ("slow_sample_window", self.recovery.slow_sample_window),
         ] {
             if value.is_zero() || value > Duration::from_secs(86400) {
                 return Err(DownloadError::InvalidConfig(format!(
@@ -879,9 +913,9 @@ impl DownloadSpec {
             return Err(DownloadError::InvalidConfig("url cannot be empty".into()));
         }
         for (label, value) in [
-            ("all_proxy", self.all_proxy.as_deref()),
-            ("http_proxy", self.http_proxy.as_deref()),
-            ("https_proxy", self.https_proxy.as_deref()),
+            ("all_proxy", self.network_overrides.all_proxy.as_deref()),
+            ("http_proxy", self.network_overrides.http_proxy.as_deref()),
+            ("https_proxy", self.network_overrides.https_proxy.as_deref()),
         ] {
             if let Some(value) = value {
                 if value.trim().is_empty() {
@@ -891,57 +925,30 @@ impl DownloadSpec {
                 }
             }
         }
-        if self.max_connections == 0 {
-            return Err(DownloadError::InvalidConfig(
-                "max_connections must be >= 1".into(),
-            ));
-        }
-        if self.memory_budget == 0 {
-            return Err(DownloadError::InvalidConfig(
-                "memory_budget must be >= 1".into(),
-            ));
-        }
-        if self.channel_buffer == 0 {
-            return Err(DownloadError::InvalidConfig(
-                "channel_buffer must be >= 1".into(),
-            ));
-        }
-        if self.piece_size == 0 {
-            return Err(DownloadError::InvalidConfig(
-                "piece_size must be >= 1".into(),
-            ));
-        }
-        if self.min_split_size == 0 {
-            return Err(DownloadError::InvalidConfig(
-                "min_split_size must be >= 1".into(),
-            ));
-        }
-        if self.min_segment_size == 0 {
-            return Err(DownloadError::InvalidConfig(
-                "min_segment_size must be >= 1".into(),
-            ));
-        }
-        if self.dynamic_min_split_size == 0 {
-            return Err(DownloadError::InvalidConfig(
-                "dynamic_min_split_size must be >= 1".into(),
-            ));
-        }
-        if self.dynamic_max_request_size == 0 {
-            return Err(DownloadError::InvalidConfig(
-                "dynamic_max_request_size must be >= 1".into(),
-            ));
-        }
-        if self.autosave_sync_every == 0 {
-            return Err(DownloadError::InvalidConfig(
-                "autosave_sync_every must be >= 1".into(),
-            ));
-        }
-        if self.retry_base_delay > self.retry_max_delay {
+        require_nonzero("max_connections", self.max_connections as u128)?;
+        require_nonzero("memory_budget", self.storage.memory_budget as u128)?;
+        require_nonzero("channel_buffer", self.storage.channel_buffer as u128)?;
+        require_nonzero("piece_size", self.scheduling.piece_size as u128)?;
+        require_nonzero("min_split_size", self.scheduling.min_split_size as u128)?;
+        require_nonzero("min_segment_size", self.scheduling.min_segment_size as u128)?;
+        require_nonzero(
+            "dynamic_min_split_size",
+            self.scheduling.dynamic_min_split_size as u128,
+        )?;
+        require_nonzero(
+            "dynamic_max_request_size",
+            self.scheduling.dynamic_max_request_size as u128,
+        )?;
+        require_nonzero(
+            "autosave_sync_every",
+            self.storage.autosave_sync_every as u128,
+        )?;
+        if self.retry.retry_base_delay > self.retry.retry_max_delay {
             return Err(DownloadError::InvalidConfig(
                 "retry_base_delay cannot exceed retry_max_delay".into(),
             ));
         }
-        if let Some(ref checksum) = self.checksum {
+        if let Some(ref checksum) = self.storage.checksum {
             let value = match checksum {
                 Checksum::Sha256(v)
                 | Checksum::Sha1(v)
@@ -1051,27 +1058,27 @@ mod tests {
         );
         assert_eq!(spec.get_pool_idle_timeout(), DEFAULT_HTTP_IDLE_POOL_TIMEOUT);
         assert!(!spec.has_pool_override());
-        assert_eq!(spec.all_proxy, None);
-        assert_eq!(spec.http_proxy, None);
-        assert_eq!(spec.https_proxy, None);
-        assert_eq!(spec.ca_info, None);
-        assert_eq!(spec.ca_path, None);
-        assert_eq!(spec.client_cert, None);
-        assert_eq!(spec.client_key, None);
+        assert_eq!(spec.network_overrides.all_proxy, None);
+        assert_eq!(spec.network_overrides.http_proxy, None);
+        assert_eq!(spec.network_overrides.https_proxy, None);
+        assert_eq!(spec.network_overrides.ca_info, None);
+        assert_eq!(spec.network_overrides.ca_path, None);
+        assert_eq!(spec.network_overrides.client_cert, None);
+        assert_eq!(spec.network_overrides.client_key, None);
         assert_eq!(spec.read_timeout, Duration::from_secs(60));
-        assert_eq!(spec.memory_budget, 64 * 1024 * 1024);
-        assert_eq!(spec.file_allocation, FileAllocation::Prealloc);
-        assert_eq!(spec.channel_buffer, 64);
-        assert!(spec.resume);
-        assert_eq!(spec.piece_size, 1024 * 1024);
-        assert_eq!(spec.min_split_size, 10 * 1024 * 1024);
-        assert_eq!(spec.min_segment_size, 256 * 1024);
-        assert_eq!(spec.max_retries, 5);
-        assert_eq!(spec.max_retry_elapsed, None);
+        assert_eq!(spec.storage.memory_budget, 64 * 1024 * 1024);
+        assert_eq!(spec.storage.file_allocation, FileAllocation::Prealloc);
+        assert_eq!(spec.storage.channel_buffer, 64);
+        assert!(spec.storage.resume);
+        assert_eq!(spec.scheduling.piece_size, 1024 * 1024);
+        assert_eq!(spec.scheduling.min_split_size, 10 * 1024 * 1024);
+        assert_eq!(spec.scheduling.min_segment_size, 256 * 1024);
+        assert_eq!(spec.retry.max_retries, 5);
+        assert_eq!(spec.retry.max_retry_elapsed, None);
         assert_eq!(spec.max_download_speed, 0);
-        assert!(spec.checksum.is_none());
+        assert!(spec.storage.checksum.is_none());
         assert!(spec.headers.is_empty());
-        assert_eq!(spec.autosave_sync_every, 2);
+        assert_eq!(spec.storage.autosave_sync_every, 2);
     }
 
     #[test]
@@ -1124,31 +1131,45 @@ mod tests {
         assert_eq!(spec.get_pool_max_idle_per_host(), 3);
         assert_eq!(spec.get_pool_idle_timeout(), Duration::from_secs(15));
         assert!(spec.has_pool_override());
-        assert_eq!(spec.all_proxy.as_deref(), Some("http://127.0.0.1:8080"));
-        assert_eq!(spec.http_proxy.as_deref(), Some("http://127.0.0.1:8081"));
-        assert_eq!(spec.https_proxy.as_deref(), Some("http://127.0.0.1:8443"));
+        assert_eq!(
+            spec.network_overrides.all_proxy.as_deref(),
+            Some("http://127.0.0.1:8080")
+        );
+        assert_eq!(
+            spec.network_overrides.http_proxy.as_deref(),
+            Some("http://127.0.0.1:8081")
+        );
+        assert_eq!(
+            spec.network_overrides.https_proxy.as_deref(),
+            Some("http://127.0.0.1:8443")
+        );
         assert_eq!(spec.get_ca_info(), Some(Path::new("/tmp/ca.pem")));
         assert_eq!(spec.get_ca_path(), Some(Path::new("/tmp/certs")));
         assert_eq!(spec.get_client_cert(), Some(Path::new("/tmp/client.pem")));
         assert_eq!(spec.get_client_key(), Some(Path::new("/tmp/client.key")));
         assert_eq!(spec.read_timeout, Duration::from_secs(20));
-        assert_eq!(spec.memory_budget, 1024);
-        assert_eq!(spec.file_allocation, FileAllocation::None);
-        assert_eq!(spec.channel_buffer, 8);
-        assert!(!spec.resume);
-        assert_eq!(spec.piece_size, 2048);
-        assert_eq!(spec.range_scheduling_mode, RangeSchedulingMode::Dynamic);
-        assert_eq!(spec.dynamic_min_split_size, 4096);
-        assert_eq!(spec.dynamic_max_request_size, 8192);
-        assert_eq!(spec.min_split_size, 4096);
-        assert_eq!(spec.min_segment_size, 1024);
-        assert_eq!(spec.max_retries, 7);
-        assert_eq!(spec.retry_base_delay, Duration::from_millis(10));
-        assert_eq!(spec.retry_max_delay, Duration::from_millis(50));
-        assert_eq!(spec.max_retry_elapsed, Some(Duration::from_secs(3)));
+        assert_eq!(spec.storage.memory_budget, 1024);
+        assert_eq!(spec.storage.file_allocation, FileAllocation::None);
+        assert_eq!(spec.storage.channel_buffer, 8);
+        assert!(!spec.storage.resume);
+        assert_eq!(spec.scheduling.piece_size, 2048);
+        assert_eq!(
+            spec.scheduling.range_scheduling_mode,
+            RangeSchedulingMode::Dynamic
+        );
+        assert_eq!(spec.scheduling.dynamic_min_split_size, 4096);
+        assert_eq!(spec.scheduling.dynamic_max_request_size, 8192);
+        assert_eq!(spec.scheduling.min_split_size, 4096);
+        assert_eq!(spec.scheduling.min_segment_size, 1024);
+        assert_eq!(spec.retry.max_retries, 7);
+        assert_eq!(spec.retry.retry_base_delay, Duration::from_millis(10));
+        assert_eq!(spec.retry.retry_max_delay, Duration::from_millis(50));
+        assert_eq!(spec.retry.max_retry_elapsed, Some(Duration::from_secs(3)));
         assert_eq!(spec.max_download_speed, 12345);
-        assert!(matches!(spec.checksum, Some(Checksum::Sha256(ref value)) if value == "abc123"));
-        assert_eq!(spec.autosave_sync_every, 4);
+        assert!(
+            matches!(spec.storage.checksum, Some(Checksum::Sha256(ref value)) if value == "abc123")
+        );
+        assert_eq!(spec.storage.autosave_sync_every, 4);
     }
 
     #[test]

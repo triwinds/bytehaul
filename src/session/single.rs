@@ -116,7 +116,7 @@ impl SingleWriterRuntime {
             write_tx: None,
             writer_handle: None,
             written_bytes: Arc::new(AtomicU64::new(start_offset)),
-            budget: Arc::new(MemoryBudget::new(spec.memory_budget)),
+            budget: Arc::new(MemoryBudget::new(spec.storage.memory_budget)),
             file_total_size: total_size,
         };
         runtime
@@ -135,13 +135,13 @@ impl SingleWriterRuntime {
         let file = if start_offset > 0 {
             open_existing_file(output_path).await?
         } else {
-            create_output_file(output_path, total_size, spec.file_allocation).await?
+            create_output_file(output_path, total_size, spec.storage.file_allocation).await?
         };
 
-        self.budget = Arc::new(MemoryBudget::new(spec.memory_budget));
+        self.budget = Arc::new(MemoryBudget::new(spec.storage.memory_budget));
         self.written_bytes = Arc::new(AtomicU64::new(start_offset));
         self.file_total_size = total_size;
-        let (write_tx, write_rx) = mpsc::channel::<WriterCommand>(spec.channel_buffer);
+        let (write_tx, write_rx) = mpsc::channel::<WriterCommand>(spec.storage.channel_buffer);
         let written_bytes = self.written_bytes.clone();
         let budget = self.budget.clone();
         self.writer_handle = Some(tokio::spawn(
@@ -232,13 +232,13 @@ pub(super) async fn run_single_with_retry(
     let mut pending_response = Some((response, meta));
     let mut cancel_rx = cancel_rx;
     let mut retry_state = RetryState::new(
-        spec.max_retries,
-        spec.retry_base_delay,
-        spec.retry_max_delay,
-        spec.max_retry_elapsed,
+        spec.retry.max_retries,
+        spec.retry.retry_base_delay,
+        spec.retry.retry_max_delay,
+        spec.retry.max_retry_elapsed,
     );
     let mut writer = SingleWriterRuntime::start(output_path, offset, spec, total_size).await?;
-    let mut use_control = spec.resume && total_size.is_some();
+    let mut use_control = spec.storage.resume && total_size.is_some();
     let mut control_save_tracker = ControlSaveTracker::new(offset);
     let mut snap_template = single_snapshot_template(request_url, total_size, offset, &baseline);
 
@@ -246,7 +246,7 @@ pub(super) async fn run_single_with_retry(
         let control_ctx = SingleControlSaveContext {
             control_path,
             snap_template: &snap_template,
-            autosave_sync_every: spec.autosave_sync_every,
+            autosave_sync_every: spec.storage.autosave_sync_every,
             log_level,
             download_id,
         };
@@ -436,12 +436,12 @@ pub(super) async fn run_single_with_retry(
                 super::single_response_total_size(response.status().as_u16(), &response_meta)
             {
                 total_size = Some(discovered_total);
-                use_control = spec.resume;
+                use_control = spec.storage.resume;
             }
             baseline = response_meta.clone();
             snap_template = single_snapshot_template(request_url, total_size, 0, &baseline);
             if matches!(
-                spec.file_allocation,
+                spec.storage.file_allocation,
                 crate::config::FileAllocation::Prealloc
             ) && writer.file_total_size() != total_size
             {
@@ -455,7 +455,7 @@ pub(super) async fn run_single_with_retry(
         let control_ctx = SingleControlSaveContext {
             control_path,
             snap_template: &snap_template,
-            autosave_sync_every: spec.autosave_sync_every,
+            autosave_sync_every: spec.storage.autosave_sync_every,
             log_level,
             download_id,
         };
@@ -475,9 +475,9 @@ pub(super) async fn run_single_with_retry(
             control,
             writer.budget.clone(),
             &speed_limit,
-            spec.control_save_interval,
+            spec.storage.control_save_interval,
             &mut control_save_tracker,
-            spec.autosave_sync_every,
+            spec.storage.autosave_sync_every,
             log_level,
             download_id,
         )
@@ -1144,11 +1144,11 @@ mod tests {
 
     fn test_spec(url: &str) -> DownloadSpec {
         let mut spec = DownloadSpec::new(url.to_string());
-        spec.resume = true;
-        spec.memory_budget = 1024;
-        spec.channel_buffer = 4;
-        spec.control_save_interval = Duration::from_millis(5);
-        spec.autosave_sync_every = 1;
+        spec.storage.resume = true;
+        spec.storage.memory_budget = 1024;
+        spec.storage.channel_buffer = 4;
+        spec.storage.control_save_interval = Duration::from_millis(5);
+        spec.storage.autosave_sync_every = 1;
         spec
     }
 
@@ -1713,7 +1713,7 @@ mod tests {
             .retry_base_delay(Duration::ZERO)
             .retry_max_delay(Duration::ZERO)
             .file_allocation(crate::config::FileAllocation::None);
-        spec.control_save_interval = Duration::from_secs(60);
+        spec.storage.control_save_interval = Duration::from_secs(60);
         let dir = tempfile::tempdir().unwrap();
         let output_path = dir.path().join("continuation.bin");
         let control_path = dir.path().join("continuation.bytehaul");

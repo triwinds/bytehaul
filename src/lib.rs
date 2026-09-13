@@ -64,6 +64,13 @@ pub use error::DownloadError;
 pub use manager::{DownloadHandle, Downloader, DownloaderBuilder};
 pub use progress::{DownloadState, ProgressSnapshot};
 
+/// Shared implementation helpers for the bundled language bindings.
+/// Not a stable application API.
+#[doc(hidden)]
+pub mod binding_support {
+    pub use crate::config::require_nonzero;
+}
+
 /// Re-exports for benchmarking. Not part of the public API.
 #[doc(hidden)]
 pub mod bench {

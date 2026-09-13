@@ -80,14 +80,14 @@ pub(super) async fn run_multi_worker(
     let file = if piece_map.completed_count() > 0 {
         open_existing_file(output_path).await?
     } else {
-        create_output_file(output_path, Some(total_size), spec.file_allocation).await?
+        create_output_file(output_path, Some(total_size), spec.storage.file_allocation).await?
     };
 
     // Memory budget semaphore
-    let budget = Arc::new(MemoryBudget::new(spec.memory_budget));
+    let budget = Arc::new(MemoryBudget::new(spec.storage.memory_budget));
 
     // Writer with cache
-    let (write_tx, write_rx) = mpsc::channel::<WriterCommand>(spec.channel_buffer);
+    let (write_tx, write_rx) = mpsc::channel::<WriterCommand>(spec.storage.channel_buffer);
     let written_bytes = Arc::new(AtomicU64::new(0));
     let writer_handle = tokio::spawn(
         WriterTask::new(
@@ -134,11 +134,11 @@ pub(super) async fn run_multi_worker(
         remaining_pieces = remaining,
         total_size = total_size,
         initial_completed_bytes = initial_completed_bytes,
-        range_scheduling_mode = %spec.range_scheduling_mode,
-        request_batch_size = spec.request_batch_size,
-        dynamic_min_split_size_configured = spec.dynamic_min_split_size,
+        range_scheduling_mode = %spec.scheduling.range_scheduling_mode,
+        request_batch_size = spec.scheduling.request_batch_size,
+        dynamic_min_split_size_configured = spec.scheduling.dynamic_min_split_size,
         dynamic_min_split_size_effective = spec.get_effective_dynamic_min_split_size(),
-        dynamic_max_request_size_configured = spec.dynamic_max_request_size,
+        dynamic_max_request_size_configured = spec.scheduling.dynamic_max_request_size,
         dynamic_max_request_size_effective = spec.get_effective_dynamic_max_request_size(),
         max_request_leases = crate::scheduler::MAX_REQUEST_LEASES,
         "multi-worker download started"
@@ -167,16 +167,19 @@ pub(super) async fn run_multi_worker(
             // share of the session's memory budget.
             .with_body_budget(budget.transport_body_budget(num_workers)),
         read_timeout: spec.read_timeout,
-        max_retries: spec.max_retries,
-        retry_base_delay: spec.retry_base_delay,
-        retry_max_delay: spec.retry_max_delay,
-        max_retry_elapsed: spec.max_retry_elapsed,
+        max_retries: spec.retry.max_retries,
+        retry_base_delay: spec.retry.retry_base_delay,
+        retry_max_delay: spec.retry.retry_max_delay,
+        max_retry_elapsed: spec.retry.max_retry_elapsed,
         max_active_leases: num_workers,
-        min_segment_size: spec.min_segment_size.min(spec.piece_size),
-        request_batch_size: spec.request_batch_size,
-        range_scheduling_mode: spec.range_scheduling_mode,
-        dynamic_min_split_size: spec.dynamic_min_split_size,
-        dynamic_max_request_size: spec.dynamic_max_request_size,
+        min_segment_size: spec
+            .scheduling
+            .min_segment_size
+            .min(spec.scheduling.piece_size),
+        request_batch_size: spec.scheduling.request_batch_size,
+        range_scheduling_mode: spec.scheduling.range_scheduling_mode,
+        dynamic_min_split_size: spec.scheduling.dynamic_min_split_size,
+        dynamic_max_request_size: spec.scheduling.dynamic_max_request_size,
         validator: adaptive::usable_validator(spec, meta),
         recovery: adaptive::Coordinator::new_with_start(
             spec,
@@ -217,7 +220,7 @@ pub(super) async fn run_multi_worker(
 
     // 鈹€鈹€ Monitor loop 鈹€鈹€
     let mut cancel_rx = cancel_rx;
-    let mut save_ticker = tokio::time::interval(spec.control_save_interval);
+    let mut save_ticker = tokio::time::interval(spec.storage.control_save_interval);
     save_ticker.tick().await;
     let mut progress_interval = tokio::time::interval(MULTI_PROGRESS_INTERVAL);
     progress_interval.tick().await;
@@ -250,7 +253,7 @@ pub(super) async fn run_multi_worker(
                     now,
                 );
                 progress_reporter.force_report(progress_tx, update, now);
-                if spec.resume {
+                if spec.storage.resume {
                     match persist_multi_control_snapshot(
                         ControlSaveReason::Terminal,
                         Some(&save_write_tx),
@@ -277,7 +280,7 @@ pub(super) async fn run_multi_worker(
                 break;
             }
 
-            _ = save_ticker.tick(), if spec.resume => {
+            _ = save_ticker.tick(), if spec.storage.resume => {
                 // An autosave may fail without failing the transfer: the next
                 // tick retries it, and the terminal path is what a stop request
                 // depends on.
@@ -374,7 +377,7 @@ pub(super) async fn run_multi_worker(
 
     if let Some(e) = download_error {
         // A closed writer is a durability barrier only when its final sync succeeded.
-        if spec.resume && writer_succeeded {
+        if spec.storage.resume && writer_succeeded {
             // The task already fails with `e`, so a checkpoint that also could
             // not be written only has to be visible: the root cause stays the
             // reported error.
@@ -406,7 +409,7 @@ pub(super) async fn run_multi_worker(
     }
 
     if !scheduler.lock().all_done() {
-        if spec.resume {
+        if spec.storage.resume {
             // Incomplete is reported as a failure either way; a missing
             // checkpoint is logged next to the root cause.
             if let Err(error) = persist_multi_control_snapshot(
@@ -491,7 +494,11 @@ async fn persist_multi_control_snapshot(
     let completed_bytes = ctx.scheduler.lock().completed_bytes();
     let force_terminal_snapshot = matches!(reason, ControlSaveReason::Terminal);
     if !force_terminal_snapshot
-        && !control_save_tracker.should_save(reason, completed_bytes, ctx.spec.autosave_sync_every)
+        && !control_save_tracker.should_save(
+            reason,
+            completed_bytes,
+            ctx.spec.storage.autosave_sync_every,
+        )
     {
         if matches!(reason, ControlSaveReason::Autosave)
             && completed_bytes > control_save_tracker.last_saved_downloaded_bytes()
@@ -502,7 +509,7 @@ async fn persist_multi_control_snapshot(
                 checkpoint = reason.label(),
                 completed_bytes = completed_bytes,
                 pending_autosaves = control_save_tracker.pending_autosaves(),
-                autosave_sync_every = ctx.spec.autosave_sync_every,
+                autosave_sync_every = ctx.spec.storage.autosave_sync_every,
                 "control snapshot deferred"
             );
         }

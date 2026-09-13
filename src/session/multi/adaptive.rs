@@ -555,20 +555,20 @@ impl Coordinator {
         total: u64,
         started_at: Instant,
     ) -> Option<Arc<Self>> {
-        if spec.slow_transfer_mode == SlowTransferMode::Disabled
-            && spec.range_scheduling_mode == RangeSchedulingMode::Fixed
-            && spec.request_batch_size == 0
+        if spec.recovery.slow_transfer_mode == SlowTransferMode::Disabled
+            && spec.scheduling.range_scheduling_mode == RangeSchedulingMode::Fixed
+            && spec.scheduling.request_batch_size == 0
         {
             return None;
         }
         let validator = usable_validator(spec, meta);
         Some(Arc::new(Self {
             policy: Policy {
-                mode: spec.slow_transfer_mode,
-                absolute: spec.low_speed_limit,
-                duration: spec.low_speed_duration,
-                grace: spec.slow_start_grace,
-                window: spec.slow_sample_window,
+                mode: spec.recovery.slow_transfer_mode,
+                absolute: spec.recovery.low_speed_limit,
+                duration: spec.recovery.low_speed_duration,
+                grace: spec.recovery.slow_start_grace,
+                window: spec.recovery.slow_sample_window,
             },
             validator,
             output_dir: output
@@ -2238,7 +2238,7 @@ mod tests {
         let received = Arc::new(AtomicU64::new(0));
         let observation = Arc::new(Mutex::new(Observation::new(
             Instant::now(),
-            spec.slow_sample_window,
+            spec.recovery.slow_sample_window,
         )));
         recovery
             .state

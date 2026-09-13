@@ -605,3 +605,10 @@ class TestRequestHeadersTimeout:
                        max_connections=1, max_retries=0, request_headers_timeout=0.05)
             if object_api:
                 task.wait()
+
+
+def test_scalar_validation_preserves_python_error_priority(tmp_path):
+    with pytest.raises(ConfigError, match="max_connections"):
+        download("http://localhost/file", str(tmp_path / "out"), max_connections=0, piece_size=0)
+    with pytest.raises(ConfigError, match="dynamic_min_split_size"):
+        download("http://localhost/file", str(tmp_path / "out"), dynamic_min_split_size=0, max_connections=0)

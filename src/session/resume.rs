@@ -36,7 +36,7 @@ pub(crate) async fn validate_local_resume_state(
     let actual_len = metadata.len();
     let is_multi = ctrl.piece_count > 1 && spec.max_connections > 1;
     let preallocated = matches!(
-        spec.file_allocation,
+        spec.storage.file_allocation,
         crate::config::FileAllocation::Prealloc
     );
 
@@ -126,7 +126,7 @@ pub(super) async fn try_resume_download(
     download_id: u64,
 ) -> Result<Option<PathBuf>, DownloadError> {
     let control_path = ControlSnapshot::control_path(output_path);
-    let resume_ctrl = if spec.resume {
+    let resume_ctrl = if spec.storage.resume {
         match ControlSnapshot::load_with_hints(&control_path).await {
             Ok((ctrl, hints)) => {
                 log_debug!(
@@ -181,10 +181,10 @@ pub(super) async fn try_resume_download(
             if let Some(probe_piece) = piece_map.first_missing() {
                 let (start, end) = piece_map.piece_range(probe_piece);
                 let probe_result = retry_with_backoff(
-                    spec.max_retries,
-                    spec.retry_base_delay,
-                    spec.retry_max_delay,
-                    spec.max_retry_elapsed,
+                    spec.retry.max_retries,
+                    spec.retry.retry_base_delay,
+                    spec.retry.retry_max_delay,
+                    spec.retry.max_retry_elapsed,
                     cancel_rx,
                     || worker.send_range(start, end - 1),
                 )
@@ -238,10 +238,10 @@ pub(super) async fn try_resume_download(
             }
         } else if ctrl.downloaded_bytes > 0 && ctrl.downloaded_bytes < ctrl.total_size {
             let probe_result = retry_with_backoff(
-                spec.max_retries,
-                spec.retry_base_delay,
-                spec.retry_max_delay,
-                spec.max_retry_elapsed,
+                spec.retry.max_retries,
+                spec.retry.retry_base_delay,
+                spec.retry.retry_max_delay,
+                spec.retry.max_retry_elapsed,
                 cancel_rx,
                 || worker.send_range(ctrl.downloaded_bytes, ctrl.total_size - 1),
             )

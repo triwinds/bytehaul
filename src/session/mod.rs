@@ -54,12 +54,12 @@ async fn probe_or_fallback_get(
     cancel_rx: &mut watch::Receiver<StopSignal>,
 ) -> Result<(HttpResponse, ResponseMeta, FreshResponseSource), DownloadError> {
     if spec.max_connections > 1 {
-        let piece_end = spec.piece_size.saturating_sub(1);
+        let piece_end = spec.scheduling.piece_size.saturating_sub(1);
         match retry_with_backoff(
-            spec.max_retries,
-            spec.retry_base_delay,
-            spec.retry_max_delay,
-            spec.max_retry_elapsed,
+            spec.retry.max_retries,
+            spec.retry.retry_base_delay,
+            spec.retry.retry_max_delay,
+            spec.retry.max_retry_elapsed,
             cancel_rx,
             || worker.send_range(0, piece_end),
         )
@@ -75,10 +75,10 @@ async fn probe_or_fallback_get(
         }
     }
     let (resp, meta) = retry_with_backoff(
-        spec.max_retries,
-        spec.retry_base_delay,
-        spec.retry_max_delay,
-        spec.max_retry_elapsed,
+        spec.retry.max_retries,
+        spec.retry.retry_base_delay,
+        spec.retry.retry_max_delay,
+        spec.retry.max_retry_elapsed,
         cancel_rx,
         || worker.send_get(),
     )
@@ -277,7 +277,7 @@ async fn run_fresh_from_response(
             RangeValidationMode::FreshProbe,
             ExpectedRange {
                 start: 0,
-                end_inclusive: spec.piece_size.saturating_sub(1),
+                end_inclusive: spec.scheduling.piece_size.saturating_sub(1),
                 total_size: None,
             },
         )?;
@@ -287,18 +287,20 @@ async fn run_fresh_from_response(
                 let total_size = meta
                     .content_range_total
                     .expect("fresh probe validation requires a total size");
-                if total_size > spec.min_split_size {
+                if total_size > spec.scheduling.min_split_size {
                     log_info!(
                         log_level,
                         download_id,
                         strategy = "fresh multi",
                         total_size,
                         max_connections = spec.max_connections,
-                        piece_size = spec.piece_size,
+                        piece_size = spec.scheduling.piece_size,
                         "download strategy selected"
                     );
-                    let piece_map =
-                        crate::storage::piece_map::PieceMap::new(total_size, spec.piece_size);
+                    let piece_map = crate::storage::piece_map::PieceMap::new(
+                        total_size,
+                        spec.scheduling.piece_size,
+                    );
                     run_multi_worker(
                         client,
                         spec,
@@ -453,7 +455,7 @@ pub(crate) async fn run_download(
     progress_tx: &watch::Sender<ProgressSnapshot>,
     cancel_rx: watch::Receiver<StopSignal>,
 ) -> Result<(), DownloadError> {
-    let checksum = spec.checksum.clone();
+    let checksum = spec.storage.checksum.clone();
     let cancel_rx = cancel_rx;
     let output_path = match run_download_inner(
         client,
@@ -514,7 +516,7 @@ async fn run_download_inner(
     let worker = HttpWorker::new(client.clone(), &spec)
         .with_diagnostics(log_level, download_id)
         // One body in flight at a time until the session picks its mode.
-        .with_body_budget(BodyBudget::for_session(spec.memory_budget, 1).0);
+        .with_body_budget(BodyBudget::for_session(spec.storage.memory_budget, 1).0);
     let mut cancel_rx = cancel_rx;
     let speed_limit = SpeedLimit::new(spec.max_download_speed);
 
@@ -645,12 +647,12 @@ async fn retry_plain_get(
     cancel_rx: &mut watch::Receiver<StopSignal>,
 ) -> Result<(HttpResponse, ResponseMeta), DownloadError> {
     let worker = HttpWorker::new(client, spec)
-        .with_body_budget(BodyBudget::for_session(spec.memory_budget, 1).0);
+        .with_body_budget(BodyBudget::for_session(spec.storage.memory_budget, 1).0);
     retry_with_backoff(
-        spec.max_retries,
-        spec.retry_base_delay,
-        spec.retry_max_delay,
-        spec.max_retry_elapsed,
+        spec.retry.max_retries,
+        spec.retry.retry_base_delay,
+        spec.retry.retry_max_delay,
+        spec.retry.max_retry_elapsed,
         cancel_rx,
         || worker.send_get(),
     )

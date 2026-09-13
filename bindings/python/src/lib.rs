@@ -158,23 +158,17 @@ fn apply_client_options(
 }
 
 fn non_zero_u32(field: &str, value: u32) -> PyResult<u32> {
-    if value == 0 {
-        return Err(config_error(format!("{field} must be >= 1")));
-    }
+    bytehaul::binding_support::require_nonzero(field, value as u128).map_err(map_download_error)?;
     Ok(value)
 }
 
 fn non_zero_u64(field: &str, value: u64) -> PyResult<u64> {
-    if value == 0 {
-        return Err(config_error(format!("{field} must be >= 1")));
-    }
+    bytehaul::binding_support::require_nonzero(field, value as u128).map_err(map_download_error)?;
     Ok(value)
 }
 
 fn non_zero_usize(field: &str, value: usize) -> PyResult<usize> {
-    if value == 0 {
-        return Err(config_error(format!("{field} must be >= 1")));
-    }
+    bytehaul::binding_support::require_nonzero(field, value as u128).map_err(map_download_error)?;
     Ok(value)
 }
 

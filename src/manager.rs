@@ -218,7 +218,7 @@ impl Downloader {
             url = %spec.url,
             output = %output,
             max_connections = spec.max_connections,
-            resume = spec.resume,
+            resume = spec.storage.resume,
             "download task created"
         );
 
