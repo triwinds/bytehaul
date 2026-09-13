@@ -1,3 +1,6 @@
+//! One ordinary multi-connection executor for every scheduling/recovery mode.
+//! The executor owns slots, leases, lineage and writer settlement; recovery
+//! supplies recommendations and request handles ordinary body consumption.
 mod recovery;
 mod request;
 use request::{checked_response, primary, BodyActivity, RequestContext, RequestStream};
@@ -6,6 +9,7 @@ use super::super::flow::wait_for_stop;
 use super::*;
 use crate::config::{RangeSchedulingMode, SlowTransferMode};
 use crate::scheduler::{RequestAssignment, MAX_REQUEST_LEASES};
+use crate::session::retry::sleep_with_backoff;
 use crate::storage::segment::LeaseKey;
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, VecDeque};
@@ -523,7 +527,7 @@ impl State {
             .filter(|delay| !delay.is_zero())
     }
 }
-pub(super) struct Coordinator {
+pub(super) struct Execution {
     policy: Policy,
     validator: Option<String>,
     output_dir: PathBuf,
@@ -538,14 +542,14 @@ pub(super) struct Coordinator {
     duplicate: AtomicU64,
     pub(super) timing: Arc<TimingDiagnostics>,
 }
-impl Coordinator {
+impl Execution {
     #[allow(dead_code)]
     pub(super) fn new(
         spec: &DownloadSpec,
         meta: &ResponseMeta,
         output: &Path,
         total: u64,
-    ) -> Option<Arc<Self>> {
+    ) -> Arc<Self> {
         Self::new_with_start(spec, meta, output, total, Instant::now())
     }
 
@@ -555,15 +559,9 @@ impl Coordinator {
         output: &Path,
         total: u64,
         started_at: Instant,
-    ) -> Option<Arc<Self>> {
-        if spec.recovery.slow_transfer_mode == SlowTransferMode::Disabled
-            && spec.scheduling.range_scheduling_mode == RangeSchedulingMode::Fixed
-            && spec.scheduling.request_batch_size == 0
-        {
-            return None;
-        }
+    ) -> Arc<Self> {
         let validator = usable_validator(spec, meta);
-        Some(Arc::new(Self {
+        Arc::new(Self {
             policy: Policy {
                 mode: spec.recovery.slow_transfer_mode,
                 absolute: spec.recovery.low_speed_limit,
@@ -599,7 +597,7 @@ impl Coordinator {
             wire: AtomicU64::new(0),
             duplicate: AtomicU64::new(0),
             timing: Arc::new(TimingDiagnostics::new(started_at)),
-        }))
+        })
     }
     pub(super) fn report(&self, log_level: LogLevel, download_id: u64) {
         let state = self.state.lock();
@@ -837,7 +835,7 @@ fn recovery_request_cap(cfg: &WorkerConfig) -> u64 {
 }
 
 fn recover_segments(
-    recovery: &Coordinator,
+    recovery: &Execution,
     scheduler: &Scheduler,
     segments: &[Segment],
     lineage: &SharedLineage,
@@ -920,7 +918,7 @@ fn strong_etag(value: &str) -> bool {
 
 struct Slot<'a> {
     permit: Option<OwnedSemaphorePermit>,
-    owner: &'a Coordinator,
+    owner: &'a Execution,
 }
 impl Drop for Slot<'_> {
     fn drop(&mut self) {
@@ -928,7 +926,7 @@ impl Drop for Slot<'_> {
         self.owner.changed.notify_waiters();
     }
 }
-struct HedgeGuard<'a>(&'a Coordinator);
+struct HedgeGuard<'a>(&'a Execution);
 impl Drop for HedgeGuard<'_> {
     fn drop(&mut self) {
         self.0.state.lock().hedge = false;
@@ -945,8 +943,7 @@ async fn wait_backoff_deadline(deadline: Option<Instant>) {
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn worker_loop(
     worker_id: usize,
-    cfg: &WorkerConfig,
-    recovery: &Arc<Coordinator>,
+    cfg: Arc<WorkerConfig>,
     scheduler: Scheduler,
     write_tx: mpsc::Sender<WriterCommand>,
     received: Arc<AtomicU64>,
@@ -958,6 +955,7 @@ pub(super) async fn worker_loop(
     log_level: LogLevel,
     download_id: u64,
 ) -> Result<(), DownloadError> {
+    let recovery = &cfg.execution;
     let validator = recovery.validator.as_deref();
     let worker = match validator {
         Some(etag) => cfg.worker.clone().with_validator(etag),
@@ -1094,7 +1092,7 @@ pub(super) async fn worker_loop(
             permit: Some(permit),
             owner: recovery,
         };
-        let lineage = recovery.lineage(&segment, cfg);
+        let lineage = recovery.lineage(&segment, &cfg);
         // Consume an exact probe before batching, so it neither becomes an
         // unused live response nor forces a second request for the same bytes.
         let mut initial_response =
@@ -1124,7 +1122,7 @@ pub(super) async fn worker_loop(
             let response = initial_response.take();
             let context = AttemptContext {
                 worker: &worker,
-                cfg,
+                cfg: &cfg,
                 recovery,
                 scheduler: &scheduler,
                 segment: &segment,
@@ -1244,7 +1242,7 @@ pub(super) async fn worker_loop(
                         recovery.backoff(*backoff);
                     }
                     let released = queued.drain(..).collect::<Vec<_>>();
-                    let request_cap = recovery_request_cap(cfg);
+                    let request_cap = recovery_request_cap(&cfg);
                     if retain {
                         recovery.completed(&prefix, &lineage);
                     }
@@ -1393,7 +1391,14 @@ pub(super) async fn worker_loop(
                                                 "cannot renew adaptive retry lease".into(),
                                             )
                                         })?;
-                                    sleep_with_backoff(backoff, &mut stop).await?;
+                                    if let Err(error) = sleep_with_backoff(backoff, &mut stop).await
+                                    {
+                                        // This renewed lease has no running producer and
+                                        // the previous attempt already crossed the writer
+                                        // barrier. Do not leave it owned when stopping.
+                                        scheduler.lock().reclaim(segment.lease_key());
+                                        return Err(error);
+                                    }
                                     observation = Arc::new(Mutex::new(Observation::new(
                                         Instant::now(),
                                         recovery.policy.window,
@@ -1415,7 +1420,7 @@ pub(super) async fn worker_loop(
 struct AttemptContext<'a> {
     worker: &'a HttpWorker,
     cfg: &'a WorkerConfig,
-    recovery: &'a Coordinator,
+    recovery: &'a Execution,
     scheduler: &'a Scheduler,
     segment: &'a Segment,
     request_end: u64,
@@ -1782,14 +1787,13 @@ mod tests {
             content_encoding: None,
         }
     }
-    fn coordinator(total: u64) -> Arc<Coordinator> {
-        Coordinator::new(
+    fn coordinator(total: u64) -> Arc<Execution> {
+        Execution::new(
             &DownloadSpec::new("http://example.invalid"),
             &meta(Some("\"v1\"")),
             Path::new("file"),
             total,
         )
-        .unwrap()
     }
 
     #[test]
@@ -1991,13 +1995,12 @@ mod tests {
             .build_client()
             .unwrap();
         let worker = HttpWorker::new(client, &spec);
-        let recovery = Coordinator::new(
+        let recovery = Execution::new(
             &spec,
             &meta(Some("\"v1\"")),
             Path::new("unused"),
             64_469_455,
-        )
-        .unwrap();
+        );
         let scheduler: Scheduler = Arc::new(Mutex::new(SchedulerState::new(PieceMap::new(32, 32))));
         let segment = scheduler.lock().assign_to(0).unwrap();
         let cfg = WorkerConfig {
@@ -2007,14 +2010,13 @@ mod tests {
             retry_base_delay: Duration::ZERO,
             retry_max_delay: Duration::ZERO,
             max_retry_elapsed: None,
-            max_active_leases: 4,
+
             min_segment_size: 32,
             request_batch_size: 0,
             range_scheduling_mode: RangeSchedulingMode::Fixed,
             dynamic_min_split_size: 32,
             dynamic_max_request_size: 64 * 1024 * 1024,
-            validator: Some("\"v1\"".into()),
-            recovery: None,
+            execution: recovery.clone(),
         };
         let budget = Arc::new(MemoryBudget::new(32));
         let _all_memory = budget.semaphore.acquire_many(32).await.unwrap();
@@ -2600,20 +2602,23 @@ mod tests {
             assert!(strong_etag(valid));
         }
         let config = DownloadSpec::new("http://example.invalid");
-        assert!(Coordinator::new(
-            &config
-                .clone()
-                .slow_transfer_mode(SlowTransferMode::Disabled)
-                .request_batch_size(0)
-                .range_scheduling_mode(RangeSchedulingMode::Fixed),
-            &meta(None),
-            Path::new("file"),
-            100
-        )
-        .is_none());
+        assert_eq!(
+            Execution::new(
+                &config
+                    .clone()
+                    .slow_transfer_mode(SlowTransferMode::Disabled)
+                    .request_batch_size(0)
+                    .range_scheduling_mode(RangeSchedulingMode::Fixed),
+                &meta(None),
+                Path::new("file"),
+                100
+            )
+            .policy
+            .mode,
+            SlowTransferMode::Disabled
+        );
         assert!(
-            Coordinator::new(&config, &meta(Some("W/\"v1\"")), Path::new("file"), 100)
-                .unwrap()
+            Execution::new(&config, &meta(Some("W/\"v1\"")), Path::new("file"), 100)
                 .validator
                 .is_none()
         );
@@ -2628,8 +2633,7 @@ mod tests {
                 .clone()
                 .headers([(condition.into(), "custom".into())].into());
             assert!(
-                Coordinator::new(&config, &meta(Some("\"v1\"")), Path::new("file"), 100)
-                    .unwrap()
+                Execution::new(&config, &meta(Some("\"v1\"")), Path::new("file"), 100)
                     .validator
                     .is_none()
             );

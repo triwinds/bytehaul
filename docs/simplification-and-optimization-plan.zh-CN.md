@@ -1,6 +1,6 @@
 # bytehaul 简化与优化实施计划
 
-日期：2026-09-13。状态：实施中；P0、P1 已完成，并已按评审意见修正（见[P0/P1 评审修正记录](#p0p1-评审修正记录)），P2 已实现，P3 继续实施；验证限制见完成记录。审查阶段已完成代码审查和四项行为问题的复现，B1–B4 已在 P0 修复并转为回归测试；P1 已完成默认路径与资源基线归档，并在评审后重新采集。
+日期：2026-09-13。状态：实施中；P0、P1 已完成，并已按评审意见修正（见[P0/P1 评审修正记录](#p0p1-评审修正记录)），P2/P3 已实现；最终验证与环境限制见完成记录。审查阶段已完成代码审查和四项行为问题的复现，B1–B4 已在 P0 修复并转为回归测试；P1 已完成默认路径与资源基线归档，并在评审后重新采集。
 
 审查基线：`2161fd4388bec05ec7183605e88b7e1c2b939164`，bytehaul 0.2.4，Windows。P0/P1 已完成；后续阶段以各步骤完成记录为准。
 
@@ -77,7 +77,7 @@ P1 的测量结果、复现命令与判据见[默认路径与资源基线](pipel
 | P0 | 最高 | 生命周期修复和 B1–B4 回归测试 | 无 | 已完成 |
 | P1 | 高 | 覆盖默认路径的可复现基线 | 可先准备夹具；正式比较使用 P0 后基线 | 已完成 |
 | P2 | 高 | 配置统一解析、请求超时与共享 client 分离、缓存有界 | P0；资源比较使用 P1 | 已实现，验证限制见记录 |
-| P3 | 高 | 多连接传输循环统一，慢速恢复只负责策略 | P0、P1；配置结构复用 P2 | 实施中 |
+| P3 | 高 | 多连接传输循环统一，慢速恢复只负责策略 | P0、P1；配置结构复用 P2 | 已实现，验证限制见记录 |
 | P4 | 中 | 减少预分配与 writer 管线成本 | P0、P1；与 P3 分开提交 | 待实施 |
 | P5 | 中 | 修正多 pool 等待，按测量决定事件机制改造 | P1；在 P2 后验证资源生命周期 | 待实施 |
 | P6 | 中，低成本 | 清理唯一后端包装和重复 CI | CI 去重可独立提前实施 | 待实施 |
@@ -142,9 +142,9 @@ P1 的测量结果、复现命令与判据见[默认路径与资源基线](pipel
 
 ### P3：统一多连接传输循环
 
-状态：实施中；步骤 1–4 已完成，继续旧循环删除。
+状态：五个实施步骤已完成；最终验证与环境限制见完成记录。
 
-改动位置：[multi.rs](../src/session/multi.rs)、[adaptive.rs](../src/session/multi/adaptive.rs)、[scheduler.rs](../src/scheduler.rs)、[flow.rs](../src/session/flow.rs)、[retry.rs](../src/session/retry.rs)。
+改动位置：[multi.rs](../src/session/multi.rs)、[worker.rs](../src/session/multi/worker.rs)、[scheduler.rs](../src/scheduler.rs)、[flow.rs](../src/session/flow.rs)、[retry.rs](../src/session/retry.rs)。
 
 目标职责：scheduler 负责范围所有权和分配；统一 worker 负责请求、读取、转发、确认和失败结算；恢复策略根据观测返回继续、回收或竞速建议。
 
@@ -312,7 +312,7 @@ P1 由测量本身暴露并修复的三处缺陷：
 - [x] P0：生命周期问题修复并通过回归测试（含评审修正）。
 - [x] P1：默认执行路径与资源基线归档（含评审修正后重采）。
 - [x] P2：配置解析统一、超时与 client 身份分离、缓存有界（验证限制见完成记录）。
-- [ ] P3：多连接普通执行统一，恢复策略独立。
+- [x] P3：多连接普通执行统一，恢复策略独立（验证限制见完成记录）。
 - [ ] P4：存储实验完成，采用有收益的改动或记录保留原实现的依据。
 - [ ] P5：多 pool 等待验证完成，修复已确认问题。
 - [ ] P6：唯一后端结构与重复 CI 清理完成。
@@ -362,13 +362,13 @@ P2 实现已完成。以上分组不改变公开签名；缓存上限与请求�
 
 ### P3 步骤 2：抽出普通请求与跨 piece body 消费（2026-09-14）
 
-- 新增 `multi/adaptive/request.rs`，集中有限 Range 响应校验、probe 响应消费、frame 后缀保留、长度检查与 writer 转发。`RequestContext` 显式接收请求几何、超时、身份约束、写入资源和观测数据，不持有恢复协调器。
+- 新增 `multi/worker/request.rs`，集中有限 Range 响应校验、probe 响应消费、frame 后缀保留、长度检查与 writer 转发。`RequestContext` 显式接收请求几何、超时、身份约束、写入资源和观测数据，不持有恢复协调器。
 - 普通请求与 challenger 复用同一响应校验；是否要求响应必须回显 validator 由执行层传入，保持原有 hedging 身份规则。旧 producer 被丢弃后才进入 writer 确认的次序不变。
 - 重构后模式矩阵 12 组合、慢速恢复 11 项通过。全量命令 lib 通过，随后 `http_header_timeout::header_deadline_includes_tls_handshake` 出现已记录的间歇失败；该测试直接调用传输层，不经过本步调整的多连接模块。fmt、doc test、workspace rustdoc 通过；Clippy 仍为两项既有告警。Linux 覆盖率未执行。
 
 ### P3 步骤 3：恢复建议与执行结算分离（2026-09-14）
 
-- `multi/adaptive/recovery.rs` 根据读取阶段、健康基线、慢尾条件、限速状态和 challenger 状态返回 `Advice`。策略不获取 slot、不续签 lease、不修改重试或流量预算。
+- `multi/worker/recovery.rs` 根据读取阶段、健康基线、慢尾条件、限速状态和 challenger 状态返回 `Advice`。策略不获取 slot、不续签 lease、不修改重试或流量预算。
 - 执行层继续负责并发名额、预留/退款、hedge 预算不足后的回收降级、pending range 的 lineage、Retry-After 退避，以及旧 producer 停止后的 writer 屏障。Disabled 模式不再轮询性能恢复定时器。
 - fmt、模式矩阵 12 组合与慢速恢复 11 项通过，包含 released batch 继承重试预算/Retry-After、小预算下首/中/末 piece 恢复、竞速双方完成与失败、对象变化和限速抑制。全量 Rust 检查已启动，最终结果随阶段验证汇总记录；Linux 覆盖率未执行。
 
@@ -377,3 +377,11 @@ P2 实现已完成。以上分组不改变公开签名；缓存上限与请求�
 - `MemoryBudget::forward_observed` 集中限速、预算获取、channel 预留、停止响应与已发送字节结算；既有 `forward` 是不采集阶段的薄入口，供单连接使用。普通多连接消费也使用这一实现。
 - `ForwardPhase` 分别报告 RateLimited、MemoryBlocked、ChannelBlocked，多连接继续独立报告网络 Reading 和 WriterBarrier；没有把本地背压混入健康网络速度样本。取消前真正入队的字节才计入进度，未入队的预算由 permit 自动归还。
 - fmt、flow 单元测试 4 项、流控集成 4 项、慢速恢复 11 项、模式矩阵 12 组合通过。现有阻塞测试增加各阶段断言，并继续检查停止、writer 关闭、部分发送与 permit 回收。全量检查的最终结果统一列于阶段汇总；Linux 覆盖率未执行。
+
+### P3 步骤 5：全部模式迁移并删除旧循环（2026-09-14）
+
+- 删除旧 `worker_loop`、`download_segment`、`stream_segment` 及仅为该路径存在的状态辅助；全仓库仅保留 `multi/worker.rs` 的一个普通 worker 循环。原 `adaptive` 模块改名为 `worker`，协调对象改名为 `Execution` 且始终存在，不再由恢复策略决定普通执行入口。
+- 保留并迁移旧路径的停止、重试、无效 probe、writer discard 失败、截断与多读回归。两项旧测试的虚构 probe 从 HTTP 200 改成 206，避免在目标断言前被真实 Range 状态校验拒绝。删除的两项单元测试只对应已删除的重复 stop 辅助函数；统一 stop 信号测试仍保留。
+- 迁移回归发现旧批处理路径在重试退避中暂停时遗漏续签 lease 的回收；现在在返回停止错误前归还这一尚未启动 producer 的 lease，原 writer 屏障不变。该行为由迁移后的暂停退避测试固定。
+- 重构后多连接单元测试 **46 项通过**；完整 `cargo test --tests --no-fail-fast` 为 **lib 527 通过 / 3 忽略、集成 105 通过**，包括模式矩阵 12 组合、probe 接管、跨 piece frame、断点空洞、截断/多读/身份变化、重试预算、暂停续传、慢尾和 writer 错误。fmt、doc test、workspace rustdoc 通过。Clippy 仅余已记录的两项工具链告警，随后单独处理；Linux 覆盖率尚待最终验证。
+- 中英文架构文档已同步配置继承、缓存生命周期、统一执行职责与阶段观测。P4/P5/P6 本轮未实施。

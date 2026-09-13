@@ -106,25 +106,11 @@ pub(crate) enum StopSignal {
     Pause,
 }
 
-impl StopSignal {
-    fn is_stop_requested(self) -> bool {
-        !matches!(self, Self::Running)
-    }
-}
-
 fn stop_signal_error(signal: StopSignal) -> Option<DownloadError> {
     match signal {
         StopSignal::Running => None,
         StopSignal::Cancel => Some(DownloadError::Cancelled),
         StopSignal::Pause => Some(DownloadError::Paused),
-    }
-}
-
-fn stop_signal_label(signal: StopSignal) -> &'static str {
-    match signal {
-        StopSignal::Running => "running",
-        StopSignal::Cancel => "cancelled",
-        StopSignal::Pause => "paused",
     }
 }
 
@@ -1168,13 +1154,6 @@ mod tests {
     }
 
     #[test]
-    fn test_stop_signal_is_stop_requested() {
-        assert!(!StopSignal::Running.is_stop_requested());
-        assert!(StopSignal::Cancel.is_stop_requested());
-        assert!(StopSignal::Pause.is_stop_requested());
-    }
-
-    #[test]
     fn test_stop_signal_error() {
         assert!(stop_signal_error(StopSignal::Running).is_none());
         assert!(matches!(
@@ -1185,13 +1164,6 @@ mod tests {
             stop_signal_error(StopSignal::Pause),
             Some(DownloadError::Paused)
         ));
-    }
-
-    #[test]
-    fn test_stop_signal_label() {
-        assert_eq!(stop_signal_label(StopSignal::Running), "running");
-        assert_eq!(stop_signal_label(StopSignal::Cancel), "cancelled");
-        assert_eq!(stop_signal_label(StopSignal::Pause), "paused");
     }
 
     #[test]

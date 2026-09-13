@@ -111,3 +111,11 @@ DNS 查询和有容量限制的 TTL 响应缓存由 Hickory 负责；下载前�
 `ProgressSnapshot.downloaded` 用于显示已接收字节，多 Worker 重试时可能回退；控制文件只声明已确认持久化的单连接前缀或完整分片。最终 writer 写入或同步失败时保留此前的持久化断点，即使界面字节数已达到总大小。
 
 每个下载任务从配置校验、传输、writer 收尾到配置的校验和检查都由同一处生命周期出口负责。传输循环只报告字节数、速度和 ETA，不发布公开状态；任务自身根据 `wait()` 返回的结果发布唯一一次终态：成功为 `Completed`，收到停止请求为 `Cancelled`/`Paused`，其余为 `Failed`。因此校验和不匹配会以 `Failed` 结束，之前不会出现 `Completed` 快照。单连接完成要求 flush、关闭 writer 和所需的控制文件清理全部成功；多连接要求最终同步成功并确认所有分片完成，控制文件删除是尽力而为。校验和计算过程同样响应停止请求。调用方应等待 `wait()` 的最终结果，其中已包含校验和检查。
+
+## 配置与统一多连接执行
+
+`DownloadSpec` 内部按网络覆盖、重试、调度、恢复和存储分组，公开 builder/getter 保持不变。manager 解析网络继承后为每个请求传递连接期限，DNS 与建连消耗同一个预算。共享 client 使用容量 16 的 LRU，默认 client 计入上限；key 保留路由、TLS、DNS 与 pool 配置，连接超时不属于共享身份。环境代理在 client 创建时解析，命中缓存不重读；淘汰只释放缓存引用，活动请求仍可完成。
+
+所有恢复模式及 Fixed/Dynamic 调度都使用 [worker.rs](../src/session/multi/worker.rs) 的同一个执行循环。scheduler 拥有范围分配，执行器拥有 slot、lease、lineage 重试预算与 writer 确认；[request.rs](../src/session/multi/worker/request.rs) 负责有限 Range 校验与跨 piece body 消费；[recovery.rs](../src/session/multi/worker/recovery.rs) 只给出恢复建议。Disabled 模式仍支持动态规划和批处理，但不轮询性能恢复决策。
+
+单连接与多连接共用 `MemoryBudget::forward_observed` 的限速、内存和 channel 等待。多连接分别观测这些本地等待、网络读取和 writer 屏障，避免将背压视为网络低速。未知长度与非 Range 的处理仍属于单连接路径。

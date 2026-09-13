@@ -1,4 +1,5 @@
-mod adaptive;
+mod worker;
+use worker::worker_loop;
 
 #[cfg(test)]
 mod prefix_tests;
@@ -16,14 +17,12 @@ use tokio::sync::{mpsc, watch, Mutex as TokioMutex};
 
 use super::flow::MemoryBudget;
 
-use super::range_validate::{
-    validate_range_response, ExpectedRange, RangeValidationDecision, RangeValidationMode,
-};
-use super::retry::{sleep_with_backoff, RetryDecision, RetryState};
+use super::range_validate::{validate_range_response, ExpectedRange, RangeValidationMode};
+use super::retry::{RetryDecision, RetryState};
 use super::{
     begin_lease_and_wait, discard_lease_and_wait, flush_all_and_wait, flush_lease_and_wait,
-    stop_signal_error, stop_signal_label, wait_for_stop, ControlSaveReason, ControlSaveTracker,
-    StopSignal, MIN_SPEED_SAMPLE_SPAN, MULTI_PROGRESS_INTERVAL, SPEED_ESTIMATE_WINDOW,
+    stop_signal_error, wait_for_stop, ControlSaveReason, ControlSaveTracker, StopSignal,
+    MIN_SPEED_SAMPLE_SPAN, MULTI_PROGRESS_INTERVAL, SPEED_ESTIMATE_WINDOW,
 };
 use crate::config::{DownloadSpec, LogLevel, RangeSchedulingMode};
 use crate::error::DownloadError;
@@ -171,7 +170,7 @@ pub(super) async fn run_multi_worker(
         retry_base_delay: spec.retry.retry_base_delay,
         retry_max_delay: spec.retry.retry_max_delay,
         max_retry_elapsed: spec.retry.max_retry_elapsed,
-        max_active_leases: num_workers,
+
         min_segment_size: spec
             .scheduling
             .min_segment_size
@@ -180,8 +179,7 @@ pub(super) async fn run_multi_worker(
         range_scheduling_mode: spec.scheduling.range_scheduling_mode,
         dynamic_min_split_size: spec.scheduling.dynamic_min_split_size,
         dynamic_max_request_size: spec.scheduling.dynamic_max_request_size,
-        validator: adaptive::usable_validator(spec, meta),
-        recovery: adaptive::Coordinator::new_with_start(
+        execution: worker::Execution::new_with_start(
             spec,
             meta,
             output_path,
@@ -190,7 +188,8 @@ pub(super) async fn run_multi_worker(
         ),
     });
 
-    if let Some(recovery) = &worker_cfg.recovery {
+    {
+        let recovery = &worker_cfg.execution;
         recovery
             .timing
             .record_completed_bytes(initial_completed_bytes, total_size);
@@ -342,7 +341,8 @@ pub(super) async fn run_multi_worker(
         while workers.next().await.is_some() {}
     }
 
-    if let Some(recovery) = &worker_cfg.recovery {
+    {
+        let recovery = &worker_cfg.execution;
         recovery.report(log_level, download_id);
     }
 
@@ -353,7 +353,8 @@ pub(super) async fn run_multi_worker(
         .await
         .map_err(|e| DownloadError::TaskFailed(format!("writer panicked: {e}")))?;
 
-    if let Some(recovery) = &worker_cfg.recovery {
+    {
+        let recovery = &worker_cfg.execution;
         let final_flush_elapsed_ms = recovery.timing.elapsed_ms();
         log_info!(
             log_level,
@@ -599,252 +600,13 @@ struct WorkerConfig {
     retry_base_delay: Duration,
     retry_max_delay: Duration,
     max_retry_elapsed: Option<Duration>,
-    max_active_leases: usize,
+
     min_segment_size: u64,
     request_batch_size: u64,
     range_scheduling_mode: RangeSchedulingMode,
     dynamic_min_split_size: u64,
     dynamic_max_request_size: u64,
-    validator: Option<String>,
-    recovery: Option<Arc<adaptive::Coordinator>>,
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn worker_loop(
-    worker_id: usize,
-    cfg: Arc<WorkerConfig>,
-    scheduler: Scheduler,
-    write_tx: mpsc::Sender<WriterCommand>,
-    received_bytes: Arc<AtomicU64>,
-    cancel_rx: watch::Receiver<StopSignal>,
-    budget: Arc<MemoryBudget>,
-    speed_limit: SpeedLimit,
-    first_response: SharedProbeResponse,
-    total_size: u64,
-    log_level: LogLevel,
-    download_id: u64,
-) -> Result<(), DownloadError> {
-    if let Some(recovery) = &cfg.recovery {
-        return adaptive::worker_loop(
-            worker_id,
-            &cfg,
-            recovery,
-            scheduler,
-            write_tx,
-            received_bytes,
-            cancel_rx,
-            budget,
-            speed_limit,
-            first_response,
-            total_size,
-            log_level,
-            download_id,
-        )
-        .await;
-    }
-    let worker = match cfg.validator.as_deref() {
-        Some(etag) => cfg.worker.clone().with_validator(etag),
-        None => cfg.worker.clone(),
-    };
-    let mut cancel_rx = cancel_rx;
-    log_debug!(
-        log_level,
-        download_id = download_id,
-        worker_id = worker_id,
-        "worker started"
-    );
-
-    loop {
-        let signal = *cancel_rx.borrow();
-        if signal.is_stop_requested() {
-            log_debug!(
-                log_level,
-                download_id = download_id,
-                worker_id = worker_id,
-                stop = stop_signal_label(signal),
-                "worker stopped"
-            );
-            return Err(stop_signal_error(signal).expect("stop signal must map to an error"));
-        }
-
-        let probe_pending = first_response.lock().await.is_some();
-        let assign_started = Instant::now();
-        let segment = match if probe_pending {
-            // The fresh probe is exactly the first piece. Do not use the
-            // small-file underutilized-piece split while that response is
-            // still available, or it can no longer be consumed.
-            scheduler.lock().assign_to(worker_id)
-        } else {
-            scheduler.lock().assign_to_with_split(
-                worker_id,
-                cfg.max_active_leases,
-                cfg.min_segment_size,
-            )
-        } {
-            Some(seg) => seg,
-            None => {
-                log_debug!(
-                    log_level,
-                    download_id = download_id,
-                    worker_id = worker_id,
-                    scheduler_lock_us = assign_started.elapsed().as_micros() as u64,
-                    "no more segments, worker exiting"
-                );
-                return Ok(());
-            }
-        };
-
-        log_debug!(
-            log_level,
-            download_id = download_id,
-            worker_id = worker_id,
-            piece_id = segment.piece_id,
-            lease_id = segment.lease_id,
-            attempt = segment.attempt,
-            owner_worker_id = segment.owner_worker_id,
-            scheduler_lock_us = assign_started.elapsed().as_micros() as u64,
-            "assigned piece"
-        );
-
-        let mut retry_state = RetryState::new(
-            cfg.max_retries,
-            cfg.retry_base_delay,
-            cfg.retry_max_delay,
-            cfg.max_retry_elapsed,
-        );
-        let mut segment = segment;
-
-        loop {
-            begin_lease_and_wait(&write_tx, segment.lease_key()).await?;
-            let response = take_matching_probe_response(&first_response, &segment).await;
-            let result = if let Some((resp, meta)) = response {
-                match validate_identity(cfg.validator.as_deref(), &meta).and_then(|()| {
-                    validate_segment_response(206, None, &meta, &segment, total_size)
-                }) {
-                    Ok(()) => {
-                        stream_segment(
-                            resp,
-                            cfg.read_timeout,
-                            total_size,
-                            &segment,
-                            &write_tx,
-                            &received_bytes,
-                            &mut cancel_rx,
-                            &budget,
-                            &speed_limit,
-                        )
-                        .await
-                    }
-                    Err(error) => Err((error, 0)),
-                }
-            } else {
-                download_segment(
-                    &worker,
-                    cfg.validator.as_deref(),
-                    cfg.read_timeout,
-                    total_size,
-                    &segment,
-                    &write_tx,
-                    &received_bytes,
-                    &mut cancel_rx,
-                    &budget,
-                    &speed_limit,
-                )
-                .await
-            };
-
-            match result {
-                Ok(_bytes_read) => {
-                    flush_lease_and_wait(&write_tx, segment.lease_key()).await?;
-                    if !scheduler.lock().complete(segment.lease_key()) {
-                        return Err(DownloadError::Internal(
-                            "stale segment lease completion rejected".into(),
-                        ));
-                    }
-                    log_debug!(
-                        log_level,
-                        download_id = download_id,
-                        worker_id = worker_id,
-                        piece_id = segment.piece_id,
-                        lease_id = segment.lease_id,
-                        "piece completed"
-                    );
-                    break;
-                }
-                Err((e, bytes_read)) => {
-                    let decision = retry_state.decide(e);
-                    let retain = cfg.validator.is_some()
-                        && matches!(decision, RetryDecision::Retry { .. })
-                        && bytes_read > 0
-                        && bytes_read < segment.end - segment.start;
-                    if let Err(error) = settle_prefix(
-                        &write_tx,
-                        &scheduler,
-                        &mut segment,
-                        &received_bytes,
-                        bytes_read,
-                        retain,
-                    )
-                    .await
-                    {
-                        let _ = scheduler.lock().reclaim(segment.lease_key());
-                        return Err(error);
-                    }
-
-                    match decision {
-                        RetryDecision::Stop(error) => {
-                            log_warn!(log_level, download_id = download_id, worker_id = worker_id,
-                                piece_id = segment.piece_id, error = %error,
-                                "segment failed (non-retryable or retry budget exhausted)");
-                            scheduler.lock().stop_and_reclaim(segment.lease_key());
-                            return Err(error);
-                        }
-                        RetryDecision::Retry {
-                            error,
-                            retry_count,
-                            backoff,
-                            elapsed,
-                        } => {
-                            segment = scheduler
-                                .lock()
-                                .renew(segment.lease_key(), worker_id)
-                                .ok_or_else(|| {
-                                    DownloadError::Internal(
-                                        "failed to renew segment lease for retry".into(),
-                                    )
-                                })?;
-
-                            log_warn!(log_level, download_id = download_id, worker_id = worker_id,
-                                piece_id = segment.piece_id, attempt = retry_count, error = %error,
-                                backoff_ms = backoff.as_millis() as u64,
-                                elapsed_ms = elapsed.as_millis() as u64,
-                                "segment failed, retrying after backoff");
-
-                            if let Err(stop_error) =
-                                sleep_with_backoff(backoff, &mut cancel_rx).await
-                            {
-                                let _ = scheduler.lock().reclaim(segment.lease_key());
-                                return Err(stop_error);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-fn validate_identity(validator: Option<&str>, meta: &ResponseMeta) -> Result<(), DownloadError> {
-    if validator.is_some_and(|expected| {
-        meta.etag
-            .as_deref()
-            .is_some_and(|actual| actual != expected)
-    }) {
-        return Err(DownloadError::ResumeMismatch(
-            "object validator changed during ranged download".into(),
-        ));
-    }
-    Ok(())
+    execution: Arc<worker::Execution>,
 }
 
 /// The producer has stopped before this FIFO barrier. FlushLease confirms every
@@ -897,147 +659,6 @@ async fn take_matching_probe_response(
 fn probe_response_matches_segment(meta: &ResponseMeta, segment: &Segment) -> bool {
     meta.content_range_start == Some(segment.start)
         && meta.content_range_end == Some(segment.end - 1)
-}
-
-fn validate_segment_response(
-    status: u16,
-    retry_after_header: Option<&str>,
-    meta: &ResponseMeta,
-    segment: &Segment,
-    total_size: u64,
-) -> Result<(), DownloadError> {
-    match validate_range_response(
-        status,
-        retry_after_header,
-        meta,
-        RangeValidationMode::Segment,
-        ExpectedRange {
-            start: segment.start,
-            end_inclusive: segment.end - 1,
-            total_size: Some(total_size),
-        },
-    )? {
-        RangeValidationDecision::Accept => Ok(()),
-        RangeValidationDecision::FallbackToSingle(_) => Err(DownloadError::Internal(
-            "segment validation unexpectedly requested a single-connection fallback".into(),
-        )),
-    }
-}
-
-/// Download a segment by sending a fresh Range request.
-#[allow(clippy::too_many_arguments)]
-async fn download_segment(
-    worker: &HttpWorker,
-    validator: Option<&str>,
-    timeout: Duration,
-    total_size: u64,
-    segment: &Segment,
-    write_tx: &mpsc::Sender<WriterCommand>,
-    received_bytes: &Arc<AtomicU64>,
-    cancel_rx: &mut watch::Receiver<StopSignal>,
-    budget: &Arc<MemoryBudget>,
-    speed_limit: &SpeedLimit,
-) -> Result<u64, (DownloadError, u64)> {
-    let (response, meta) = worker
-        .send_range(segment.start, segment.end - 1)
-        .await
-        .map_err(|error| (error, 0))?;
-
-    validate_identity(validator, &meta).map_err(|error| (error, 0))?;
-    let status = response.status().as_u16();
-    let retry_after = response
-        .headers()
-        .get("retry-after")
-        .and_then(|v| v.to_str().ok().map(|s| s.to_owned()));
-    validate_segment_response(status, retry_after.as_deref(), &meta, segment, total_size)
-        .map_err(|error| (error, 0))?;
-
-    stream_segment(
-        response,
-        timeout,
-        total_size,
-        segment,
-        write_tx,
-        received_bytes,
-        cancel_rx,
-        budget,
-        speed_limit,
-    )
-    .await
-}
-
-/// Stream an already-opened response into the writer channel.
-#[allow(clippy::too_many_arguments)]
-async fn stream_segment(
-    response: HttpResponse,
-    read_timeout: Duration,
-    total_size: u64,
-    segment: &Segment,
-    write_tx: &mpsc::Sender<WriterCommand>,
-    received_bytes: &Arc<AtomicU64>,
-    cancel_rx: &mut watch::Receiver<StopSignal>,
-    budget: &Arc<MemoryBudget>,
-    speed_limit: &SpeedLimit,
-) -> Result<u64, (DownloadError, u64)> {
-    let mut body = response.into_body();
-    let mut offset = segment.start;
-    let mut bytes_read = 0u64;
-    let expected_len = segment.end - segment.start;
-    debug_assert!(total_size >= segment.end);
-
-    loop {
-        tokio::select! {
-            biased;
-
-            // `wait_for_stop` stays pending once every signal sender is gone, so
-            // a dropped `DownloadHandle` neither stops the segment nor keeps this
-            // biased branch ready — which would starve the body below.
-            error = wait_for_stop(cancel_rx) => {
-                return Err((error, bytes_read));
-            }
-
-            chunk = next_data_chunk(&mut body, read_timeout) => {
-                match chunk {
-                    Ok(Some(data)) => {
-                        let len = data.len();
-                        let len_u64 = len as u64;
-                        if bytes_read.saturating_add(len_u64) > expected_len {
-                            return Err((
-                                DownloadError::ResumeMismatch(
-                                    "server sent more bytes than requested for segment".into(),
-                                ),
-                                bytes_read,
-                            ));
-                        }
-                        budget.forward(
-                            data, offset, Some(segment.lease_key()), write_tx,
-                            cancel_rx, speed_limit,
-                            |sent| {
-                                offset += sent;
-                                bytes_read += sent;
-                                received_bytes.fetch_add(sent, Ordering::Relaxed);
-                            },
-                        ).await.map_err(|error| (error, bytes_read))?;
-                    }
-                    Ok(None) => break,
-                    Err(error) => return Err((error, bytes_read)),
-                }
-            }
-        }
-    }
-    if bytes_read != expected_len {
-        return Err((
-            DownloadError::Transport(crate::error::TransportError::new(
-                crate::error::TransportErrorKind::Body,
-                std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    format!("segment body ended after {bytes_read} bytes, expected {expected_len}"),
-                ),
-            )),
-            bytes_read,
-        ));
-    }
-    Ok(bytes_read)
 }
 
 #[cfg(test)]
@@ -1560,14 +1181,13 @@ mod coverage_tests {
             retry_base_delay: Duration::from_millis(10),
             retry_max_delay: Duration::from_millis(20),
             max_retry_elapsed: Some(Duration::from_secs(2)),
-            max_active_leases: 1,
+
             min_segment_size: 256,
             request_batch_size: 0,
             range_scheduling_mode: RangeSchedulingMode::Fixed,
             dynamic_min_split_size: 1024,
             dynamic_max_request_size: 64 * 1024 * 1024,
-            validator: None,
-            recovery: None,
+            execution: disabled_execution(),
         });
 
         worker_loop(
@@ -1609,14 +1229,13 @@ mod coverage_tests {
             retry_base_delay: Duration::from_millis(10),
             retry_max_delay: Duration::from_secs(2),
             max_retry_elapsed: Some(Duration::from_secs(5)),
-            max_active_leases: 1,
+
             min_segment_size: 256,
             request_batch_size: 0,
             range_scheduling_mode: RangeSchedulingMode::Fixed,
             dynamic_min_split_size: 1024,
             dynamic_max_request_size: 64 * 1024 * 1024,
-            validator: None,
-            recovery: None,
+            execution: disabled_execution(),
         });
 
         tokio::spawn(async move {
@@ -1775,72 +1394,17 @@ mod coverage_tests {
         );
     }
 
-    #[tokio::test]
-    async fn stream_segment_rejects_short_and_oversized_bodies_without_false_completion() {
-        for body_len in [2, 5] {
-            let route = warp::any().map(move || vec![0xAC; body_len]);
-            let (addr, server) = warp::serve(route).bind_ephemeral(([127, 0, 0, 1], 0));
-            let server = tokio::spawn(server);
-            let response = worker_for(format!("http://{addr}/piece"))
-                .send_get()
-                .await
-                .unwrap()
-                .0;
-            let scheduler = build_scheduler(4, 4);
-            let segment = scheduler.lock().assign().unwrap();
-            let (tx, mut rx) = mpsc::channel(4);
-            let (_stop, mut stop_rx) = watch::channel(StopSignal::Running);
-            let downloaded = Arc::new(AtomicU64::new(0));
-            let (error, accepted) = stream_segment(
-                response,
-                Duration::from_secs(2),
-                4,
-                &segment,
-                &tx,
-                &downloaded,
-                &mut stop_rx,
-                &Arc::new(MemoryBudget::new(64)),
-                &SpeedLimit::new(0),
-            )
-            .await
-            .unwrap_err();
-            server.abort();
-            if body_len == 2 {
-                assert!(
-                    matches!(error, DownloadError::Transport(ref e)
-                    if e.kind() == crate::error::TransportErrorKind::Body),
-                    "{error:?}"
-                );
-                assert_eq!(accepted, 2);
-            } else {
-                assert!(
-                    matches!(error, DownloadError::ResumeMismatch(_)),
-                    "{error:?}"
-                );
-                assert!(
-                    accepted <= 4,
-                    "must not forward bytes past the requested range"
-                );
-            }
-            let mut forwarded = Vec::new();
-            while let Ok(command) = rx.try_recv() {
-                let WriterCommand::Data {
-                    data,
-                    offset,
-                    lease_key,
-                    ..
-                } = command
-                else {
-                    panic!("incomplete segment must not flush its lease");
-                };
-                assert_eq!(offset, forwarded.len() as u64);
-                assert_eq!(lease_key, Some(segment.lease_key()));
-                forwarded.extend_from_slice(&data);
-            }
-            assert_eq!(forwarded, vec![0xAC; accepted as usize]);
-            assert_eq!(downloaded.load(Ordering::Relaxed), accepted);
-            assert!(!scheduler.lock().all_done());
-        }
+    fn disabled_execution() -> Arc<worker::Execution> {
+        worker::Execution::new(
+            &DownloadSpec::new("http://example.invalid")
+                .max_connections(1)
+                .slow_transfer_mode(crate::config::SlowTransferMode::Disabled)
+                .range_scheduling_mode(RangeSchedulingMode::Fixed)
+                .request_batch_size(0),
+            &ResponseMeta::from_parts(http::StatusCode::OK, &http::HeaderMap::new(), None),
+            Path::new("unused"),
+            256,
+        )
     }
 
     fn failure_test_worker_config(worker: HttpWorker) -> Arc<WorkerConfig> {
@@ -1851,14 +1415,13 @@ mod coverage_tests {
             retry_base_delay: Duration::ZERO,
             retry_max_delay: Duration::ZERO,
             max_retry_elapsed: None,
-            max_active_leases: 1,
+
             min_segment_size: 4,
             request_batch_size: 0,
             range_scheduling_mode: RangeSchedulingMode::Fixed,
             dynamic_min_split_size: 4,
             dynamic_max_request_size: 64 * 1024 * 1024,
-            validator: None,
-            recovery: None,
+            execution: disabled_execution(),
         })
     }
 
@@ -1902,7 +1465,12 @@ mod coverage_tests {
 
     #[tokio::test]
     async fn invalid_probe_total_stops_assignment_without_forwarding_data() {
-        let route = warp::any().map(|| vec![0xAC; 4]);
+        let route = warp::any().map(|| {
+            warp::http::Response::builder()
+                .status(206)
+                .body(vec![0xAC; 4])
+                .unwrap()
+        });
         let (addr, server) = warp::serve(route).bind_ephemeral(([127, 0, 0, 1], 0));
         let server = tokio::spawn(server);
         let worker = worker_for(format!("http://{addr}/piece"));
@@ -1949,7 +1517,12 @@ mod coverage_tests {
 
     #[tokio::test]
     async fn writer_discard_failure_rolls_back_received_bytes_and_reclaims_piece() {
-        let route = warp::any().map(|| vec![0xAC; 2]);
+        let route = warp::any().map(|| {
+            warp::http::Response::builder()
+                .status(206)
+                .body(vec![0xAC; 2])
+                .unwrap()
+        });
         let (addr, server) = warp::serve(route).bind_ephemeral(([127, 0, 0, 1], 0));
         let server = tokio::spawn(server);
         let worker = worker_for(format!("http://{addr}/piece"));

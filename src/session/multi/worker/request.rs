@@ -232,3 +232,99 @@ pub(super) async fn primary(
             .await?;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use warp::Filter;
+
+    #[tokio::test]
+    async fn short_and_oversized_bodies_do_not_complete_a_piece() {
+        for body_len in [2, 5] {
+            let route = warp::any().map(move || vec![0xAC; body_len]);
+            let (addr, server) = warp::serve(route).bind_ephemeral(([127, 0, 0, 1], 0));
+            let server = tokio::spawn(server);
+            let spec = DownloadSpec::new(format!("http://{addr}/piece"));
+            let worker = HttpWorker::new(
+                crate::network::ClientNetworkConfig::default()
+                    .build_client()
+                    .unwrap(),
+                &spec,
+            );
+            let response = worker.send_get().await.unwrap().0;
+            let scheduler = SchedulerState::new(PieceMap::new(4, 4));
+            let scheduler = Arc::new(Mutex::new(scheduler));
+            let segment = scheduler.lock().assign().unwrap();
+            let (tx, mut rx) = mpsc::channel(4);
+            let (_stop, mut stop_rx) = watch::channel(StopSignal::Running);
+            let received = Arc::new(AtomicU64::new(0));
+            let timing = Arc::new(TimingDiagnostics::new(Instant::now()));
+            let observation = Arc::new(Mutex::new(Observation::new(
+                Instant::now(),
+                Duration::from_secs(5),
+            )));
+            let budget = Arc::new(MemoryBudget::new(64));
+            let wire = AtomicU64::new(0);
+            let speed = SpeedLimit::Unlimited;
+            let context = RequestContext {
+                worker: &worker,
+                read_timeout: Duration::from_secs(2),
+                segment: &segment,
+                request_end: 4,
+                write_tx: &tx,
+                received: &received,
+                budget: &budget,
+                speed: &speed,
+                total: 4,
+                validator: None,
+                require_validator: false,
+                observation: &observation,
+                wire: &wire,
+                timing: &timing,
+                log_level: LogLevel::Off,
+                download_id: 0,
+            };
+            // Response validation is covered separately; exercise the actual
+            // ordinary body consumer with both lengths and its writer output.
+            let mut stream = Some(RequestStream {
+                body: response.into_body(),
+                buffered: bytes::Bytes::new(),
+                wire: 0,
+                expected: 4,
+                consumed: 0,
+                body_activity: BodyActivity::new(timing.clone()),
+            });
+            let error = primary(&context, None, &mut stop_rx, &mut stream)
+                .await
+                .unwrap_err();
+            server.abort();
+            let accepted = observation.lock().forwarded;
+            if body_len == 2 {
+                assert!(
+                    matches!(error, DownloadError::Transport(ref e) if e.kind() == crate::error::TransportErrorKind::Body)
+                );
+                assert_eq!(accepted, 2);
+            } else {
+                assert!(matches!(error, DownloadError::ResumeMismatch(_)));
+                assert!(accepted <= 4);
+            }
+            let mut forwarded = Vec::new();
+            while let Ok(command) = rx.try_recv() {
+                let WriterCommand::Data {
+                    data,
+                    offset,
+                    lease_key,
+                } = command
+                else {
+                    panic!("incomplete body must not flush its lease");
+                };
+                assert_eq!(offset, forwarded.len() as u64);
+                assert_eq!(lease_key, Some(segment.lease_key()));
+                forwarded.extend_from_slice(&data);
+            }
+            assert_eq!(forwarded, vec![0xAC; accepted as usize]);
+            assert_eq!(received.load(Ordering::Relaxed), accepted);
+            assert!(!scheduler.lock().all_done());
+        }
+    }
+}
