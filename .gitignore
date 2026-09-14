@@ -13,6 +13,7 @@ __pycache__/
 *.pdb
 *.so
 *.dylib
+*.dSYM/
 *.dll
 .python-version
 .coverage
