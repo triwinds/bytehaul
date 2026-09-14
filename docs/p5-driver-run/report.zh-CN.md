@@ -147,3 +147,5 @@ writer 5、writer_stop 1）× 10 轮，修改前后各一次；除 driver 等待
 等待前新增 `prepare_poll`，先登记 waker，再检查 pending commands/closed。新增三项回归测试覆盖登记前 Resume/Cancel、登记前关闭，以及登记后、进入 poll 前的命令/关闭唤醒。原始性能样本未重新采集，不作为此修复版本的测量结果。
 
 修复后本机验证：Rust 库测试 535 通过 / 3 忽略、集成测试 105 通过；fmt、diff check、workspace 全目标 Clippy（`-D warnings`）、doc test 和 workspace rustdoc（`-D warnings`）通过。本次未重跑性能基准、Python 测试或 Linux 覆盖率。
+
+**最终 CI（2026-09-14，`5a4f274`）**：三平台 Rust 测试、Python 绑定测试与 Linux 覆盖率门槛（95.29%，7700/8081 行）全部通过，详见[计划文档的最终 CI 验证](../simplification-and-optimization-plan.zh-CN.md#最终-ci-验证2026-09-14)。上一段的"未重跑"只描述该修复轮次当时的状态；本报告的驱动对照仍是本机 release 测量，与 CI 的 debug 测试构建属于不同证据类别。

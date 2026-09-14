@@ -1,6 +1,6 @@
 # bytehaul 简化与优化实施计划
 
-日期：2026-09-13。状态：实施中；P0、P1 已完成，并已按评审意见修正（见[P0/P1 评审修正记录](#p0p1-评审修正记录)），P2/P3 已实现，P4 的 writer 改动与本机实验已完成（Windows 及性能复核待补），P5 已实现并完成本机驱动基准对照（见 [P5 驱动报告](p5-driver-run/report.zh-CN.md)），P6 已实现（CI 去重与类型清理分为两次提交）；最终验证与环境限制见完成记录。审查阶段已完成代码审查和四项行为问题的复现，B1–B4 已在 P0 修复并转为回归测试；P1 已完成默认路径与资源基线归档，并在评审后重新采集。
+日期：2026-09-13（2026-09-15 更新最终状态）。状态：P0–P6 全部完成。最终提交 `5a4f274` 的 [CI 运行 34859938228](https://github.com/triwinds/bytehaul/actions/runs/34859938228) 在三个平台的 Rust 测试、Python 绑定测试与 Linux 覆盖率门槛（95.29%，7700/8081）全部通过；Windows CI 已实机运行 `storage/allocation/windows_reserve`（debug，10 轮 `verified=1`）；P4 的多连接预分配观察已在最终驱动上隔离复测，未复现稳定回退（见 [P4 存储报告](p4-storage-run/report.zh-CN.md)）。P0、P1 已按评审意见修正（见[P0/P1 评审修正记录](#p0p1-评审修正记录)），各阶段实现与验证限制见完成记录，当前状态以文末[最终 CI 验证](#最终-ci-验证2026-09-14)为准。审查阶段已完成代码审查和四项行为问题的复现，B1–B4 已在 P0 修复并转为回归测试；P1 已完成默认路径与资源基线归档，并在评审后重新采集。
 
 审查基线：`2161fd4388bec05ec7183605e88b7e1c2b939164`，bytehaul 0.2.4，Windows。P0/P1 已完成；后续阶段以各步骤完成记录为准。
 
@@ -76,11 +76,11 @@ P1 的测量结果、复现命令与判据见[默认路径与资源基线](pipel
 | --- | --- | --- | --- | --- |
 | P0 | 最高 | 生命周期修复和 B1–B4 回归测试 | 无 | 已完成 |
 | P1 | 高 | 覆盖默认路径的可复现基线 | 可先准备夹具；正式比较使用 P0 后基线 | 已完成 |
-| P2 | 高 | 配置统一解析、请求超时与共享 client 分离、缓存有界 | P0；资源比较使用 P1 | 已实现，验证限制见记录 |
-| P3 | 高 | 多连接传输循环统一，慢速恢复只负责策略 | P0、P1；配置结构复用 P2 | 已实现，验证限制见记录 |
-| P4 | 中 | 减少预分配与 writer 管线成本 | P0、P1；与 P3 分开提交 | writer 已实现，本机实验已完成；Windows 对照与性能复核待补 |
-| P5 | 中 | 修正多 pool 等待，按测量决定事件机制改造 | P1；在 P2 后验证资源生命周期 | 已实现，测量未要求完整事件机制；验证限制见记录 |
-| P6 | 中，低成本 | 清理唯一后端包装和重复 CI | CI 去重可独立提前实施 | 已完成 |
+| P2 | 高 | 配置统一解析、请求超时与共享 client 分离、缓存有界 | P0；资源比较使用 P1 | 已完成；覆盖率与三平台验证见末尾最终 CI 记录 |
+| P3 | 高 | 多连接传输循环统一，慢速恢复只负责策略 | P0、P1；配置结构复用 P2 | 已完成；覆盖率与三平台验证见末尾最终 CI 记录 |
+| P4 | 中 | 减少预分配与 writer 管线成本 | P0、P1；与 P3 分开提交 | 已完成；Windows 原生预留经 CI（debug）实机运行，多连接预分配场景在最终驱动上隔离复测无稳定回退 |
+| P5 | 中 | 修正多 pool 等待，按测量决定事件机制改造 | P1；在 P2 后验证资源生命周期 | 已完成；测量未要求完整事件机制，最终 CI 通过 |
+| P6 | 中，低成本 | 清理唯一后端包装和重复 CI | CI 去重可独立提前实施 | 已完成；三个平台 job 全通过（见文末最终 CI 记录） |
 
 ### P0：统一生命周期、停止处理和终态
 
@@ -125,7 +125,7 @@ P1 的测量结果、复现命令与判据见[默认路径与资源基线](pipel
 
 ### P2：收敛配置并限制共享 client 资源
 
-状态：三个实施步骤已完成；Linux 覆盖率与既有平台检查问题见完成记录。
+状态：三个实施步骤已完成；Linux 覆盖率门槛已由 5a4f274 的 CI 通过（见末尾最终 CI 记录），既有平台检查问题见完成记录。
 
 改动位置：[config.rs](../src/config.rs)、[manager.rs](../src/manager.rs)、[network.rs](../src/network.rs)、[transport.rs](../src/network/curl/transport.rs)、[Python 绑定](../bindings/python/src/lib.rs)。
 
@@ -160,7 +160,7 @@ P1 的测量结果、复现命令与判据见[默认路径与资源基线](pipel
 
 ### P4：降低预分配和 writer 成本
 
-状态：连续偏移、单连接批量缓冲和预算所有权已实现；本机对照支持保留 Tokio 路径及现有多连接缓存表示。Windows 原生空间预留仅有实验入口，尚未在 Windows 执行，默认分配策略不变。结果与限制见 [P4 存储报告](p4-storage-run/report.zh-CN.md)。
+状态：已完成。连续偏移、单连接批量缓冲和预算所有权已实现；本机对照支持保留 Tokio 路径及现有多连接缓存表示。Windows 原生空间预留已在 CI 的 Windows job 实机运行（debug，10 轮 `verified=1`），默认分配策略不变；多连接预分配场景已在最终 P5 driver 上隔离复测，未复现稳定回退。结果与限制见 [P4 存储报告](p4-storage-run/report.zh-CN.md)。
 
 改动位置：[file.rs](../src/storage/file.rs)、[writer.rs](../src/storage/writer.rs)、[cache.rs](../src/storage/cache.rs) 和 P1 基准。
 
@@ -315,9 +315,9 @@ P1 由测量本身暴露并修复的三处缺陷：
 
 - [x] P0：生命周期问题修复并通过回归测试（含评审修正）。
 - [x] P1：默认执行路径与资源基线归档（含评审修正后重采）。
-- [x] P2：配置解析统一、超时与 client 身份分离、缓存有界（验证限制见完成记录）。
-- [x] P3：多连接普通执行统一，恢复策略独立（验证限制见完成记录）。
-- [ ] P4：writer 优化及本机实验完成，已记录各候选取舍；Windows 原生空间预留对照及多连接预分配性能复核待补。
+- [x] P2：配置解析统一、超时与 client 身份分离、缓存有界（最终 CI 通过，见末尾最终 CI 记录）。
+- [x] P3：多连接普通执行统一，恢复策略独立（最终 CI 通过，见末尾最终 CI 记录）。
+- [x] P4：writer 优化及本机实验完成，已记录各候选取舍；Windows 原生空间预留已由 CI（debug）实机运行，多连接预分配场景已在最终驱动上隔离复测、无稳定回退（见 P4 存储报告）。
 - [x] P5：多 pool 等待验证完成，修复已确认问题。
 - [x] P6：唯一后端结构与重复 CI 清理完成。
 
@@ -414,6 +414,8 @@ Ubuntu 24.04 x86_64 覆盖率入口已在本机 QEMU 容器中调用 `python3 sc
 
 本轮交付为 **P2/P3 实现完成，macOS 全套 Rust/Python 检查通过，Linux 覆盖率验收待补**。此前间歇失败的 macOS 空闲池与 TLS 握手用例在最终全量复验中均通过；其环境波动记录保留，不将其表述为本轮修复了 P5。
 
+**后续（2026-09-14）**：同一入口已由 CI 覆盖率 job 104029167928 在 `5a4f274` 上通过（**95.29%，7700/8081 行**，Tarpaulin 0.37.2 / Rust 1.98.1 / LLVM）。上文的容器失败记录保留为历史，其"门槛尚未验证"不再代表当前状态；详见文末[最终 CI 验证](#最终-ci-验证2026-09-14)。
+
 
 ### P4：writer 优化、预算所有权与候选实验（2026-09-14）
 
@@ -421,11 +423,11 @@ Ubuntu 24.04 x86_64 覆盖率入口已在本机 QEMU 容器中调用 `python3 sc
 - 普通响应和 staged challenger 将 `OwnedSemaphorePermit` 随数据入队，writer 持有到 flush/discard；删除生产路径的手动 `forget + add_permits`。写入错误、停止、缓存丢弃、迟到数据、未消费队列以及已预留 channel slot 后关闭接收端均能回收预算。
 - 同机 release 基线/候选交替 20 轮：4 MiB 单连接写块中位数 **257 → 16**、seek **257 → 1**，总耗时 **83.33 → 43.24 ms**、round CPU **21.13 → 13.14 ms**。代价是新增 4 MiB 聚合复制。缓冲取消前文件写入为 0，取消后约 80 KiB 前缀和断点均正确，取消中位数 **12.16 → 12.01 ms**，driver 退出后均归零。
 - 64 MiB 存储微基准支持减少 seek 和批量写。相同 256 KiB 批量下 Tokio 与阻塞线程池 CPU 接近，保留 Tokio；引用/vectored 方案在微基准有收益，但尚未证明真实下载受复制限制，保留 `BytesMut` 及 lease 隔离。没有新增专用线程、公开参数或逐块 fsync。
-- 默认文件分配不变。Windows 原生 `FileAllocationInfo` 只加入可复现的实验入口，尚未在 Windows 编译和实机执行。macOS 逻辑长度/写零/按需增长结果不能替代 Windows 比较，文档明确 `set_len` 不等于物理空间预留。
-- **尚未完成的验收**：Windows 原生预留实机对照；Linux 覆盖率。另一个未关闭的性能观察是多连接预分配场景：独立 40 轮复测总耗时中位数 **108.67 → 136.97 ms**，CPU、预分配、最终同步无对应退化，逐轮方差较大；需要稳定负载环境复核，不能宣称全部场景无回退。
+- 默认文件分配不变。Windows 原生 `FileAllocationInfo` 已在 CI 的 Windows job 实机运行（debug 构建，`storage/allocation/windows_reserve` 10 轮 `verified=1`，见 [P4 报告](p4-storage-run/report.zh-CN.md)）；该结果不代替 release 对照。macOS 逻辑长度/写零/按需增长结果不能替代 Windows 比较，文档明确 `set_len` 不等于物理空间预留。
+- **验收状态**：Windows 原生预留已实机运行（debug/CI）；Linux 覆盖率门槛已由 CI 通过（95.29%）。多连接预分配场景的观察已按评审要求在最终 P5 driver 上做隔离配对 release 复测（只回退 P4 源码、其余相同，40 轮）：未复现稳定回退（total 中位 **17.889 → 17.426 ms**，CPU 中位变化 +2.1%，本次样本的两项中位数变化均未超过 10% 调查门槛；配对均值差的 95% 区间为 **[−3.30, +0.63] ms**，不将该区间作为中位数回退的界限；seek 计数按设计下降），该项关闭。pre-P5 的 20/40 轮原始数据（123.27 → 144.23、108.67 → 136.97 ms）保留在 [P4 存储报告](p4-storage-run/report.zh-CN.md)的归档目录中，未删除或改写。
 - 最终 Rust lib **530 通过 / 3 忽略**、集成 **105 通过**；fmt、workspace Clippy（`-D warnings`）、doc test、workspace rustdoc 均通过。Python 最终扩展重建后 **157 项通过**，详见 [P4 完整报告](p4-storage-run/report.zh-CN.md)。模式矩阵、未知长度、重试、暂停续传、checksum 和 writer 失败继续通过；取消续传测试改为观察已接收进度后取消，确保实际覆盖新增缓冲的收尾。
 
-实现、候选取舍、逐轮原始数据及复现命令见 [P4 存储报告](p4-storage-run/report.zh-CN.md)。P4 的本机实现已交付，以上未完成验收仍保留，计划复选框暂不勾选。
+实现、候选取舍、逐轮原始数据及复现命令见 [P4 存储报告](p4-storage-run/report.zh-CN.md)。P4 的实现、取舍与最终隔离复测证据均已归档，复选框按上述验收状态勾选。
 
 
 ### P5：多 pool 等待修复与命令唤醒（2026-09-14）
@@ -470,3 +472,14 @@ CI（[test.yml](../.github/workflows/test.yml)）：
 - Linux 覆盖率门槛未执行（延续既有状态，不因本阶段改变）。
 
 兼容性影响：无公开 API 变化（两个新结构体与 `driver_stats` 均为 `pub(crate)` 内部类型；`bench::bench_driver_stats` 是 `#[doc(hidden)]` 访问器且签名未变）；公开用法、feature 语义与 wheel 构建不变。
+
+### 最终 CI 验证（2026-09-14）
+
+提交 `5a4f274`（CI 运行 [34859938228](https://github.com/triwinds/bytehaul/actions/runs/34859938228)）的全部 job 通过，已逐 job 核对日志：
+
+- **三平台 Rust**：`Rust tests (ubuntu-latest)`（job 104029168175）、`Rust tests (windows-latest)`（job 104029167854）、`Rust tests (macos-latest)`（job 104029167703）通过；每平台执行 `cargo test -p bytehaul --all-targets`、doc test、workspace Clippy（`-D warnings`）与 rustdoc（`-D warnings`），Ubuntu 另含显式 `--no-default-features --features curl-backend` 编译检查。
+- **Python 绑定**：`Python binding tests`（job 104029167880）通过（`uv sync`、`maturin develop --bindings pyo3 --no-default-features --features curl-backend`、`pytest`）。
+- **Linux 覆盖率门槛通过**：`Coverage gate (≥95%)`（job 104029167928）以固定 Rust 1.98.1 与 Tarpaulin 0.37.2 / LLVM 引擎运行，结果 **95.29% coverage, 7700/8081 lines covered**，阈值 95%、退出码 0，诊断产物为 `linux-coverage-5a4f2741...`。此前本地容器安装失败的记录保留在[Linux 覆盖率尝试记录](#linux-覆盖率尝试的最终结果2026-09-14)；其"门槛未验证"的当时结论由本运行关闭，固定版本、阈值与源码排除规则均未修改。
+- **Windows 原生空间预留已实机运行**：Windows job 的基准目标执行了 `storage/allocation/windows_reserve` 10 轮，全部 `verified=1`；数据与 debug 构建限制见 [P4 存储报告](p4-storage-run/report.zh-CN.md)。
+
+CI 的局限：三平台 job 与 Windows 基准使用的是测试/debug 构建和标准托管 runner，只证明编译、测试、覆盖率与 Windows 候选可运行；**不代替 release 性能验收**。本文档各阶段记录中"未执行、未验证、待补"类的表述均为记录当时的实际状态，当前状态以本节为准。

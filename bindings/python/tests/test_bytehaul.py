@@ -130,6 +130,17 @@ class TestConfigValidation:
         with pytest.raises(ConfigError, match="max_connections"):
             download(f"{server}/ok", str(tmp_path / "out"), max_connections=0)
 
+    @pytest.mark.parametrize("object_api", [False, True])
+    def test_control_save_interval_zero(self, server, tmp_path, object_api):
+        # A zero interval used to pass validation; the download task then
+        # panicked after creating the output file. Both API routes must reject
+        # it as a config error before any request or file is made.
+        api = Downloader().download if object_api else download
+        out = tmp_path / "zero-interval.bin"
+        with pytest.raises(ConfigError, match="control_save_interval"):
+            api(f"{server}/ok", out, control_save_interval=0.0)
+        assert not out.exists()
+
     def test_piece_size_zero(self, server, tmp_path):
         with pytest.raises(ConfigError, match="piece_size"):
             download(f"{server}/ok", str(tmp_path / "out"), piece_size=0)

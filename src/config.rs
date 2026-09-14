@@ -902,6 +902,13 @@ impl DownloadSpec {
                 )));
             }
         }
+        // A zero interval makes `tokio::time::interval` panic inside the
+        // transfer, after the output file has already been created.
+        if self.storage.control_save_interval.is_zero() {
+            return Err(DownloadError::InvalidConfig(
+                "control_save_interval must be > 0 seconds".into(),
+            ));
+        }
         if self.request_headers_timeout.is_some_and(|timeout| {
             timeout.is_zero() || std::time::Instant::now().checked_add(timeout).is_none()
         }) {
@@ -1203,6 +1210,12 @@ mod tests {
             .validate()
             .unwrap_err();
         assert!(err.to_string().contains("autosave_sync_every"));
+
+        let err = DownloadSpec::new("https://example.com/file")
+            .control_save_interval(Duration::ZERO)
+            .validate()
+            .unwrap_err();
+        assert!(err.to_string().contains("control_save_interval"));
 
         let err = DownloadSpec::new("https://example.com/file")
             .min_segment_size(0)

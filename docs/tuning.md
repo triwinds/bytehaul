@@ -130,6 +130,8 @@ For a fresh download, files at or below this threshold use a single connection r
 
 **Default:** 5 seconds
 
+**Range:** Must be > 0
+
 How often the downloader evaluates whether it should persist a durable control file (`.bytehaul`) during a download. The actual durable save cadence is also gated by `autosave_sync_every`. Lower values improve resume accuracy at the cost of more disk writes; higher values reduce I/O overhead but risk losing more progress on crash.
 
 | Scenario | Recommended Value |

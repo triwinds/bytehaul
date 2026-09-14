@@ -1,6 +1,6 @@
 # P4 存储优化与实验记录
 
-日期：2026-09-14。writer 优化及 macOS 实验已完成；Windows 原生空间预留尚未实机运行，Linux 覆盖率未执行。多连接预分配场景的总耗时波动仍需更稳定的性能环境复核，不能将 P4 全部验收项标为通过。
+日期：2026-09-14（2026-09-15 更新验证状态）。writer 优化及 macOS 实验已完成；Windows 原生空间预留已在 CI 的 Windows job 实机运行（debug 构建，10 轮 `verified=1`），Linux 覆盖率门槛已由 CI 通过（95.29%，7700/8081 行）。多连接预分配场景已在最终 P5 driver 上用隔离配对 release 测量复测，未复现稳定回退，见[专节](#p5-驱动上的-p4-writer-隔离复测2026-09-15)；debug CI 结果不代替 release 性能验收。
 
 ## 实际采用的改动
 
@@ -40,7 +40,36 @@
 
 复测总耗时中位数仍为 **108.67 → 136.97 ms**；但 round CPU 为 **16.67 → 16.87 ms**、预分配 **3.407 → 3.319 ms**、最终同步 **6.522 → 5.825 ms**，均没有对应的存储阶段变慢。body wait 为 148.58 → 143.12 ms（并行请求时间之和，不等于关键路径），连接数保持 4。逐轮数据有较大波动，40 个配对总耗时差的均值为 +9.76 ms、标准差 91.89 ms；固定随机种子 1、10,000 次配对 bootstrap 的均值差 95% 区间约为 **[-18.74, +37.40] ms**。
 
-这些结果不足以确认稳定的退化，也不足以证明没有退化；不能把变化归因到 P5，更不能把该场景写成性能提升。本轮保留原有分配策略，没有用更改默认预分配掩盖结果。此项端到端性能验收仍需稳定负载环境复核。
+这些结果不足以确认稳定的退化，也不足以证明没有退化；不能把变化归因到 P5，更不能把该场景写成性能提升。本轮保留原有分配策略，没有用更改默认预分配掩盖结果。这些数字的适用边界是当时的 pre-P5 驱动；评审要求后的最终驱动隔离复测见下一节，本节数据原样保留、不改写、不重定义统计口径。
+
+## P5 驱动上的 P4 writer 隔离复测（2026-09-15）
+
+评审要求把 `split_prealloc_on` 的未定项放到最终 P5 driver 上隔离复核：只改变 P4 的实现，其余源码、工具链与计时边界相同。复测使用仓库已有的 [compare_writer_bench.py](../../scripts/compare_writer_bench.py)（交替顺序、每轮校验输出），两侧各 40 轮，不做超采或选择性重跑。
+
+**来源与方法**
+
+- 候选（after）是最终提交 `5a4f274` 的 `git archive` 快照；基线（before）是同一快照反向应用 P4 提交 `6d9bdfe` 的全部源码改动（writer、预算所有权与相关 session 代码，不含基准、`bench_stats`、`Cargo.toml` 与文档），并在旧 `writer::write_block` 的 `bench_stats` 计数块内补一行 `record_writer_seek()`，使 seek 计数语义与候选一致；其余文件在构建前经目录对比确认逐字节相同。
+- 两个二进制均为 **Rust 1.96.0、bench（release）profile、aarch64-apple-darwin**，同机回环夹具，独立 `CARGO_TARGET_DIR`。SHA-256：before `6146c75586c977f7e93ac2ad8a8962946d0b2c5d026fe4352f12eb591c3e8e83`，after `fb032fc79e81d59c2e101eedee2844c644c1e63c388b1a4fdaeac6a4b419634d`（原始记录见 [metadata.json](prealloc-p5-driver/metadata.json)）。
+- 40 个配对轮，80 次下载两侧全部 `verified=1`，无失败或被丢弃的轮次；逐轮原始数据：[before.csv](prealloc-p5-driver/before.csv)、[after.csv](prealloc-p5-driver/after.csv)。统计为配对差（after − before）均值与固定随机种子 1、10,000 次重采样的 95% 区间。
+
+**结果（40 配对轮，毫秒）**
+
+| 指标 | before 中位 (p25–p75) | after 中位 (p25–p75) | 配对差均值（标准差） | 95% bootstrap 区间 | after 更快的轮数 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| total | 17.889 (16.500–19.415) | 17.426 (16.436–19.085) | −0.964 (6.612) | [−3.298, +0.629] | 23/40 |
+| cpu_ms | 28.477 (25.563–32.563) | 29.081 (26.589–31.523) | −0.174 (4.706) | [−1.624, +1.216] | 18/40 |
+| prealloc_ms | 3.850 (3.454–4.258) | 3.811 (3.335–4.145) | −0.308 (1.294) | [−0.738, +0.055] | 23/40 |
+| fsync_ms | 6.517 (5.481–7.464) | 6.538 (5.377–7.120) | +0.039 (2.947) | [−0.852, +0.953] | 18/40 |
+| body_wait_ms | 7.085 (6.043–7.813) | 6.976 (6.290–8.137) | −0.115 (2.541) | [−0.986, +0.532] | 16/40 |
+| writer_seeks | 12 (12–12) | 11 (4.75–12) | −3.075 (3.812) | [−4.275, −1.950] | 25/40 |
+
+`writer_blocks` 两侧恒为 12、`cache_copied_bytes` 恒为 12 MiB，多连接路径的写块结构未变；`process_peak_rss_bytes` 中位 49.22 → 48.38 MiB（差均值 −0.71 MiB，区间 [−1.40, −0.01] MiB），没有增加。
+
+**结论与边界**
+
+- 在最终 P5 driver 上只回退 P4 实现，未复现稳定回退：total 中位差 −0.46 ms（−2.6%），配对差均值 −0.96 ms 由单轮 before 57.0 ms 的离群点主导（去掉该轮后均值约 0.0 ms），该区间描述配对均值差，不能直接用于判断中位数回退是否低于 10%；本次样本的 total 与 CPU 中位数变化分别为 −2.6% 与 +2.1%，未观察到超过调查门槛的回退；更快/更慢的轮次约各半，CPU、预分配、最终同步与 body 等待均无对应变化，seek 计数按 P4 设计下降。据此关闭"P4 writer 在最终驱动上造成 `split_prealloc_on` 稳定回退"这一验收项。
+- 本项结论只覆盖该场景、该配置与最终源码；两侧都含 P5，差异只来自 P4，**没有**用 P5 的整体收益代替对照测量；也不反推 pre-P5 数字的成因。上文 pre-P5 原始数据保留在 [paired](paired/) 与 [prealloc-recheck](prealloc-recheck/) 目录，未删除或改写。
+- 与 CI 的关系：Windows CI 的 `storage/allocation/windows_reserve` 等基准是 debug 构建，与本节的 release 配对测量不是同一证据类别。
 
 ## 缓冲未写出时取消（前后各 10 轮）
 
@@ -72,7 +101,9 @@
 
 实验入口 `storage/allocation/windows_reserve` 仅在 Windows 构建中列出，调用 `SetFileInformationByHandle(FileAllocationInfo)`，记录预留后的逻辑长度，再单独扩展 EOF 并同步。依据 [Microsoft FILE_ALLOCATION_INFO](https://learn.microsoft.com/en-us/windows/win32/api/winbase/ns-winbase-file_allocation_info) 与 [Microsoft 关于预留和可读长度的说明](https://devblogs.microsoft.com/oldnewthing/20160714-00/?p=93875)。
 
-当前只有 macOS，**Windows 候选尚未编译和实机运行**。不能用本机 logical-length/zero-fill 对照代替 Windows 三路径结果，也不能据此改变默认值。Windows 后续运行 `cargo bench --locked --bench pipeline_bench -- --filter storage/allocation/ --rounds 10 --archive docs/p4-storage-run/windows`；再比较预留时间、总完成时间、实际文件及磁盘空间语义。
+2026-09-14 的 CI 运行 [34859938228](https://github.com/triwinds/bytehaul/actions/runs/34859938228)（Windows job [104029167854](https://github.com/triwinds/bytehaul/actions/runs/34859938228/job/104029167854)）已在 windows-latest 上编译并执行该入口：`cargo test -p bytehaul --all-targets` 会运行基准目标，`storage/allocation/windows_reserve` **10 轮全部 `verified=1`**，中位 `total` 129.409 ms（p25–p75 118.808–149.655）、`allocation_ms` 0.280（0.265–0.317）；同一运行的对照为 `grow` 126.311 ms / 0.000 ms、`zero_fill` 314.507 ms / 129.266 ms、`logical_length` 130.392 ms / 0.276 ms（分别为 `total` / `allocation_ms`）。这里使用 `total` 指标，不使用包含夹具校验的整轮耗时列。
+
+该运行在 debug 测试构建与托管 runner 上完成，只证明候选能在真实 Windows 上编译、执行并产出通过校验的文件，且预留本身耗时与按需增长同级、明显低于写零路径；**不代替 release 性能验收**，也不据此改变默认分配策略。需要 release 数字时可在 Windows 上运行 `cargo bench --locked --bench pipeline_bench -- --filter storage/allocation/ --rounds 10 --archive docs/p4-storage-run/windows`，再比较预留时间、总完成时间、实际文件及磁盘空间语义。
 
 ## 复现
 
@@ -95,6 +126,8 @@ python3 scripts/compare_writer_bench.py --before /absolute/before/pipeline_bench
 
 目录 `before`/`after`/`experiments` 为最初探索样本，`before-final`/`after-final` 为首次同仪表的整批独立运行，保留以便审计；它们不是主表来源。主表采用后续 `paired` 交替样本，预分配问题另列 `prealloc-recheck`，不选择性删除偏慢轮次。
 
+P5 驱动上的隔离复测（见前文专节）只在上面的脚本之外多一步基线构造：取 `git archive HEAD` 快照，对该快照反向应用 `6d9bdfe` 的全部生产源码改动（`git diff 6d9bdfe^ 6d9bdfe -- src/... | patch -R -p1`，排除 `bench_stats.rs`、`lib.rs`、`Cargo.toml` 与 `benches/`），再在旧 `write_block` 的计数块内补 `record_writer_seek()`；两个快照各自用独立 `CARGO_TARGET_DIR` 构建，之后仍由 `compare_writer_bench.py --rounds 40 --filter writer/split_prealloc_on` 交替运行，数据归档于 `prealloc-p5-driver/`。
+
 ## 验证
 
 - `cargo fmt --all -- --check`、`git diff --check` 通过。
@@ -103,6 +136,6 @@ python3 scripts/compare_writer_bench.py --before /absolute/before/pipeline_bench
 - `cargo test -p bytehaul --locked --doc`：1 项通过；`RUSTDOCFLAGS=-Dwarnings cargo doc --workspace --no-deps --locked` 通过。
 - 新增预算为 1/3/9 字节时的单连接缓冲、回退和持久化屏障；写入失败、连续性错误、队列丢弃、writer abort、缓存 discard 和迟到数据均检查许可回收。真实单连接计数测试同时校验文件内容、写块及 seek。
 - 原取消续传用例原本等待 `metadata.len > 0`，对小于缓冲阈值的文件会直到正常完成才触发取消；现在等待已接收进度，明确断言返回 `Cancelled`，再验证持久化前缀和续传。首次该用例的失败已由这一更新解决，未放宽返回结果或断点校验。
-- 生产路径 20 轮配对 writer、40 轮预分配复测、10 轮缓冲取消及九类存储候选各十轮均已运行并保存样本。未重复运行无关 scheduler/client/driver 基准，也不把 Clippy 的全目标编译表述为 `cargo test --all-targets` 通过。
+- 生产路径 20 轮配对 writer、40 轮预分配复测、P5 驱动上的 40 轮隔离复测、10 轮缓冲取消及九类存储候选各十轮均已运行并保存样本。未重复运行无关 scheduler/client/driver 基准，也不把 Clippy 的全目标编译表述为 `cargo test --all-targets` 通过。
 - 在 `bindings/python` 目录执行 `maturin develop --bindings pyo3 --no-default-features --features curl-backend` 重建最终扩展，再运行 `pytest tests -q`：**157 项全部通过**。
-- Windows 原生预留候选和 Linux 95% 覆盖率门槛未验证；本报告不将其标记为通过。
+- Windows 原生预留候选已由 CI 的 Windows job 实机运行（debug 构建，10 轮 `verified=1`）；Linux 95% 覆盖率门槛已由同一提交的 CI 通过（95.29%）。两者均为 debug/CI 证据，不代替 release 性能验收；release 侧的隔离复测见前文专节。

@@ -186,7 +186,7 @@ cargo bench --bench pipeline_bench -- --list
 
 ## 5. 已知限制
 
-- **只在 Windows x86_64 上采集。** 本仓库的 Linux 覆盖率门槛（`python3 scripts/coverage.py`，95% 行覆盖）未执行，本报告也不代替它。文件系统差异（预分配、sync 语义）会让 writer 组与 `prealloc_ms` 在 Linux 上不同。
+- **只在 Windows x86_64 上采集。** 本仓库的 Linux 覆盖率门槛（`python3 scripts/coverage.py`，95% 行覆盖）未执行，本报告也不代替它。文件系统差异（预分配、sync 语义）会让 writer 组与 `prealloc_ms` 在 Linux 上不同。（2026-09-14 更新：该门槛已由 `5a4f274` 的 CI 覆盖率 job 通过，95.29%，7700/8081 行；覆盖率门槛与本报告的 Windows 基线仍是两类证据，基线数据未重采。）
 - **主机噪声较大。** writer、driver 与 e2e 组单轮差异可见（例如 `e2e/large_64MiB_4conns` 的 `total` 在 159–333 ms 之间）。因此汇总用中位数与 IQR，逐轮数据在 `samples.csv` 中完整保留；判断某改动是否有收益时应当比较中位数并复测，而不是比较单轮。
 - **`to_first_report`/`report_span`/`finalize` 受进度发布节奏限制**（见第 3 节），不适合用来衡量毫秒级差异；这类问题看 `total`、六个分段阶段与库内计数器。
 - **`cpu_ms` 覆盖整轮且包含夹具与基准自身**，是下载 CPU 开销的上界；进程级时钟粒度约 15.6 ms，scheduler 组这类十微秒级场景的 CPU 读数为 0，属预期而非缺陷。

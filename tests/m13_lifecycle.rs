@@ -224,6 +224,83 @@ async fn invalid_config_ends_failed_and_creates_no_files() {
 }
 
 // ──────────────────────────────────────────────────────────────
+//  A zero control-save interval must be rejected before I/O
+// ──────────────────────────────────────────────────────────────
+
+/// Regression for the review gap where `control_save_interval(Duration::ZERO)`
+/// passed validation: the download task then panicked at
+/// `tokio::time::interval(0)` (single.rs / multi.rs) after the output file had
+/// already been created, so `wait()` returned a task failure while the published
+/// state stayed `Pending`. Shared validation must now reject the value for
+/// single and multi connection, with resume on and off, before any request or
+/// file is made.
+#[tokio::test]
+async fn zero_control_save_interval_fails_before_touching_network_or_disk() {
+    let (url, requests, _gate, server) =
+        spawn_held_range_server("zero-interval", 256 * 1024, 128 * 1024);
+    let dir = tempfile::tempdir().unwrap();
+    let downloader = Downloader::builder().build().unwrap();
+
+    for max_connections in [1, 4] {
+        for resume in [false, true] {
+            let output_path = dir
+                .path()
+                .join(format!("zero-{max_connections}-{resume}.bin"));
+            let mut control_name = output_path.as_os_str().to_os_string();
+            control_name.push(".bytehaul");
+            let control_path = std::path::PathBuf::from(control_name);
+
+            let spec = DownloadSpec::new(url.clone())
+                .output_path(output_path.clone())
+                .file_allocation(FileAllocation::None)
+                .resume(resume)
+                .max_connections(max_connections)
+                .min_split_size(1)
+                .control_save_interval(Duration::ZERO);
+
+            let handle = downloader.download(spec);
+            let states = collect_states(&handle);
+            let progress = handle.subscribe_progress();
+            let result = handle.wait().await;
+
+            assert!(
+                matches!(
+                    result,
+                    Err(DownloadError::InvalidConfig(ref message))
+                        if message.contains("control_save_interval")
+                ),
+                "max_connections={max_connections} resume={resume}: got {result:?}"
+            );
+            assert_eq!(
+                progress.borrow().state,
+                DownloadState::Failed,
+                "the wait() result and the published terminal state must agree \
+                 (max_connections={max_connections} resume={resume})"
+            );
+            assert_single_terminal_state(&states, DownloadState::Failed).await;
+
+            assert!(
+                !output_path.exists(),
+                "a rejected config must not create the output file \
+                 (max_connections={max_connections} resume={resume})"
+            );
+            assert!(
+                !control_path.exists(),
+                "a rejected config must not create a checkpoint \
+                 (max_connections={max_connections} resume={resume})"
+            );
+        }
+    }
+
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        0,
+        "a rejected config must not reach the network"
+    );
+    server.abort();
+}
+
+// ──────────────────────────────────────────────────────────────
 //  B3: a queued task must stop on its own, without a released permit
 // ──────────────────────────────────────────────────────────────
 

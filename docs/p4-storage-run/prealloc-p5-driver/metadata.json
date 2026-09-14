@@ -1,0 +1,339 @@
+{
+  "started_utc": "2026-09-14T16:00:55.979009+00:00",
+  "platform": "macOS-26.5.1-arm64-arm-64bit",
+  "rounds": 40,
+  "filter": "writer/split_prealloc_on",
+  "binaries": {
+    "before": {
+      "path": "/Users/chenjn/project/bytehaul/target/p4b-before-build/release/deps/pipeline_bench-6a854549080f4933",
+      "sha256": "6146c75586c977f7e93ac2ad8a8962946d0b2c5d026fe4352f12eb591c3e8e83"
+    },
+    "after": {
+      "path": "/Users/chenjn/project/bytehaul/target/p4b-after-build/release/deps/pipeline_bench-6a854549080f4933",
+      "sha256": "fb032fc79e81d59c2e101eedee2844c644c1e63c388b1a4fdaeac6a4b419634d"
+    }
+  },
+  "order": [
+    {
+      "round": 0,
+      "binary": "before"
+    },
+    {
+      "round": 0,
+      "binary": "after"
+    },
+    {
+      "round": 1,
+      "binary": "after"
+    },
+    {
+      "round": 1,
+      "binary": "before"
+    },
+    {
+      "round": 2,
+      "binary": "before"
+    },
+    {
+      "round": 2,
+      "binary": "after"
+    },
+    {
+      "round": 3,
+      "binary": "after"
+    },
+    {
+      "round": 3,
+      "binary": "before"
+    },
+    {
+      "round": 4,
+      "binary": "before"
+    },
+    {
+      "round": 4,
+      "binary": "after"
+    },
+    {
+      "round": 5,
+      "binary": "after"
+    },
+    {
+      "round": 5,
+      "binary": "before"
+    },
+    {
+      "round": 6,
+      "binary": "before"
+    },
+    {
+      "round": 6,
+      "binary": "after"
+    },
+    {
+      "round": 7,
+      "binary": "after"
+    },
+    {
+      "round": 7,
+      "binary": "before"
+    },
+    {
+      "round": 8,
+      "binary": "before"
+    },
+    {
+      "round": 8,
+      "binary": "after"
+    },
+    {
+      "round": 9,
+      "binary": "after"
+    },
+    {
+      "round": 9,
+      "binary": "before"
+    },
+    {
+      "round": 10,
+      "binary": "before"
+    },
+    {
+      "round": 10,
+      "binary": "after"
+    },
+    {
+      "round": 11,
+      "binary": "after"
+    },
+    {
+      "round": 11,
+      "binary": "before"
+    },
+    {
+      "round": 12,
+      "binary": "before"
+    },
+    {
+      "round": 12,
+      "binary": "after"
+    },
+    {
+      "round": 13,
+      "binary": "after"
+    },
+    {
+      "round": 13,
+      "binary": "before"
+    },
+    {
+      "round": 14,
+      "binary": "before"
+    },
+    {
+      "round": 14,
+      "binary": "after"
+    },
+    {
+      "round": 15,
+      "binary": "after"
+    },
+    {
+      "round": 15,
+      "binary": "before"
+    },
+    {
+      "round": 16,
+      "binary": "before"
+    },
+    {
+      "round": 16,
+      "binary": "after"
+    },
+    {
+      "round": 17,
+      "binary": "after"
+    },
+    {
+      "round": 17,
+      "binary": "before"
+    },
+    {
+      "round": 18,
+      "binary": "before"
+    },
+    {
+      "round": 18,
+      "binary": "after"
+    },
+    {
+      "round": 19,
+      "binary": "after"
+    },
+    {
+      "round": 19,
+      "binary": "before"
+    },
+    {
+      "round": 20,
+      "binary": "before"
+    },
+    {
+      "round": 20,
+      "binary": "after"
+    },
+    {
+      "round": 21,
+      "binary": "after"
+    },
+    {
+      "round": 21,
+      "binary": "before"
+    },
+    {
+      "round": 22,
+      "binary": "before"
+    },
+    {
+      "round": 22,
+      "binary": "after"
+    },
+    {
+      "round": 23,
+      "binary": "after"
+    },
+    {
+      "round": 23,
+      "binary": "before"
+    },
+    {
+      "round": 24,
+      "binary": "before"
+    },
+    {
+      "round": 24,
+      "binary": "after"
+    },
+    {
+      "round": 25,
+      "binary": "after"
+    },
+    {
+      "round": 25,
+      "binary": "before"
+    },
+    {
+      "round": 26,
+      "binary": "before"
+    },
+    {
+      "round": 26,
+      "binary": "after"
+    },
+    {
+      "round": 27,
+      "binary": "after"
+    },
+    {
+      "round": 27,
+      "binary": "before"
+    },
+    {
+      "round": 28,
+      "binary": "before"
+    },
+    {
+      "round": 28,
+      "binary": "after"
+    },
+    {
+      "round": 29,
+      "binary": "after"
+    },
+    {
+      "round": 29,
+      "binary": "before"
+    },
+    {
+      "round": 30,
+      "binary": "before"
+    },
+    {
+      "round": 30,
+      "binary": "after"
+    },
+    {
+      "round": 31,
+      "binary": "after"
+    },
+    {
+      "round": 31,
+      "binary": "before"
+    },
+    {
+      "round": 32,
+      "binary": "before"
+    },
+    {
+      "round": 32,
+      "binary": "after"
+    },
+    {
+      "round": 33,
+      "binary": "after"
+    },
+    {
+      "round": 33,
+      "binary": "before"
+    },
+    {
+      "round": 34,
+      "binary": "before"
+    },
+    {
+      "round": 34,
+      "binary": "after"
+    },
+    {
+      "round": 35,
+      "binary": "after"
+    },
+    {
+      "round": 35,
+      "binary": "before"
+    },
+    {
+      "round": 36,
+      "binary": "before"
+    },
+    {
+      "round": 36,
+      "binary": "after"
+    },
+    {
+      "round": 37,
+      "binary": "after"
+    },
+    {
+      "round": 37,
+      "binary": "before"
+    },
+    {
+      "round": 38,
+      "binary": "before"
+    },
+    {
+      "round": 38,
+      "binary": "after"
+    },
+    {
+      "round": 39,
+      "binary": "after"
+    },
+    {
+      "round": 39,
+      "binary": "before"
+    }
+  ],
+  "completed_utc": "2026-09-14T16:01:30.138177+00:00"
+}
