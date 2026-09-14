@@ -46,15 +46,16 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use curl::easy::{Easy2, Handler, HttpVersion, List, WriteError};
-use curl::multi::{Easy2Handle, Multi};
+use curl::multi::{Easy2Handle, Multi, MultiWaker};
 use parking_lot::{Condvar, Mutex};
 use tokio::sync::{oneshot, Notify};
 
 use crate::error::{DownloadError, TransportError, TransportErrorKind};
 
-/// Maximum time the driver blocks in `Multi::wait` before it re-checks its
+/// Maximum time the driver blocks in a libcurl wait before it re-checks its
 /// command queue. Bounded waiting keeps command latency low without a
-/// per-transfer socket registration.
+/// per-transfer socket registration; a command submitted meanwhile wakes the
+/// blocked `poll` through the target pool's wakeup socket.
 const DRIVER_WAIT_SLICE: Duration = Duration::from_millis(20);
 
 /// How long the driver blocks on the command queue when it has no transfer
@@ -410,6 +411,12 @@ pub(crate) struct BodySink {
     id: TransferId,
     pause_count: AtomicUsize,
     accepted_bytes: AtomicUsize,
+    /// Mirror of `SinkState::paused`, readable without the lock. Set while a
+    /// paused write callback leaves libcurl with no read interest on this
+    /// transfer (a blocked download reports no `want_recv`), which is what
+    /// the driver's wait-target selection consults. Advisory only; the
+    /// authoritative pause state stays in `SinkState`.
+    paused_for_wait: AtomicBool,
 }
 
 impl BodySink {
@@ -428,6 +435,7 @@ impl BodySink {
             id,
             pause_count: AtomicUsize::new(0),
             accepted_bytes: AtomicUsize::new(0),
+            paused_for_wait: AtomicBool::new(false),
         })
     }
 
@@ -442,12 +450,14 @@ impl BodySink {
             // The consumer is gone or the transfer already failed: pause the
             // transfer instead of buffering bytes nobody will read. The driver
             // removes the handle as soon as it sees the cancelled state.
+            self.paused_for_wait.store(true, Ordering::Relaxed);
             self.pause_count.fetch_add(1, Ordering::Relaxed);
             return Err(WriteError::Pause);
         }
         if !state.queue.is_empty() && state.buffered + data.len() > self.budget {
             state.paused = true;
             state.drained_since_pause = false;
+            self.paused_for_wait.store(true, Ordering::Relaxed);
             self.pause_count.fetch_add(1, Ordering::Relaxed);
             return Err(WriteError::Pause);
         }
@@ -526,6 +536,10 @@ impl BodySink {
         if state.paused && state.drained_since_pause {
             state.paused = false;
             state.drained_since_pause = false;
+            // The driver is about to unpause the handle, which re-registers
+            // the transfer's read interest, so the wait target may pick this
+            // pool again.
+            self.paused_for_wait.store(false, Ordering::Relaxed);
             true
         } else {
             false
@@ -541,6 +555,14 @@ impl BodySink {
     /// this transfer, reported through [`DriverStats`].
     fn pause_count(&self) -> usize {
         self.pause_count.load(Ordering::Relaxed)
+    }
+
+    /// Whether a paused write callback currently leaves this transfer without
+    /// a socket libcurl could register read interest on, so waiting on its
+    /// pool can only end with the wait timeout or a wakeup. See
+    /// [`BodySink::paused_for_wait`].
+    fn paused_for_wait(&self) -> bool {
+        self.paused_for_wait.load(Ordering::Relaxed)
     }
 
     /// Bytes the write callback accepted from libcurl.
@@ -681,6 +703,11 @@ struct CommandState {
 struct CommandQueue {
     state: Mutex<CommandState>,
     ready: Condvar,
+    /// Waker of the pool the driver is currently blocked on in `Multi::poll`,
+    /// so a command submitted meanwhile interrupts that wait instead of
+    /// being served after the slice. `None` while the driver is not polling:
+    /// it re-checks the command queue on every loop anyway.
+    poll_waker: Mutex<Option<MultiWaker>>,
 }
 
 impl CommandQueue {
@@ -688,6 +715,7 @@ impl CommandQueue {
         Arc::new(Self {
             state: Mutex::new(CommandState::default()),
             ready: Condvar::new(),
+            poll_waker: Mutex::new(None),
         })
     }
 
@@ -703,6 +731,7 @@ impl CommandQueue {
             command,
         });
         drop(state);
+        self.wake_poll();
         self.ready.notify_one();
     }
 
@@ -745,6 +774,7 @@ impl CommandQueue {
         state.closed = true;
         state.commands.clear();
         drop(state);
+        self.wake_poll();
         self.ready.notify_all();
     }
 
@@ -771,7 +801,31 @@ impl CommandQueue {
 
     /// Wakes the driver so it can re-evaluate its shutdown condition.
     fn wake(&self) {
+        self.wake_poll();
         self.ready.notify_one();
+    }
+
+    /// Registers the wakeup target before checking for work that arrived since
+    /// the last drain. Earlier commands/close skip polling; later ones see the
+    /// registered waker, including between this check and entry into `poll`.
+    fn prepare_poll(&self, waker: MultiWaker) -> bool {
+        *self.poll_waker.lock() = Some(waker);
+        let state = self.state.lock();
+        let should_poll = state.commands.is_empty() && !state.closed;
+        drop(state);
+        if !should_poll {
+            *self.poll_waker.lock() = None;
+        }
+        should_poll
+    }
+
+    /// Wakes the driver out of a `Multi::poll` wait. With a registered waker,
+    /// wakeup also interrupts a poll that has not started yet. Without one,
+    /// `prepare_poll` must observe pending commands or closure before waiting.
+    fn wake_poll(&self) {
+        if let Some(waker) = self.poll_waker.lock().as_ref() {
+            let _ = waker.wakeup();
+        }
     }
 }
 
@@ -1468,6 +1522,22 @@ impl Pool {
         );
     }
 
+    /// Whether at least one active transfer of this pool may still produce
+    /// socket events.
+    ///
+    /// An active request does not guarantee a waitable socket: libcurl drops
+    /// the read interest of a transfer whose write callback paused it (the
+    /// blocked download reports no `want_recv`), so a pool whose transfers
+    /// are all paused has no data descriptor to wait on. Waiting there can
+    /// only end with the timeout or a command wakeup, while another pool may
+    /// have ready sockets; the selection in [`run_driver`] prefers a pollable
+    /// pool.
+    fn has_pollable_transfer(&self) -> bool {
+        self.active
+            .values()
+            .any(|transfer| !transfer.handle.get_ref().sink.paused_for_wait())
+    }
+
     /// The instant this pool's cached sockets have to be closed because it is
     /// completely idle, if any.
     ///
@@ -1668,12 +1738,32 @@ fn run_driver(queue: Arc<CommandQueue>, shared: Arc<DriverShared>, config: Drive
         if pools.values().any(|pool| !pool.active.is_empty()) {
             let wait = pools
                 .values()
+                .filter(|pool| !pool.active.is_empty())
                 .filter_map(|pool| pool.multi.get_timeout().ok().flatten())
                 .min()
                 .unwrap_or(DRIVER_WAIT_SLICE)
                 .min(DRIVER_WAIT_SLICE);
-            if let Some(pool) = pools.values().next() {
-                let _ = pool.multi.wait(&mut [], wait);
+            // Only a pool that runs a transfer may be waited on: an idle pool
+            // has nothing to wake the driver for, and `curl_multi_wait`
+            // returns from it immediately, which is what used to spin the loop
+            // whenever the arbitrary `pools.values().next()` picked it (P1
+            // §4.4 measured ~440k loops/s). Among the active pools, prefer one
+            // that may still produce socket events: an all-paused pool is a
+            // no-descriptor case whose wait only ends with the timeout.
+            let target = pools
+                .values()
+                .filter(|pool| !pool.active.is_empty())
+                .find(|pool| pool.has_pollable_transfer())
+                .or_else(|| pools.values().find(|pool| !pool.active.is_empty()));
+            if let Some(pool) = target {
+                // `poll` honours the timeout even without a waitable
+                // descriptor, and a command submitted meanwhile wakes it
+                // through the multi's wakeup socket: the waker is parked in
+                // the command queue for that.
+                if queue.prepare_poll(pool.multi.waker()) {
+                    let _ = pool.multi.poll(&mut [], wait);
+                    *queue.poll_waker.lock() = None;
+                }
             }
         } else {
             let wait = next_idle_wait(&pools, &config);

@@ -642,6 +642,123 @@ async fn a_slow_consumer_does_not_block_another_transfer() {
 }
 
 #[tokio::test]
+async fn a_fully_paused_transfer_does_not_spin_the_driver() {
+    // A write callback paused by backpressure leaves the transfer without
+    // read interest: libcurl registers no socket that could make progress
+    // for it. The wait then has nothing but the multi's wakeup socket, so a
+    // wait that does not honour its timeout would spin the loop (this is the
+    // pure-idle shape of P1 §4.4 with a live transfer attached). The driver
+    // must sleep out its wait slice instead.
+    let body: Vec<u8> = (0..262_144u32).map(|index| (index % 251) as u8).collect();
+    let plan = ResponsePlan {
+        chunk_size: 8 * 1024,
+        ..ResponsePlan::body(body.clone())
+    };
+    let server = TestServer::start(plan).await;
+    let driver = DriverHandle::spawn(DriverConfig::default());
+
+    let mut transfer = driver
+        .get(RequestOptions::new(server.url("/paused")), 8 * 1024)
+        .await
+        .unwrap();
+
+    // Reading nothing fills the budget and pauses the transfer; it stays
+    // paused as long as this test keeps not reading.
+    let started = Instant::now();
+    while transfer.body.pause_count() == 0 && started.elapsed() < Duration::from_secs(5) {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        transfer.body.pause_count() > 0,
+        "an 8 KiB budget must pause the transfer"
+    );
+    // Let the driver reach its wait with the transfer already paused.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let before = driver.stats().loops;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let loops = driver.stats().loops.saturating_sub(before);
+    // A spinning driver runs hundreds of thousands of loops here; a bounded
+    // wait runs about one per DRIVER_WAIT_SLICE.
+    assert!(
+        loops < 50,
+        "a fully paused driver ran {loops} loops inside a 200 ms hold"
+    );
+
+    // The paused bytes are still delivered exactly once afterwards.
+    let collected = collect_body(&mut transfer, Duration::from_secs(5)).await;
+    assert_eq!(collected, body);
+    assert_eq!(transfer.body.accepted_bytes(), body.len());
+    assert_eq!(driver.completed(), 1);
+    assert!(wait_for_idle(&driver, Duration::from_secs(2)).await);
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_stalled_transfer_next_to_an_idle_pool_keeps_the_loop_bounded() {
+    // The P1 §4.4 shape: one pool that finished its work (and now only keeps
+    // cached connections) next to a pool whose transfer waits for a slow
+    // origin. Waiting on the idle pool used to return immediately and spin
+    // the loop in about half the rounds.
+    let idle_plan = ResponsePlan::body(vec![b'i'; 4096]);
+    let idle_server = TestServer::start(idle_plan).await;
+    let stalled_plan = ResponsePlan {
+        head_delay: Duration::from_millis(500),
+        ..ResponsePlan::body(vec![b's'; 4096])
+    };
+    let stalled_server = TestServer::start(stalled_plan).await;
+
+    let driver = DriverHandle::spawn(DriverConfig::default());
+    // Complete one transfer first: its pool stays in the driver with a cached
+    // connection and no active transfer.
+    let mut idle_transfer = driver
+        .get(RequestOptions::new(idle_server.url("/idle")), 64 * 1024)
+        .await
+        .unwrap();
+    let idle_body = collect_body(&mut idle_transfer, Duration::from_secs(5)).await;
+    assert_eq!(idle_body, vec![b'i'; 4096]);
+
+    // The stalled request is in flight while its head is still delayed; the
+    // holder keeps the driver reference alive for the transfer.
+    let stalled = tokio::spawn({
+        let driver = driver.clone();
+        let url = stalled_server.url("/stalled");
+        async move { driver.get(RequestOptions::new(url), 64 * 1024).await }
+    });
+    let started = Instant::now();
+    while stalled_server.request_heads().is_empty() && started.elapsed() < Duration::from_secs(5) {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        !stalled_server.request_heads().is_empty(),
+        "the stalled request never reached the origin"
+    );
+
+    let before = driver.stats().loops;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let loops = driver.stats().loops.saturating_sub(before);
+    assert!(
+        loops < 50,
+        "the driver ran {loops} loops while an idle pool could be waited on"
+    );
+
+    // The stalled transfer still completes normally.
+    let mut transfer = tokio::time::timeout(Duration::from_secs(5), stalled)
+        .await
+        .expect("the stalled transfer must resolve")
+        .expect("the task must not panic")
+        .unwrap();
+    let stalled_body = collect_body(&mut transfer, Duration::from_secs(5)).await;
+    assert_eq!(stalled_body, vec![b's'; 4096]);
+    assert!(wait_for_idle(&driver, Duration::from_secs(2)).await);
+    assert_eq!(driver.completed(), 2);
+
+    idle_server.stop().await;
+    stalled_server.stop().await;
+}
+
+#[tokio::test]
 async fn body_errors_arrive_after_the_bytes_already_delivered() {
     let plan = ResponsePlan {
         truncate_at: Some(1024),
@@ -2250,4 +2367,54 @@ async fn a_busy_pool_closes_connections_left_idle_for_the_idle_timeout() {
         "the close must come from idle reclamation, not from a pool drop"
     );
     server.stop().await;
+}
+
+#[test]
+fn commands_before_waker_registration_skip_poll() {
+    for command in [
+        Command::Resume(TransferId(1)),
+        Command::Cancel(TransferId(1)),
+    ] {
+        let queue = CommandQueue::new();
+        let multi = Multi::new();
+        queue.drain(&mut Vec::new());
+        // Force the interleaving: drain -> send with no waker -> prepare poll.
+        queue.send(command);
+        assert!(!queue.prepare_poll(multi.waker()));
+        assert!(queue.poll_waker.lock().is_none());
+        assert_eq!(queue.take_commands().len(), 1);
+        // The skipped wait must not prevent the next idle wait from arming.
+        assert!(queue.prepare_poll(multi.waker()));
+    }
+}
+
+#[test]
+fn closure_before_waker_registration_skips_poll() {
+    let queue = CommandQueue::new();
+    let multi = Multi::new();
+    queue.close();
+    assert!(!queue.prepare_poll(multi.waker()));
+    assert!(queue.poll_waker.lock().is_none());
+    assert!(queue.is_closed());
+}
+
+#[test]
+fn commands_and_closure_after_registration_wake_the_next_poll() {
+    for close in [false, true] {
+        let queue = CommandQueue::new();
+        let multi = Multi::new();
+        assert!(queue.prepare_poll(multi.waker()));
+        // Force the other boundary: prepare -> send/close -> enter poll.
+        if close {
+            queue.close();
+        } else {
+            queue.send(Command::Resume(TransferId(1)));
+        }
+        let started = Instant::now();
+        multi.poll(&mut [], Duration::from_secs(2)).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        *queue.poll_waker.lock() = None;
+        assert_eq!(queue.is_closed(), close);
+        assert_eq!(queue.take_commands().len(), usize::from(!close));
+    }
 }

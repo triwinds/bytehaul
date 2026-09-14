@@ -113,8 +113,12 @@ P3 验收复审的 4 项修正见第 6 节。
    （该选项按秒截断），作为复用前的第二道防线。
 4. **等待与回收粒度**：命令通道改为 `Mutex<VecDeque<Command>> + Condvar`（`CommandQueue`），
    因为 driver 需要“带截止时间的阻塞等待”，而 tokio mpsc 只能无限阻塞或忙轮询。
-   有传输时仍按 `min(libcurl timer, 20 ms)` 调用 `Multi::wait`；无传输时等待命令或
-   最近的回收时刻。命令排队延迟记入 `DriverStats::max_command_latency`。
+   有传输时只在**有活动传输的池**上按 `min(libcurl timer, 20 ms)` 调用 `Multi::poll`
+   （P5：无描述符时也按超时有界等待；空闲池没有可等待描述符，选中它会让循环空转）。
+   命令入队同时通过当前池的 wakeup socket（`Multi::waker`）打断阻塞中的 `poll`，
+   登记 waker 后重查命令队列及关闭状态，有待处理状态就跳过等待，避免登记前的唤醒丢失。
+   排队延迟不再受 20 ms 分片限制；无传输时等待命令或最近的回收时刻。
+   命令排队延迟记入 `DriverStats::max_command_latency`。
 5. **RESOLVE 与池的交互**：注入条目按 `host:port` 记在池内，TTL 见
    `src/network/dns.rs` 的 `DnsAnswer`。TTL 到期或地址变化时先发 `-host:port` 再发新条目；
    地址变化额外对该传输设置 `CURLOPT_FRESH_CONNECT`，避免复用指向旧地址的连接

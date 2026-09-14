@@ -1,6 +1,6 @@
 # bytehaul 简化与优化实施计划
 
-日期：2026-09-13。状态：实施中；P0、P1 已完成，并已按评审意见修正（见[P0/P1 评审修正记录](#p0p1-评审修正记录)），P2/P3 已实现，P4 的 writer 改动与本机实验已完成（Windows 及性能复核待补）；最终验证与环境限制见完成记录。审查阶段已完成代码审查和四项行为问题的复现，B1–B4 已在 P0 修复并转为回归测试；P1 已完成默认路径与资源基线归档，并在评审后重新采集。
+日期：2026-09-13。状态：实施中；P0、P1 已完成，并已按评审意见修正（见[P0/P1 评审修正记录](#p0p1-评审修正记录)），P2/P3 已实现，P4 的 writer 改动与本机实验已完成（Windows 及性能复核待补），P5 已实现并完成本机驱动基准对照（见 [P5 驱动报告](p5-driver-run/report.zh-CN.md)）；最终验证与环境限制见完成记录。审查阶段已完成代码审查和四项行为问题的复现，B1–B4 已在 P0 修复并转为回归测试；P1 已完成默认路径与资源基线归档，并在评审后重新采集。
 
 审查基线：`2161fd4388bec05ec7183605e88b7e1c2b939164`，bytehaul 0.2.4，Windows。P0/P1 已完成；后续阶段以各步骤完成记录为准。
 
@@ -79,7 +79,7 @@ P1 的测量结果、复现命令与判据见[默认路径与资源基线](pipel
 | P2 | 高 | 配置统一解析、请求超时与共享 client 分离、缓存有界 | P0；资源比较使用 P1 | 已实现，验证限制见记录 |
 | P3 | 高 | 多连接传输循环统一，慢速恢复只负责策略 | P0、P1；配置结构复用 P2 | 已实现，验证限制见记录 |
 | P4 | 中 | 减少预分配与 writer 管线成本 | P0、P1；与 P3 分开提交 | writer 已实现，本机实验已完成；Windows 对照与性能复核待补 |
-| P5 | 中 | 修正多 pool 等待，按测量决定事件机制改造 | P1；在 P2 后验证资源生命周期 | 待实施 |
+| P5 | 中 | 修正多 pool 等待，按测量决定事件机制改造 | P1；在 P2 后验证资源生命周期 | 已实现，测量未要求完整事件机制；验证限制见记录 |
 | P6 | 中，低成本 | 清理唯一后端包装和重复 CI | CI 去重可独立提前实施 | 待实施 |
 
 ### P0：统一生命周期、停止处理和终态
@@ -177,7 +177,9 @@ P1 的测量结果、复现命令与判据见[默认路径与资源基线](pipel
 
 ### P5：改进 libcurl 多 pool 等待
 
-改动位置：[driver/mod.rs](../src/network/curl/driver/mod.rs)、[driver/tests.rs](../src/network/curl/driver/tests.rs) 和 [pool_semantics.rs](../src/network/curl/pool_semantics.rs)。
+状态：已实现。等待目标限定在有活动传输的池、无描述符场景用 `Multi::poll` 有界等待、命令经 wakeup socket 打断等待；driver 组 10 轮对照消除空转双峰并把命令/Resume 延迟降到 µs 级，未采用完整事件机制。结果与限制见 [P5 驱动报告](p5-driver-run/report.zh-CN.md)。
+
+改动位置：[driver/mod.rs](../src/network/curl/driver/mod.rs)、[driver/tests.rs](../src/network/curl/driver/tests.rs) 和 [pool_semantics.rs](../src/network/curl/pool_semantics.rs)；本轮实际改动为 driver 等待与命令唤醒、两项行为回归测试与三项 `prepare_poll` 竞态边界单测，并在 [Cargo.toml](../Cargo.toml) 启用 `poll_7_68_0`，池契约测试与单 pool 助手未改动。
 
 - 用 P1 的活动/闲置混合场景确认循环频率、CPU 和命令延迟；增加无活动描述符时的检查。
 - 首先修正任意选择 pool 等待的问题，并给无描述符场景建立有界等待；有活动请求不等于一定有可等待的 socket。
@@ -316,7 +318,7 @@ P1 由测量本身暴露并修复的三处缺陷：
 - [x] P2：配置解析统一、超时与 client 身份分离、缓存有界（验证限制见完成记录）。
 - [x] P3：多连接普通执行统一，恢复策略独立（验证限制见完成记录）。
 - [ ] P4：writer 优化及本机实验完成，已记录各候选取舍；Windows 原生空间预留对照及多连接预分配性能复核待补。
-- [ ] P5：多 pool 等待验证完成，修复已确认问题。
+- [x] P5：多 pool 等待验证完成，修复已确认问题。
 - [ ] P6：唯一后端结构与重复 CI 清理完成。
 
 ## 7. 外部实现依据
@@ -424,3 +426,17 @@ Ubuntu 24.04 x86_64 覆盖率入口已在本机 QEMU 容器中调用 `python3 sc
 - 最终 Rust lib **530 通过 / 3 忽略**、集成 **105 通过**；fmt、workspace Clippy（`-D warnings`）、doc test、workspace rustdoc 均通过。Python 最终扩展重建后 **157 项通过**，详见 [P4 完整报告](p4-storage-run/report.zh-CN.md)。模式矩阵、未知长度、重试、暂停续传、checksum 和 writer 失败继续通过；取消续传测试改为观察已接收进度后取消，确保实际覆盖新增缓冲的收尾。
 
 实现、候选取舍、逐轮原始数据及复现命令见 [P4 存储报告](p4-storage-run/report.zh-CN.md)。P4 的本机实现已交付，以上未完成验收仍保留，计划复选框暂不勾选。
+
+
+### P5：多 pool 等待修复与命令唤醒（2026-09-14）
+
+两次前后对照运行都在含 P4 未提交改动的树上（报告 `worktree = dirty`），比较对象只是 P5 diff；结果与限制见 [P5 驱动报告](p5-driver-run/report.zh-CN.md)。
+
+- driver 主循环第 5 步不再等待 `pools.values().next()` 选出的任意 pool：等待目标限定在有活动传输的池中，且优先还能产生 socket 事件的池。写回调暂停的传输会被 libcurl 摘除读兴趣（`Curl_req_want_recv` 为假），判定用 `BodySink::paused_for_wait` 原子镜像（仅作选择的启发式，权威暂停状态仍在 `SinkState`）。空闲池没有可等待描述符，`curl_multi_wait` 对它立即返回，正是 P1 §4.4 的空转来源。
+- 等待由 `Multi::wait` 改为 `Multi::poll`（[Cargo.toml](../Cargo.toml) 启用 curl crate 的 `poll_7_68_0` feature，静态 libcurl 8.21.0 提供该符号）：没有可等待描述符时也按超时有界等待；保留 `min(libcurl timer, 20 ms)` 时长上限，未缩短轮询间隔。
+- `CommandQueue` 增加 `poll_waker` 槽位：等待前登记当前池的 `Multi::waker()`，`send`/`wake`/`close` 都经 wakeup socket 打断阻塞中的 `poll`；评审修复补充登记后的 commands/closed 重查，有待处理状态就跳过 `poll`，检查后到达的命令由已登记的 waker 唤醒。修改前命令与 Resume 只能等 `wait` 超时返回——`max_command_latency` 稳定在 ≈25 ms，背压场景约 55 次 pause/resume 的 758.9 ms 中位耗时正是这些分片级等待而不是传输时间。
+- 同机 driver 组 10 轮前后对照：停滞+空闲场景“静止期循环/秒”由双峰（254580 对 41–53；全量运行 8/10 轮在 57 万–63 万档）变为每一轮 40–53，该场景 cpu_ms 142.4（7.7–309.7）→ 9.4（9.2–10.2）；背压 total 758.9 → 21.2 ms，single origin 120.3 → 13.2 ms；命令最大延迟降到 µs 级，取消与 idle 窗口场景持平。
+- 全量 52 场景前后两次运行：无超过 10% 调查门槛的中位回退（唯一到线的小文件形态经 20 轮复测为噪声）；下载类普遍受益于“恢复不再等分片”，`e2e/large_64MiB_4conns` 中位 total 774.8 → 30.4 ms（库内合计 body 等待 1372 → 16.4 ms），断流与慢尾形态不变。逐轮数据均已归档。
+- 新增五项 driver 测试：两项行为回归——`a_stalled_transfer_next_to_an_idle_pool_keeps_the_loop_bounded`（修改前 4 次运行 2 次以约 105k–108k 循环失败，修改后连续 6 次通过）与 `a_fully_paused_transfer_does_not_spin_the_driver`；以及三项 `prepare_poll` 竞态边界单测（登记 waker 前已入队或已关闭时跳过 `poll` 且不留悬挂 waker，登记后到达的命令与关闭唤醒下一次 `poll`）。既有 51 项 driver 单元测试（暂停/恢复、慢消费者、取消、idle 回收、驱动释放）全部通过；`pool_semantics` 池契约测试未改动并保持通过。
+- 验证：fmt、workspace Clippy（`-D warnings`）、doc test、workspace rustdoc（`-D warnings`）通过；lib 535 通过 / 3 忽略（P4 的 530 + 新增 5），集成 105 项中 104 通过、`http_header_timeout::header_deadline_includes_tls_handshake` 为 P0 起记录在案的本机间歇失败（隔离重跑 3 次通过），`--all-targets`（含基准目标执行）退出码 0；Python 扩展重建后 157 项通过。本计划与 [pool-semantics](libcurl-pool-semantics.zh-CN.md) 的等待描述已同步修订。
+- 未采用的复杂度：跨多个 `Multi` 的完整事件聚合（socket 回调）。测量不支持其必要性（CPU 与命令延迟均已达标、无回退场景）；多个活动池并存时未被选中的池仍最多延后一个 20 ms 分片，`poll + wakeup` 已是将来改造的前置条件。Linux 覆盖率门槛本轮仍未执行，不因本阶段改变其状态。

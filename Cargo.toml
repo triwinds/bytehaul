@@ -44,7 +44,10 @@ hickory-resolver = { version = "0.25", default-features = false, features = ["to
 # speak `http::{Request, Response, HeaderMap, StatusCode}` (see src/http/mod.rs).
 http = "1"
 # Vendored libcurl driver; see docs/libcurl-migration-plan.zh-CN.md (P0/P2).
-curl = { version = "0.4.50", features = ["static-curl"], optional = true }
+# `poll_7_68_0` exposes `Multi::poll`/`Multi::waker`: the driver's wait must
+# honour its timeout even with no waitable descriptor, and commands wake a
+# blocked poll through the multi's wakeup socket (P5).
+curl = { version = "0.4.50", features = ["static-curl", "poll_7_68_0"], optional = true }
 # Raw libcurl options the `curl` crate does not wrap yet
 # (`CURLMOPT_NETWORK_CHANGED`, see src/network/curl/driver/mod.rs).
 curl-sys = { version = "0.4.89", default-features = false, optional = true }
