@@ -14,31 +14,13 @@ concurrency:
 
 jobs:
   rust-tests:
-    name: Rust tests (${{ matrix.os }}, ${{ matrix.backend }})
+    name: Rust tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
 
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: ubuntu-latest
-            backend: curl-default
-            feature_args: ""
-          - os: ubuntu-latest
-            backend: curl-only
-            feature_args: --no-default-features --features curl-backend
-          - os: windows-latest
-            backend: curl-default
-            feature_args: ""
-          - os: windows-latest
-            backend: curl-only
-            feature_args: --no-default-features --features curl-backend
-          - os: macos-latest
-            backend: curl-default
-            feature_args: ""
-          - os: macos-latest
-            backend: curl-only
-            feature_args: --no-default-features --features curl-backend
+        os: [ubuntu-latest, windows-latest, macos-latest]
 
     steps:
       - name: Check out source
@@ -62,18 +44,26 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-
 
       - name: Run unit tests
-        run: cargo test -p bytehaul --all-targets ${{ matrix.feature_args }}
+        run: cargo test -p bytehaul --all-targets
 
       - name: Run doc tests
-        run: cargo test -p bytehaul --doc ${{ matrix.feature_args }}
+        run: cargo test -p bytehaul --doc
 
       - name: Clippy lint check
-        run: cargo clippy --workspace --all-targets ${{ matrix.feature_args }} -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Check documentation builds without warnings
         env:
           RUSTDOCFLAGS: "-D warnings"
-        run: cargo doc --no-deps --workspace ${{ matrix.feature_args }}
+        run: cargo doc --no-deps --workspace
+
+      # `default = ["curl-backend"]`, so this resolves to the same feature set
+      # as the default build; the step keeps the explicitly spelled-out
+      # configuration (used by the Python bindings and downstream builders)
+      # verified without a second full test job per platform.
+      - name: Check explicit curl-only feature configuration
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo check -p bytehaul --no-default-features --features curl-backend
 
   coverage:
     name: Coverage gate (≥95%)
