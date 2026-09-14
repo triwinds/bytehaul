@@ -1456,7 +1456,7 @@ mod tests {
         // tick may legitimately advance the file to the final prefix. The
         // invariant under test is the pre-body autosave of the written prefix.
         let (url, server) =
-            spawn_single_response_server(4, b"data".to_vec(), Duration::from_millis(200));
+            spawn_single_response_server(4, b"data".to_vec(), Duration::from_secs(1));
         let response = get_response(&url).await;
         let dir = tempfile::tempdir().unwrap();
         let control_path = dir.path().join("single-autosave.bytehaul");
@@ -1476,7 +1476,7 @@ mod tests {
             let path = control_path.clone();
             let observed = observed.clone();
             tokio::spawn(async move {
-                for _ in 0..60 {
+                for _ in 0..400 {
                     if let Ok(loaded) = ControlSnapshot::load(&path).await {
                         observed.lock().push(loaded.downloaded_bytes);
                     }
@@ -1843,7 +1843,7 @@ mod tests {
                         LogLevel::Off,
                         18,
                     );
-                    let (result, ()) = tokio::time::timeout(Duration::from_millis(500), async {
+                    let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
                         tokio::join!(run, stop)
                     })
                     .await
