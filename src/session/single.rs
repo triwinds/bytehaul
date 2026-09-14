@@ -2145,7 +2145,6 @@ mod tests {
         assert!(matches!(err, DownloadError::Io(_)), "got: {err:?}");
         let snapshot = progress_tx.borrow().clone();
         assert_eq!(snapshot.downloaded, 4);
-        drop(snapshot);
         assert_deferred_terminal_state(&progress_tx, Err(err), DownloadState::Failed);
         assert!(
             !control_path.exists(),
