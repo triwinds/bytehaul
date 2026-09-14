@@ -40,7 +40,9 @@
 进度、piece map 和控制文件仍以现有会话/存储规则为准。
 
 当前实际边界：响应类型是 `http::Response<HttpBody>`，`HttpBody`
-（`src/http/body.rs`）只有 `Curl(driver::BodyStream)` 变体；libcurl 响应头和 body 在
+（`src/http/body.rs`）包装驱动 `driver::BodyStream`（迁移期间它是 `Curl` 单变体枚举，
+后续在[简化与优化计划](simplification-and-optimization-plan.zh-CN.md)的 P6 中收敛为
+具体类型）；libcurl 响应头和 body 在
 `src/network/curl/transport.rs` 处转换后，不再向 worker、session 或 adaptive 暴露具体驱动
 类型。请求体是自有 ZST `HttpRequestBody`。解析器位于 `src/network/dns.rs`，通过
 `CURLOPT_RESOLVE` 注入 libcurl；`enable_ipv6`、自定义 DNS、DoH 与 TTL 缓存在同一条路径生效。
@@ -65,7 +67,8 @@ worker、session、scheduler、storage 与 rate_limiter 的调用形态没有变
 
 实现使用内部 `HttpBody` 包装驱动 body，无需引入公开后端 trait 或让用户接触 libcurl
 handle。P6 完成后 `HttpBody` 只保留 libcurl 变体，`next_chunk`/`next_data_chunk` 的签名
-与调用点不变；也不再提供后端选择字段或测试用的 `with_backend` 入口。
+与调用点不变；也不再提供后端选择字段或测试用的 `with_backend` 入口。后续简化计划的 P6
+把单变体枚举与 `BytehaulClient` 一并收敛为包装具体传输的类型，这一 seam 与签名保持不变。
 
 ### 3.2 Multi driver 与线程归属
 

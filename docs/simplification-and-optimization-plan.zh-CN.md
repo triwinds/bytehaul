@@ -1,6 +1,6 @@
 # bytehaul 简化与优化实施计划
 
-日期：2026-09-13。状态：实施中；P0、P1 已完成，并已按评审意见修正（见[P0/P1 评审修正记录](#p0p1-评审修正记录)），P2/P3 已实现，P4 的 writer 改动与本机实验已完成（Windows 及性能复核待补），P5 已实现并完成本机驱动基准对照（见 [P5 驱动报告](p5-driver-run/report.zh-CN.md)）；最终验证与环境限制见完成记录。审查阶段已完成代码审查和四项行为问题的复现，B1–B4 已在 P0 修复并转为回归测试；P1 已完成默认路径与资源基线归档，并在评审后重新采集。
+日期：2026-09-13。状态：实施中；P0、P1 已完成，并已按评审意见修正（见[P0/P1 评审修正记录](#p0p1-评审修正记录)），P2/P3 已实现，P4 的 writer 改动与本机实验已完成（Windows 及性能复核待补），P5 已实现并完成本机驱动基准对照（见 [P5 驱动报告](p5-driver-run/report.zh-CN.md)），P6 已实现（CI 去重与类型清理分为两次提交）；最终验证与环境限制见完成记录。审查阶段已完成代码审查和四项行为问题的复现，B1–B4 已在 P0 修复并转为回归测试；P1 已完成默认路径与资源基线归档，并在评审后重新采集。
 
 审查基线：`2161fd4388bec05ec7183605e88b7e1c2b939164`，bytehaul 0.2.4，Windows。P0/P1 已完成；后续阶段以各步骤完成记录为准。
 
@@ -49,7 +49,7 @@ cargo test -p bytehaul --locked --offline --test m6_features --test m8_pause_res
 | worker 职责耦合 | `Coordinator::new_with_start` 仅在 `Disabled + Fixed + request_batch_size=0` 时返回 `None`，普通动态调度和批处理也依赖 adaptive 执行路径 | 两套 worker 的维护成本及重构后的行为一致性 | 未测（属结构问题，P3 用行为矩阵而非耗时判断） |
 | 文件写入成本 | Windows 默认预分配先写零并同步；单连接逐块 `seek + write_all`；多连接缓存追加时复制数据 | 启动时间、CPU、文件操作次数和总完成时间 | 已量化：单连接 4 MiB = 256 次写块（平均 16384 字节）且不经写回缓存，split 12 MiB = 12 块 / 1 MiB；1 MiB 预算 = 48.5 块；预分配 12 MiB ≈ 8.0 ms 对按需增长 0.64 ms |
 | driver 等待 | 推进所有 pool，却只等待 `pools.values().next()` 选出的 pool，未保证它有活动请求 | 多 origin 或暂停传输时的空转、命令延迟和事件处理延迟 | 已复现：停滞 pool + 空闲 pool 场景单进程逐轮双峰，静止期 41–47 对 44 万次/秒；纯空闲场景 0 次 |
-| 配置与 CI 重复 | Rust/Python 多处声明和验证选项；唯一后端保留单分支包装；CI 完整运行两个等价 feature 组合 | 配置规则漂移、重复构建与测试时间 | 未测（P2/P6 按规则一致性和 CI 时长判断） |
+| 配置与 CI 重复 | Rust/Python 多处声明和验证选项；唯一后端保留单分支包装；CI 完整运行两个等价 feature 组合 | 配置规则漂移、重复构建与测试时间 | P6 已删除重复 job 与单分支包装（显式 feature 配置保留轻量检查）；实际 CI 计算时间变化待 Actions 观测 |
 | 基准与默认路径不一致 | scheduler 基准主要调用 `assign_to_with_split`，默认下载还经过动态候选与请求规划 | 默认策略的调度开销是否进入现有测量 | 已解决：`bench_scheduler_plan` 按自适应 worker 的方式驱动 `assign_request_with_diagnostics`；默认 Dynamic 与 Fixed 的请求数差异已可测（4096 piece：64 对 1024） |
 
 driver 空转属于代码和接口语义推导，P1 已实测复现，见[基线报告 4.4](pipeline-baseline.zh-CN.md)：libcurl 在没有可等待描述符时会让 `curl_multi_wait` 立即返回。[官方说明](https://curl.se/libcurl/c/curl_multi_wait.html)
@@ -80,7 +80,7 @@ P1 的测量结果、复现命令与判据见[默认路径与资源基线](pipel
 | P3 | 高 | 多连接传输循环统一，慢速恢复只负责策略 | P0、P1；配置结构复用 P2 | 已实现，验证限制见记录 |
 | P4 | 中 | 减少预分配与 writer 管线成本 | P0、P1；与 P3 分开提交 | writer 已实现，本机实验已完成；Windows 对照与性能复核待补 |
 | P5 | 中 | 修正多 pool 等待，按测量决定事件机制改造 | P1；在 P2 后验证资源生命周期 | 已实现，测量未要求完整事件机制；验证限制见记录 |
-| P6 | 中，低成本 | 清理唯一后端包装和重复 CI | CI 去重可独立提前实施 | 待实施 |
+| P6 | 中，低成本 | 清理唯一后端包装和重复 CI | CI 去重可独立提前实施 | 已完成 |
 
 ### P0：统一生命周期、停止处理和终态
 
@@ -319,7 +319,7 @@ P1 由测量本身暴露并修复的三处缺陷：
 - [x] P3：多连接普通执行统一，恢复策略独立（验证限制见完成记录）。
 - [ ] P4：writer 优化及本机实验完成，已记录各候选取舍；Windows 原生空间预留对照及多连接预分配性能复核待补。
 - [x] P5：多 pool 等待验证完成，修复已确认问题。
-- [ ] P6：唯一后端结构与重复 CI 清理完成。
+- [x] P6：唯一后端结构与重复 CI 清理完成。
 
 ## 7. 外部实现依据
 
@@ -440,3 +440,33 @@ Ubuntu 24.04 x86_64 覆盖率入口已在本机 QEMU 容器中调用 `python3 sc
 - 新增五项 driver 测试：两项行为回归——`a_stalled_transfer_next_to_an_idle_pool_keeps_the_loop_bounded`（修改前 4 次运行 2 次以约 105k–108k 循环失败，修改后连续 6 次通过）与 `a_fully_paused_transfer_does_not_spin_the_driver`；以及三项 `prepare_poll` 竞态边界单测（登记 waker 前已入队或已关闭时跳过 `poll` 且不留悬挂 waker，登记后到达的命令与关闭唤醒下一次 `poll`）。既有 51 项 driver 单元测试（暂停/恢复、慢消费者、取消、idle 回收、驱动释放）全部通过；`pool_semantics` 池契约测试未改动并保持通过。
 - 验证：fmt、workspace Clippy（`-D warnings`）、doc test、workspace rustdoc（`-D warnings`）通过；lib 535 通过 / 3 忽略（P4 的 530 + 新增 5），集成 105 项中 104 通过、`http_header_timeout::header_deadline_includes_tls_handshake` 为 P0 起记录在案的本机间歇失败（隔离重跑 3 次通过），`--all-targets`（含基准目标执行）退出码 0；Python 扩展重建后 157 项通过。本计划与 [pool-semantics](libcurl-pool-semantics.zh-CN.md) 的等待描述已同步修订。
 - 未采用的复杂度：跨多个 `Multi` 的完整事件聚合（socket 回调）。测量不支持其必要性（CPU 与命令延迟均已达标、无回退场景）；多个活动池并存时未被选中的池仍最多延后一个 20 ms 分片，`poll + wakeup` 已是将来改造的前置条件。Linux 覆盖率门槛本轮仍未执行，不因本阶段改变其状态。
+
+
+### P6：唯一后端结构清理与 CI 去重（2026-09-14）
+
+按计划的提交划分：CI 去重 `cd19a77`、类型清理 `1a27023`，均可独立回退；本记录与上述提交之后的文档更新一并归档。
+
+CI（[test.yml](../.github/workflows/test.yml)）：
+
+- 每平台两套等价完整 Rust job 合并为一套：矩阵改为 Linux、Windows、macOS 各一个完整 job（unit 测试、doc test、Clippy、rustdoc），步骤与原 `curl-default` 相同，job 名去掉已不存在的 backend 维度。原 `curl-only` 与默认构建解析出的特性集合完全一致（`default = ["curl-backend"]`），合并不删除任何实际编译或测试路径。
+- 显式 `--no-default-features --features curl-backend` 保留为 Linux job 内的一条轻量编译检查 `cargo check -p bytehaul`（本地缓存命中时约 2 秒；验证的是显式写法与特性解析，因为该配置编译的代码与默认配置相同）；Python job 继续以该显式配置构建扩展，覆盖率 job 未动。
+- 完整 Rust 平台 job 6 → 3。本机无法测量 GitHub 托管计算时间：记录 job 数变化与轻量检查步骤的本地耗时，不声明总时间减半；实际总计算时间变化须在 push 后由 Actions 观测。
+
+类型清理（[network.rs](../src/network.rs)、[body.rs](../src/http/body.rs)）：
+
+- `BytehaulClient` 由单变体 `enum Curl(Arc<CurlTransport>)` 收敛为包装具体传输的结构体，删除 3 处单臂 `match`（`request`、`request_with_timeout`、`driver_stats`）；`driver_stats` 不再返回 `Option`（唯一后端必有驱动线程），manager 缓存测试改用新增的 `BytehaulClient::same_transport` 测试方法。
+- `HttpBody` 由单变体枚举收敛为包装 `driver::BodyStream` 的结构体，删除读取与 `Debug` 两处单臂 `match`；逐帧读取的 body 计时逻辑保留，`next_chunk`/`next_data_chunk` 签名与全部调用点不变。
+- 删除 `network.rs`（8 处）与 `http/body.rs`（3 处）全部 `#[cfg(feature = "curl-backend")]` 内联分支。保留 HTTP 类型边界：manager/session/worker 继续通过 `http::Request`/`HttpResponse` 访问传输，libcurl 细节仍只存在于 `network/curl/`。
+- `curl-backend` 名称、默认启用、Python 绑定特性转发与 [bindings/python/Cargo.toml](../bindings/python/Cargo.toml) 未变；缺特性构建仍以 `compile_error!("bytehaul requires the curl-backend feature")` 为第一条错误（其后的错误是 `curl`/`curl-sys` 依赖被关掉后的常规级联，与改动前同类）。[Cargo.toml](../Cargo.toml) 只更新注释。
+
+文档：[architecture.md](architecture.md)/[architecture.zh-CN.md](architecture.zh-CN.md) 在迁移阶段已表述为“libcurl 是唯一生产后端”，本轮核对无残留历史后端措辞；[迁移计划](libcurl-migration-plan.zh-CN.md) 两处“当前边界/目标”描述更新为收敛后的类型并指回本计划；迁移实验、公网对照与多 IP 原型文档保留为历史依据。maturin 调试构建产生的 `*.dSYM/` 加入 `.gitignore`（`c9354ac`）。
+
+验证（本机 macOS，改动后的固定源码）：
+
+- `cargo fmt --all -- --check`、`cargo clippy --workspace --locked --all-targets -- -D warnings`、`cargo doc --no-deps --workspace --locked`（`RUSTDOCFLAGS=-D warnings`）、`cargo test -p bytehaul --locked --doc`（1 项）通过。
+- `cargo test -p bytehaul --locked --all-targets --no-fail-fast`：lib **535 通过 / 3 忽略**、集成 **105 通过**，基准目标执行完毕，整体退出码 0。首轮曾在全量并行负载下出现 `network::curl::driver::tests::a_pool_that_may_not_reuse_connections_keeps_none_idle` 失败——即 P2 起记录在案的本机空闲池时序波动（原始源码同样复现，且本改动不触及 driver）：隔离重跑 **8/8 通过**，全量 lib 复跑与整体复跑均通过。
+- 显式特性配置 `cargo check -p bytehaul --locked --no-default-features --features curl-backend` 通过；`cargo check -p bytehaul --no-default-features` 仍以明确错误开头。
+- Python：`uv sync --project bindings/python`、`maturin develop --bindings pyo3 --no-default-features --features curl-backend`、`uv run pytest` 完成，**157 项通过**。
+- Linux 覆盖率门槛未执行（延续既有状态，不因本阶段改变）。
+
+兼容性影响：无公开 API 变化（两个新结构体与 `driver_stats` 均为 `pub(crate)` 内部类型；`bench::bench_driver_stats` 是 `#[doc(hidden)]` 访问器且签名未变）；公开用法、feature 语义与 wheel 构建不变。
