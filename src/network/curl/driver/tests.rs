@@ -1727,17 +1727,20 @@ async fn a_pool_that_may_not_reuse_connections_keeps_none_idle() {
         );
     }
 
-    // The driver stops the pool on its next pass, which runs just after the
-    // completion the consumer observed.
+    // The contract is that no socket remains idle. Observe that at the peer
+    // instead of using `stats().pools` as a synchronization barrier: the body
+    // EOF is published just before the driver's next pass updates that
+    // diagnostic counter, and the full parallel suite can widen that window.
     let reclaimed = tokio::time::timeout(Duration::from_secs(2), async {
-        while driver.stats().pools != 0 {
+        while closed.load(Ordering::SeqCst) != 2 {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
     .await;
     assert!(
         reclaimed.is_ok(),
-        "a pool with reuse disabled is dropped as soon as it is idle"
+        "a pool with reuse disabled must close every completed connection; closed={}",
+        closed.load(Ordering::SeqCst)
     );
     server.abort();
 }

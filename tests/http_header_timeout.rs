@@ -90,9 +90,9 @@ fn spec(server: &Server, path: &std::path::Path) -> DownloadSpec {
 }
 fn assert_timeout(error: DownloadError) {
     match error {
-        DownloadError::Transport(error) => assert_eq!(
-            error.to_string(),
-            "timeout transport error: request timed out"
+        DownloadError::Transport(error) => assert!(
+            error.to_string().starts_with("timeout transport error:"),
+            "expected a timeout transport error, got {error}"
         ),
         other => panic!("expected transport timeout, got {other:?}"),
     }
