@@ -1,0 +1,178 @@
+{
+  "started_utc": "2026-09-14T01:59:43.721311+00:00",
+  "platform": "macOS-26.5.1-arm64-arm-64bit",
+  "rounds": 20,
+  "binaries": {
+    "before": {
+      "path": "/Users/chenjn/project/bytehaul/target/p4-before-build/release/deps/pipeline_bench-86ee3b2ba6477b83",
+      "sha256": "a4afb5fddb69549be31204c4b0b9289ed65293fccfc4d8f84964047049d11205"
+    },
+    "after": {
+      "path": "/Users/chenjn/project/bytehaul/target/release/deps/pipeline_bench-86ee3b2ba6477b83",
+      "sha256": "e34a80b8e3356ac22f1297c8d7581f7d999f4437a8790338eb6eff21ea957afe"
+    }
+  },
+  "order": [
+    {
+      "round": 0,
+      "binary": "before"
+    },
+    {
+      "round": 0,
+      "binary": "after"
+    },
+    {
+      "round": 1,
+      "binary": "after"
+    },
+    {
+      "round": 1,
+      "binary": "before"
+    },
+    {
+      "round": 2,
+      "binary": "before"
+    },
+    {
+      "round": 2,
+      "binary": "after"
+    },
+    {
+      "round": 3,
+      "binary": "after"
+    },
+    {
+      "round": 3,
+      "binary": "before"
+    },
+    {
+      "round": 4,
+      "binary": "before"
+    },
+    {
+      "round": 4,
+      "binary": "after"
+    },
+    {
+      "round": 5,
+      "binary": "after"
+    },
+    {
+      "round": 5,
+      "binary": "before"
+    },
+    {
+      "round": 6,
+      "binary": "before"
+    },
+    {
+      "round": 6,
+      "binary": "after"
+    },
+    {
+      "round": 7,
+      "binary": "after"
+    },
+    {
+      "round": 7,
+      "binary": "before"
+    },
+    {
+      "round": 8,
+      "binary": "before"
+    },
+    {
+      "round": 8,
+      "binary": "after"
+    },
+    {
+      "round": 9,
+      "binary": "after"
+    },
+    {
+      "round": 9,
+      "binary": "before"
+    },
+    {
+      "round": 10,
+      "binary": "before"
+    },
+    {
+      "round": 10,
+      "binary": "after"
+    },
+    {
+      "round": 11,
+      "binary": "after"
+    },
+    {
+      "round": 11,
+      "binary": "before"
+    },
+    {
+      "round": 12,
+      "binary": "before"
+    },
+    {
+      "round": 12,
+      "binary": "after"
+    },
+    {
+      "round": 13,
+      "binary": "after"
+    },
+    {
+      "round": 13,
+      "binary": "before"
+    },
+    {
+      "round": 14,
+      "binary": "before"
+    },
+    {
+      "round": 14,
+      "binary": "after"
+    },
+    {
+      "round": 15,
+      "binary": "after"
+    },
+    {
+      "round": 15,
+      "binary": "before"
+    },
+    {
+      "round": 16,
+      "binary": "before"
+    },
+    {
+      "round": 16,
+      "binary": "after"
+    },
+    {
+      "round": 17,
+      "binary": "after"
+    },
+    {
+      "round": 17,
+      "binary": "before"
+    },
+    {
+      "round": 18,
+      "binary": "before"
+    },
+    {
+      "round": 18,
+      "binary": "after"
+    },
+    {
+      "round": 19,
+      "binary": "after"
+    },
+    {
+      "round": 19,
+      "binary": "before"
+    }
+  ],
+  "completed_utc": "2026-09-14T02:00:18.632780+00:00"
+}

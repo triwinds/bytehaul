@@ -89,14 +89,7 @@ pub(super) async fn run_multi_worker(
     let (write_tx, write_rx) = mpsc::channel::<WriterCommand>(spec.storage.channel_buffer);
     let written_bytes = Arc::new(AtomicU64::new(0));
     let writer_handle = tokio::spawn(
-        WriterTask::new(
-            write_rx,
-            file,
-            written_bytes.clone(),
-            budget.semaphore.clone(),
-            budget.watermark,
-        )
-        .run(),
+        WriterTask::new(write_rx, file, written_bytes.clone(), budget.watermark).run(),
     );
 
     // Scheduler

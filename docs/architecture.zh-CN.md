@@ -88,7 +88,7 @@ DNS 查询和有容量限制的 TTL 响应缓存由 Hickory 负责；下载前�
 
 ### Writer
 
-通过有界 channel 接收数据，使用 `seek + write_all` 写入输出文件。单连接数据直接写盘，带 lease 的数据经过缓存。flush 确认允许 worker 标记 lease 完成，sync 确认则用于建立 checkpoint 持久化边界。文件创建与预分配位于 `storage/file.rs`。
+通过有界 channel 接收数据，跟踪文件偏移，仅在非连续写入时 seek。单连接合并相邻小块，在 256 KiB 阈值或会话内存水位处写出，大块直接写入；带 lease 的数据继续经过独立缓存。内存许可随数据入队，由 writer 持有到写出或丢弃，关闭队列和写入失败也自动归还。flush 确认允许 worker 标记 lease 完成，sync 确认则用于建立 checkpoint 持久化边界。文件创建与预分配位于 `storage/file.rs`。
 
 ### ControlSnapshot
 

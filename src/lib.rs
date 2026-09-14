@@ -178,8 +178,10 @@ pub mod bench {
     /// really produced, not a benchmark-only reimplementation.
     #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
     pub struct BenchCounters {
-        /// Blocks the writer flushed to disk, one seek+write pair each.
+        /// Blocks handed to the file writer.
         pub writer_blocks: u64,
+        /// Actual seeks; contiguous writes reuse the tracked file offset.
+        pub writer_seeks: u64,
         /// Bytes those blocks contained.
         pub writer_bytes: u64,
         /// Body bytes copied into the write-back cache.
@@ -219,6 +221,7 @@ pub mod bench {
         fn from(snapshot: crate::bench_stats::Snapshot) -> Self {
             Self {
                 writer_blocks: snapshot.writer_blocks,
+                writer_seeks: snapshot.writer_seeks,
                 writer_bytes: snapshot.writer_bytes,
                 cache_copied_bytes: snapshot.cache_copied_bytes,
                 cache_evicted_bytes: snapshot.cache_evicted_bytes,

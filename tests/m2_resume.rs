@@ -146,21 +146,25 @@ async fn test_resume_after_cancel() {
         .file_allocation(FileAllocation::None);
     let handle = downloader.download(spec.clone());
 
-    // Wait until some data is actually written, then cancel.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-    while tokio::time::Instant::now() < deadline {
-        if tokio::fs::metadata(&output_path)
-            .await
-            .map(|metadata| metadata.len() > 0)
-            .unwrap_or(false)
-        {
-            break;
+    // Observe producer progress: small downloads may still be entirely in the
+    // writer buffer. Cancellation itself must flush and checkpoint that prefix.
+    let mut progress = handle.subscribe_progress();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if progress.borrow().downloaded > 0 {
+                assert!(progress.borrow().downloaded < expected.len() as u64);
+                break;
+            }
+            progress.changed().await.unwrap();
         }
-
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    })
+    .await
+    .expect("download must report an interruptible prefix");
     handle.cancel();
-    let _ = handle.wait().await;
+    assert!(matches!(
+        handle.wait().await,
+        Err(bytehaul::DownloadError::Cancelled)
+    ));
 
     let partial_size = std::fs::metadata(&output_path)
         .map(|m| m.len())

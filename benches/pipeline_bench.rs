@@ -24,6 +24,9 @@
 //!   header) so two runs compare the same phases.
 //! * Temporary files stay under `target/pipeline-bench`.
 
+#[path = "pipeline_bench/storage_experiments.rs"]
+mod storage_experiments;
+
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
 use std::future::Future;
@@ -321,6 +324,9 @@ where
             round = round
                 .metric("cpu_ms", cpu_ms)
                 .metric("cpu_percent", cpu_ms * 100.0 / millis(elapsed).max(0.001));
+        }
+        if let Some(peak) = memory_bytes().1 {
+            round = round.metric("process_peak_rss_bytes", peak as f64);
         }
         scenario.samples.push(Sample {
             round: round_index,
@@ -824,7 +830,21 @@ fn cpu_seconds() -> Option<f64> {
     Some((user + system) as f64 / ticks_per_second as f64)
 }
 
-#[cfg(not(any(windows, target_os = "linux")))]
+#[cfg(target_os = "macos")]
+fn cpu_seconds() -> Option<f64> {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+    // getrusage initializes the output only on success.
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    let usage = unsafe { usage.assume_init() };
+    Some(
+        (usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) as f64
+            + (usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) as f64 / 1_000_000.0,
+    )
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 fn cpu_seconds() -> Option<f64> {
     None
 }
@@ -864,7 +884,18 @@ fn memory_bytes() -> (Option<u64>, Option<u64>) {
     (read("VmRSS:"), read("VmHWM:"))
 }
 
-#[cfg(not(any(windows, target_os = "linux")))]
+#[cfg(target_os = "macos")]
+fn memory_bytes() -> (Option<u64>, Option<u64>) {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } != 0 {
+        return (None, None);
+    }
+    let usage = unsafe { usage.assume_init() };
+    // Darwin reports ru_maxrss in bytes; this is a process high-water mark.
+    (None, Some(usage.ru_maxrss as u64))
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 fn memory_bytes() -> (Option<u64>, Option<u64>) {
     (None, None)
 }
@@ -1163,6 +1194,7 @@ fn download_round(outcome: &DownloadOutcome, expect_failure: bool) -> Round {
         .metric("verified", f64::from(outcome.verified))
         .metric("failed", f64::from(outcome.result.is_err()))
         .metric("writer_blocks", counters.writer_blocks as f64)
+        .metric("writer_seeks", counters.writer_seeks as f64)
         .metric("writer_bytes", counters.writer_bytes as f64)
         .metric(
             "avg_block_bytes",
@@ -1400,7 +1432,13 @@ async fn run_writer(config: &Config, dir: &Path) -> Vec<Scenario> {
                         true,
                     )
                     .await;
-                    let round = download_round(&outcome, false);
+                    let mut round = download_round(&outcome, false);
+                    if let Some(stats) = bench_driver_stats(&downloader) {
+                        round = round
+                            .metric("driver_loops", stats.loops as f64)
+                            .metric("driver_pauses", stats.pauses as f64)
+                            .metric("driver_connections", stats.connections as f64);
+                    }
                     let _ = std::fs::remove_file(&output);
                     drop(downloader);
                     round
@@ -1417,6 +1455,83 @@ async fn run_writer(config: &Config, dir: &Path) -> Vec<Scenario> {
 // ──────────────────────────────────────────────────────────────
 //  Group 3: client cache and driver lifetime
 // ──────────────────────────────────────────────────────────────
+
+// Cancellation after a received prefix, while the single writer may still hold
+// it below its batching threshold. Timing includes flush, sync and checkpoint.
+async fn run_writer_stop(config: &Config, dir: &Path) -> Vec<Scenario> {
+    let fixture = Fixture::spawn(
+        "writer_stop",
+        FixtureShape::new(4 * 1024 * 1024).slow_tail(0, 16 * 1024, Duration::from_millis(50)),
+    );
+    let expected = fixture.expected();
+    let output = dir.join("writer-stop.bin");
+    vec![
+        collect(
+            config,
+            "writer_stop",
+            "writer_stop/single_buffered_cancel",
+            "cancel through durable checkpoint",
+            vec![],
+            move |_| {
+                let fixture = fixture.clone();
+                let expected = expected.clone();
+                let output = output.clone();
+                async move {
+                    let baseline = bench_driver_threads();
+                    let downloader = Downloader::builder().build().unwrap();
+                    bench_counters_reset();
+                    let handle = downloader.download(
+                        DownloadSpec::new(fixture.url.clone())
+                            .output_path(&output)
+                            .max_connections(1)
+                            .file_allocation(FileAllocation::None),
+                    );
+                    let mut progress = handle.subscribe_progress();
+                    tokio::time::timeout(Duration::from_secs(10), async {
+                        loop {
+                            if progress.borrow().downloaded > 0 {
+                                break;
+                            }
+                            progress.changed().await.unwrap();
+                        }
+                    })
+                    .await
+                    .expect("an interruptible prefix must arrive");
+                    let observed = progress.borrow().downloaded;
+                    assert!(observed < expected.len() as u64);
+                    let before = bench_counters_snapshot();
+                    let started = Instant::now();
+                    handle.cancel();
+                    let result = handle.wait().await;
+                    let cancel_ms = millis(started.elapsed());
+                    assert!(matches!(result, Err(bytehaul::DownloadError::Cancelled)));
+                    let bytes = std::fs::read(&output).unwrap();
+                    assert!(bytes.len() >= observed as usize && bytes.len() < expected.len());
+                    assert_eq!(bytes, expected[..bytes.len()]);
+                    let control = output.with_file_name("writer-stop.bin.bytehaul");
+                    assert!(control.exists());
+                    assert!(
+                        wait_until(|| fixture.active.load(Ordering::SeqCst) == 0, CANCEL_GRACE)
+                            .await
+                    );
+                    std::fs::remove_file(&output).unwrap();
+                    std::fs::remove_file(control).unwrap();
+                    drop(downloader);
+                    assert!(wait_for_driver_threads(baseline, CANCEL_GRACE).await);
+                    Round::new()
+                        .metric("total", cancel_ms)
+                        .metric("cancel_ms", cancel_ms)
+                        .metric("received_before_cancel", observed as f64)
+                        .metric("written_before_cancel", before.writer_bytes as f64)
+                        .metric("durable_prefix_bytes", bytes.len() as f64)
+                        .metric("verified", 1.0)
+                        .metric("driver_threads_after_drop", bench_driver_threads() as f64)
+                }
+            },
+        )
+        .await,
+    ]
+}
 
 async fn run_client(config: &Config, dir: &Path) -> Vec<Scenario> {
     const GROUP: &str = "client";
@@ -2248,11 +2363,31 @@ fn summary_columns(group: &str) -> &'static [&'static str] {
             "total",
             "cpu_ms",
             "writer_blocks",
+            "writer_seeks",
             "avg_block_bytes",
             "cache_copied_bytes",
             "fsync_calls",
             "fsync_ms",
             "prealloc_ms",
+        ],
+        "storage" => &[
+            "bytes",
+            "total",
+            "cpu_ms",
+            "write_calls",
+            "seek_calls",
+            "assembly_ms",
+            "cache_copied_bytes",
+            "allocation_ms",
+            "verified",
+        ],
+        "writer_stop" => &[
+            "cancel_ms",
+            "received_before_cancel",
+            "written_before_cancel",
+            "durable_prefix_bytes",
+            "verified",
+            "driver_threads_after_drop",
         ],
         "client" => &[
             "total",
@@ -2461,7 +2596,15 @@ fn render_report(
     );
     let _ = writeln!(out);
 
-    for group in ["scheduler", "writer", "client", "driver", "e2e"] {
+    for group in [
+        "scheduler",
+        "writer",
+        "writer_stop",
+        "storage",
+        "client",
+        "driver",
+        "e2e",
+    ] {
         let selected: Vec<&Scenario> = scenarios
             .iter()
             .filter(|scenario| scenario.group == group && !scenario.samples.is_empty())
@@ -2616,6 +2759,8 @@ async fn main() {
     let mut scenarios = Vec::new();
     scenarios.extend(run_scheduler(&config).await);
     scenarios.extend(run_writer(&config, &work_dir).await);
+    scenarios.extend(run_writer_stop(&config, &work_dir).await);
+    scenarios.extend(storage_experiments::run(&config, &work_dir).await);
     scenarios.extend(run_client(&config, &work_dir).await);
     scenarios.extend(run_driver(&config, &work_dir).await);
     scenarios.extend(run_end_to_end(&config, &work_dir).await);
@@ -2690,7 +2835,7 @@ async fn main() {
 /// the `scenario_names_cover_every_scenario` harness self-check at the bottom of
 /// this file.
 fn scenario_names() -> Vec<String> {
-    let mut names = Vec::new();
+    let mut names = storage_experiments::names();
     for pieces in [64usize, 512, 4096] {
         for pattern in ["fresh", "holes", "resumed_suffix"] {
             for mode in ["dynamic", "fixed"] {
@@ -2698,6 +2843,7 @@ fn scenario_names() -> Vec<String> {
             }
         }
     }
+    names.push("writer_stop/single_buffered_cancel".into());
     names.extend(
         writer_variants()
             .into_iter()

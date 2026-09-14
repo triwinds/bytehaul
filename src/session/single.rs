@@ -145,14 +145,7 @@ impl SingleWriterRuntime {
         let written_bytes = self.written_bytes.clone();
         let budget = self.budget.clone();
         self.writer_handle = Some(tokio::spawn(
-            WriterTask::new(
-                write_rx,
-                file,
-                written_bytes,
-                budget.semaphore.clone(),
-                budget.watermark,
-            )
-            .run(),
+            WriterTask::new(write_rx, file, written_bytes, budget.watermark).run(),
         ));
         self.write_tx = Some(write_tx);
         Ok(())

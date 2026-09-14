@@ -319,6 +319,7 @@ mod tests {
                     data,
                     offset,
                     lease_key,
+                    ..
                 } = command
                 else {
                     panic!("incomplete body must not flush its lease");

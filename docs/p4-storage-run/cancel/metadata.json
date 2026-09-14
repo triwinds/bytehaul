@@ -1,0 +1,99 @@
+{
+  "started_utc": "2026-09-14T02:07:02.884968+00:00",
+  "platform": "macOS-26.5.1-arm64-arm-64bit",
+  "rounds": 10,
+  "filter": "writer_stop/single_buffered_cancel",
+  "binaries": {
+    "before": {
+      "path": "/Users/chenjn/project/bytehaul/target/p4-before-build/release/deps/pipeline_bench-86ee3b2ba6477b83",
+      "sha256": "b9e1de4c62e1740d1f3511f05ae61363db79260796b9f7d283711df8292c90c0"
+    },
+    "after": {
+      "path": "/Users/chenjn/project/bytehaul/target/release/deps/pipeline_bench-86ee3b2ba6477b83",
+      "sha256": "755e15c57a402d56fe459b23e54249354d8b318e4e87723af5fd91a7eeedbc70"
+    }
+  },
+  "order": [
+    {
+      "round": 0,
+      "binary": "before"
+    },
+    {
+      "round": 0,
+      "binary": "after"
+    },
+    {
+      "round": 1,
+      "binary": "after"
+    },
+    {
+      "round": 1,
+      "binary": "before"
+    },
+    {
+      "round": 2,
+      "binary": "before"
+    },
+    {
+      "round": 2,
+      "binary": "after"
+    },
+    {
+      "round": 3,
+      "binary": "after"
+    },
+    {
+      "round": 3,
+      "binary": "before"
+    },
+    {
+      "round": 4,
+      "binary": "before"
+    },
+    {
+      "round": 4,
+      "binary": "after"
+    },
+    {
+      "round": 5,
+      "binary": "after"
+    },
+    {
+      "round": 5,
+      "binary": "before"
+    },
+    {
+      "round": 6,
+      "binary": "before"
+    },
+    {
+      "round": 6,
+      "binary": "after"
+    },
+    {
+      "round": 7,
+      "binary": "after"
+    },
+    {
+      "round": 7,
+      "binary": "before"
+    },
+    {
+      "round": 8,
+      "binary": "before"
+    },
+    {
+      "round": 8,
+      "binary": "after"
+    },
+    {
+      "round": 9,
+      "binary": "after"
+    },
+    {
+      "round": 9,
+      "binary": "before"
+    }
+  ],
+  "completed_utc": "2026-09-14T02:07:13.510950+00:00"
+}

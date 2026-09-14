@@ -98,7 +98,7 @@ In-memory write buffer keyed by lease identity. Each lease appends a contiguous 
 
 ### Writer
 
-Receives data through a bounded channel and writes the output with `seek + write_all`. Single-connection data is written directly; leased data passes through the cache. Flush acknowledgements let workers mark leases complete, and sync acknowledgements establish checkpoint durability. File creation and preallocation live in `storage/file.rs`.
+Receives data through a bounded channel and tracks the file offset, seeking only for noncontiguous writes. Single connections coalesce adjacent small chunks until the 256 KiB threshold or session memory watermark; large chunks are written directly. Leased data keeps its isolated cache. Owned memory permits travel with queued data and remain with the writer until writing or discarding it; queue closure and writer failure also return permits automatically. Flush acknowledgements let workers mark leases complete, and sync acknowledgements establish checkpoint durability. File creation and preallocation live in `storage/file.rs`.
 
 ### ControlSnapshot
 

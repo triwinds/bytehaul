@@ -45,8 +45,9 @@ pub(crate) async fn create_output_file(
 /// Platform-optimized pre-allocation.
 ///
 /// On Linux, uses `fallocate(2)` to allocate disk space without writing zeros.
-/// On macOS, uses `ftruncate` to extend the file (F_PREALLOCATE requires unsafe
-/// ioctl and provides marginal benefit over ftruncate for our use-case).
+/// On macOS, extends the logical length with `set_len`; this does not promise
+/// physical disk-space reservation. The existing policy is retained pending
+/// platform-specific allocation measurements.
 /// On other platforms (Windows, etc.), falls back to writing zeros.
 fn preallocate_sync(file: &std::fs::File, size: u64) -> Result<(), std::io::Error> {
     #[cfg(target_os = "linux")]

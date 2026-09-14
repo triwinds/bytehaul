@@ -1645,7 +1645,8 @@ impl Staged {
             let copy = async {
                 let permit = budget
                     .semaphore
-                    .acquire_many(len as u32)
+                    .clone()
+                    .acquire_many_owned(len as u32)
                     .await
                     .map_err(|_| DownloadError::ChannelClosed)?;
                 let mut data = vec![0u8; len];
@@ -1655,11 +1656,11 @@ impl Staged {
                     .await
                     .map_err(|_| DownloadError::ChannelClosed)?;
                 slot.send(WriterCommand::Data {
+                    permit: Some(permit),
                     offset,
                     data: bytes::Bytes::from(data),
                     lease_key: Some(segment.lease_key()),
                 });
-                permit.forget();
                 received.fetch_add(len as u64, Ordering::Relaxed);
                 Ok::<_, DownloadError>(())
             };

@@ -95,7 +95,8 @@ impl MemoryBudget {
                 observe(ForwardPhase::MemoryBlocked);
                 let permit = self
                     .semaphore
-                    .acquire_many(len as u32)
+                    .clone()
+                    .acquire_many_owned(len as u32)
                     .await
                     .map_err(|_| DownloadError::Internal("budget semaphore closed".into()))?;
                 // Reserving the channel slot keeps cancellation from losing a
@@ -106,11 +107,11 @@ impl MemoryBudget {
                     .await
                     .map_err(|_| DownloadError::ChannelClosed)?;
                 slot.send(WriterCommand::Data {
+                    permit: Some(permit),
                     offset,
                     data: data.split_to(len),
                     lease_key,
                 });
-                permit.forget();
                 Ok::<(), DownloadError>(())
             };
             tokio::select! {
@@ -186,14 +187,7 @@ mod tests {
             let budget = Arc::new(MemoryBudget::new(size));
             let (tx, rx) = mpsc::channel(1);
             let writer = tokio::spawn(
-                WriterTask::new(
-                    rx,
-                    file,
-                    Arc::new(AtomicU64::new(0)),
-                    budget.semaphore.clone(),
-                    budget.watermark,
-                )
-                .run(),
+                WriterTask::new(rx, file, Arc::new(AtomicU64::new(0)), budget.watermark).run(),
             );
             let (stop_tx, stop_rx) = watch::channel(StopSignal::Running);
             let mut tasks = Vec::new();
@@ -277,7 +271,7 @@ mod tests {
             }
             assert_eq!(sent, 1);
             assert!(rx.try_recv().is_err());
-            assert_eq!(budget.semaphore.available_permits(), 0);
+            assert_eq!(budget.semaphore.available_permits(), 1);
         }
     }
 

@@ -16,7 +16,7 @@
 //! Recorded states are the only numbers the harness trusts:
 //!
 //! * `writer_blocks` / `writer_bytes` — what the writer actually handed to the
-//!   file, one block per seek+write pair.
+//!   file; `writer_seeks` counts actual seeks separately.
 //! * `cache_copied_bytes` / `cache_evicted_bytes` — body bytes copied into the
 //!   write-back cache and bytes leaving it again.
 //! * `fsync_calls` / `fsync_micros` — flush+sync pairs performed by the writer.
@@ -41,6 +41,7 @@ use std::time::{Duration, Instant};
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
 static WRITER_BLOCKS: AtomicU64 = AtomicU64::new(0);
+static WRITER_SEEKS: AtomicU64 = AtomicU64::new(0);
 static WRITER_BYTES: AtomicU64 = AtomicU64::new(0);
 static CACHE_COPIED_BYTES: AtomicU64 = AtomicU64::new(0);
 static CACHE_EVICTED_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -66,6 +67,7 @@ static DRIVER_THREADS: AtomicI64 = AtomicI64::new(0);
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct Snapshot {
     pub writer_blocks: u64,
+    pub writer_seeks: u64,
     pub writer_bytes: u64,
     pub cache_copied_bytes: u64,
     pub cache_evicted_bytes: u64,
@@ -97,6 +99,7 @@ pub(crate) fn set_enabled(enabled: bool) {
 pub(crate) fn reset() {
     for counter in [
         &WRITER_BLOCKS,
+        &WRITER_SEEKS,
         &WRITER_BYTES,
         &CACHE_COPIED_BYTES,
         &CACHE_EVICTED_BYTES,
@@ -120,6 +123,7 @@ pub(crate) fn reset() {
 pub(crate) fn snapshot() -> Snapshot {
     Snapshot {
         writer_blocks: WRITER_BLOCKS.load(Ordering::SeqCst),
+        writer_seeks: WRITER_SEEKS.load(Ordering::SeqCst),
         writer_bytes: WRITER_BYTES.load(Ordering::SeqCst),
         cache_copied_bytes: CACHE_COPIED_BYTES.load(Ordering::SeqCst),
         cache_evicted_bytes: CACHE_EVICTED_BYTES.load(Ordering::SeqCst),
@@ -139,10 +143,14 @@ pub(crate) fn snapshot() -> Snapshot {
     }
 }
 
-/// One block the writer wrote to disk, after seeking to its offset.
+/// One block handed to the file writer.
 pub(crate) fn record_write_block(bytes: u64) {
     WRITER_BLOCKS.fetch_add(1, Ordering::Relaxed);
     WRITER_BYTES.fetch_add(bytes, Ordering::Relaxed);
+}
+
+pub(crate) fn record_writer_seek() {
+    WRITER_SEEKS.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Body bytes copied into the write-back cache by a lease append.

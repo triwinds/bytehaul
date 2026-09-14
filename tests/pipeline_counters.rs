@@ -32,9 +32,8 @@ const PIECE_SIZE: usize = 1024 * 1024;
 const PIECES: usize = 4;
 const SMALL_BYTES: usize = PIECES * PIECE_SIZE;
 /// The session only splits a download between connections above
-/// `min_split_size` (10 MiB by default), and only the split path writes through
-/// the write-back cache. A measured download that must show cache traffic has
-/// to be larger than that default, or it is a single-connection download.
+/// `min_split_size` (10 MiB by default). This fixture exercises the lease cache;
+/// single connections have their own bounded contiguous buffer.
 const LARGE_BYTES: u64 = 12 * 1024 * 1024;
 
 /// The fixture body is not a repetition of one byte, so a mis-placed range
@@ -295,6 +294,25 @@ async fn the_pipeline_counters_observe_the_default_download_path() {
         large.request_count() >= 2,
         "the split path issues more than one request: {}",
         large.request_count()
+    );
+
+    let before = bench_counters_snapshot();
+    download_into(&downloader, &small, &dir, "single-batched.bin", |spec| {
+        spec.max_connections(1)
+            .checksum(Checksum::Sha256(small_digest.clone()))
+    })
+    .await
+    .unwrap();
+    let after = bench_counters_snapshot();
+    assert_eq!(after.writer_seeks - before.writer_seeks, 1);
+    assert_eq!(after.writer_bytes - before.writer_bytes, SMALL_BYTES as u64);
+    assert!(
+        after.writer_blocks - before.writer_blocks <= 16,
+        "4 MiB should need at most sixteen 256 KiB batches"
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("single-batched.bin")).unwrap(),
+        body(SMALL_BYTES)
     );
 
     // ── 3. Preallocation is recorded as a phase of its own.
