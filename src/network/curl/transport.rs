@@ -372,7 +372,7 @@ fn response_from_transfer(transfer: Transfer) -> Result<HttpResponse, DownloadEr
         ))
     })?;
 
-    let mut response = http::Response::new(HttpBody::Curl(body));
+    let mut response = http::Response::new(HttpBody::new(body));
     *response.status_mut() = status;
     *response.version_mut() = http::Version::HTTP_11;
     let headers = response.headers_mut();

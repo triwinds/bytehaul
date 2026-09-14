@@ -34,7 +34,8 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tarpaulin)'] }
 
 [features]
 default = ["curl-backend"]
-# libcurl transport backend (the sole production transport after P6).
+# libcurl transport backend: the only production transport. The name and the
+# default stay as-is; builds that turn it off fail with a clear error.
 curl-backend = ["dep:curl", "dep:curl-sys"]
 
 [dependencies]

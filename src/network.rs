@@ -6,7 +6,6 @@ use std::time::Duration;
 use http::Uri;
 use url::Url;
 
-#[cfg(feature = "curl-backend")]
 pub(crate) mod curl;
 pub(crate) mod dns;
 
@@ -16,7 +15,6 @@ use crate::config::{DEFAULT_HTTP_IDLE_POOL_MAX_PER_HOST, DEFAULT_HTTP_IDLE_POOL_
 use crate::error::DownloadError;
 use crate::http::{HttpRequestBody, HttpResponse};
 
-#[cfg(feature = "curl-backend")]
 use self::curl::CurlTransport;
 
 /// Per-request connection budget, including DNS resolution.
@@ -40,11 +38,15 @@ pub(crate) struct ClientNetworkConfig {
     pub enable_ipv6: bool,
 }
 
+/// Shared handle to one transport client.
+///
+/// libcurl is the only production transport: the crate rejects builds without
+/// `curl-backend`, so this is a handle to the concrete client rather than a
+/// backend-selecting enum. Requests and responses still cross this type as
+/// neutral `http` types, which is what keeps libcurl details out of the
+/// manager and session layers.
 #[derive(Clone)]
-pub(crate) enum BytehaulClient {
-    #[cfg(feature = "curl-backend")]
-    Curl(Arc<CurlTransport>),
-}
+pub(crate) struct BytehaulClient(Arc<CurlTransport>);
 
 #[derive(Debug, Clone, Default)]
 struct EffectiveProxyConfig {
@@ -62,17 +64,14 @@ impl EffectiveProxyConfig {
 impl BytehaulClient {
     /// Send one request without a caller-supplied deadline.
     ///
-    /// Production code always goes through [`Self::request_with_timeout`].
-    /// This deadline-backed helper is retained for transport-neutral tests.
+    /// Production code always goes through [`Self::request_with_timeout`];
+    /// this deadline-backed helper exists for transport tests.
     #[cfg(test)]
     pub(crate) async fn request(
         &self,
         req: http::Request<HttpRequestBody>,
     ) -> Result<HttpResponse, DownloadError> {
-        match self {
-            #[cfg(feature = "curl-backend")]
-            Self::Curl(transport) => transport.request_with_backstop(req).await,
-        }
+        self.0.request_with_backstop(req).await
     }
 
     pub(crate) async fn request_with_timeout(
@@ -80,22 +79,22 @@ impl BytehaulClient {
         req: http::Request<HttpRequestBody>,
         timeout: Duration,
     ) -> Result<HttpResponse, DownloadError> {
-        match self {
-            // The libcurl driver enforces the caller's deadline itself, so it
-            // can remove the handle at the moment the deadline expires. The
-            // caller's value is the only deadline: a shorter internal default
-            // would silently override a longer `request_headers_timeout`.
-            #[cfg(feature = "curl-backend")]
-            Self::Curl(transport) => transport.request(req, timeout).await,
-        }
+        // The libcurl driver enforces the caller's deadline itself, so it can
+        // remove the handle at the moment the deadline expires. The caller's
+        // value is the only deadline: a shorter internal default would
+        // silently override a longer `request_headers_timeout`.
+        self.0.request(req, timeout).await
     }
 
-    /// Counters reported by the transport's driver thread, when it has one.
-    pub(crate) fn driver_stats(&self) -> Option<crate::network::curl::driver::DriverStats> {
-        match self {
-            #[cfg(feature = "curl-backend")]
-            Self::Curl(transport) => Some(transport.driver_stats()),
-        }
+    /// Counters reported by this client's driver thread.
+    pub(crate) fn driver_stats(&self) -> self::curl::driver::DriverStats {
+        self.0.driver_stats()
+    }
+
+    /// Whether both handles share one transport (test-only cache assertion).
+    #[cfg(test)]
+    pub(crate) fn same_transport(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
     }
 }
 
@@ -123,8 +122,7 @@ impl ClientNetworkConfig {
     pub(crate) fn build_client(&self) -> Result<BytehaulClient, DownloadError> {
         let effective_proxies = self.effective_proxies()?;
         // Record which libcurl/TLS/resolver build is linked.
-        #[cfg(feature = "curl-backend")]
-        crate::network::curl::log_runtime_features(crate::config::LogLevel::Debug);
+        self::curl::log_runtime_features(crate::config::LogLevel::Debug);
         #[cfg(not(tarpaulin))]
         tracing::debug!(
             connect_timeout_ms = self.connect_timeout.as_millis() as u64,
@@ -137,10 +135,7 @@ impl ClientNetworkConfig {
             "building HTTP client"
         );
 
-        #[cfg(feature = "curl-backend")]
-        {
-            Ok(BytehaulClient::Curl(Arc::new(CurlTransport::new(self)?)))
-        }
+        Ok(BytehaulClient(Arc::new(CurlTransport::new(self)?)))
     }
 
     pub(crate) fn with_connect_timeout(&self, connect_timeout: Duration) -> Self {

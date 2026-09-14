@@ -935,7 +935,7 @@ mod tests {
                 },
             )
             .unwrap();
-            assert!(same_transport(&first, &reused));
+            assert!(first.same_transport(&reused));
             let miss = cached_client_for_config(
                 &downloader.client_cache,
                 ClientNetworkConfig {
@@ -989,10 +989,7 @@ mod tests {
             )
             .unwrap();
         }
-        assert!(!same_transport(
-            &client,
-            &downloader.bench_default_client().unwrap()
-        ));
+        assert!(!client.same_transport(&downloader.bench_default_client().unwrap()));
         drop(client);
         let mut body = response.into_body();
         while next_data_chunk(&mut body, Duration::from_secs(2))
@@ -1000,12 +997,6 @@ mod tests {
             .unwrap()
             .is_some()
         {}
-    }
-
-    fn same_transport(left: &BytehaulClient, right: &BytehaulClient) -> bool {
-        match (left, right) {
-            (BytehaulClient::Curl(left), BytehaulClient::Curl(right)) => Arc::ptr_eq(left, right),
-        }
     }
 
     #[test]
@@ -1025,19 +1016,19 @@ mod tests {
             CLIENT_CACHE_CAPACITY
         );
         let reused = cached_client_for_config(&downloader.client_cache, config(100)).unwrap();
-        assert!(same_transport(&first, &reused));
+        assert!(first.same_transport(&reused));
         // Refreshing 100 evicts 101 on the next miss, rather than 100.
         cached_client_for_config(&downloader.client_cache, config(200)).unwrap();
-        assert!(same_transport(
-            &first,
+        assert!(first.same_transport(
             &cached_client_for_config(&downloader.client_cache, config(100)).unwrap()
         ));
-        assert!(!same_transport(
-            &default,
-            &downloader.bench_default_client().unwrap()
-        ));
-        // The evicted default remains usable while this caller holds it.
-        assert!(default.driver_stats().is_some());
+        assert!(!default.same_transport(&downloader.bench_default_client().unwrap()));
+        // The evicted default still owns its driver; stats stay readable.
+        assert_eq!(
+            default.driver_stats().pools,
+            0,
+            "an idle client holds no pool"
+        );
     }
 
     #[test]
@@ -1071,7 +1062,7 @@ mod tests {
         assert_eq!(downloader.bench_cached_client_count(), 2);
         assert!(clients
             .iter()
-            .all(|client| same_transport(client, &clients[0])));
+            .all(|client| client.same_transport(&clients[0])));
     }
 
     #[test]

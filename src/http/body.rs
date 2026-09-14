@@ -17,14 +17,20 @@ use std::time::Duration;
 use bytes::Bytes;
 
 use crate::error::DownloadError;
+use crate::network::curl::driver::BodyStream;
 
 /// Streaming response body returned by the libcurl transport.
-pub(crate) enum HttpBody {
-    #[cfg(feature = "curl-backend")]
-    Curl(crate::network::curl::driver::BodyStream),
-}
+///
+/// A thin wrapper over the transport's body stream rather than a
+/// backend-selecting enum: every read passes through here so the pipeline
+/// harness can record body time, and sessions never name driver types.
+pub(crate) struct HttpBody(BodyStream);
 
 impl HttpBody {
+    pub(crate) fn new(body: BodyStream) -> Self {
+        Self(body)
+    }
+
     /// Await the next data chunk, skipping non-data frames such as trailers.
     ///
     /// The wait is what the pipeline harness reports as body time: it is the
@@ -36,10 +42,7 @@ impl HttpBody {
         read_timeout: Duration,
     ) -> Result<Option<Bytes>, DownloadError> {
         let started = crate::bench_stats::phase_start();
-        let result = match self {
-            #[cfg(feature = "curl-backend")]
-            Self::Curl(body) => body.next_chunk(read_timeout).await,
-        };
+        let result = self.0.next_chunk(read_timeout).await;
         crate::bench_stats::record_phase(started, crate::bench_stats::record_body_read);
         result
     }
@@ -47,10 +50,7 @@ impl HttpBody {
 
 impl std::fmt::Debug for HttpBody {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            #[cfg(feature = "curl-backend")]
-            Self::Curl(_) => formatter.write_str("HttpBody::Curl"),
-        }
+        formatter.write_str("HttpBody")
     }
 }
 

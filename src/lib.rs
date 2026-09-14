@@ -34,9 +34,10 @@
 //! - **Proxy & custom DNS** – supports HTTP/HTTPS proxies and
 //!   custom DNS / DNS-over-HTTPS resolvers.
 
-// The production transport is selected at build time. Keeping the feature
-// explicit lets downstream builds opt out of the native libcurl dependency
-// intentionally, while a normal build always uses the default feature.
+// libcurl is the only production transport. The feature name stays as the
+// explicit build-time switch: a build that disables default features and does
+// not enable `curl-backend` fails here with this message instead of a wall of
+// unresolved-import errors.
 #[cfg(not(feature = "curl-backend"))]
 compile_error!("bytehaul requires the `curl-backend` feature");
 
@@ -268,7 +269,7 @@ pub mod bench {
     /// Driver counters of the downloader's default client, if it has one.
     pub fn bench_driver_stats(downloader: &crate::manager::Downloader) -> Option<BenchDriverStats> {
         let client = downloader.bench_default_client().ok()?;
-        client.driver_stats().map(BenchDriverStats::from)
+        Some(BenchDriverStats::from(client.driver_stats()))
     }
 
     /// Counters reported by the libcurl driver thread.
