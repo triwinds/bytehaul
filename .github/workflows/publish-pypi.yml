@@ -134,7 +134,9 @@ jobs:
           PY
 
       - name: Verify backfill ref matches the release tag
-        if: ${{ github.event_name == 'workflow_dispatch' }}
+        # Dry runs never publish, so the source-equality guard only applies to
+        # real backfill dispatches.
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run != true }}
         env:
           INPUT_VERSION: ${{ inputs.version }}
         run: |
