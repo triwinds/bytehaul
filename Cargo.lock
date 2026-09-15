@@ -121,7 +121,7 @@ checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 
 [[package]]
 name = "bytehaul"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "bincode",
  "bitvec",
@@ -154,7 +154,7 @@ dependencies = [
 
 [[package]]
 name = "bytehaul-python"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "bytehaul",
  "openssl-sys",
