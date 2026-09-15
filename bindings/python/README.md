@@ -1,6 +1,6 @@
 # bytehaul
 
-Python bindings for the [bytehaul](https://github.com/triwinds/bytehaul) Rust download library. This guide targets the published **0.2.4** release.
+Python bindings for the [bytehaul](https://github.com/triwinds/bytehaul) Rust download library. This guide targets the published **0.2.5** release.
 
 [中文使用文档](../../docs/python.zh-CN.md)
 
@@ -16,10 +16,10 @@ Each source-build command block below assumes you start from the repository root
 ### From PyPI
 
 ```bash
-pip install "bytehaul==0.2.4"
+pip install "bytehaul==0.2.5"
 ```
 
-See the [0.2.4 release notes](https://github.com/triwinds/bytehaul/releases/tag/v0.2.4).
+See the [0.2.5 release notes](https://github.com/triwinds/bytehaul/releases/tag/v0.2.5).
 
 ### From source (development)
 

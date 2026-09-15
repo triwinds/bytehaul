@@ -9,9 +9,9 @@
 
 A Rust async HTTP download library with Python bindings (also available on PyPI), supporting resume, multi-connection downloads, write-back cache, rate limiting, and checksum verification.
 
-These examples target **0.2.4**, which improves HTTP connection reuse, contiguous Range requests, cancellation, response-header deadlines, and slow-tail recovery while preserving existing resume-file compatibility. See the [0.2.4 release notes](https://github.com/triwinds/bytehaul/releases/tag/v0.2.4).
+These examples target **0.2.5**, which completes the vendored-libcurl transport migration, enables dynamic range scheduling by default, and strengthens checkpoint durability, while preserving existing resume-file compatibility. See the [0.2.5 release notes](https://github.com/triwinds/bytehaul/releases/tag/v0.2.5).
 
-Version 0.2.4 includes default HTTP pooling and request batching, cooperative cancellation, per-request response-header deadlines, confirmed-prefix reuse, and bounded slow-tail recovery; see [advanced usage](docs/advanced.md).
+Version 0.2.5 includes the single libcurl transport backend, default dynamic range scheduling, terminal checkpoints that survive cancellation and retries, offset-aware batched storage writes, and bounded client pooling with command wakeups; see [advanced usage](docs/advanced.md).
 
 The Rust and Python builds use the vendored libcurl transport, which is the
 sole production transport and is enabled by default.
@@ -42,20 +42,20 @@ sole production transport and is enabled by default.
 Add `bytehaul` to your project via Cargo:
 
 ```bash
-cargo add bytehaul@0.2.4
+cargo add bytehaul@0.2.5
 ```
 
 Or add it manually to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-bytehaul = "0.2.4"
+bytehaul = "0.2.5"
 ```
 
 ### Python
 
 ```bash
-pip install "bytehaul==0.2.4"
+pip install "bytehaul==0.2.5"
 ```
 
 Requires Python 3.9+. A single wheel per platform covers all supported Python versions (abi3).
