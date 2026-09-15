@@ -5,13 +5,14 @@
 #   Environment: pypi
 #
 # Wheel TLS dependencies: libcurl links the platform TLS stack (Schannel on
-# Windows, OpenSSL elsewhere). The Linux wheel is built in a manylinux_2_34
-# container whose system OpenSSL is 3.x (curl-sys requires OpenSSL >= 3.0;
-# manylinux_2_28 only ships 1.1.1) with openssl-devel installed, and maturin
-# bundles the linked libs. The macOS wheels are repaired with delocate to
-# bundle the Homebrew OpenSSL dylibs, which requires macOS 15 or newer. Every
-# wheel is then verified in a clean environment, including an HTTPS smoke test
-# against example.com.
+# Windows, OpenSSL elsewhere). Non-Windows builds of the Python extension
+# force the vendored openssl-src build (see bindings/python/Cargo.toml), so the
+# wheels are fully self-contained: no build-host OpenSSL paths, no delocate,
+# no dependency on the manylinux container's OpenSSL. The Linux wheel is built
+# in a manylinux2014 container (glibc 2.17, matching the pre-libcurl wheel
+# floor) with perl and nasm tooling for the openssl-src compile. Every wheel is
+# then verified in a clean environment, including an HTTPS smoke test against
+# example.com.
 #
 # Backfill: workflow_dispatch accepts a version and requires that the dispatch
 # ref matches the v<version> tag outside .github, so a retried release builds
@@ -159,7 +160,7 @@ jobs:
           - os: ubuntu-latest
             label: linux-x86_64
             interpreter: python3.9
-            manylinux: "2_34"
+            manylinux: "2014"
           - os: windows-latest
             label: windows-x86_64
             interpreter: python
@@ -199,17 +200,8 @@ jobs:
             --interpreter ${{ matrix.interpreter }}
           manylinux: ${{ matrix.manylinux }}
           before-script-linux: |
-            dnf install -y openssl-devel pkgconf-pkg-config
-            openssl version
-            pkg-config --modversion openssl
-
-      - name: Bundle linked dylibs into the wheel (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          python3 -m pip install --quiet delocate
-          delocate-wheel -v -w wheelhouse dist/*.whl
-          rm -f dist/*.whl
-          mv wheelhouse/*.whl dist/
+            yum install -y perl-core ca-certificates nasm
+            perl -v | head -2
 
       - name: Upload wheel
         uses: actions/upload-artifact@v7

@@ -25,3 +25,12 @@ pyo3 = { version = "0.23", features = ["abi3-py39", "extension-module"] }
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[target.'cfg(not(windows))'.dependencies]
+# Force the vendored (openssl-src) build for every non-Windows build of this
+# extension so wheels never link a build-host OpenSSL: the manylinux container
+# and the Homebrew prefix would otherwise leak build paths and library
+# versions that user machines do not have. Windows keeps Schannel and never
+# links OpenSSL. This direct dependency exists only to unify
+# openssl-sys/vendored into the graph built by curl-sys/ssl.
+openssl-sys = { version = "0.9", features = ["vendored"] }
