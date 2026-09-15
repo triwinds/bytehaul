@@ -5,11 +5,13 @@
 #   Environment: pypi
 #
 # Wheel TLS dependencies: libcurl links the platform TLS stack (Schannel on
-# Windows, OpenSSL elsewhere), so the Linux wheel is built in a manylinux_2_28
-# container with openssl-devel installed (maturin bundles the linked libs), and
-# the macOS wheels are repaired with delocate to bundle the Homebrew OpenSSL
-# dylibs. Every wheel is then verified in a clean environment, including an
-# HTTPS smoke test against example.com.
+# Windows, OpenSSL elsewhere). The Linux wheel is built in a manylinux_2_34
+# container whose system OpenSSL is 3.x (curl-sys requires OpenSSL >= 3.0;
+# manylinux_2_28 only ships 1.1.1) with openssl-devel installed, and maturin
+# bundles the linked libs. The macOS wheels are repaired with delocate to
+# bundle the Homebrew OpenSSL dylibs, which requires macOS 15 or newer. Every
+# wheel is then verified in a clean environment, including an HTTPS smoke test
+# against example.com.
 #
 # Backfill: workflow_dispatch accepts a version and requires that the dispatch
 # ref matches the v<version> tag outside .github, so a retried release builds
@@ -157,7 +159,7 @@ jobs:
           - os: ubuntu-latest
             label: linux-x86_64
             interpreter: python3.9
-            manylinux: "2_28"
+            manylinux: "2_34"
           - os: windows-latest
             label: windows-x86_64
             interpreter: python
