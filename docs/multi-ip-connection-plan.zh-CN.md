@@ -1,6 +1,8 @@
 # 多 IP 建连与连接复用收敛计划（libcurl）
 
-状态：重新设计，尚未实现多 IP 策略。更新：2026-09-17。
+状态：M1–M3 已实现，默认关闭（`Downloader::builder().multi_ip(true)`）；M0 原型确认了首选架构，
+实现与验收见 [实现记录](multi-ip-connection-implementation.zh-CN.md)，
+机制实测见 [M0 实验结论](multi-ip-connection-m0.zh-CN.md)。公网复测（M4）尚未执行。更新：2026-09-19。
 
 本文以当前 libcurl 生产后端为基线，替代原先“按 IP 分组的 Hyper client”方案。
 旧原型及其测试、覆盖率仅作为[历史记录](multi-ip-connection-prototype.zh-CN.md)，不代表本方案已验收。
@@ -239,6 +241,15 @@ worker ID 通过请求扩展下传，transport 再将上下文关联到响应扩
 - 所有任务路径的活动预算和真实 socket 峰值；提交失败/取消确认不泄漏额度。
 
 输出可复现结论，再确认首选架构。空闲记账或预算未过关，不进入策略启用阶段。
+
+M0 已验证定向、复用、并发隔离、缓存上界共享、`k = 0`、IPv6 渲染与 TLS 域名校验
+（[M0 实验结论](multi-ip-connection-m0.zh-CN.md)）。M1–M3 已实现，其中：
+
+* driver 侧按 IP 的占用与结算按 `(generation, 连接身份)` 实现，缓存上界仍是整池共享的 `k`；
+* 任务活动预算按"回退不回到 session、不重新申请额度"实现，
+  由 `connect_retries` 单独记录多花的连接；
+* 实测结果与未覆盖项（公网复测、端到端收敛的墙钟实验）见
+  [实现记录](multi-ip-connection-implementation.zh-CN.md) §7。
 
 ### M1：开关、候选分散和回退
 

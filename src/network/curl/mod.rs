@@ -5,6 +5,7 @@
 //! measurements are test-gated evidence for P3.
 
 pub(crate) mod driver;
+pub(crate) mod ip_policy;
 #[cfg(test)]
 mod pool_semantics;
 pub(crate) mod runtime;

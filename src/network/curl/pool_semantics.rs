@@ -11,6 +11,14 @@
 //! Measurements from this module are written up in
 //! `docs/libcurl-pool-semantics.zh-CN.md`.
 //!
+//! The second half of the module is the M0 prototype of
+//! `docs/multi-ip-connection-plan.zh-CN.md` §8: it measures whether
+//! `CURLOPT_CONNECT_TO` can pin one origin to a chosen address, whether the
+//! cache and its bound stay shared by the addresses, and whether
+//! `CURLINFO_CONN_ID` is usable as a connection identity. The M0 verdict lives
+//! in `docs/multi-ip-connection-m0.zh-CN.md`; the strategy itself is not
+//! implemented here.
+//!
 //! Run with `cargo test --features curl-backend curl::pool_semantics`.
 
 use std::collections::HashMap;
@@ -25,6 +33,9 @@ use parking_lot::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
+
+use super::driver::connection_id;
+use super::test_support::{serve_address, AddressObserver, DualAddressServer};
 
 /// Server-side observation of one connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -233,13 +244,23 @@ fn new_multi(options: PoolOptions) -> Multi {
     multi
 }
 
-fn new_request(multi: &Multi, request: &Request, options: PoolOptions) -> Easy2Handle<Collector> {
+fn new_easy(
+    request: &Request,
+    options: PoolOptions,
+    connect_to: Option<&str>,
+    ca_info: Option<&std::path::Path>,
+) -> Easy2<Collector> {
     let mut easy = Easy2::new(Collector { body: Vec::new() });
     easy.url(&request.url).unwrap();
     easy.http_version(HttpVersion::V11).unwrap();
     easy.noproxy("*").unwrap();
     easy.connect_timeout(Duration::from_secs(5)).unwrap();
     easy.http_content_decoding(false).unwrap();
+    if let Some(ca_info) = ca_info {
+        // Adds the fixture's CA on top of the system anchors; verification
+        // itself stays on.
+        easy.cainfo(ca_info).unwrap();
+    }
     if options.forbid_reuse {
         easy.fresh_connect(true).unwrap();
         easy.forbid_reuse(true).unwrap();
@@ -252,7 +273,52 @@ fn new_request(multi: &Multi, request: &Request, options: PoolOptions) -> Easy2H
         list.append(resolve).unwrap();
         easy.resolve(list).unwrap();
     }
-    multi.add2(easy).unwrap()
+    if let Some(spec) = connect_to {
+        let mut list = List::new();
+        list.append(spec).unwrap();
+        easy.connect_to(list).unwrap();
+    }
+    easy
+}
+
+fn new_request(multi: &Multi, request: &Request, options: PoolOptions) -> Easy2Handle<Collector> {
+    multi.add2(new_easy(request, options, None, None)).unwrap()
+}
+
+/// Same as [`new_request`], but the transfer carries one `CURLOPT_CONNECT_TO`
+/// entry: the URL keeps its origin name while the connection goes to the
+/// address the entry names.
+fn new_request_to(
+    multi: &Multi,
+    request: &Request,
+    options: PoolOptions,
+    connect_to: &str,
+) -> Easy2Handle<Collector> {
+    multi
+        .add2(new_easy(request, options, Some(connect_to), None))
+        .unwrap()
+}
+
+/// A transfer that pins one origin name to an address *and* trusts one extra
+/// CA, which is what the TLS experiments need.
+fn new_request_verifying(
+    multi: &Multi,
+    url: &str,
+    connect_to: &str,
+    ca_info: &std::path::Path,
+) -> Easy2Handle<Collector> {
+    let request = Request {
+        url: url.to_string(),
+        resolve: None,
+    };
+    multi
+        .add2(new_easy(
+            &request,
+            PoolOptions::default(),
+            Some(connect_to),
+            Some(ca_info),
+        ))
+        .unwrap()
 }
 
 /// Drives one handle to completion and returns its body and connect count.
@@ -295,6 +361,288 @@ fn run_sequential(options: PoolOptions, requests: &[Request]) -> Vec<(Vec<u8>, u
             drive_until_done(&multi, handle)
         })
         .collect()
+}
+
+/// What one driven transfer reported about the connection it used.
+struct TransferOutcome {
+    body: Vec<u8>,
+    /// `CURLINFO_NUM_CONNECTS`: connections this transfer opened itself, as
+    /// opposed to the sockets it reused from the cache.
+    connects: u64,
+    /// `CURLINFO_CONN_ID`: the connection's identity inside this cache.
+    conn_id: Option<i64>,
+    /// `CURLINFO_PRIMARY_IP`: the address libcurl actually connected to.
+    primary_ip: Option<String>,
+}
+
+/// Drives one handle to completion and reports its body plus the connection it
+/// used. The getinfo calls happen while the handle is still attached, because
+/// removing it from the multi drops the transfer state they read.
+fn drive_observing(multi: &Multi, handle: Easy2Handle<Collector>) -> TransferOutcome {
+    loop {
+        multi.perform().unwrap();
+        let mut finished = false;
+        multi.messages(|message| {
+            if message.is_for2(&handle) {
+                if let Some(result) = message.result() {
+                    result.unwrap();
+                    finished = true;
+                }
+            }
+        });
+        if finished {
+            break;
+        }
+        let wait = multi
+            .get_timeout()
+            .ok()
+            .flatten()
+            .unwrap_or(Duration::from_millis(20))
+            .min(Duration::from_millis(20));
+        multi.wait(&mut [], wait).unwrap();
+    }
+
+    let mut outcome = TransferOutcome {
+        body: Vec::new(),
+        connects: handle.num_connects().unwrap(),
+        conn_id: connection_id(&handle),
+        primary_ip: handle.primary_ip().ok().flatten().map(str::to_owned),
+    };
+    let mut easy = multi.remove2(handle).unwrap();
+    outcome.body = std::mem::take(&mut easy.get_mut().body);
+    outcome
+}
+
+/// Drives one handle that is expected to fail and returns libcurl's error
+/// message, which is where a rejected certificate or a failed handshake shows
+/// up.
+fn drive_until_error(multi: &Multi, handle: Easy2Handle<Collector>) -> String {
+    let mut failure: Option<String> = None;
+    loop {
+        multi.perform().unwrap();
+        let mut finished = false;
+        multi.messages(|message| {
+            // `result_for2` attaches libcurl's error buffer to the error, which
+            // is where the sentence naming the host of a verification failure
+            // lives; the plain `result` only carries the short description.
+            if let Some(result) = message.result_for2(&handle) {
+                failure = Some(match result {
+                    Ok(()) => String::new(),
+                    Err(error) => format!("{error:?}"),
+                });
+                finished = true;
+            }
+        });
+        if finished {
+            break;
+        }
+        let wait = multi
+            .get_timeout()
+            .ok()
+            .flatten()
+            .unwrap_or(Duration::from_millis(20))
+            .min(Duration::from_millis(20));
+        multi.wait(&mut [], wait).unwrap();
+    }
+    let _ = multi.remove2(handle);
+    failure.expect("the transfer has to end with a result")
+}
+
+/// Drives several handles on one `Multi` at the same time, returning every
+/// outcome in submission order.
+///
+/// Concurrent transfers are the case a multi-IP policy has to keep apart: each
+/// handle carries its own connect target, and two of them finishing in the same
+/// pass have to be matched back to the handle they belong to. The loop has a
+/// deadline so a transfer that never completes fails the test instead of
+/// hanging the suite.
+fn drive_concurrently(
+    multi: &Multi,
+    handles: Vec<Easy2Handle<Collector>>,
+) -> Vec<Option<TransferOutcome>> {
+    // Each pending entry carries the position it was submitted at: removing a
+    // finished handle shifts the indices of the ones behind it, so the index
+    // inside `pending` is not the position an outcome belongs to.
+    let mut pending: Vec<(usize, Easy2Handle<Collector>)> =
+        handles.into_iter().enumerate().collect();
+    let mut outcomes: Vec<Option<TransferOutcome>> = (0..pending.len()).map(|_| None).collect();
+    let deadline = Instant::now() + Duration::from_secs(10);
+
+    while !pending.is_empty() && Instant::now() < deadline {
+        multi.perform().unwrap();
+        // Every completion has to be taken in the same pass: keeping only the
+        // last one would drop a handle forever.
+        let mut finished: Vec<usize> = Vec::new();
+        multi.messages(|message| {
+            if let Some(result) = message.result() {
+                result.unwrap();
+                for (position, (_, handle)) in pending.iter().enumerate() {
+                    if message.is_for2(handle) && !finished.contains(&position) {
+                        finished.push(position);
+                    }
+                }
+            }
+        });
+        for position in finished.into_iter().rev() {
+            let (submitted_at, handle) = pending.remove(position);
+            let mut outcome = TransferOutcome {
+                body: Vec::new(),
+                connects: handle.num_connects().unwrap(),
+                conn_id: connection_id(&handle),
+                primary_ip: handle.primary_ip().ok().flatten().map(str::to_owned),
+            };
+            let mut easy = multi.remove2(handle).unwrap();
+            outcome.body = std::mem::take(&mut easy.get_mut().body);
+            outcomes[submitted_at] = Some(outcome);
+        }
+        let wait = multi
+            .get_timeout()
+            .ok()
+            .flatten()
+            .unwrap_or(Duration::from_millis(20))
+            .min(Duration::from_millis(20));
+        multi.wait(&mut [], wait).unwrap();
+    }
+
+    outcomes
+}
+
+/// A local HTTPS server that answers every request with `secure` and whose
+/// certificate is issued for exactly the names it was started with.
+///
+/// One name per fixture is what makes the two M0 TLS experiments possible: a
+/// certificate for the URL's name accepts the request, a certificate for the
+/// *connect target's* name must reject it. If `CONNECT_TO` changed the name
+/// libcurl verified against, the two fixtures would swap outcomes.
+struct TlsPinnedFixture {
+    addr: SocketAddr,
+    ca_pem: std::path::PathBuf,
+    accepted: Arc<AtomicUsize>,
+    task: tokio::task::JoinHandle<()>,
+    _dir: tempfile::TempDir,
+}
+
+impl TlsPinnedFixture {
+    async fn start(subject_names: &[&str]) -> Self {
+        use rcgen::{
+            BasicConstraints, CertificateParams, DistinguishedName, DnType,
+            ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose,
+        };
+        use tokio_rustls::rustls::{self, pki_types::PrivatePkcs8KeyDer};
+        use tokio_rustls::TlsAcceptor;
+
+        let ca_key = KeyPair::generate().unwrap();
+        let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        // rcgen's default distinguished name is the same for every certificate,
+        // which would make the leaf's issuer equal to its own subject and let
+        // OpenSSL treat it as self-signed instead of chaining it to this CA.
+        let mut ca_name = DistinguishedName::new();
+        ca_name.push(DnType::CommonName, "bytehaul-m0-ca");
+        ca_params.distinguished_name = ca_name;
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+        let ca = ca_params.self_signed(&ca_key).unwrap();
+
+        let key = KeyPair::generate().unwrap();
+        let names: Vec<String> = subject_names.iter().map(|name| name.to_string()).collect();
+        let mut leaf_params = CertificateParams::new(names).unwrap();
+        leaf_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        leaf_params.key_usages = vec![
+            KeyUsagePurpose::DigitalSignature,
+            KeyUsagePurpose::KeyEncipherment,
+        ];
+        let cert = leaf_params.signed_by(&key, &ca, &ca_key).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let ca_pem = dir.path().join("bytehaul-m0-ca.pem");
+        std::fs::write(&ca_pem, ca.pem()).unwrap();
+
+        let config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.der().clone()],
+                PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
+            )
+            .unwrap();
+        let acceptor = TlsAcceptor::from(Arc::new(config));
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let task_accepted = accepted.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((tcp, _)) = listener.accept().await else {
+                    return;
+                };
+                task_accepted.fetch_add(1, Ordering::SeqCst);
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    // A client that rejects the certificate aborts the handshake;
+                    // that is a valid outcome for the caller.
+                    let Ok(mut stream) = acceptor.accept(tcp).await else {
+                        return;
+                    };
+                    let mut buffer = Vec::new();
+                    let mut byte = [0u8; 1];
+                    loop {
+                        buffer.clear();
+                        loop {
+                            match stream.read(&mut byte).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(_) => buffer.push(byte[0]),
+                            }
+                            if buffer.ends_with(b"\r\n\r\n") {
+                                break;
+                            }
+                            if buffer.len() > 64 * 1024 {
+                                return;
+                            }
+                        }
+                        let body = b"secure";
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+                            body.len()
+                        );
+                        if stream.write_all(response.as_bytes()).await.is_err() {
+                            return;
+                        }
+                        if stream.write_all(body).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        Self {
+            addr,
+            ca_pem,
+            accepted,
+            task,
+            _dir: dir,
+        }
+    }
+
+    fn url(&self, host: &str) -> String {
+        format!("https://{host}:{}/range", self.addr.port())
+    }
+
+    /// The connect target that sends the URL's `host:port` to this fixture,
+    /// which is what the multi-IP policy sets instead of a `RESOLVE` entry.
+    fn connect_to(&self, host: &str) -> String {
+        super::driver::ConnectToEntry::new(
+            host,
+            self.addr.port(),
+            std::net::IpAddr::from([127, 0, 0, 1]),
+            self.addr.port(),
+        )
+        .spec
+    }
+
+    fn stop(self) {
+        self.task.abort();
+    }
 }
 
 #[cfg(test)]
@@ -1083,6 +1431,497 @@ mod tests {
         );
 
         server.abort();
+    }
+
+    /// M0 experiment 1: `CURLOPT_CONNECT_TO` sends one origin name to the
+    /// address the handle names, and a later request choosing that address
+    /// again reuses the socket it opened instead of creating a new one.
+    ///
+    /// This is the whole point of the preferred design (§3): A → B → A must end
+    /// on the socket the first request opened, with the URL (and therefore
+    /// `Host`) unchanged throughout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn connect_to_steers_each_request_to_the_chosen_address() {
+        let server = DualAddressServer::start(Duration::ZERO).await;
+        let url = server.url("/steer");
+        let specs = [
+            server.connect_to(0),
+            server.connect_to(1),
+            server.connect_to(0),
+        ];
+
+        let outcomes = tokio::task::spawn_blocking(move || {
+            let options = PoolOptions::default();
+            let multi = new_multi(options);
+            specs
+                .iter()
+                .map(|spec| {
+                    let request = Request {
+                        url: url.clone(),
+                        resolve: None,
+                    };
+                    drive_observing(&multi, new_request_to(&multi, &request, options, spec))
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(outcomes[0].body, b"a0", "the first request must reach A");
+        assert_eq!(outcomes[1].body, b"b0", "the second request must reach B");
+        assert_eq!(
+            outcomes[2].body, b"a0",
+            "the third request must land on the socket the first one opened"
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .map(|outcome| outcome.connects)
+                .collect::<Vec<_>>(),
+            vec![1, 1, 0],
+            "only the first request to each address may open a connection"
+        );
+        assert_eq!(server.accepted(0), 1, "address A accepted one socket");
+        assert_eq!(server.accepted(1), 1, "address B accepted one socket");
+        assert_eq!(
+            server.requests_on(0, 0),
+            2,
+            "A's socket served two requests"
+        );
+        assert_eq!(server.requests_on(1, 0), 1, "B's socket served one request");
+        assert_eq!(
+            outcomes[0].conn_id, outcomes[2].conn_id,
+            "the reusing request must report the connection it reused"
+        );
+        assert_ne!(
+            outcomes[0].conn_id, outcomes[1].conn_id,
+            "the two addresses are two connections"
+        );
+        assert_eq!(outcomes[0].primary_ip.as_deref(), Some("127.0.0.1"));
+        assert_eq!(outcomes[1].primary_ip.as_deref(), Some("127.0.0.2"));
+        assert!(
+            outcomes[0].conn_id.is_some(),
+            "this libcurl must report CURLINFO_CONN_ID at all"
+        );
+
+        server.stop().await;
+    }
+
+    /// M0 experiment 2: `CURLINFO_CONN_ID` is unique inside one connection
+    /// cache only. A rebuilt `Multi` hands the same numbers out again, so a
+    /// bare connection id is not an identity across pool rebuilds - the driver
+    /// has to pair it with a generation (§4).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn connection_ids_are_only_unique_inside_one_cache() {
+        let server = DualAddressServer::start(Duration::ZERO).await;
+        let url = server.url("/rebuild");
+        let spec = server.connect_to(0);
+
+        let samples = tokio::task::spawn_blocking(move || {
+            let options = PoolOptions::default();
+            let request = Request {
+                url: url.clone(),
+                resolve: None,
+            };
+            // One multi per request: the second one starts from an empty cache,
+            // exactly like a driver that was recreated.
+            let first = {
+                let multi = new_multi(options);
+                drive_observing(&multi, new_request_to(&multi, &request, options, &spec))
+            };
+            let second = {
+                let multi = new_multi(options);
+                drive_observing(&multi, new_request_to(&multi, &request, options, &spec))
+            };
+            (first, second)
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(samples.0.body, b"a0");
+        assert_eq!(
+            samples.1.body, b"a1",
+            "a rebuilt cache must open a new socket, not reuse the old one"
+        );
+        assert_eq!(server.accepted(0), 2);
+        assert_eq!(
+            samples.0.conn_id, samples.1.conn_id,
+            "the number is reused for an unrelated connection"
+        );
+        assert!(
+            samples.0.conn_id.is_some(),
+            "this libcurl must report CURLINFO_CONN_ID at all"
+        );
+
+        server.stop().await;
+    }
+
+    /// M0 experiment 3: concurrent transfers that pick different addresses keep
+    /// their own target and their own socket.
+    ///
+    /// `CONNECT_TO` is per easy handle, which is what makes this work: a shared
+    /// DNS cache entry (the `RESOLVE` alternative) could not have two values at
+    /// once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_requests_keep_their_own_address() {
+        let server = DualAddressServer::start(Duration::from_millis(150)).await;
+        let url = server.url("/concurrent");
+        let specs = [server.connect_to(0), server.connect_to(1)];
+
+        let outcomes = tokio::task::spawn_blocking(move || {
+            let options = PoolOptions::default();
+            let multi = new_multi(options);
+            let handles = specs
+                .iter()
+                .map(|spec| {
+                    let request = Request {
+                        url: url.clone(),
+                        resolve: None,
+                    };
+                    new_request_to(&multi, &request, options, spec)
+                })
+                .collect::<Vec<_>>();
+            drive_concurrently(&multi, handles)
+        })
+        .await
+        .unwrap();
+
+        let outcomes: Vec<TransferOutcome> = outcomes.into_iter().flatten().collect();
+        assert_eq!(outcomes.len(), 2, "both transfers must finish");
+        assert_eq!(outcomes[0].body, b"a0");
+        assert_eq!(outcomes[1].body, b"b0");
+        assert_eq!(
+            server.peak_live(0),
+            1,
+            "A must never serve the transfer pinned to B"
+        );
+        assert_eq!(server.peak_live(1), 1);
+        assert_eq!(server.accepted(0), 1);
+        assert_eq!(server.accepted(1), 1);
+        assert_eq!(
+            outcomes.iter().map(|outcome| outcome.connects).sum::<u64>(),
+            2,
+            "each pinned transfer opens its own connection"
+        );
+
+        server.stop().await;
+    }
+
+    /// M0 experiment 4: `CONNECT_TO` redirects the connection only. The request
+    /// still carries the origin name, so `Host` (and over TLS the SNI and the
+    /// certificate check) stay bound to the URL rather than to the address the
+    /// policy picked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn connect_to_leaves_the_origin_name_in_the_request() {
+        let server = DualAddressServer::start(Duration::ZERO).await;
+        let url = server.url("/origin-name");
+        let spec = server.connect_to(1);
+
+        tokio::task::spawn_blocking(move || {
+            let options = PoolOptions::default();
+            let multi = new_multi(options);
+            let request = Request { url, resolve: None };
+            drive_observing(&multi, new_request_to(&multi, &request, options, &spec));
+        })
+        .await
+        .unwrap();
+
+        let head = server.first_head(1);
+        assert!(
+            head.starts_with("get /origin-name "),
+            "the request line must keep the URL path, got: {head}"
+        );
+        assert!(
+            head.contains(&format!("host: dual.test:{}", server.port())),
+            "the Host header must keep the origin name, got: {head}"
+        );
+        assert_eq!(
+            server.accepted(1),
+            1,
+            "the pinned address is where the connection went"
+        );
+
+        server.stop().await;
+    }
+
+    /// M0 experiment 5: `CURLMOPT_MAXCONNECTS` stays one cache bound for the
+    /// whole origin. Two addresses share `k`, so when the second address goes
+    /// idle the first one's socket is the entry that gets evicted - the bound
+    /// is not silently multiplied by the number of candidates (§6).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_cache_bound_is_shared_by_the_addresses() {
+        let server = DualAddressServer::start(Duration::ZERO).await;
+        let url = server.url("/bound");
+        let specs = [server.connect_to(0), server.connect_to(1)];
+        let options = PoolOptions {
+            max_connects: Some(1),
+            ..PoolOptions::default()
+        };
+        let live = (server.live_handle(0), server.live_handle(1));
+
+        let samples = tokio::task::spawn_blocking(move || {
+            let multi = new_multi(options);
+            let request = Request {
+                url: url.clone(),
+                resolve: None,
+            };
+            drive_observing(&multi, new_request_to(&multi, &request, options, &specs[0]));
+            let after_first = live.0.load(Ordering::SeqCst);
+            // Space the two idle moments apart: libcurl evicts the connection
+            // that has been idle longest, and two sockets that went idle in the
+            // same millisecond would tie.
+            std::thread::sleep(Duration::from_millis(150));
+            drive_observing(&multi, new_request_to(&multi, &request, options, &specs[1]));
+            // Sampled while the multi is alive: dropping it would close every
+            // cached socket and hide what the bound did.
+            std::thread::sleep(Duration::from_millis(200));
+            (
+                after_first,
+                live.0.load(Ordering::SeqCst),
+                live.1.load(Ordering::SeqCst),
+            )
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            samples.0, 1,
+            "the first address caches its socket while the cache is under the bound"
+        );
+        assert_eq!(
+            (samples.1, samples.2),
+            (0, 1),
+            "one bound covers both addresses: A's socket is evicted, not kept alongside B's"
+        );
+        assert_eq!(server.accepted(0), 1);
+        assert_eq!(server.accepted(1), 1);
+
+        server.stop().await;
+    }
+
+    /// M0 experiment 6: `pool_max_idle_per_host = 0` keeps its "no connection
+    /// reuse" contract on the pinned path: every request opens its own socket
+    /// and nothing stays cached.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forbid_reuse_opens_one_connection_per_pinned_request() {
+        let server = DualAddressServer::start(Duration::ZERO).await;
+        let url = server.url("/no-pool");
+        let spec = server.connect_to(0);
+        let options = PoolOptions {
+            forbid_reuse: true,
+            ..PoolOptions::default()
+        };
+
+        let outcomes = tokio::task::spawn_blocking(move || {
+            let multi = new_multi(options);
+            (0..2)
+                .map(|_| {
+                    let request = Request {
+                        url: url.clone(),
+                        resolve: None,
+                    };
+                    drive_observing(&multi, new_request_to(&multi, &request, options, &spec))
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            outcomes
+                .iter()
+                .map(|outcome| outcome.connects)
+                .collect::<Vec<_>>(),
+            vec![1, 1],
+            "each request must open its own connection"
+        );
+        assert_eq!(outcomes[0].body, b"a0");
+        assert_eq!(outcomes[1].body, b"a1");
+        assert_eq!(server.accepted(0), 2);
+        assert_eq!(
+            server.wait_for_live(0, 0, Duration::from_secs(2)).await,
+            0,
+            "sockets that may not be reused must be closed after the transfer"
+        );
+
+        server.stop().await;
+    }
+
+    /// M0 experiment 7: the cache bound is a cache bound, not a concurrency
+    /// bound, even when every transfer is pinned to the same address.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_cache_bound_does_not_serialize_concurrent_pinned_transfers() {
+        let server = DualAddressServer::start(Duration::from_millis(150)).await;
+        let url = server.url("/wave");
+        let spec = server.connect_to(0);
+        let options = PoolOptions {
+            max_connects: Some(1),
+            ..PoolOptions::default()
+        };
+
+        let outcomes = tokio::task::spawn_blocking(move || {
+            let multi = new_multi(options);
+            let handles = (0..3)
+                .map(|index| {
+                    let request = Request {
+                        url: format!("{url}?i={index}"),
+                        resolve: None,
+                    };
+                    new_request_to(&multi, &request, options, &spec)
+                })
+                .collect::<Vec<_>>();
+            drive_concurrently(&multi, handles)
+        })
+        .await
+        .unwrap();
+
+        let outcomes: Vec<TransferOutcome> = outcomes.into_iter().flatten().collect();
+        assert_eq!(outcomes.len(), 3, "all three transfers must finish");
+        assert_eq!(
+            outcomes
+                .iter()
+                .map(|outcome| outcome.connects)
+                .collect::<Vec<_>>(),
+            vec![1, 1, 1],
+            "a cache bound must not queue transfers on one connection"
+        );
+        assert_eq!(
+            server.peak_live(0),
+            3,
+            "the three transfers have to overlap on the same address"
+        );
+        assert_eq!(server.accepted(0), 3);
+
+        server.stop().await;
+    }
+
+    /// M0 experiment 8: an IPv6 target is rendered in brackets and is really
+    /// reachable through the same mechanism.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn connect_to_reaches_an_ipv6_target() {
+        let listener = TcpListener::bind(("::1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let observer = Arc::new(AddressObserver::new("v"));
+        let server_observer = observer.clone();
+        let server = tokio::spawn(async move {
+            let mut ordinal = 0usize;
+            while let Ok((stream, _)) = listener.accept().await {
+                let id = ordinal;
+                ordinal += 1;
+                let observer = server_observer.clone();
+                tokio::spawn(async move {
+                    serve_address(stream, observer, id, Duration::ZERO).await;
+                });
+            }
+        });
+
+        // The URL keeps an unresolvable name: only the connect target can lead
+        // to the listener.
+        let host = "dual.test";
+        let spec = super::super::driver::ConnectToEntry::new(
+            host,
+            port,
+            std::net::IpAddr::from([0, 0, 0, 0, 0, 0, 0, 1]),
+            port,
+        );
+        assert!(
+            spec.spec.contains(":[::1]:"),
+            "an IPv6 connect target has to be bracketed, got: {}",
+            spec.spec
+        );
+
+        let outcome = tokio::task::spawn_blocking(move || {
+            let options = PoolOptions::default();
+            let multi = new_multi(options);
+            let request = Request {
+                url: format!("http://{host}:{port}/v6"),
+                resolve: None,
+            };
+            drive_observing(
+                &multi,
+                new_request_to(&multi, &request, options, &spec.spec),
+            )
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.body, b"v0");
+        assert_eq!(outcome.primary_ip.as_deref(), Some("::1"));
+        assert_eq!(observer.requests.lock().get(&0).copied(), Some(1));
+        server.abort();
+    }
+
+    /// These TLS experiments need a TLS-capable environment; the same
+    /// limitation as the driver's own HTTPS tests applies (see
+    /// `driver::tests`). Run them with
+    /// `cargo test --features curl-backend -- --ignored`.
+    ///
+    /// M0 experiment 9: a pinned transfer over TLS still verifies the
+    /// certificate against the URL's name. The certificate is issued for
+    /// `localhost` and the connection goes to `127.0.0.1`, so the transfer can
+    /// only succeed if the connect target never replaced the name used for
+    /// verification.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires a TLS-capable environment (Schannel credentials unavailable in the dev sandbox)"]
+    async fn connect_to_verifies_the_certificate_against_the_url_name() {
+        let fixture = TlsPinnedFixture::start(&["localhost"]).await;
+        let url = fixture.url("localhost");
+        let connect_to = fixture.connect_to("localhost");
+        let ca_info = fixture.ca_pem.clone();
+
+        let outcome = tokio::task::spawn_blocking(move || {
+            let multi = Multi::new();
+            drive_observing(
+                &multi,
+                new_request_verifying(&multi, &url, &connect_to, &ca_info),
+            )
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.body, b"secure");
+        assert_eq!(outcome.connects, 1);
+        assert_eq!(
+            outcome.primary_ip.as_deref(),
+            Some("127.0.0.1"),
+            "the connection has to go to the pinned address"
+        );
+        assert_eq!(fixture.accepted.load(Ordering::SeqCst), 1);
+        fixture.stop();
+    }
+
+    /// M0 experiment 10: the mirror image of experiment 9 - a certificate
+    /// issued for the *connect target's* name does not make the transfer
+    /// succeed. Pinning an address therefore cannot weaken the certificate
+    /// check (§6: no IP rotation around a verification failure).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires a TLS-capable environment (Schannel credentials unavailable in the dev sandbox)"]
+    async fn connect_to_does_not_verify_against_the_pinned_address() {
+        let fixture = TlsPinnedFixture::start(&["127.0.0.1"]).await;
+        let url = fixture.url("localhost");
+        let connect_to = fixture.connect_to("localhost");
+        let ca_info = fixture.ca_pem.clone();
+
+        let error = tokio::task::spawn_blocking(move || {
+            let multi = Multi::new();
+            drive_until_error(
+                &multi,
+                new_request_verifying(&multi, &url, &connect_to, &ca_info),
+            )
+        })
+        .await
+        .unwrap();
+
+        let lowered = error.to_ascii_lowercase();
+        assert!(
+            lowered.contains("certificate") || lowered.contains("ssl"),
+            "a hostname mismatch must fail verification, got: {error}"
+        );
+        assert!(
+            lowered.contains("localhost"),
+            "the failure has to name the URL's host, got: {error}"
+        );
+        fixture.stop();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

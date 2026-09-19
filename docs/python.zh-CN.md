@@ -195,7 +195,7 @@ except DownloadFailedError as exc:
 - 省略 `output_path` 时，会按 `Content-Disposition` → URL 路径 → `download` 自动选择文件名
 - 若未设置 `output_dir`，仍可直接传绝对 `output_path`
 
-### `Downloader(connect_timeout=None, proxy=None, http_proxy=None, https_proxy=None, dns_servers=None, doh_servers=None, enable_ipv6=None, log_level=None)`
+### `Downloader(connect_timeout=None, proxy=None, http_proxy=None, https_proxy=None, dns_servers=None, doh_servers=None, enable_ipv6=None, multi_ip=None, log_level=None)`
 
 可复用的下载器实例。
 
@@ -291,6 +291,7 @@ task = bytehaul.download(
 | `dns_servers` | `list[str] \| None` | `None` | 自定义 DNS 服务器，支持 `IP` 或 `IP:PORT` |
 | `doh_servers` | `list[str] \| None` | `None` | 自定义 DNS-over-HTTPS 端点，传入 `https://...` URL |
 | `enable_ipv6` | `bool \| None` | `True` | 是否允许解析和连接 IPv6 地址 |
+| `multi_ip` | `bool \| None` | `False` | 直连请求是否在源站的多个候选地址间分散并收敛到较快的地址（见 `multi-ip-connection-plan.zh-CN.md`） |
 | `ca_info` | `str \| Path \| None` | `None` | 额外 PEM 信任根；不关闭证书和主机名校验 |
 | `ca_path` | `str \| Path \| None` | `None` | 带哈希证书文件的 CA 目录 |
 | `client_cert` | `str \| Path \| None` | `None` | mTLS 客户端证书 |

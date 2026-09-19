@@ -130,6 +130,21 @@ impl DownloaderBuilder {
         self
     }
 
+    /// Spread direct transfers over the candidate addresses of their origin
+    /// (default: `false`).
+    ///
+    /// With it off, every request keeps the pre-existing behaviour and libcurl
+    /// picks the address. With it on, a direct HTTP/HTTPS request pins its
+    /// connection to one address of the origin, chosen from the addresses DNS
+    /// just returned and, once measured, from how fast and stable each of them
+    /// turned out. No extra probe traffic is generated and proxied requests or
+    /// IP-literal URLs are unaffected. See
+    /// `docs/multi-ip-connection-plan.zh-CN.md`.
+    pub fn multi_ip(mut self, enabled: bool) -> Self {
+        self.client_config.multi_ip = enabled;
+        self
+    }
+
     /// Set the log verbosity level for download tasks (default: [`LogLevel::Off`]).
     pub fn log_level(mut self, level: LogLevel) -> Self {
         self.log_level = level;
@@ -510,6 +525,19 @@ mod tests {
             .build()
             .unwrap();
         drop(downloader);
+    }
+
+    #[test]
+    fn test_downloader_builder_multi_ip_policy() {
+        // Off by default, and part of the client identity once it is on: two
+        // downloaders that differ only in this flag must not share a cached
+        // client, because one driver would then mix two policies.
+        let plain = Downloader::builder().build().unwrap();
+        assert!(!plain.client_config.multi_ip);
+
+        let pinned = Downloader::builder().multi_ip(true).build().unwrap();
+        assert!(pinned.client_config.multi_ip);
+        assert_ne!(plain.client_config, pinned.client_config);
     }
 
     #[test]

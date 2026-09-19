@@ -44,6 +44,15 @@ impl DnsAnswer {
     pub(crate) fn time_to_live(&self) -> Duration {
         self.valid_until.saturating_duration_since(Instant::now())
     }
+
+    /// The absolute instant this answer stops being valid.
+    ///
+    /// The multi-IP policy carries this instant to the driver instead of a
+    /// duration: the transfer may wait in the driver's queue, and a snapshot
+    /// that expired meanwhile must not start a fresh selection.
+    pub(crate) fn valid_until(&self) -> Instant {
+        self.valid_until
+    }
 }
 
 /// Hickory-backed resolver used by the libcurl transport.

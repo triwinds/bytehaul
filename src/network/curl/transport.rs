@@ -32,6 +32,7 @@ use crate::network::ClientNetworkConfig;
 use super::driver::{
     DriverConfig, DriverHandle, DriverStats, RequestOptions, ResolveEntry, Transfer,
 };
+use super::ip_policy::CandidateSet;
 
 /// Head deadline used by the test-only deadline-less request helper, so it
 /// cannot wait forever on a silent server.
@@ -83,6 +84,8 @@ pub(crate) struct CurlTransport {
     resolver: Arc<BytehaulDnsResolver>,
     connect_timeout: Duration,
     forbid_connection_reuse: bool,
+    /// One origin, one policy: see `docs/multi-ip-connection-plan.zh-CN.md`.
+    multi_ip: bool,
     http_proxy: Option<ProxyEndpoint>,
     https_proxy: Option<ProxyEndpoint>,
     all_proxy: Option<ProxyEndpoint>,
@@ -114,6 +117,7 @@ impl CurlTransport {
             // `pool_max_idle_per_host = 0` keeps the old "no connection reuse"
             // contract; the pool accounting implements the `k > 0` case.
             forbid_connection_reuse: config.pool_max_idle_per_host == 0,
+            multi_ip: config.multi_ip,
             http_proxy: proxy_endpoint(proxies.http_proxy)?,
             https_proxy: proxy_endpoint(proxies.https_proxy)?,
             all_proxy: proxy_endpoint(proxies.all_proxy)?,
@@ -142,9 +146,14 @@ impl CurlTransport {
         let mut options = self.options_for(&req, head_deadline)?;
         let connect_budget = options.connect_timeout.min(head_deadline);
 
-        options.resolve = self
+        match self
             .resolve_for(&options, connect_budget.saturating_sub(started.elapsed()))
-            .await?;
+            .await?
+        {
+            HopTarget::Resolve(entry) => options.resolve = Some(entry),
+            HopTarget::Candidates(set) => options.candidates = Some(set),
+            HopTarget::Literal => {}
+        }
 
         let spent = started.elapsed();
         let remaining_connect = connect_budget.saturating_sub(spent);
@@ -241,9 +250,16 @@ impl CurlTransport {
     ///
     /// With a proxy, that hop is the proxy: the origin hostname travels inside
     /// the request (absolute form) or the `CONNECT` line, so the proxy resolves
-    /// it. Without a proxy the origin hostname is resolved here and injected
-    /// with `CURLOPT_RESOLVE`, which keeps the URL (and therefore `Host`, SNI
-    /// and certificate verification) unchanged.
+    /// it. Without a proxy the origin hostname is resolved here; how the answer
+    /// reaches libcurl depends on the multi-IP policy:
+    ///
+    /// * off: `CURLOPT_RESOLVE` carries the whole answer, and libcurl picks an
+    ///   address, which is the pre-existing behaviour;
+    /// * on: the answer travels as a candidate snapshot and the driver pins
+    ///   each transfer to one address with `CURLOPT_CONNECT_TO`.
+    ///
+    /// Either way the URL keeps the origin name, so `Host`, SNI and certificate
+    /// verification are unchanged.
     ///
     /// `budget` is what is left of the connect phase; a lookup that needs
     /// longer fails here instead of letting the connection start late.
@@ -251,14 +267,16 @@ impl CurlTransport {
         &self,
         options: &RequestOptions,
         budget: Duration,
-    ) -> Result<Option<ResolveEntry>, DownloadError> {
+    ) -> Result<HopTarget, DownloadError> {
+        let proxied = self.proxy_for(&scheme_of(&options.url)?).is_some();
         let target = match self.proxy_for(&scheme_of(&options.url)?) {
             Some(proxy) => proxy.host.clone().map(|host| (host, proxy.port)),
             None => origin_target(&options.url)?,
         };
         let Some((host, port)) = target else {
-            // An IP literal needs no injection: libcurl connects to it as-is.
-            return Ok(None);
+            // An IP literal needs no injection: libcurl connects to it as-is,
+            // and the policy never scores an address the URL already names.
+            return Ok(HopTarget::Literal);
         };
 
         let lookup = self.resolver.resolve(&host);
@@ -274,13 +292,35 @@ impl CurlTransport {
             ))
         })?;
 
-        Ok(Some(ResolveEntry::new(
+        // A proxied hop resolves the proxy, never the origin the proxy will
+        // reach itself: the policy has nothing to choose there.
+        if self.multi_ip && !proxied {
+            return Ok(HopTarget::Candidates(CandidateSet {
+                host,
+                port,
+                addresses: answer.addresses().to_vec(),
+                valid_until: answer.valid_until(),
+            }));
+        }
+
+        Ok(HopTarget::Resolve(ResolveEntry::new(
             &host,
             port,
             answer.addresses(),
             answer.time_to_live(),
         )))
     }
+}
+
+/// How one hop's resolved addresses reach libcurl.
+#[derive(Debug)]
+enum HopTarget {
+    /// Injected into the pool's shared DNS cache; libcurl picks the address.
+    Resolve(ResolveEntry),
+    /// Handed to the driver, which pins each transfer to one address.
+    Candidates(CandidateSet),
+    /// The hop is an IP literal and needs no answer at all.
+    Literal,
 }
 
 impl Drop for CurlTransport {
@@ -878,6 +918,190 @@ mod tests {
             "the lookup must not exceed the caller's deadline, took {elapsed:?}"
         );
         keeper.abort();
+    }
+
+    /// With the policy on, a direct hop travels as candidates: the driver
+    /// chooses one address per transfer, and nothing is injected into the
+    /// pool's shared DNS cache.
+    #[tokio::test]
+    async fn multi_ip_hands_the_driver_candidates_instead_of_a_resolve_entry() {
+        let (dns_addr, _queries, dns_server) = crate::network::dns::spawn_dns_test_server(60).await;
+        let transport = transport(&ClientNetworkConfig {
+            dns_servers: vec![dns_addr],
+            enable_ipv6: false,
+            multi_ip: true,
+            ..ClientNetworkConfig::default()
+        });
+        let options = transport
+            .options_for(
+                &request("http://pinned.test:8080/file", &[]),
+                Duration::from_secs(1),
+            )
+            .unwrap();
+
+        match transport
+            .resolve_for(&options, Duration::from_secs(1))
+            .await
+            .unwrap()
+        {
+            HopTarget::Candidates(set) => {
+                assert_eq!(set.host, "pinned.test");
+                assert_eq!(set.port, 8080);
+                assert_eq!(set.addresses, vec![IpAddr::from([127, 0, 0, 1])]);
+                assert!(
+                    set.valid_until > Instant::now(),
+                    "the snapshot carries the answer's absolute validity"
+                );
+            }
+            other => panic!("expected candidate addresses, got {other:?}"),
+        }
+        dns_server.abort();
+    }
+
+    /// The switch is off by default: the `RESOLVE` path is unchanged.
+    #[tokio::test]
+    async fn the_default_path_still_injects_resolved_addresses() {
+        let (dns_addr, _queries, dns_server) = crate::network::dns::spawn_dns_test_server(60).await;
+        let transport = transport(&ClientNetworkConfig {
+            dns_servers: vec![dns_addr],
+            enable_ipv6: false,
+            ..ClientNetworkConfig::default()
+        });
+        let options = transport
+            .options_for(
+                &request("http://pinned.test:8080/file", &[]),
+                Duration::from_secs(1),
+            )
+            .unwrap();
+
+        match transport
+            .resolve_for(&options, Duration::from_secs(1))
+            .await
+            .unwrap()
+        {
+            HopTarget::Resolve(entry) => assert_eq!(entry.key, "pinned.test:8080"),
+            other => panic!("expected a resolve entry, got {other:?}"),
+        }
+        dns_server.abort();
+    }
+
+    /// A proxy resolves the origin itself, so there is nothing for the policy
+    /// to choose: the hop that is resolved is the proxy, and it is resolved the
+    /// way it always was.
+    #[tokio::test]
+    async fn multi_ip_leaves_proxied_hops_on_the_resolve_path() {
+        let (dns_addr, _queries, dns_server) = crate::network::dns::spawn_dns_test_server(60).await;
+        let transport = transport(&ClientNetworkConfig {
+            dns_servers: vec![dns_addr],
+            enable_ipv6: false,
+            multi_ip: true,
+            http_proxy: Some("http://proxy.test:3128".into()),
+            ..ClientNetworkConfig::default()
+        });
+        let options = transport
+            .options_for(
+                &request("http://origin.test/file", &[]),
+                Duration::from_secs(1),
+            )
+            .unwrap();
+
+        match transport
+            .resolve_for(&options, Duration::from_secs(1))
+            .await
+            .unwrap()
+        {
+            HopTarget::Resolve(entry) => assert_eq!(
+                entry.key, "proxy.test:3128",
+                "the proxy hop stays on the resolve path even with the policy on"
+            ),
+            other => panic!("expected a resolve entry for the proxy, got {other:?}"),
+        }
+        dns_server.abort();
+    }
+
+    /// An IP-literal URL names its address already, so the policy has nothing
+    /// to choose and no lookup to do.
+    #[tokio::test]
+    async fn multi_ip_does_not_choose_for_ip_literal_urls() {
+        let transport = transport(&ClientNetworkConfig {
+            multi_ip: true,
+            // A resolver that cannot answer anything: a lookup would fail.
+            dns_servers: vec![SocketAddr::from(([127, 0, 0, 1], 9))],
+            enable_ipv6: false,
+            ..ClientNetworkConfig::default()
+        });
+        let options = transport
+            .options_for(
+                &request("http://127.0.0.1:8080/file", &[]),
+                Duration::from_secs(1),
+            )
+            .unwrap();
+
+        assert!(matches!(
+            transport
+                .resolve_for(&options, Duration::from_secs(1))
+                .await
+                .unwrap(),
+            HopTarget::Literal
+        ));
+    }
+
+    /// The whole path with the policy on: the driver pins the transfer to the
+    /// address the resolver returned, and the origin still sees its own name.
+    #[tokio::test]
+    async fn a_policy_transport_reaches_the_resolved_address_under_the_origin_name() {
+        use super::super::test_support::scripted_http_server;
+
+        let server = scripted_http_server(b"pinned-body".to_vec()).await;
+        let (dns_addr, _queries, dns_server) = crate::network::dns::spawn_dns_test_server(60).await;
+        let transport = transport(&ClientNetworkConfig {
+            dns_servers: vec![dns_addr],
+            enable_ipv6: false,
+            multi_ip: true,
+            ..ClientNetworkConfig::default()
+        });
+        let req = request(
+            &format!("http://bytehaul-pinned.test:{}/file", server.port),
+            &[],
+        );
+
+        let response = transport
+            .request(req, Duration::from_secs(5))
+            .await
+            .unwrap();
+        let body = response.into_body().collect_to_bytes().await.unwrap();
+        assert_eq!(body.as_ref(), b"pinned-body");
+
+        let head = server.request_head();
+        assert!(
+            head.contains(&format!("host: bytehaul-pinned.test:{}", server.port)),
+            "the pinned connection must not change the request, got: {head}"
+        );
+        assert_eq!(
+            transport.driver_stats().ip_selections,
+            1,
+            "the transfer was pinned"
+        );
+        // The window reaches the policy once the consumer releases the body,
+        // which the driver learns through its command queue. This body is far
+        // below the sample minimums, so it is classified as pollution - which
+        // is the point: the policy saw it and refused to rank a tiny window.
+        let started = Instant::now();
+        let window = loop {
+            let stats = transport.driver_stats();
+            if stats.ip_samples + stats.ip_polluted_samples > 0
+                || started.elapsed() > Duration::from_secs(5)
+            {
+                break stats;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(
+            (window.ip_samples, window.ip_polluted_samples),
+            (0, 1),
+            "a window below the minimums must not rank the address"
+        );
+        dns_server.abort();
     }
 
     /// The configured `connect_timeout` covers name resolution too.

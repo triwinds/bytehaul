@@ -1,4 +1,6 @@
 use super::*;
+use crate::http::{MAX_BODY_BUDGET_BYTES, MIN_BODY_BUDGET_BYTES};
+use crate::network::curl::test_support::DualAddressServer;
 use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -229,14 +231,20 @@ struct TlsFixture {
 impl TlsFixture {
     async fn start(requests: usize) -> Self {
         use rcgen::{
-            BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair,
-            KeyUsagePurpose,
+            BasicConstraints, CertificateParams, DistinguishedName, DnType,
+            ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose,
         };
         use tokio_rustls::rustls::{self, pki_types::PrivatePkcs8KeyDer};
         use tokio_rustls::TlsAcceptor;
 
         let ca_key = KeyPair::generate().unwrap();
         let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        // rcgen's default distinguished name is the same for every certificate,
+        // which would make the leaf's issuer equal to its own subject and let
+        // OpenSSL treat it as self-signed instead of chaining it to this CA.
+        let mut ca_name = DistinguishedName::new();
+        ca_name.push(DnType::CommonName, "bytehaul-test-ca");
+        ca_params.distinguished_name = ca_name;
         ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
         let ca = ca_params.self_signed(&ca_key).unwrap();
@@ -1481,6 +1489,21 @@ fn resolve_entries_render_ipv6_addresses_in_brackets() {
 }
 
 #[test]
+fn connect_to_entries_name_one_address_of_the_request_origin() {
+    let ipv4 = ConnectToEntry::new("download.test", 8080, [127, 0, 0, 2].into(), 8080);
+    assert_eq!(ipv4.spec, "download.test:8080:127.0.0.2:8080");
+    assert_eq!(ipv4.address, std::net::IpAddr::from([127, 0, 0, 2]));
+
+    // The target port is the port of the address, not of the origin: a proxy
+    // or a re-mapped port must survive the rendering.
+    let remapped = ConnectToEntry::new("download.test", 443, [127, 0, 0, 1].into(), 8443);
+    assert_eq!(remapped.spec, "download.test:443:127.0.0.1:8443");
+
+    let ipv6 = ConnectToEntry::new("download.test", 80, [0, 0, 0, 0, 0, 0, 0, 1].into(), 80);
+    assert_eq!(ipv6.spec, "download.test:80:[::1]:80");
+}
+
+#[test]
 fn resolve_plans_inject_once_and_refresh_stale_or_changed_answers() {
     let mut pool = Pool::new(&DriverConfig::default());
     let now = Instant::now();
@@ -2419,5 +2442,694 @@ fn commands_and_closure_after_registration_wake_the_next_poll() {
         *queue.poll_waker.lock() = None;
         assert_eq!(queue.is_closed(), close);
         assert_eq!(queue.take_commands().len(), usize::from(!close));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Multi-IP policy (docs/multi-ip-connection-plan.zh-CN.md, M1/M2/M4)
+// ---------------------------------------------------------------------------
+
+/// Options that ask the driver to pick an address from `set`.
+fn policy_options(url: &str, set: CandidateSet) -> RequestOptions {
+    let mut options = RequestOptions::new(url);
+    options.connect_timeout = Duration::from_secs(5);
+    options.head_timeout = Duration::from_secs(5);
+    options.candidates = Some(set);
+    options
+}
+
+/// A snapshot that stays valid for the whole test.
+fn candidates(host: &str, port: u16, addresses: &[[u8; 4]]) -> CandidateSet {
+    CandidateSet {
+        host: host.to_string(),
+        port,
+        addresses: addresses
+            .iter()
+            .copied()
+            .map(std::net::IpAddr::from)
+            .collect(),
+        valid_until: Instant::now() + Duration::from_secs(600),
+    }
+}
+
+/// An address with nothing listening: connecting to it is refused at once,
+/// which is the connection failure the internal fallback exists for.
+const DEAD_ADDRESS: [u8; 4] = [127, 0, 0, 3];
+
+#[test]
+fn policy_regression_connect_timeouts_require_pre_request_evidence() {
+    let zero = Some(Duration::ZERO);
+    for code in [5, 6, 7, 28, 35] {
+        assert!(is_safe_connect_failure(code, false, Some(0), zero));
+        assert!(!is_safe_connect_failure(code, false, Some(100), zero));
+        assert!(!is_safe_connect_failure(code, true, Some(0), zero));
+        assert!(!is_safe_connect_failure(code, false, None, zero));
+    }
+    assert!(!is_safe_connect_failure(28, false, Some(0), None));
+    assert!(!is_safe_connect_failure(
+        28,
+        false,
+        Some(0),
+        Some(Duration::from_millis(1)),
+    ));
+    for code in [18, 55, 56, 60] {
+        assert!(!is_safe_connect_failure(code, false, Some(0), zero));
+    }
+}
+
+#[test]
+fn policy_regression_unknown_and_other_connections_keep_their_deadlines() {
+    let mut pool = Pool::new(&DriverConfig::default());
+    let now = Instant::now();
+    let generation = pool.clear_generation;
+    for id in [11, 12] {
+        pool.settle_pinned_connection(generation, Some(id), TransferExit::Completed, now);
+    }
+    pool.settle_pinned_connection(
+        generation,
+        Some(12),
+        TransferExit::Completed,
+        now + Duration::from_secs(1),
+    );
+    assert_eq!(pool.oldest_idle(), Some(now));
+    assert_eq!(pool.idle_connections(), 2);
+    pool.idle_since = Some(now + Duration::from_secs(1));
+    assert_eq!(
+        pool.idle_deadline(Duration::from_secs(2), false),
+        Some(now + Duration::from_secs(2)),
+        "a fully idle pool must still honour its oldest policy socket"
+    );
+    pool.settle_pinned_connection(generation, Some(12), TransferExit::Cancelled, now);
+    assert_eq!(pool.oldest_idle(), Some(now));
+    assert_eq!(pool.idle_connections(), 1);
+    pool.settle_pinned_connection(generation, None, TransferExit::Completed, now);
+    pool.settle_pinned_connection(
+        generation,
+        None,
+        TransferExit::Completed,
+        now + Duration::from_secs(2),
+    );
+    assert_eq!(pool.oldest_idle(), Some(now));
+    pool.clear_idle_connections().unwrap();
+    pool.settle_pinned_connection(generation, Some(11), TransferExit::Completed, now);
+    assert_eq!(
+        pool.idle_connections(),
+        0,
+        "old generation cannot restore an entry"
+    );
+}
+
+/// Drive submission and completion on this thread, without opening sockets,
+/// so the otherwise private attempt table can be checked after head failures.
+#[test]
+fn policy_regression_pre_head_failures_release_attempt_records() {
+    let shared = Arc::new(DriverShared {
+        sinks: Mutex::new(HashMap::new()),
+        active: AtomicUsize::new(0),
+        counters: DriverCounters::default(),
+        alive: AtomicBool::new(true),
+        pools: AtomicUsize::new(0),
+        idle_clear_unsupported: AtomicBool::new(false),
+    });
+    let queue = CommandQueue::new();
+    let config = DriverConfig::default();
+    let mut pools = HashMap::new();
+    let mut policy = IpPolicy::new();
+    let mut attempts = HashMap::new();
+    for (code, address_count) in [(7, 1), (28, 1), (60, 1), (7, 3), (28, 3), (60, 3)] {
+        let addresses = [DEAD_ADDRESS, [127, 0, 0, 4], [127, 0, 0, 5]];
+        let options = policy_options(
+            "https://dual.test:443/file",
+            candidates("dual.test", 443, &addresses[..address_count]),
+        );
+        let key = options.pool_key();
+        let id = TransferId::next();
+        let sink = BodySink::new(id, 1024, Arc::downgrade(&queue));
+        let (head, mut receiver) = oneshot::channel();
+        shared.sinks.lock().insert(id, sink.clone());
+        start_transfer(
+            &mut pools,
+            &shared,
+            &mut policy,
+            &mut attempts,
+            &config,
+            SubmitRequest {
+                id,
+                options,
+                sink,
+                head,
+            },
+        );
+        assert_eq!(attempts.len(), 1);
+        let mut completions = 0;
+        loop {
+            completions += 1;
+            assert!(completions <= address_count);
+            match complete_transfer(
+                &mut pools,
+                &shared,
+                &mut policy,
+                &mut attempts,
+                &key,
+                id,
+                Err((code, "simulated pre-head failure".into())),
+            ) {
+                Completion::Done => break,
+                Completion::Retry(request) => {
+                    assert_eq!(attempts.len(), 1, "retry retains the same attempt record");
+                    assert!(matches!(
+                        receiver.try_recv(),
+                        Err(oneshot::error::TryRecvError::Empty)
+                    ));
+                    start_retry(
+                        &mut pools,
+                        &shared,
+                        &mut policy,
+                        &mut attempts,
+                        &config,
+                        *request,
+                    );
+                }
+            }
+        }
+        assert_eq!(completions, if code == 60 { 1 } else { address_count });
+        assert!(receiver.try_recv().unwrap().is_err());
+        assert!(
+            attempts.is_empty(),
+            "curl {code} left a record with no BodyStream"
+        );
+        assert!(shared.sinks.lock().is_empty());
+        cancel_transfer(&mut pools, &shared, &mut policy, &mut attempts, id);
+        assert!(attempts.is_empty());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn policy_regression_another_ips_idle_socket_does_not_disable_fallback() {
+    let server = DualAddressServer::start(Duration::ZERO).await;
+    let driver = DriverHandle::spawn(DriverConfig::default());
+    let url = server.url("/cached-fallback");
+    let mut warm = driver
+        .get(
+            policy_options(
+                &url,
+                server.candidates(&[server.address(0)], Duration::from_secs(60)),
+            ),
+            1024,
+        )
+        .await
+        .unwrap();
+    assert_eq!(collect_body(&mut warm, Duration::from_secs(2)).await, b"a0");
+    drop(warm);
+
+    let mut transfer = driver
+        .get(
+            policy_options(
+                &url,
+                candidates(
+                    server.host(),
+                    server.port(),
+                    &[DEAD_ADDRESS, [127, 0, 0, 1]],
+                ),
+            ),
+            1024,
+        )
+        .await
+        .expect("an unrelated idle socket must not suppress retry");
+    assert_eq!(
+        collect_body(&mut transfer, Duration::from_secs(2)).await,
+        b"a0"
+    );
+    assert_eq!(driver.stats().connect_retries, 1);
+    assert_eq!(
+        server.accepted(0),
+        1,
+        "the healthy socket is still reusable"
+    );
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn policy_regression_busy_a_does_not_refresh_idle_b() {
+    let server = DualAddressServer::start(Duration::from_millis(150)).await;
+    let driver = DriverHandle::spawn(DriverConfig {
+        max_idle_per_host: 8,
+        pool_idle_timeout: Duration::from_millis(400),
+        max_age_conn: None,
+    });
+    let url = server.url("/idle");
+    // B is older. All later traffic is pinned to A, including several reuses.
+    for index in [1, 0, 0, 0, 0, 0] {
+        let mut transfer = driver
+            .get(
+                policy_options(
+                    &url,
+                    server.candidates(&[server.address(index)], Duration::from_secs(60)),
+                ),
+                1024,
+            )
+            .await
+            .unwrap();
+        collect_body(&mut transfer, Duration::from_secs(2)).await;
+    }
+    assert_eq!(
+        server.wait_for_live(1, 0, Duration::from_millis(100)).await,
+        0
+    );
+    assert!(driver.stats().idle_clears > 0);
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn policy_regression_same_ip_reuse_keeps_the_unused_socket_deadline() {
+    let server = TestServer::start_with(Arc::new(|target: &str| {
+        if target.starts_with("/slow") {
+            ResponsePlan {
+                chunk_size: 2048,
+                chunk_delay: Duration::from_millis(25),
+                ..ResponsePlan::body(vec![b'x'; 96 * 1024])
+            }
+        } else {
+            ResponsePlan {
+                head_delay: Duration::from_millis(150),
+                ..ResponsePlan::body(b"warm".to_vec())
+            }
+        }
+    }))
+    .await;
+    let driver = DriverHandle::spawn(DriverConfig {
+        max_idle_per_host: 8,
+        pool_idle_timeout: Duration::from_millis(400),
+        max_age_conn: None,
+    });
+    let options = policy_options(
+        &format!("http://dual.test:{}/warm", server.addr.port()),
+        candidates("dual.test", server.addr.port(), &[[127, 0, 0, 1]]),
+    );
+    let (first, second) = tokio::join!(
+        driver.get(options.clone(), 1024),
+        driver.get(options.clone(), 1024),
+    );
+    for mut transfer in [first.unwrap(), second.unwrap()] {
+        collect_body(&mut transfer, Duration::from_secs(2)).await;
+    }
+    assert_eq!(server.live.load(Ordering::SeqCst), 2);
+    let mut options = options;
+    options.url = format!("http://dual.test:{}/slow", server.addr.port());
+    let mut transfer = driver.get(options, 256 * 1024).await.unwrap();
+    assert_eq!(server.accepted(), 2, "the long request reused one socket");
+    assert_eq!(server.wait_for_live(1, Duration::from_millis(700)).await, 1);
+    assert_eq!(
+        driver.active_transfers(),
+        1,
+        "the reused socket is still busy"
+    );
+    assert!(driver.stats().idle_clears > 0);
+    assert_eq!(
+        collect_body(&mut transfer, Duration::from_secs(3)).await,
+        vec![b'x'; 96 * 1024]
+    );
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg_attr(windows, ignore = "requires available Schannel credentials")]
+async fn policy_regression_stalled_tls_falls_back_within_the_original_budget() {
+    let fixture = TlsFixture::start(1).await;
+    let stalled = TcpListener::bind(("127.0.0.2", fixture.addr.port()))
+        .await
+        .unwrap();
+    let stall_task = tokio::spawn(async move {
+        let (mut stream, _) = stalled.accept().await.unwrap();
+        // Accept TCP and read ClientHello, but never send a TLS response.
+        let mut bytes = Vec::new();
+        let _ = stream.read_to_end(&mut bytes).await;
+        assert!(!bytes.is_empty());
+    });
+    let driver = DriverHandle::spawn(DriverConfig::default());
+    let mut options = fixture.options(&fixture.url("127.0.0.1"), 0);
+    options.candidates = Some(candidates(
+        "127.0.0.1",
+        fixture.addr.port(),
+        &[[127, 0, 0, 2], [127, 0, 0, 1]],
+    ));
+    options.connect_timeout = Duration::from_secs(4);
+    options.head_timeout = Duration::from_secs(4);
+    let started = Instant::now();
+    let mut transfer = driver
+        .get(options, 1024)
+        .await
+        .expect("the initial connect slice must leave time for the healthy IP");
+    assert_eq!(
+        collect_body(&mut transfer, Duration::from_secs(2)).await,
+        b"abcd"
+    );
+    assert!(started.elapsed() < Duration::from_secs(4));
+    assert_eq!(driver.stats().connect_retries, 1);
+    assert_eq!(driver.stats().submitted, 1);
+    stall_task.await.unwrap();
+    fixture.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn policy_transfers_land_on_the_address_the_driver_chose() {
+    let server = DualAddressServer::start(Duration::ZERO).await;
+    let driver = DriverHandle::spawn(DriverConfig::default());
+    let url = server.url("/pinned");
+    let set = server.candidates(
+        &[server.address(0), server.address(1)],
+        Duration::from_secs(600),
+    );
+
+    // §7 rule 2: the first two requests cover both candidates.
+    let mut bodies = Vec::new();
+    for _ in 0..2 {
+        let mut transfer = driver
+            .get(policy_options(&url, set.clone()), 1024)
+            .await
+            .unwrap();
+        bodies.push(collect_body(&mut transfer, Duration::from_secs(5)).await);
+    }
+
+    bodies.sort();
+    assert_eq!(
+        bodies,
+        vec![b"a0".to_vec(), b"b0".to_vec()],
+        "each address served the request the driver pinned there"
+    );
+    assert_eq!(server.accepted(0), 1);
+    assert_eq!(server.accepted(1), 1);
+    assert_eq!(driver.stats().ip_selections, 2);
+    assert!(wait_for_idle(&driver, Duration::from_secs(2)).await);
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_candidate_is_retried_without_a_second_request() {
+    let server = DualAddressServer::start(Duration::ZERO).await;
+    let driver = DriverHandle::spawn(DriverConfig::default());
+    let url = server.url("/fallback");
+    // The dead address is first, so coverage sends the request there.
+    let set = candidates(
+        server.host(),
+        server.port(),
+        &[DEAD_ADDRESS, [127, 0, 0, 1]],
+    );
+
+    let mut transfer = driver
+        .get(policy_options(&url, set), 4096)
+        .await
+        .expect("a refused candidate must not fail the request");
+    let body = collect_body(&mut transfer, Duration::from_secs(5)).await;
+
+    assert_eq!(body, b"a0", "the retry reached the healthy address");
+    let stats = driver.stats();
+    assert_eq!(
+        stats.submitted, 1,
+        "the session asked for one request and got one"
+    );
+    assert_eq!(
+        stats.connect_retries, 1,
+        "the second connection belongs to the same request"
+    );
+    assert_eq!(stats.completed, 1);
+    assert_eq!(stats.ip_selections, 2, "both attempts reserved an address");
+    assert_eq!(server.accepted(0), 1);
+    assert!(wait_for_idle(&driver, Duration::from_secs(2)).await);
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_single_dead_candidate_reports_a_connect_failure() {
+    let driver = DriverHandle::spawn(DriverConfig::default());
+    let set = candidates("dual.test", 9, &[DEAD_ADDRESS]);
+    let mut options = policy_options("http://dual.test:9/file", set);
+    options.connect_timeout = Duration::from_secs(2);
+
+    let error = match driver.get(options, 1024).await {
+        Ok(_) => panic!("nothing listens on the only candidate"),
+        Err(error) => error,
+    };
+
+    match error {
+        DownloadError::Transport(transport) => {
+            assert_eq!(transport.kind(), TransportErrorKind::Connect);
+            assert!(
+                DownloadError::Transport(transport).is_retryable(),
+                "a refused connection is the caller's to retry"
+            );
+        }
+        other => panic!("expected a transport error, got {other:?}"),
+    }
+    let stats = driver.stats();
+    assert_eq!(
+        stats.connect_retries, 0,
+        "one candidate leaves nothing to retry"
+    );
+    assert_eq!(stats.completed, 1);
+    assert!(wait_for_idle(&driver, Duration::from_secs(2)).await);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_internal_retry_never_resets_the_callers_deadline() {
+    // The healthy address answers far too late for the caller's 400 ms budget.
+    let server = TestServer::start(ResponsePlan {
+        head_delay: Duration::from_secs(3),
+        ..ResponsePlan::body(b"late".to_vec())
+    })
+    .await;
+    let driver = DriverHandle::spawn(DriverConfig::default());
+    let url = format!("http://dual.test:{}/late", server.addr.port());
+    let mut options = policy_options(
+        &url,
+        candidates(
+            "dual.test",
+            server.addr.port(),
+            &[DEAD_ADDRESS, [127, 0, 0, 1]],
+        ),
+    );
+    options.head_timeout = Duration::from_millis(400);
+
+    let started = Instant::now();
+    let error = match driver.get(options, 1024).await {
+        Ok(_) => panic!("the caller's deadline must bound the retried transfer"),
+        Err(error) => error,
+    };
+    let elapsed = started.elapsed();
+
+    assert!(
+        matches!(
+            error,
+            DownloadError::Transport(ref transport)
+                if transport.kind() == TransportErrorKind::Timeout
+        ),
+        "the caller's deadline decides, not the retry: {error:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "the deadline must not be extended by the retry, took {elapsed:?}"
+    );
+    assert_eq!(
+        driver.stats().connect_retries,
+        1,
+        "the refused candidate was retried before the deadline ran out"
+    );
+    assert!(wait_for_idle(&driver, Duration::from_secs(3)).await);
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_body_failure_is_not_retried_inside_the_driver() {
+    // The connection succeeds and the body is truncated: the request may have
+    // reached the origin, so §6 leaves it to the caller's retry rules.
+    let server = TestServer::start(ResponsePlan {
+        body: vec![b'x'; 64 * 1024],
+        truncate_at: Some(1024),
+        ..ResponsePlan::body(vec![b'x'; 64 * 1024])
+    })
+    .await;
+    let driver = DriverHandle::spawn(DriverConfig::default());
+    let url = format!("http://dual.test:{}/truncated", server.addr.port());
+    let set = candidates(
+        "dual.test",
+        server.addr.port(),
+        &[[127, 0, 0, 1], [127, 0, 0, 2]],
+    );
+
+    let mut transfer = driver.get(policy_options(&url, set), 4096).await.unwrap();
+    let error = loop {
+        match transfer.body.next_chunk(Duration::from_secs(5)).await {
+            Ok(Some(_)) => continue,
+            Ok(None) => panic!("a truncated body must not look like a clean EOF"),
+            Err(error) => break error,
+        }
+    };
+
+    assert_eq!(
+        driver.stats().connect_retries,
+        0,
+        "a body error is never rotated to another address"
+    );
+    assert!(
+        !error.is_retryable() || matches!(error, DownloadError::Transport(_)),
+        "the failure has to stay the session's business, got {error:?}"
+    );
+    assert!(wait_for_idle(&driver, Duration::from_secs(2)).await);
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn an_expired_candidate_snapshot_is_refused() {
+    let driver = DriverHandle::spawn(DriverConfig::default());
+    let mut set = candidates("dual.test", 9, &[[127, 0, 0, 1]]);
+    set.valid_until = Instant::now();
+
+    let error = match driver
+        .get(policy_options("http://dual.test:9/file", set), 1024)
+        .await
+    {
+        Ok(_) => panic!("an expired snapshot must not start a transfer"),
+        Err(error) => error,
+    };
+
+    assert!(
+        matches!(
+            error,
+            DownloadError::Transport(ref transport)
+                if transport.kind() == TransportErrorKind::Connect
+        ),
+        "§5: a snapshot that expired before the transfer started fails the request, got {error:?}"
+    );
+    assert_eq!(driver.stats().ip_selections, 0);
+    assert!(wait_for_idle(&driver, Duration::from_secs(2)).await);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_addresses_share_one_cache_bound() {
+    let server = DualAddressServer::start(Duration::ZERO).await;
+    let driver = DriverHandle::spawn(DriverConfig {
+        max_idle_per_host: 1,
+        ..DriverConfig::default()
+    });
+    let url = server.url("/bound");
+    let live = (server.live_handle(0), server.live_handle(1));
+
+    for index in 0..2 {
+        if index == 1 {
+            // Space the two idle moments apart: libcurl evicts the connection
+            // that has been idle longest, and two sockets that went idle in the
+            // same millisecond would tie.
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+        let set = candidates(
+            server.host(),
+            server.port(),
+            &[[127, 0, 0, 1 + index as u8]],
+        );
+        let mut transfer = driver.get(policy_options(&url, set), 1024).await.unwrap();
+        collect_body(&mut transfer, Duration::from_secs(5)).await;
+    }
+
+    // §6: the bound is the origin's, not one per address.
+    assert_eq!(
+        live.0.load(Ordering::SeqCst),
+        0,
+        "the first address's socket is evicted when the second goes idle"
+    );
+    assert_eq!(live.1.load(Ordering::SeqCst), 1);
+    assert!(wait_for_idle(&driver, Duration::from_secs(2)).await);
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_consumed_body_ranks_its_address_and_an_abandoned_one_does_not() {
+    let body = vec![b'x'; 256 * 1024];
+    let server = TestServer::start(ResponsePlan {
+        chunk_delay: Duration::from_millis(10),
+        ..ResponsePlan::body(body)
+    })
+    .await;
+    let driver = DriverHandle::spawn(DriverConfig::default());
+    let url = format!("http://dual.test:{}/slow", server.addr.port());
+    let set = || candidates("dual.test", server.addr.port(), &[[127, 0, 0, 1]]);
+
+    // A body read to EOF is a sample. What the driver counts is the consumer's
+    // verdict, so the body has to be released before the counters are read.
+    let mut transfer = driver
+        .get(policy_options(&url, set()), MAX_BODY_BUDGET_BYTES)
+        .await
+        .unwrap();
+    let read = collect_body(&mut transfer, Duration::from_secs(10)).await;
+    assert_eq!(read.len(), 256 * 1024);
+    drop(transfer);
+    assert_eq!(
+        wait_for_windows(&driver, 1).await,
+        (1, 0),
+        "a completely consumed body has to rank its address"
+    );
+
+    // A body the consumer drops is not.
+    let mut transfer = driver
+        .get(policy_options(&url, set()), MAX_BODY_BUDGET_BYTES)
+        .await
+        .unwrap();
+    let _ = transfer
+        .body
+        .next_chunk(Duration::from_secs(5))
+        .await
+        .unwrap();
+    drop(transfer);
+    assert!(wait_for_idle(&driver, Duration::from_secs(5)).await);
+    assert_eq!(
+        driver.stats().ip_samples,
+        1,
+        "an abandoned body must not become a success sample"
+    );
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_window_stretched_by_backpressure_is_dropped() {
+    let body = vec![b'x'; 128 * 1024];
+    let server = TestServer::start(ResponsePlan {
+        chunk_delay: Duration::from_millis(5),
+        ..ResponsePlan::body(body)
+    })
+    .await;
+    let driver = DriverHandle::spawn(DriverConfig::default());
+    let url = format!("http://dual.test:{}/held", server.addr.port());
+    let set = candidates("dual.test", server.addr.port(), &[[127, 0, 0, 1]]);
+
+    // A budget far below the body: the write callback has to pause while the
+    // consumer deliberately reads nothing, which is local pollution.
+    let mut transfer = driver
+        .get(policy_options(&url, set), MIN_BODY_BUDGET_BYTES)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let read = collect_body(&mut transfer, Duration::from_secs(10)).await;
+    assert_eq!(read.len(), 128 * 1024);
+    drop(transfer);
+
+    assert_eq!(
+        wait_for_windows(&driver, 1).await,
+        (0, 1),
+        "a window that is mostly backpressure must not rank the address"
+    );
+    server.stop().await;
+}
+
+/// Waits until the policy has seen `expected` windows, and reports how they
+/// were classified: `(usable, polluted)`.
+async fn wait_for_windows(driver: &DriverHandle, expected: u64) -> (u64, u64) {
+    let started = Instant::now();
+    loop {
+        let stats = driver.stats();
+        if stats.ip_samples + stats.ip_polluted_samples >= expected
+            || started.elapsed() > Duration::from_secs(5)
+        {
+            return (stats.ip_samples, stats.ip_polluted_samples);
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }

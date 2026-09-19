@@ -135,6 +135,8 @@ let downloader = Downloader::builder()
     ])
     .doh_server("https://dns.google/dns-query")
     .enable_ipv6(false)
+    // 直连请求在源站解析出的多个地址之间分散并收敛
+    .multi_ip(true)
     .build()?;
 
 let spec = DownloadSpec::new("https://example.com/file.bin")
@@ -144,6 +146,10 @@ let spec = DownloadSpec::new("https://example.com/file.bin")
 
 let handle = downloader.download(spec);
 ```
+
+`multi_ip(true)` 默认关闭。开启后，直连 HTTP/HTTPS 请求会被固定到 DNS 返回的其中一个地址，而不是交给
+libcurl 自行选择；后续请求会优先使用实测又快又稳的地址。代理请求和字面 IP URL 不受影响，也不会产生任何
+额外探测流量。设计见 `multi-ip-connection-plan.zh-CN.md`。
 
 builder 上的 `all_proxy(...)`、`http_proxy(...)`、`https_proxy(...)` 仍然适合作为默认值。若任务通过 `DownloadSpec::all_proxy(...)`、`http_proxy(...)`、`https_proxy(...)` 或 `connect_timeout(...)` 做覆盖，bytehaul 会按这组生效配置派生出一个等价 client，并在后续遇到相同配置时复用它。
 

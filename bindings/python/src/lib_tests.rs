@@ -212,6 +212,7 @@ fn test_apply_client_options_and_build_download_spec() {
         Some(vec!["1.1.1.1".into(), "[::1]".into()]),
         Some(vec!["https://127.0.0.1/dns-query".into()]),
         Some(false),
+        Some(true),
         None,
         None,
         None,
@@ -548,7 +549,7 @@ fn test_error_mapping_snapshot_conversion_and_repr() {
 fn test_download_task_methods_and_consumption_errors() {
     init_python();
     let downloader = PyDownloader::new(
-        None, None, None, None, None, None, None, None, None, None, None, None,
+        None, None, None, None, None, None, None, None, None, None, None, None, None,
     )
     .unwrap();
     let task = downloader
@@ -632,7 +633,7 @@ fn test_download_task_methods_and_consumption_errors() {
 fn test_download_task_pause_maps_to_paused_error() {
     init_python();
     let downloader = PyDownloader::new(
-        None, None, None, None, None, None, None, None, None, None, None, None,
+        None, None, None, None, None, None, None, None, None, None, None, None, None,
     )
     .unwrap();
     let task = downloader
@@ -696,6 +697,7 @@ fn test_py_downloader_with_log_level() {
         None,
         None,
         None,
+        None,
         Some("debug".into()),
         None,
         None,
@@ -706,6 +708,7 @@ fn test_py_downloader_with_log_level() {
     drop(d);
     // Test invalid log_level
     let result = PyDownloader::new(
+        None,
         None,
         None,
         None,
@@ -739,6 +742,7 @@ fn test_py_downloader_download_success_and_module_registration() {
         None,
         None,
         None,
+        None,
     )
     .unwrap();
     drop(configured);
@@ -751,7 +755,7 @@ fn test_py_downloader_download_success_and_module_registration() {
     let mut headers = HashMap::new();
     headers.insert("X-Test".into(), "1".into());
     let downloader = PyDownloader::new(
-        None, None, None, None, None, None, None, None, None, None, None, None,
+        None, None, None, None, None, None, None, None, None, None, None, None, None,
     )
     .unwrap();
     let task = downloader
@@ -858,6 +862,7 @@ fn test_top_level_download_success_and_failure() {
             Some(vec!["1.1.1.1".into()]),
             Some(vec!["https://127.0.0.1/dns-query".into()]),
             Some(false),
+            None,
             Some(2.0),
             Some(8192),
             Some("prealloc".into()),
@@ -900,6 +905,7 @@ fn test_top_level_download_success_and_failure() {
             py,
             "http://127.0.0.1:1/fail".into(),
             Some(unique_path("top-level-error")),
+            None,
             None,
             None,
             None,

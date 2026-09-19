@@ -52,6 +52,10 @@ use tokio::sync::{oneshot, Notify};
 
 use crate::error::{DownloadError, TransportError, TransportErrorKind};
 
+use super::ip_policy::{
+    AttemptOutcome, CandidateSet, IpPolicy, Selection, SelectionError, TransferSample,
+};
+
 /// Maximum time the driver blocks in a libcurl wait before it re-checks its
 /// command queue. Bounded waiting keeps command latency low without a
 /// per-transfer socket registration; a command submitted meanwhile wakes the
@@ -65,6 +69,16 @@ const DRIVER_IDLE_WAIT: Duration = Duration::from_secs(30);
 /// Default `CURLOPT_MAXAGE_CONN`: a second line of defence so an idle socket
 /// is not reused indefinitely when the pool's own reclamation is coarse.
 const DEFAULT_MAX_AGE_CONN: Duration = Duration::from_secs(118);
+
+/// Upper bound on how many times one transfer may re-attempt a failed
+/// connection on its own (plan §6: bounded by the candidate count, the
+/// remaining time and this internal cap).
+const MAX_INTERNAL_CONNECT_ATTEMPTS: u32 = 3;
+
+/// Smallest share of the remaining head budget a single connect attempt may
+/// get. A retry hands each candidate a slice instead of the whole deadline, so
+/// one slow candidate cannot spend the time the others would have used.
+const MIN_CONNECT_SLICE: Duration = Duration::from_secs(2);
 
 /// Identifies one transfer submitted to a driver.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -187,19 +201,81 @@ pub(crate) struct ResolveEntry {
 impl ResolveEntry {
     /// Builds an entry for one `host:port` hop.
     pub(crate) fn new(host: &str, port: u16, addrs: &[std::net::IpAddr], ttl: Duration) -> Self {
-        let rendered: Vec<String> = addrs
-            .iter()
-            .map(|addr| match addr {
-                std::net::IpAddr::V4(ip) => ip.to_string(),
-                std::net::IpAddr::V6(ip) => format!("[{ip}]"),
-            })
-            .collect();
+        let rendered: Vec<String> = addrs.iter().map(render_address).collect();
         Self {
             spec: format!("{host}:{port}:{}", rendered.join(",")),
             key: format!("{host}:{port}"),
             ttl,
         }
     }
+}
+
+/// Renders one address the way libcurl's `RESOLVE` and `CONNECT_TO` lists
+/// expect it: an IPv6 literal keeps its brackets, an IPv4 one does not.
+fn render_address(addr: &std::net::IpAddr) -> String {
+    match addr {
+        std::net::IpAddr::V4(ip) => ip.to_string(),
+        std::net::IpAddr::V6(ip) => format!("[{ip}]"),
+    }
+}
+
+/// One `CURLOPT_CONNECT_TO` entry: the address a transfer opens its connection
+/// to, chosen instead of letting libcurl pick from the origin's addresses.
+///
+/// `CONNECT_TO` only redirects the connection. `Host`, SNI and certificate
+/// verification keep using the URL, so pinning a transfer to one address of its
+/// origin never changes the request the origin sees. Unlike `RESOLVE`, the entry
+/// belongs to the single easy handle that carries it and does not touch the
+/// multi handle's shared DNS cache, which is what lets two concurrent transfers
+/// of the same origin reach different addresses.
+///
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ConnectToEntry {
+    /// `host:port:connect-to-host:connect-to-port`, the wire form.
+    pub spec: String,
+    /// The address this entry points the connection at, for attribution of the
+    /// transfer that carries it.
+    pub address: std::net::IpAddr,
+}
+
+impl ConnectToEntry {
+    /// Builds the entry that sends `host:port` of the request URL to
+    /// `address:address_port`.
+    pub(crate) fn new(host: &str, port: u16, address: std::net::IpAddr, address_port: u16) -> Self {
+        Self {
+            spec: format!("{host}:{port}:{}:{address_port}", render_address(&address)),
+            address,
+        }
+    }
+}
+
+/// `CURLINFO_OFF_T`: the getinfo type tag for `curl_off_t` values.
+const CURLINFO_OFF_T: curl_sys::CURLINFO = 0x600000;
+
+/// `CURLINFO_CONN_ID` (libcurl 8.16.0), spelled out from the public header
+/// because the `curl-sys` release this crate builds against does not bind it.
+/// Both values are part of libcurl's append-only option ABI.
+const CURLINFO_CONN_ID: curl_sys::CURLINFO = CURLINFO_OFF_T + 64;
+
+/// The identity libcurl gives the connection a transfer is using, or `None`
+/// when the transfer has no connection (or the library is too old to report
+/// one).
+///
+/// The number is only unique **inside one connection cache**: it is assigned
+/// per `Multi`, a rebuilt cache hands out the same numbers again, and the same
+/// physical socket is reported with the same number by every transfer that
+/// uses it. Callers therefore have to pair it with a pool generation before
+/// treating it as an identity, and must not read it as a cache enumeration.
+///
+/// Reading it is what lets the driver tie a transfer's outcome to the address
+/// the policy chose, instead of trusting that the connection went where the
+/// `CONNECT_TO` entry pointed.
+pub(crate) fn connection_id<H>(handle: &Easy2Handle<H>) -> Option<i64> {
+    let mut id: curl_sys::curl_off_t = -1;
+    // SAFETY: the handle is a live easy handle owned by the caller, and
+    // `CURLINFO_CONN_ID` documents a `curl_off_t` out-parameter.
+    let code = unsafe { curl_sys::curl_easy_getinfo(handle.raw(), CURLINFO_CONN_ID, &mut id) };
+    (code == curl_sys::CURLE_OK && id >= 0).then_some(id)
 }
 
 /// What has to be done to one `Easy2` before it joins a pool.
@@ -224,6 +300,12 @@ pub(crate) struct RequestOptions {
     pub forbid_connection_reuse: bool,
     /// Resolved addresses for this hop, injected as `CURLOPT_RESOLVE`.
     pub resolve: Option<ResolveEntry>,
+    /// Candidate addresses for this hop, when the multi-IP policy is on.
+    ///
+    /// The driver picks one and pins the transfer to it with
+    /// `CURLOPT_CONNECT_TO`; the pool's shared DNS cache is left alone. Only
+    /// one of `resolve` and `candidates` is ever set.
+    pub candidates: Option<CandidateSet>,
     /// Explicit proxy URL. `None` disables proxies, matching a task that has
     /// no proxy configuration.
     pub proxy: Option<String>,
@@ -247,6 +329,7 @@ impl RequestOptions {
             head_timeout: Duration::from_secs(10),
             forbid_connection_reuse: false,
             resolve: None,
+            candidates: None,
             proxy: None,
             ca_info: None,
             ca_path: None,
@@ -361,6 +444,18 @@ pub(crate) struct DriverStats {
     pub active: usize,
     /// Pools currently holding connections.
     pub pools: usize,
+    /// Transfers pinned to a policy-chosen address. Zero while the multi-IP
+    /// policy is off, which is what makes the switch visible in the counters.
+    pub ip_selections: u64,
+    /// Connections the driver spent re-attempting a request that never reached
+    /// the origin. These are connections, not requests: the session still sees
+    /// one request.
+    pub connect_retries: u64,
+    /// Body windows folded into an address's ranking.
+    pub ip_samples: u64,
+    /// Body windows dropped because a local constraint (rate limit, memory
+    /// wait, write backpressure) polluted them.
+    pub ip_polluted_samples: u64,
 }
 
 #[derive(Default)]
@@ -375,6 +470,10 @@ struct DriverCounters {
     resumes: AtomicU64,
     idle_clears: AtomicU64,
     max_command_latency_us: AtomicU64,
+    ip_selections: AtomicU64,
+    connect_retries: AtomicU64,
+    ip_samples: AtomicU64,
+    ip_polluted_samples: AtomicU64,
 }
 
 struct SinkState {
@@ -385,6 +484,19 @@ struct SinkState {
     /// Set when the consumer pops a chunk after a pause, which is the signal
     /// that the driver may unpause the handle again.
     drained_since_pause: bool,
+    /// When the write callback accepted the first body byte of this transfer.
+    first_byte_at: Option<Instant>,
+    /// When it accepted the last one. Together with `first_byte_at` this is the
+    /// body window, which includes waiting for remote data - only local stalls
+    /// are subtracted through `paused`.
+    last_byte_at: Option<Instant>,
+    /// When the transfer most recently had to pause for the consumer to catch
+    /// up, if it is paused right now.
+    paused_at: Option<Instant>,
+    /// Time inside the window the transfer spent paused. A window that is
+    /// mostly backpressure says nothing about the address, so it is dropped
+    /// instead of adjusted (plan §7).
+    paused_total: Duration,
 }
 
 /// One atomic observation of the body channel.
@@ -429,6 +541,10 @@ impl BodySink {
                 terminal: None,
                 paused: false,
                 drained_since_pause: false,
+                first_byte_at: None,
+                last_byte_at: None,
+                paused_at: None,
+                paused_total: Duration::ZERO,
             }),
             notify: Notify::new(),
             resume,
@@ -445,20 +561,17 @@ impl BodySink {
         if data.is_empty() {
             return Ok(0);
         }
+        let now = Instant::now();
         let mut state = self.state.lock();
         if state.terminal.is_some() {
             // The consumer is gone or the transfer already failed: pause the
             // transfer instead of buffering bytes nobody will read. The driver
             // removes the handle as soon as it sees the cancelled state.
-            self.paused_for_wait.store(true, Ordering::Relaxed);
-            self.pause_count.fetch_add(1, Ordering::Relaxed);
+            self.start_pause(&mut state, now);
             return Err(WriteError::Pause);
         }
         if !state.queue.is_empty() && state.buffered + data.len() > self.budget {
-            state.paused = true;
-            state.drained_since_pause = false;
-            self.paused_for_wait.store(true, Ordering::Relaxed);
-            self.pause_count.fetch_add(1, Ordering::Relaxed);
+            self.start_pause(&mut state, now);
             return Err(WriteError::Pause);
         }
         // Either the queue is empty (a single oversized chunk must still be
@@ -466,21 +579,59 @@ impl BodySink {
         // chunk fits the remaining budget.
         state.buffered += data.len();
         state.queue.push_back(Bytes::copy_from_slice(data));
+        state.first_byte_at.get_or_insert(now);
+        state.last_byte_at = Some(now);
         self.accepted_bytes.fetch_add(data.len(), Ordering::Relaxed);
         drop(state);
         self.notify.notify_one();
         Ok(data.len())
     }
 
+    /// Records that this transfer is waiting for the consumer.
+    ///
+    /// Only *accepted* bytes extend the window, and the time a paused callback
+    /// spends waiting is collected as backpressure: that is what §7 needs to
+    /// drop a window local constraints polluted instead of subtracting time
+    /// from it.
+    fn start_pause(&self, state: &mut SinkState, now: Instant) {
+        state.paused = true;
+        state.drained_since_pause = false;
+        state.paused_at.get_or_insert(now);
+        self.paused_for_wait.store(true, Ordering::Relaxed);
+        self.pause_count.fetch_add(1, Ordering::Relaxed);
+    }
+
     fn finish(&self, terminal: Terminal) {
         {
+            let now = Instant::now();
             let mut state = self.state.lock();
             if state.terminal.is_some() {
                 return;
             }
+            // A transfer that ends while paused still spent that interval
+            // waiting for the consumer, so the window has to carry it.
+            if let Some(at) = state.paused_at.take() {
+                state.paused_total += now.saturating_duration_since(at);
+            }
             state.terminal = Some(terminal);
         }
         self.notify.notify_one();
+    }
+
+    /// The body window this transfer produced, if it accepted any bytes.
+    ///
+    /// §7: measured on the monotonic clock, from the first accepted byte to the
+    /// last, with the backpressure the consumer caused kept separate so the
+    /// policy can drop a polluted window rather than adjust it.
+    fn sample(&self) -> Option<TransferSample> {
+        let state = self.state.lock();
+        let first = state.first_byte_at?;
+        let last = state.last_byte_at?;
+        Some(TransferSample {
+            bytes: self.accepted_bytes.load(Ordering::Relaxed) as u64,
+            window: last.saturating_duration_since(first),
+            backpressure: state.paused_total,
+        })
     }
 
     /// Drops buffered bytes; used on the cancel path so a cancelled transfer
@@ -532,10 +683,14 @@ impl BodySink {
     /// Reports whether the consumer freed space since the last pause, and
     /// clears the flag so the driver is asked to unpause only once.
     fn needs_resume(&self) -> bool {
+        let now = Instant::now();
         let mut state = self.state.lock();
         if state.paused && state.drained_since_pause {
             state.paused = false;
             state.drained_since_pause = false;
+            if let Some(at) = state.paused_at.take() {
+                state.paused_total += now.saturating_duration_since(at);
+            }
             // The driver is about to unpause the handle, which re-registers
             // the transfer's read interest, so the wait target may pick this
             // pool again.
@@ -661,6 +816,14 @@ impl BodyStream {
 
 impl Drop for BodyStream {
     fn drop(&mut self) {
+        // Reported before the cancel: the outcome of the body is what decides
+        // whether this transfer may rank its address, and it is known here and
+        // nowhere else.
+        self.queue.send(Command::BodyDone {
+            id: self.id,
+            consumed: self.saw_eof,
+            sample: self.sink.sample(),
+        });
         if !self.saw_eof {
             self.queue.send(Command::Cancel(self.id));
         }
@@ -681,6 +844,16 @@ enum Command {
     Submit(Box<SubmitRequest>),
     Resume(TransferId),
     Cancel(TransferId),
+    /// The consumer is done with this transfer's body.
+    ///
+    /// `consumed` is true only when it read the body to EOF: §7 forbids
+    /// crediting the address for a transfer whose body the consumer abandoned,
+    /// and this is where that distinction is made.
+    BodyDone {
+        id: TransferId,
+        consumed: bool,
+        sample: Option<TransferSample>,
+    },
 }
 
 /// A command plus the moment it was enqueued, for latency diagnostics.
@@ -914,6 +1087,33 @@ impl DriverShared {
         self.counters.idle_clears.fetch_add(1, Ordering::SeqCst);
     }
 
+    /// One transfer was pinned to a policy-chosen address.
+    fn count_ip_selection(&self) {
+        self.counters.ip_selections.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// One connection was spent re-attempting a request that never reached the
+    /// origin. Counted as a connection, never as a second transfer.
+    fn count_connect_retry(&self, connections: u64, pauses: u64) {
+        self.counters.connect_retries.fetch_add(1, Ordering::SeqCst);
+        self.counters
+            .connections
+            .fetch_add(connections, Ordering::SeqCst);
+        self.counters.pauses.fetch_add(pauses, Ordering::SeqCst);
+    }
+
+    /// One body window was folded into an address's ranking.
+    fn count_ip_sample(&self) {
+        self.counters.ip_samples.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// One body window was dropped because a local constraint polluted it.
+    fn count_ip_pollution(&self) {
+        self.counters
+            .ip_polluted_samples
+            .fetch_add(1, Ordering::SeqCst);
+    }
+
     /// A cancelled transfer is not a completed one: `submitted == completed +
     /// cancelled + active` has to hold for every driver.
     fn count_cancelled(&self, pauses: u64) {
@@ -942,6 +1142,10 @@ impl DriverShared {
             ),
             active: self.active.load(Ordering::SeqCst),
             pools: self.pools.load(Ordering::SeqCst),
+            ip_selections: self.counters.ip_selections.load(Ordering::SeqCst),
+            connect_retries: self.counters.connect_retries.load(Ordering::SeqCst),
+            ip_samples: self.counters.ip_samples.load(Ordering::SeqCst),
+            ip_polluted_samples: self.counters.ip_polluted_samples.load(Ordering::SeqCst),
         }
     }
 }
@@ -1261,6 +1465,16 @@ impl HeadParser {
         }
     }
 
+    /// Takes the head channel out of a transfer that never published a head.
+    ///
+    /// A retried transfer keeps the caller's channel: the session is waiting on
+    /// one request and must not learn that the driver spent two connections on
+    /// it. `None` means the head was already published, so the request did
+    /// reach the origin and the transfer is past the retryable stage.
+    fn take_sender(&mut self) -> Option<oneshot::Sender<Result<ResponseHead, DownloadError>>> {
+        self.sender.take()
+    }
+
     fn published(&self) -> bool {
         self.published
     }
@@ -1317,7 +1531,7 @@ impl Handler for TransferHandler {
     }
 }
 
-/// The cache entry a transfer takes when it joins a pool.
+/// The estimated cache entry a non-policy transfer takes when it joins a pool.
 ///
 /// libcurl only reports how many connections a transfer *created*
 /// (`CURLINFO_NUM_CONNECTS`), so the driver keeps its own estimate of what a
@@ -1350,10 +1564,60 @@ enum TransferExit {
 
 struct ActiveTransfer {
     handle: Easy2Handle<TransferHandler>,
-    /// The cache entry this transfer took when it was admitted.
+    /// Estimated cache claim for the non-policy path. Policy transfers use
+    /// actual connection IDs after curl has assigned a socket instead.
     claim: Option<IdleClaim>,
     /// Pool generation at admission, for [`Pool::settle_connection`].
     generation: u64,
+    /// Set while this transfer is pinned to a policy-chosen address. Every
+    /// state that ends an attempt settles through this claim exactly once.
+    candidate: Option<CandidateClaim>,
+    /// Everything a bounded internal connect retry needs. Only policy
+    /// transfers carry it, so a driver with the policy off clones nothing.
+    retry: Option<Box<RetryState>>,
+}
+
+/// The address one transfer is pinned to, and what the policy owes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CandidateClaim {
+    address: std::net::IpAddr,
+    /// Generation the reservation was made in; an event that arrives after the
+    /// answer changed must not park the current candidate.
+    generation: u64,
+    /// Attempts this transfer has already spent, including this one.
+    attempts: u32,
+}
+
+/// The material one transfer needs to retry a failed connection internally.
+#[derive(Clone, Debug)]
+struct RetryState {
+    /// The submission, kept so a retry rebuilds the identical request.
+    options: RequestOptions,
+    /// Attempts spent so far.
+    attempts: u32,
+    /// Attempts this transfer may spend in total, bounded by the candidate
+    /// count and by the driver's own cap (plan §6).
+    max_attempts: u32,
+    /// Absolute instant the caller stops waiting for a response head. The
+    /// retry never resets it.
+    deadline: Instant,
+}
+
+/// The policy half of one transfer, split between what the driver saw and what
+/// the consumer did with the body.
+///
+/// §7 requires both halves before a window may rank an address: libcurl
+/// finishing is not the same as the file being written, and a transfer the
+/// consumer abandoned is not a success sample at all.
+struct AttemptRecord {
+    pool: PoolKey,
+    claim: CandidateClaim,
+    /// Set once libcurl finished the transfer.
+    outcome: Option<AttemptOutcome>,
+    /// Set once the consumer either read to EOF or dropped the body.
+    consumed: Option<bool>,
+    /// The window libcurl produced, folded in only for a complete accept.
+    sample: Option<TransferSample>,
 }
 
 /// One connection pool: its own `Multi`, active transfers and DNS overrides.
@@ -1362,11 +1626,19 @@ struct Pool {
     active: HashMap<TransferId, ActiveTransfer>,
     /// Set while the pool has no active transfer, for idle reclamation.
     idle_since: Option<Instant>,
-    /// Connections this pool caches that no transfer is using, each dated by
+    /// Non-policy connections this pool estimates as idle, each dated by
     /// the moment it became idle. The oldest entry decides when the pool's idle
     /// connections are due, so a connection nobody reused keeps its own
     /// deadline no matter how much other traffic the pool sees.
     idle: BinaryHeap<Reverse<Instant>>,
+    /// Policy transfers are tracked by libcurl's actual connection identity,
+    /// never by a guessed IP or the oldest timestamp. IDs are scoped to this
+    /// Multi and cleared with its generation. Stale entries for sockets curl
+    /// evicted can cause an early cache clear, but cannot postpone one.
+    pinned_idle: HashMap<i64, Instant>,
+    /// Earliest unresolved deadline when curl cannot report connection IDs.
+    /// No request may refresh an idle socket whose identity is unknown.
+    pinned_unknown_idle: Option<Instant>,
     /// Bumped whenever every cached connection of this pool was closed, which
     /// invalidates the claims of the transfers that were running then.
     clear_generation: u64,
@@ -1389,12 +1661,14 @@ impl Pool {
             // reclaimed instead of being kept forever.
             idle_since: Some(Instant::now()),
             idle: BinaryHeap::new(),
+            pinned_idle: HashMap::new(),
+            pinned_unknown_idle: None,
             clear_generation: 0,
             resolve: HashMap::new(),
         }
     }
 
-    /// Takes the cache entry a joining transfer will reuse.
+    /// Estimates the cache entry a joining non-policy transfer will reuse.
     ///
     /// Which connection libcurl picks is its own business; what matters here is
     /// that one cached connection is now in use, so the pool must not act on
@@ -1419,6 +1693,39 @@ impl Pool {
     fn add_idle_connections(&mut self, count: u64, since: Instant) {
         for _ in 0..count {
             self.idle.push(Reverse(since));
+        }
+    }
+
+    /// Observe reuse after curl has actually assigned connections. Admission
+    /// cannot know which socket (even on the same IP) curl will choose.
+    fn observe_pinned_connections(&mut self) {
+        for transfer in self.active.values() {
+            if transfer.candidate.is_some() {
+                if let Some(id) = connection_id(&transfer.handle) {
+                    self.pinned_idle.remove(&id);
+                }
+            }
+        }
+    }
+
+    fn settle_pinned_connection(
+        &mut self,
+        generation: u64,
+        connection: Option<i64>,
+        exit: TransferExit,
+        now: Instant,
+    ) {
+        if generation != self.clear_generation {
+            return;
+        }
+        if let Some(id) = connection {
+            self.pinned_idle.remove(&id);
+            if exit == TransferExit::Completed {
+                self.pinned_idle.insert(id, now);
+            }
+        } else if exit == TransferExit::Completed {
+            // Older curl without CONN_ID: preserve every unknown deadline.
+            self.pinned_unknown_idle.get_or_insert(now);
         }
     }
 
@@ -1464,13 +1771,18 @@ impl Pool {
     /// driver can tell from `CURLINFO_NUM_CONNECTS`.
     #[cfg(test)]
     fn idle_connections(&self) -> usize {
-        self.idle.len()
+        self.idle.len() + self.pinned_idle.len() + usize::from(self.pinned_unknown_idle.is_some())
     }
 
     /// When the longest-idle cached connection became idle, if any.
-    #[cfg(test)]
     fn oldest_idle(&self) -> Option<Instant> {
-        self.idle.peek().map(|Reverse(since)| *since)
+        self.idle
+            .peek()
+            .map(|Reverse(since)| *since)
+            .into_iter()
+            .chain(self.pinned_idle.values().copied())
+            .chain(self.pinned_unknown_idle)
+            .min()
     }
 
     /// Decides what has to reach this pool's DNS cache for one transfer.
@@ -1552,22 +1864,28 @@ impl Pool {
             // A pool that may not reuse connections is dropped immediately.
             return Some(Instant::now());
         }
-        self.idle_since.map(|since| since + timeout)
+        // Even between short policy requests, an unused socket retains its
+        // own deadline. Repeated pool-wide idle_since updates must not hide it.
+        self.idle_since
+            .into_iter()
+            .chain(self.pinned_idle.values().copied())
+            .chain(self.pinned_unknown_idle)
+            .min()
+            .map(|since| since + timeout)
     }
 
     /// The instant this busy pool's idle connections have to be closed, if any.
     ///
-    /// The oldest cached connection decides. A connection that gets reused
-    /// leaves the idle set through [`Pool::claim_idle_connection`] and comes
-    /// back with a fresh date, so a request neither postpones nor brings
-    /// forward the deadline of the connections nobody touched.
+    /// The oldest cached connection decides. Policy transfers remove only
+    /// their actual connection through [`Pool::observe_pinned_connections`];
+    /// the non-policy path keeps its existing admission-time estimate.
     fn idle_connection_deadline(&self, timeout: Duration, reuse_disabled: bool) -> Option<Instant> {
         if self.active.is_empty() || reuse_disabled {
             // A fully idle pool is dropped by `idle_deadline`, and a pool that
             // may not reuse connections never caches one.
             return None;
         }
-        self.idle.peek().map(|Reverse(since)| *since + timeout)
+        self.oldest_idle().map(|since| since + timeout)
     }
 
     /// Closes every connection of this pool that no transfer is using.
@@ -1599,6 +1917,8 @@ impl Pool {
         // hold connections libcurl will close instead of caching, so their
         // claims are stale.
         self.idle.clear();
+        self.pinned_idle.clear();
+        self.pinned_unknown_idle = None;
         self.clear_generation += 1;
         Ok(())
     }
@@ -1645,6 +1965,12 @@ fn apply_cache_bound(multi: &mut Multi, config: &DriverConfig) -> Result<(), cur
 
 fn run_driver(queue: Arc<CommandQueue>, shared: Arc<DriverShared>, config: DriverConfig) {
     let mut pools: HashMap<PoolKey, Pool> = HashMap::new();
+    // Candidate policy and per-transfer attempt records. Both are driver-thread
+    // state only: no Tokio task ever reads them, and one driver belongs to one
+    // `ClientNetworkConfig`, so no policy history is ever shared across
+    // configurations.
+    let mut policy = IpPolicy::new();
+    let mut attempts: HashMap<TransferId, AttemptRecord> = HashMap::new();
     let mut pending: Vec<Enqueued> = Vec::new();
     let mut draining: Vec<Enqueued> = Vec::new();
     let mut shutting_down = false;
@@ -1659,13 +1985,33 @@ fn run_driver(queue: Arc<CommandQueue>, shared: Arc<DriverShared>, config: Drive
             shared.count_command(enqueued.at.elapsed());
             match enqueued.command {
                 Command::Submit(submit) => {
-                    start_transfer(&mut pools, &shared, &config, *submit);
+                    start_transfer(
+                        &mut pools,
+                        &shared,
+                        &mut policy,
+                        &mut attempts,
+                        &config,
+                        *submit,
+                    );
                 }
                 Command::Resume(id) => {
                     shared.counters.resumes.fetch_add(1, Ordering::SeqCst);
                     resume_transfer(&pools, id);
                 }
-                Command::Cancel(id) => cancel_transfer(&mut pools, &shared, id),
+                Command::Cancel(id) => {
+                    cancel_transfer(&mut pools, &shared, &mut policy, &mut attempts, id)
+                }
+                Command::BodyDone {
+                    id,
+                    consumed,
+                    sample,
+                } => {
+                    if let Some(record) = attempts.get_mut(&id) {
+                        record.consumed = Some(consumed);
+                        record.sample = sample;
+                    }
+                    fold_attempt(&mut policy, &mut attempts, &shared, id, Instant::now());
+                }
             }
         }
 
@@ -1690,6 +2036,7 @@ fn run_driver(queue: Arc<CommandQueue>, shared: Arc<DriverShared>, config: Drive
                 ));
                 continue;
             }
+            pool.observe_pinned_connections();
             pool.multi.messages(|message| {
                 if let Some(result) = message.result() {
                     if let Ok(token) = message.token() {
@@ -1712,11 +2059,36 @@ fn run_driver(queue: Arc<CommandQueue>, shared: Arc<DriverShared>, config: Drive
             // was running and drop the pool so its sockets are closed.
             tracing::debug!(error = %message, "dropping a broken libcurl pool");
             if let Some(mut pool) = pools.remove(&key) {
-                fail_pool(&shared, &mut pool, &message);
+                fail_pool(
+                    &shared,
+                    &mut pool,
+                    &key,
+                    &mut policy,
+                    &mut attempts,
+                    &message,
+                );
             }
         }
         for (key, id, result) in completions {
-            complete_transfer(&mut pools, &shared, &key, id, result);
+            match complete_transfer(
+                &mut pools,
+                &shared,
+                &mut policy,
+                &mut attempts,
+                &key,
+                id,
+                result,
+            ) {
+                Completion::Done => {}
+                Completion::Retry(request) => start_retry(
+                    &mut pools,
+                    &shared,
+                    &mut policy,
+                    &mut attempts,
+                    &config,
+                    *request,
+                ),
+            }
         }
 
         // 4. Reclaim pools that stayed idle for `pool_idle_timeout`, and close
@@ -1772,8 +2144,17 @@ fn run_driver(queue: Arc<CommandQueue>, shared: Arc<DriverShared>, config: Drive
     }
 
     // Cancel everything that is still in flight so no waiter is left hanging.
-    for (_, pool) in pools.drain() {
+    for (key, pool) in pools.drain() {
         for (id, mut transfer) in pool.active {
+            if let Some(claim) = transfer.candidate {
+                policy.settle(
+                    &key,
+                    claim.address,
+                    claim.generation,
+                    AttemptOutcome::Cancelled,
+                    Instant::now(),
+                );
+            }
             transfer
                 .handle
                 .get_mut()
@@ -1811,10 +2192,8 @@ fn next_idle_wait(pools: &HashMap<PoolKey, Pool>, config: &DriverConfig) -> Dura
 /// a connection when it is about to be reused or when a new connection is
 /// being created.
 ///
-/// The driver reaches the deadline only when no new transfer claimed the pool
-/// in the meantime, because admitting a transfer clears the timestamp: the
-/// cached connections are then in use again, or at least on their way to being
-/// reused.
+/// Policy traffic only updates the socket actually used. Unrelated cached
+/// sockets remain visible to this deadline check while the pool stays busy.
 fn reclaim_idle_connections(
     pools: &mut HashMap<PoolKey, Pool>,
     config: &DriverConfig,
@@ -1904,10 +2283,11 @@ fn build_easy(
     sink: Arc<BodySink>,
     head: HeadParser,
     resolve: &ResolvePlan,
+    connect_to: Option<&ConnectToEntry>,
     max_age_conn_secs: Option<u32>,
 ) -> Easy2<TransferHandler> {
     let mut easy = Easy2::new(TransferHandler { head, sink });
-    if let Err(error) = configure_easy(&mut easy, options, resolve, max_age_conn_secs) {
+    if let Err(error) = configure_easy(&mut easy, options, resolve, connect_to, max_age_conn_secs) {
         // Surface configuration failures through the head channel instead of
         // panicking on the driver thread.
         easy.get_mut().head.fail(DownloadError::Internal(format!(
@@ -1921,6 +2301,7 @@ fn configure_easy(
     easy: &mut Easy2<TransferHandler>,
     options: &RequestOptions,
     resolve: &ResolvePlan,
+    connect_to: Option<&ConnectToEntry>,
     max_age_conn_secs: Option<u32>,
 ) -> Result<(), curl::Error> {
     easy.url(&options.url)?;
@@ -1951,6 +2332,15 @@ fn configure_easy(
         // The resolved address changed: a cached connection would still point
         // at the previous one.
         easy.fresh_connect(true)?;
+    }
+    if let Some(entry) = connect_to {
+        // One pinned target for this transfer. libcurl matches the entry
+        // against the URL's `host:port`, and only reuses a cached connection
+        // whose destination matches - which is what keeps an address's sockets
+        // to itself (see experiment 1 of docs/multi-ip-connection-m0.zh-CN.md).
+        let mut list = List::new();
+        list.append(&entry.spec)?;
+        easy.connect_to(list)?;
     }
     if let Some(range) = options.range.as_deref() {
         easy.range(range)?;
@@ -2017,43 +2407,265 @@ fn apply_proxy(
 fn start_transfer(
     pools: &mut HashMap<PoolKey, Pool>,
     shared: &Arc<DriverShared>,
+    policy: &mut IpPolicy,
+    attempts: &mut HashMap<TransferId, AttemptRecord>,
     config: &DriverConfig,
     submit: SubmitRequest,
 ) {
     let SubmitRequest {
         id,
-        options,
+        mut options,
         sink,
         head,
     } = submit;
     let key = options.pool_key();
     let now = Instant::now();
-    let pool = pools.entry(key).or_insert_with(|| Pool::new(config));
+    // The address is chosen before the pool is touched, so a snapshot the
+    // driver cannot use fails the request instead of leaving a half-built
+    // transfer behind.
+    let pinned = match reserve_candidate(policy, &options, &key, now, None) {
+        Ok(pinned) => pinned,
+        Err(error) => {
+            let message = match error {
+                SelectionError::Expired => {
+                    "the resolved addresses expired before the transfer started".to_string()
+                }
+                SelectionError::NoCandidates => {
+                    format!("no usable address for {key:?} was resolved")
+                }
+            };
+            let _ = head.send(Err(DownloadError::Transport(TransportError::new(
+                TransportErrorKind::Connect,
+                std::io::Error::other(message.clone()),
+            ))));
+            shared.sinks.lock().remove(&id);
+            sink.finish(Terminal::Failed {
+                kind: TransportErrorKind::Connect,
+                code: None,
+                message,
+            });
+            return;
+        }
+    };
+    if let Some(pinned) = &pinned {
+        shared.count_ip_selection();
+        attempts.insert(
+            id,
+            AttemptRecord {
+                pool: key.clone(),
+                claim: pinned.claim,
+                outcome: None,
+                consumed: None,
+                sample: None,
+            },
+        );
+    }
+
+    let pool = pools
+        .entry(key.clone())
+        .or_insert_with(|| Pool::new(config));
     let plan = pool.plan_resolve(options.resolve.as_ref(), now);
-    let applied = !plan.list.is_empty();
+    let retry = pinned.as_ref().map(|pinned| {
+        Box::new(RetryState {
+            options: options.clone(),
+            attempts: pinned.claim.attempts,
+            max_attempts: options
+                .candidates
+                .as_ref()
+                .map_or(1, |set| set.addresses.len() as u32)
+                .min(MAX_INTERNAL_CONNECT_ATTEMPTS),
+            deadline: now + options.head_timeout,
+        })
+    });
+    if let Some(retry) = &retry {
+        options.connect_timeout = connect_slice(
+            options.head_timeout,
+            retry.max_attempts,
+            options.connect_timeout,
+        );
+    }
     let parser = HeadParser::new(head, expects_proxy_tunnel(&options));
     let easy = build_easy(
         &options,
         sink.clone(),
         parser,
         &plan,
+        pinned.as_ref().map(|pinned| &pinned.entry),
         config.max_age_conn_secs(),
     );
+    attach_transfer(
+        pool, shared, policy, attempts, id, easy, pinned, retry, &options, &plan, &sink,
+    );
+}
+
+/// Re-attempts a transfer whose connection never carried the request.
+///
+/// The caller's deadline, its body budget and the session's own concurrency
+/// budget are all untouched: this is one more connection for the *same*
+/// request, not a new request (plan §6).
+fn start_retry(
+    pools: &mut HashMap<PoolKey, Pool>,
+    shared: &Arc<DriverShared>,
+    policy: &mut IpPolicy,
+    attempts: &mut HashMap<TransferId, AttemptRecord>,
+    config: &DriverConfig,
+    request: RetryRequest,
+) {
+    let RetryRequest {
+        id,
+        pool: key,
+        state,
+        sink,
+        head,
+        error,
+    } = request;
+    let now = Instant::now();
+    let remaining = state.deadline.saturating_duration_since(now);
+    if remaining.is_zero() {
+        fail_retry(shared, attempts, id, &sink, head, error);
+        return;
+    }
+    let mut options = state.options.clone();
+    // §6: the connect phase uses what is left of `min(connect_timeout,
+    // head_budget)`, shared between the candidates that are left, so a retry
+    // neither inherits a full connect timeout nor spends everyone's time.
+    options.connect_timeout = connect_slice(
+        remaining,
+        state.max_attempts.saturating_sub(state.attempts),
+        options.connect_timeout,
+    );
+    options.head_timeout = remaining;
+
+    let pinned = match reserve_candidate(policy, &options, &key, now, Some(&state)) {
+        Ok(Some(pinned)) => pinned,
+        // No candidate, an expired snapshot or no time left: report the
+        // original failure instead of looping.
+        _ => {
+            tracing::debug!(transfer = id.0, "no retry left for a failed connection");
+            fail_retry(shared, attempts, id, &sink, head, error);
+            return;
+        }
+    };
+    shared.count_ip_selection();
+    match attempts.get_mut(&id) {
+        Some(record) => {
+            record.claim = pinned.claim;
+            record.outcome = None;
+            record.sample = None;
+        }
+        None => {
+            attempts.insert(
+                id,
+                AttemptRecord {
+                    pool: key.clone(),
+                    claim: pinned.claim,
+                    outcome: None,
+                    consumed: None,
+                    sample: None,
+                },
+            );
+        }
+    }
+
+    let pool = pools
+        .entry(key.clone())
+        .or_insert_with(|| Pool::new(config));
+    let plan = pool.plan_resolve(options.resolve.as_ref(), now);
+    let parser = HeadParser::new(head, expects_proxy_tunnel(&options));
+    let easy = build_easy(
+        &options,
+        sink.clone(),
+        parser,
+        &plan,
+        Some(&pinned.entry),
+        config.max_age_conn_secs(),
+    );
+    let retry = Some(Box::new(RetryState {
+        // Keep the configured timeout, not the previous attempt's slice.
+        options: state.options,
+        attempts: pinned.claim.attempts,
+        max_attempts: state.max_attempts,
+        deadline: state.deadline,
+    }));
+    attach_transfer(
+        pool,
+        shared,
+        policy,
+        attempts,
+        id,
+        easy,
+        Some(pinned),
+        retry,
+        &options,
+        &plan,
+        &sink,
+    );
+}
+
+/// The connect budget one attempt of a retried transfer may spend.
+///
+/// The remaining head budget is shared between the attempts left, with a floor
+/// so a healthy but slow connection is not cut off, and never exceeds the
+/// configured connect timeout.
+fn connect_slice(remaining_head: Duration, attempts_left: u32, configured: Duration) -> Duration {
+    let share = remaining_head / attempts_left.max(1);
+    configured.min(share.max(MIN_CONNECT_SLICE).min(remaining_head))
+}
+
+/// Fails a transfer that has no attempt left.
+fn fail_retry(
+    shared: &Arc<DriverShared>,
+    attempts: &mut HashMap<TransferId, AttemptRecord>,
+    id: TransferId,
+    sink: &Arc<BodySink>,
+    head: oneshot::Sender<Result<ResponseHead, DownloadError>>,
+    error: DownloadError,
+) {
+    let _ = head.send(Err(error));
+    shared.sinks.lock().remove(&id);
+    attempts.remove(&id);
+    sink.discard_buffer();
+    sink.finish(Terminal::Failed {
+        kind: TransportErrorKind::Connect,
+        code: None,
+        message: "no candidate could be reached".to_string(),
+    });
+}
+
+/// Adds one built handle to its pool, or releases what the transfer held.
+#[allow(clippy::too_many_arguments)]
+fn attach_transfer(
+    pool: &mut Pool,
+    shared: &Arc<DriverShared>,
+    policy: &mut IpPolicy,
+    attempts: &mut HashMap<TransferId, AttemptRecord>,
+    id: TransferId,
+    easy: Easy2<TransferHandler>,
+    pinned: Option<Pinned>,
+    retry: Option<Box<RetryState>>,
+    options: &RequestOptions,
+    plan: &ResolvePlan,
+    sink: &Arc<BodySink>,
+) -> bool {
     match pool.multi.add2(easy) {
         Ok(mut handle) => {
             if let Err(error) = handle.set_token(id.raw()) {
+                release_candidate(policy, attempts, id);
                 sink.finish(Terminal::Failed {
                     kind: TransportErrorKind::Other,
                     code: None,
                     message: format!("could not tag transfer: {error}"),
                 });
                 shared.sinks.lock().remove(&id);
-                return;
+                return false;
             }
             // A forced fresh connection cannot use any cached socket. Leave
             // those deadlines visible while this transfer runs, rather than
             // hiding one until completion reveals that it was not reused.
-            let claim = if options.forbid_connection_reuse || plan.force_fresh_connect {
+            let claim = if pinned.is_some()
+                || options.forbid_connection_reuse
+                || plan.force_fresh_connect
+            {
                 None
             } else {
                 pool.claim_idle_connection()
@@ -2065,42 +2677,132 @@ fn start_transfer(
                     handle,
                     claim,
                     generation,
+                    candidate: pinned.map(|pinned| pinned.claim),
+                    retry,
                 },
             );
             pool.idle_since = None;
-            pool.commit_resolve(options.resolve.as_ref(), applied, now);
+            pool.commit_resolve(
+                options.resolve.as_ref(),
+                !plan.list.is_empty(),
+                Instant::now(),
+            );
+            true
         }
         Err(error) => {
+            release_candidate(policy, attempts, id);
             sink.finish(Terminal::Failed {
                 kind: TransportErrorKind::Other,
                 code: None,
                 message: format!("could not add transfer to multi handle: {error}"),
             });
             shared.sinks.lock().remove(&id);
+            false
         }
     }
+}
+
+/// The address one transfer was pinned to, and the entry that sends it there.
+struct Pinned {
+    claim: CandidateClaim,
+    entry: ConnectToEntry,
+}
+
+/// Folds this hop's candidates into the policy and reserves one address.
+///
+/// `previous` carries the attempts a retry already spent, so a bounded internal
+/// retry counts against the same transfer instead of looking like a fresh one.
+fn reserve_candidate(
+    policy: &mut IpPolicy,
+    options: &RequestOptions,
+    key: &PoolKey,
+    now: Instant,
+    previous: Option<&RetryState>,
+) -> Result<Option<Pinned>, SelectionError> {
+    let Some(set) = options.candidates.as_ref() else {
+        return Ok(None);
+    };
+    policy.observe(key, set, now);
+    let selection: Selection = policy.select(key, now)?;
+    let claim = CandidateClaim {
+        address: selection.address,
+        generation: selection.generation,
+        attempts: previous.map_or(1, |state| state.attempts + 1),
+    };
+    #[cfg(not(tarpaulin))]
+    tracing::trace!(
+        pool = ?key,
+        address = %selection.address,
+        generation = selection.generation,
+        reason = selection.reason.as_str(),
+        attempt = claim.attempts,
+        "selected a candidate address"
+    );
+    Ok(Some(Pinned {
+        claim,
+        entry: ConnectToEntry::new(&set.host, set.port, selection.address, set.port),
+    }))
+}
+
+/// Releases a reservation for a transfer that never reached the wire.
+fn release_candidate(
+    policy: &mut IpPolicy,
+    attempts: &mut HashMap<TransferId, AttemptRecord>,
+    id: TransferId,
+) {
+    if let Some(record) = attempts.remove(&id) {
+        policy.settle(
+            &record.pool,
+            record.claim.address,
+            record.claim.generation,
+            AttemptOutcome::Cancelled,
+            Instant::now(),
+        );
+    }
+}
+
+/// What the driver did with a finished transfer.
+enum Completion {
+    /// The transfer ended and everything it held is settled.
+    Done,
+    /// The connection never carried the request, so the driver re-attempts it
+    /// on another candidate without returning to the session (plan §6).
+    Retry(Box<RetryRequest>),
+}
+
+/// A transfer the driver re-attempts on its own.
+struct RetryRequest {
+    id: TransferId,
+    /// The pool the transfer belongs to.
+    pool: PoolKey,
+    state: Box<RetryState>,
+    /// The same sink and head channel: the session sees one request, and only
+    /// the driver knows how many connections were spent on it.
+    sink: Arc<BodySink>,
+    head: oneshot::Sender<Result<ResponseHead, DownloadError>>,
+    /// The failure that triggered the retry, reported if no attempt is left.
+    error: DownloadError,
 }
 
 /// Returns `true` when the completion changed the pool bookkeeping.
 fn complete_transfer(
     pools: &mut HashMap<PoolKey, Pool>,
     shared: &Arc<DriverShared>,
+    policy: &mut IpPolicy,
+    attempts: &mut HashMap<TransferId, AttemptRecord>,
     key: &PoolKey,
     id: TransferId,
     result: CurlResult,
-) -> bool {
+) -> Completion {
     let Some(pool) = pools.get_mut(key) else {
-        return false;
+        return Completion::Done;
     };
     let Some(mut transfer) = pool.active.remove(&id) else {
-        return false;
+        return Completion::Done;
     };
     let sink = transfer.handle.get_ref().sink.clone();
-    let head_status = {
-        let head = &transfer.handle.get_ref().head;
-        head.published().then_some(())
-    };
-    let phase = if head_status.is_some() {
+    let head_published = transfer.handle.get_ref().head.published();
+    let phase = if head_published {
         TransferPhase::AfterHeaders
     } else {
         TransferPhase::BeforeHeaders
@@ -2114,6 +2816,7 @@ fn complete_transfer(
         .ok()
         .flatten()
         .map(str::to_owned);
+    let connection_id = connection_id(&transfer.handle);
     let terminal = match result {
         Ok(()) => Terminal::Eof,
         Err((code, message)) => Terminal::Failed {
@@ -2125,6 +2828,121 @@ fn complete_transfer(
             ),
         },
     };
+    let now = Instant::now();
+    let failure_code = match &terminal {
+        Terminal::Failed { code, .. } => *code,
+        _ => None,
+    };
+    // A cache estimate cannot tell whether this request reached the wire.
+    // Curl's request byte count and connection milestone also distinguish
+    // a connect timeout from waiting for a response on an established socket.
+    // PRETRANSFER_TIME is not usable here: curl 8.21 fills it even when an
+    // early failure jumps straight to COMPLETED.
+    let request_bytes = transfer.handle.request_size().ok();
+    let connect_finished = if key.origin.starts_with("https://") {
+        transfer.handle.appconnect_time().ok()
+    } else {
+        transfer.handle.connect_time().ok()
+    };
+    let outcome = match &terminal {
+        Terminal::Eof => AttemptOutcome::Completed,
+        Terminal::Cancelled => AttemptOutcome::Cancelled,
+        Terminal::Failed { code, .. } => {
+            match is_safe_connect_failure(
+                code.unwrap_or_default(),
+                head_published,
+                request_bytes,
+                connect_finished,
+            ) {
+                true => AttemptOutcome::ConnectFailed,
+                false => AttemptOutcome::Failed,
+            }
+        }
+    };
+
+    // §5: the reservation is settled by the attempt that made it, whichever way
+    // it ended, and the actual address is checked against the expected one
+    // before anything is credited to it.
+    let mut credit = None;
+    if let Some(claim) = transfer.candidate {
+        policy.settle(key, claim.address, claim.generation, outcome, now);
+        let actual: Option<std::net::IpAddr> = primary_ip.as_deref().and_then(|ip| ip.parse().ok());
+        let mismatch = actual.is_some_and(|actual| actual != claim.address);
+        if mismatch {
+            tracing::debug!(
+                transfer = id.0,
+                expected = %claim.address,
+                actual = ?primary_ip,
+                "the transfer connected to an address other than the one selected"
+            );
+        }
+        if let Some(record) = attempts.get_mut(&id) {
+            record.claim = claim;
+            record.outcome = Some(outcome);
+            if mismatch {
+                // Never credited to the address the policy picked: the numbers
+                // belong to whatever the connection really reached.
+                record.consumed = Some(false);
+            }
+            fold_attempt(policy, attempts, shared, id, now);
+        }
+        if !mismatch && outcome == AttemptOutcome::Completed {
+            credit = Some(claim);
+        }
+    }
+
+    // A connection that never carried the request may be retried by the driver
+    // itself. Everything else is the session's business: a body error, a
+    // rejected certificate or a 429 must surface, not be rotated away.
+    if let (Terminal::Failed { kind, message, .. }, Some(retry)) =
+        (&terminal, transfer.retry.as_ref())
+    {
+        let attempts_left = retry.attempts < retry.max_attempts;
+        let in_time = now < retry.deadline;
+        if outcome == AttemptOutcome::ConnectFailed && attempts_left && in_time {
+            if let Some(head) = transfer.handle.get_mut().head.take_sender() {
+                let error = DownloadError::Transport(TransportError::new(
+                    *kind,
+                    std::io::Error::other(message.clone()),
+                ));
+                let retry = (**retry).clone();
+                let _ = pool.multi.remove2(transfer.handle);
+                // The pool's cache bookkeeping still follows this attempt: its
+                // connection was dropped, and any claim it held returns.
+                pool.settle_pinned_connection(
+                    transfer.generation,
+                    connection_id,
+                    TransferExit::Failed,
+                    now,
+                );
+                if pool.active.is_empty() {
+                    pool.idle_since = Some(now);
+                }
+                shared.count_connect_retry(connections, sink.pause_count() as u64);
+                tracing::debug!(
+                    transfer = id.0,
+                    attempt = retry.attempts,
+                    max_attempts = retry.max_attempts,
+                    code = failure_code,
+                    "retrying a failed connection on another candidate"
+                );
+                return Completion::Retry(Box::new(RetryRequest {
+                    id,
+                    pool: key.clone(),
+                    state: Box::new(retry),
+                    sink,
+                    head,
+                    error,
+                }));
+            }
+        }
+    }
+
+    // No BodyStream exists when get() fails before publishing headers, so
+    // BodyDone can never arrive. Internal retries above retain their record.
+    if !head_published {
+        attempts.remove(&id);
+    }
     if let Terminal::Failed { kind, message, .. } = &terminal {
         // A transfer that failed before its header block must fail the request
         // future with the real reason instead of being dropped silently.
@@ -2140,7 +2958,6 @@ fn complete_transfer(
     let _ = pool.multi.remove2(transfer.handle);
     shared.sinks.lock().remove(&id);
     shared.count_transfer(connections, sink.pause_count() as u64);
-    let now = Instant::now();
     if pool.active.is_empty() {
         pool.idle_since = Some(now);
     }
@@ -2151,21 +2968,90 @@ fn complete_transfer(
     } else {
         TransferExit::Failed
     };
-    pool.settle_connection(transfer.generation, transfer.claim, connections, exit, now);
+    if transfer.candidate.is_some() {
+        pool.settle_pinned_connection(transfer.generation, connection_id, exit, now);
+    } else {
+        pool.settle_connection(transfer.generation, transfer.claim, connections, exit, now);
+    }
     tracing::debug!(
         transfer = id.0,
         phase = %phase,
         connections,
+        connection_id = ?connection_id,
+        candidate = ?credit.map(|claim| claim.address),
         primary_ip = ?primary_ip,
         pauses = sink.pause_count(),
         accepted_bytes = sink.accepted_bytes(),
         "libcurl transfer finished"
     );
     sink.finish(terminal);
-    true
+    Completion::Done
 }
 
-fn cancel_transfer(pools: &mut HashMap<PoolKey, Pool>, shared: &Arc<DriverShared>, id: TransferId) {
+/// Whether a failure is a connection-establishment failure that cannot have
+/// delivered the HTTP request.
+///
+/// No published head or sent HTTP bytes may precede a retry. Error 28 also
+/// requires that curl never finished TCP (HTTP) or TLS (HTTPS) setup.
+/// Missing getinfo evidence disables retry.
+/// This driver only issues GET; curl's own reconnect/replay behaviour must be
+/// reconsidered before supporting non-idempotent methods.
+fn is_safe_connect_failure(
+    code: u32,
+    head_published: bool,
+    request_bytes: Option<u64>,
+    connect_finished: Option<Duration>,
+) -> bool {
+    !head_published
+        && request_bytes == Some(0)
+        && (matches!(code, 5 | 6 | 7 | 35)
+            || (code == 28 && connect_finished == Some(Duration::ZERO)))
+}
+
+/// Folds a fully reported attempt into the policy.
+///
+/// Both halves have to be in: what libcurl saw (the driver's outcome) and what
+/// the consumer did with the body. Only a transfer that finished *and* had its
+/// body read to EOF may rank the address, and only the window the write
+/// callback measured is used - never the whole-download average of §7.
+fn fold_attempt(
+    policy: &mut IpPolicy,
+    attempts: &mut HashMap<TransferId, AttemptRecord>,
+    shared: &Arc<DriverShared>,
+    id: TransferId,
+    now: Instant,
+) {
+    let Some(record) = attempts.get(&id) else {
+        return;
+    };
+    let (Some(outcome), Some(consumed)) = (record.outcome, record.consumed) else {
+        return;
+    };
+    let Some(record) = attempts.remove(&id) else {
+        return;
+    };
+    if outcome != AttemptOutcome::Completed || !consumed {
+        return;
+    }
+    let Some(sample) = record.sample else {
+        return;
+    };
+    if policy.record_sample(&record.pool, record.claim.address, sample, now) {
+        shared.count_ip_sample();
+    } else {
+        shared.count_ip_pollution();
+    }
+}
+
+fn cancel_transfer(
+    pools: &mut HashMap<PoolKey, Pool>,
+    shared: &Arc<DriverShared>,
+    policy: &mut IpPolicy,
+    attempts: &mut HashMap<TransferId, AttemptRecord>,
+    id: TransferId,
+) {
+    // Only the pool that owns the transfer is touched, so a body dropped after
+    // the driver already finished it is a no-op rather than a wrong settle.
     let key = pools
         .iter()
         .find(|(_, pool)| pool.active.contains_key(&id))
@@ -2178,9 +3064,22 @@ fn cancel_transfer(pools: &mut HashMap<PoolKey, Pool>, shared: &Arc<DriverShared
         return;
     };
     let sink = transfer.handle.get_ref().sink.clone();
+    // A cancelled transfer says nothing about the address it was pinned to, so
+    // the reservation is released without a cooldown (§5).
+    if let Some(claim) = transfer.candidate {
+        policy.settle(
+            &key,
+            claim.address,
+            claim.generation,
+            AttemptOutcome::Cancelled,
+            Instant::now(),
+        );
+    }
+    attempts.remove(&id);
     // The connection count matters for the pool's cache estimate, so it has to
     // be read while the handle is still attached.
     let connections = transfer.handle.num_connects().unwrap_or(0);
+    let connection_id = connection_id(&transfer.handle);
     let primary_ip = transfer
         .handle
         .primary_ip()
@@ -2202,13 +3101,22 @@ fn cancel_transfer(pools: &mut HashMap<PoolKey, Pool>, shared: &Arc<DriverShared
     }
     // An aborted transfer's connection is dropped; a claim it never got to use
     // goes back to the pool so its deadline is not lost.
-    pool.settle_connection(
-        transfer.generation,
-        transfer.claim,
-        connections,
-        TransferExit::Cancelled,
-        now,
-    );
+    if transfer.candidate.is_some() {
+        pool.settle_pinned_connection(
+            transfer.generation,
+            connection_id,
+            TransferExit::Cancelled,
+            now,
+        );
+    } else {
+        pool.settle_connection(
+            transfer.generation,
+            transfer.claim,
+            connections,
+            TransferExit::Cancelled,
+            now,
+        );
+    }
     tracing::debug!(
         transfer = id.0,
         connections,
@@ -2225,10 +3133,29 @@ fn cancel_transfer(pools: &mut HashMap<PoolKey, Pool>, shared: &Arc<DriverShared
 ///
 /// Both the body waiters and the request futures are released: a pool failure
 /// must never leave a caller waiting for a head that will not arrive.
-fn fail_pool(shared: &Arc<DriverShared>, pool: &mut Pool, message: &str) {
-    let transfers: Vec<ActiveTransfer> = pool.active.drain().map(|(_, value)| value).collect();
-    for mut transfer in transfers {
+fn fail_pool(
+    shared: &Arc<DriverShared>,
+    pool: &mut Pool,
+    key: &PoolKey,
+    policy: &mut IpPolicy,
+    attempts: &mut HashMap<TransferId, AttemptRecord>,
+    message: &str,
+) {
+    let transfers: Vec<(TransferId, ActiveTransfer)> = pool.active.drain().collect();
+    for (id, mut transfer) in transfers {
         let sink = transfer.handle.get_ref().sink.clone();
+        if let Some(claim) = transfer.candidate {
+            // A pool that cannot perform says nothing about the address, so the
+            // reservation is only released.
+            policy.settle(
+                key,
+                claim.address,
+                claim.generation,
+                AttemptOutcome::Cancelled,
+                Instant::now(),
+            );
+        }
+        attempts.remove(&id);
         transfer
             .handle
             .get_mut()

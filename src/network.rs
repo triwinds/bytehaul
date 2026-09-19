@@ -36,6 +36,16 @@ pub(crate) struct ClientNetworkConfig {
     pub dns_servers: Vec<SocketAddr>,
     pub doh_servers: Vec<String>,
     pub enable_ipv6: bool,
+    /// Spread direct transfers over the candidate addresses of their origin,
+    /// preferring the ones that measured fast and stable.
+    ///
+    /// Off by default: with it off every request keeps the pre-existing
+    /// behaviour (`CURLOPT_RESOLVE` with the whole answer, libcurl picking the
+    /// address). With it on, a direct HTTP/HTTPS request pins its connection to
+    /// one address with `CURLOPT_CONNECT_TO`; proxied requests and IP-literal
+    /// URLs stay on the original path. See
+    /// `docs/multi-ip-connection-plan.zh-CN.md`.
+    pub multi_ip: bool,
 }
 
 /// Shared handle to one transport client.
@@ -114,6 +124,7 @@ impl Default for ClientNetworkConfig {
             dns_servers: Vec::new(),
             doh_servers: Vec::new(),
             enable_ipv6: true,
+            multi_ip: false,
         }
     }
 }
@@ -132,6 +143,7 @@ impl ClientNetworkConfig {
             custom_dns = !self.dns_servers.is_empty(),
             custom_doh = !self.doh_servers.is_empty(),
             enable_ipv6 = self.enable_ipv6,
+            multi_ip = self.multi_ip,
             "building HTTP client"
         );
 

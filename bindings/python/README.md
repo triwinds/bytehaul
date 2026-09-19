@@ -161,7 +161,7 @@ Blocking convenience function. Downloads a file and returns when complete.
 - If `output_path` is omitted, bytehaul chooses `Content-Disposition` → URL path → `download`
 - Absolute `output_path` values are still accepted when `output_dir` is omitted
 
-### `Downloader(connect_timeout=None, proxy=None, http_proxy=None, https_proxy=None, dns_servers=None, doh_servers=None, enable_ipv6=None, log_level=None, ca_info=None, ca_path=None, client_cert=None, client_key=None)`
+### `Downloader(connect_timeout=None, proxy=None, http_proxy=None, https_proxy=None, dns_servers=None, doh_servers=None, enable_ipv6=None, multi_ip=None, log_level=None, ca_info=None, ca_path=None, client_cert=None, client_key=None)`
 
 Reusable downloader instance.
 
@@ -317,6 +317,7 @@ Use these on `Downloader(...)` to set defaults, or pass `proxy`, `http_proxy`, a
 | `dns_servers`  | `list[str] \| None`| `None`  |
 | `doh_servers`  | `list[str] \| None`| `None`  |
 | `enable_ipv6`  | `bool \| None`     | `True`  |
+| `multi_ip`     | `bool \| None`     | `False` |
 | `ca_info`      | `str \| Path \| None` | `None` |
 | `ca_path`      | `str \| Path \| None` | `None` |
 | `client_cert`  | `str \| Path \| None` | `None` |

@@ -112,6 +112,7 @@ fn apply_client_options(
     dns_servers: Option<Vec<String>>,
     doh_servers: Option<Vec<String>>,
     enable_ipv6: Option<bool>,
+    multi_ip: Option<bool>,
     ca_info: Option<PathBuf>,
     ca_path: Option<PathBuf>,
     client_cert: Option<PathBuf>,
@@ -140,6 +141,9 @@ fn apply_client_options(
     }
     if let Some(enable_ipv6) = enable_ipv6 {
         builder = builder.enable_ipv6(enable_ipv6);
+    }
+    if let Some(multi_ip) = multi_ip {
+        builder = builder.multi_ip(multi_ip);
     }
     if let Some(ca_info) = ca_info {
         builder = builder.ca_info(ca_info);
@@ -577,6 +581,7 @@ impl PyDownloader {
         dns_servers = None,
         doh_servers = None,
         enable_ipv6 = None,
+        multi_ip = None,
         log_level = None,
         ca_info = None,
         ca_path = None,
@@ -592,6 +597,7 @@ impl PyDownloader {
         dns_servers: Option<Vec<String>>,
         doh_servers: Option<Vec<String>>,
         enable_ipv6: Option<bool>,
+        multi_ip: Option<bool>,
         log_level: Option<String>,
         ca_info: Option<PathBuf>,
         ca_path: Option<PathBuf>,
@@ -612,6 +618,7 @@ impl PyDownloader {
             dns_servers,
             doh_servers,
             enable_ipv6,
+            multi_ip,
             ca_info,
             ca_path,
             client_cert,
@@ -773,6 +780,7 @@ impl PyDownloader {
         dns_servers = None,
         doh_servers = None,
         enable_ipv6 = None,
+        multi_ip = None,
         read_timeout = None,
         memory_budget = None,
         file_allocation = None,
@@ -820,6 +828,7 @@ fn download(
     dns_servers: Option<Vec<String>>,
     doh_servers: Option<Vec<String>>,
     enable_ipv6: Option<bool>,
+    multi_ip: Option<bool>,
     read_timeout: Option<f64>,
     memory_budget: Option<usize>,
     file_allocation: Option<String>,
@@ -908,6 +917,7 @@ fn download(
             dns_servers,
             doh_servers,
             enable_ipv6,
+            multi_ip,
             ca_info,
             ca_path,
             client_cert,

@@ -154,6 +154,8 @@ let downloader = Downloader::builder()
     ])
     .doh_server("https://dns.google/dns-query")
     .enable_ipv6(false)
+    // Spread direct requests over the addresses the origin resolves to.
+    .multi_ip(true)
     .build()?;
 
 let spec = DownloadSpec::new("https://example.com/file.bin")
@@ -163,6 +165,11 @@ let spec = DownloadSpec::new("https://example.com/file.bin")
 
 let handle = downloader.download(spec);
 ```
+
+`multi_ip(true)` is off by default. With it on, a direct HTTP/HTTPS request is pinned to one of the
+addresses DNS returned instead of letting libcurl pick, and the addresses that measured fast and stable
+are used by later requests. It changes nothing for proxied requests or IP-literal URLs, adds no probe
+traffic, and is documented in `multi-ip-connection-plan.zh-CN.md`.
 
 Builder-level `all_proxy(...)`, `http_proxy(...)`, and `https_proxy(...)` are still useful as defaults. If a task sets `DownloadSpec::all_proxy(...)`, `http_proxy(...)`, `https_proxy(...)`, or `connect_timeout(...)`, bytehaul derives an equivalent client for that effective configuration and reuses it for later downloads with the same settings.
 

@@ -470,7 +470,7 @@ class TestSlowTransferOptions:
             "connect_timeout", "proxy", "http_proxy", "https_proxy",
         ]
         if not object_api:
-            names.extend(["dns_servers", "doh_servers", "enable_ipv6"])
+            names.extend(["dns_servers", "doh_servers", "enable_ipv6", "multi_ip"])
         names.extend([
             "read_timeout", "memory_budget", "file_allocation", "resume",
             "piece_size", "min_split_size", "max_retries", "retry_base_delay",
