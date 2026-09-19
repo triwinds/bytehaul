@@ -2323,6 +2323,24 @@ async fn the_connection_cache_keeps_at_most_the_configured_idle_connections() {
     server.stop().await;
 }
 
+#[test]
+fn oversized_idle_pool_is_reclaimed_after_a_completion_burst() {
+    let config = DriverConfig {
+        max_idle_per_host: 1,
+        pool_idle_timeout: Duration::from_secs(30),
+        max_age_conn: None,
+    };
+    let mut pool = Pool::new(&config);
+    pool.cache_high_water = 2;
+    pool.add_idle_connections(2, Instant::now());
+    let mut pools = std::collections::HashMap::new();
+    pools.insert(PoolKey::for_request("http://example.test/file", None), pool);
+
+    reclaim_idle_pools(&mut pools, &config);
+
+    assert!(pools.is_empty());
+}
+
 /// Seven paused responses hold active sockets while the eighth worker issues
 /// successive ranges. An idle limit of four must not evict that worker's
 /// connection on every completion. Exercise both DNS and pinned-IP paths.

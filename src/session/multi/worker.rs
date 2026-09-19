@@ -1002,6 +1002,23 @@ async fn wait_backoff_deadline(deadline: Option<Instant>) {
     }
 }
 
+async fn reacquire_slot(
+    recovery: &Execution,
+    scheduler: &Scheduler,
+    key: LeaseKey,
+    stop: &mut watch::Receiver<StopSignal>,
+) -> Result<OwnedSemaphorePermit, DownloadError> {
+    tokio::select! {
+        biased;
+        error = wait_for_stop(stop) => {
+            scheduler.lock().reclaim(key);
+            Err(error)
+        }
+        permit = recovery.slots.clone().acquire_owned() =>
+            permit.map_err(|_| DownloadError::ChannelClosed),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn worker_loop(
     worker_id: usize,
@@ -1499,15 +1516,15 @@ pub(super) async fn worker_loop(
                                         scheduler.lock().reclaim(segment.lease_key());
                                         return Err(error);
                                     }
-                                    slot.permit = Some(tokio::select! {
-                                        biased;
-                                        error = wait_for_stop(&mut stop) => {
-                                            scheduler.lock().reclaim(segment.lease_key());
-                                            return Err(error);
-                                        }
-                                        permit = recovery.slots.clone().acquire_owned() =>
-                                            permit.map_err(|_| DownloadError::ChannelClosed)?,
-                                    });
+                                    slot.permit = Some(
+                                        reacquire_slot(
+                                            recovery,
+                                            &scheduler,
+                                            segment.lease_key(),
+                                            &mut stop,
+                                        )
+                                        .await?,
+                                    );
                                     observation = Arc::new(Mutex::new(Observation::new(
                                         Instant::now(),
                                         recovery.policy.window,
@@ -1657,6 +1674,28 @@ fn apply_ip_suffix_handoff(
         "idle workers take over slow IP request suffix");
 }
 
+fn maybe_handoff_ip_suffix(
+    ctx: &AttemptContext<'_>,
+    queued: &mut VecDeque<Segment>,
+    lineage: &SharedLineage,
+    now: Instant,
+    tail: bool,
+    baseline: Option<f64>,
+) -> bool {
+    if tail
+        && !queued.is_empty()
+        && baseline.is_some_and(|rate| {
+            ctx.recovery
+                .schedule_ip_suffix_handoffs(ctx.segment.lease_key(), rate, now)
+        })
+    {
+        apply_ip_suffix_handoff(ctx, queued, lineage, now);
+        true
+    } else {
+        false
+    }
+}
+
 async fn run_attempt(
     ctx: &AttemptContext<'_>,
     response: Option<(HttpResponse, ResponseMeta)>,
@@ -1740,10 +1779,7 @@ async fn run_attempt(
                         // A localized slow IP may own several active requests.
                         // Hand off only untouched leases; each primary remains
                         // authoritative for its current piece until its boundary.
-                        if tail && !queued.is_empty() && baseline.is_some_and(|rate|
-                            ctx.recovery.schedule_ip_suffix_handoffs(ctx.segment.lease_key(), rate, now))
-                        {
-                            apply_ip_suffix_handoff(ctx, queued, lineage, now);
+                        if maybe_handoff_ip_suffix(ctx, queued, lineage, now, tail, baseline) {
                             continue;
                         }
                         (baseline, tail, hedge_eligible)
@@ -2004,6 +2040,137 @@ mod tests {
         let final_elapsed = timing.elapsed_ms();
         assert!(timing.completion_90_to_end_ms(final_elapsed).is_some());
         assert!(timing.last_body_to_final_flush_ms(final_elapsed).is_some());
+    }
+
+    #[test]
+    fn ip_suffix_handoff_releases_queued_pieces_only_once() {
+        let spec = DownloadSpec::new("http://example.invalid");
+        let client = crate::network::ClientNetworkConfig::default()
+            .build_client()
+            .unwrap();
+        let worker = HttpWorker::new(client, &spec);
+        let recovery = coordinator(10_000);
+        let scheduler: Scheduler = Arc::new(Mutex::new(SchedulerState::new(PieceMap::new(96, 32))));
+        let segment = scheduler.lock().assign_to(0).unwrap();
+        let queued_segment = scheduler.lock().assign_to(1).unwrap();
+        let cfg = WorkerConfig {
+            worker: worker.clone(),
+            read_timeout: Duration::from_secs(1),
+            max_retries: 0,
+            retry_base_delay: Duration::ZERO,
+            retry_max_delay: Duration::ZERO,
+            max_retry_elapsed: None,
+            min_segment_size: 32,
+            request_batch_size: 0,
+            range_scheduling_mode: RangeSchedulingMode::Fixed,
+            dynamic_min_split_size: 32,
+            dynamic_max_request_size: 64 * 1024 * 1024,
+            execution: recovery.clone(),
+        };
+        let budget = Arc::new(MemoryBudget::new(32));
+        let (write_tx, _write_rx) = mpsc::channel(1);
+        let received = Arc::new(AtomicU64::new(0));
+        let observation = Arc::new(Mutex::new(reading(Instant::now())));
+        let speed = SpeedLimit::Unlimited;
+        let ctx = AttemptContext {
+            worker: &worker,
+            cfg: &cfg,
+            recovery: &recovery,
+            scheduler: &scheduler,
+            segment: &segment,
+            request_end: segment.end,
+            write_tx: &write_tx,
+            received: &received,
+            budget: &budget,
+            speed: &speed,
+            total: 10_000,
+            validator: None,
+            observation: &observation,
+            log_level: LogLevel::Off,
+            download_id: 0,
+        };
+        let lineage = lineage();
+        let now = Instant::now();
+
+        recovery
+            .state
+            .lock()
+            .suffix_handoffs
+            .insert(segment.lease_key(), now + TAIL_WINDOW);
+        let mut empty = VecDeque::new();
+        apply_ip_suffix_handoff(&ctx, &mut empty, &lineage, now);
+        assert!(empty.is_empty());
+
+        recovery
+            .state
+            .lock()
+            .suffix_handoffs
+            .insert(segment.lease_key(), now + TAIL_WINDOW);
+        let mut queued = VecDeque::from([queued_segment]);
+        apply_ip_suffix_handoff(&ctx, &mut queued, &lineage, now);
+        assert!(queued.is_empty());
+        assert_eq!(recovery.state.lock().pending.len(), 1);
+
+        let helper_segment = scheduler.lock().assign_to(2).unwrap();
+        let slow_ip = "127.0.0.2".parse::<std::net::IpAddr>().unwrap();
+        let healthy_ip = "127.0.0.3".parse::<std::net::IpAddr>().unwrap();
+        {
+            let mut sample = observation.lock();
+            sample.ip = Some(slow_ip);
+            sample.phase_at = now - Duration::from_secs(2);
+            sample.window = Duration::from_secs(1);
+            sample.wire = 10;
+        }
+        let mut peer = reading(now - Duration::from_secs(2));
+        peer.ip = Some(slow_ip);
+        peer.window = Duration::from_secs(1);
+        peer.wire = 10;
+        let peer_key = LeaseKey {
+            piece_id: 99,
+            lease_id: 99,
+        };
+        {
+            let mut state = recovery.state.lock();
+            state
+                .active
+                .insert(segment.lease_key(), observation.clone());
+            state.active.insert(peer_key, Arc::new(Mutex::new(peer)));
+            state.history.extend([
+                (now, 2000., Some(healthy_ip)),
+                (now, 2000., Some(healthy_ip)),
+            ]);
+        }
+        let mut helper_queue = VecDeque::from([helper_segment]);
+        assert!(maybe_handoff_ip_suffix(
+            &ctx,
+            &mut helper_queue,
+            &lineage,
+            now,
+            true,
+            Some(2000.),
+        ));
+        assert!(helper_queue.is_empty());
+        assert_eq!(recovery.state.lock().pending.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn reacquire_slot_reclaims_lease_when_stop_arrives() {
+        let recovery = coordinator(10_000);
+        let scheduler: Scheduler = Arc::new(Mutex::new(SchedulerState::new(PieceMap::new(32, 32))));
+        let segment = scheduler.lock().assign_to(0).unwrap();
+        let _held = recovery
+            .slots
+            .clone()
+            .acquire_many_owned(recovery.slot_capacity as u32)
+            .await
+            .unwrap();
+        let (_stop_tx, mut stop) = watch::channel(StopSignal::Cancel);
+
+        assert!(matches!(
+            reacquire_slot(&recovery, &scheduler, segment.lease_key(), &mut stop).await,
+            Err(DownloadError::Cancelled)
+        ));
+        assert!(scheduler.lock().has_available());
     }
 
     fn lineage() -> SharedLineage {
