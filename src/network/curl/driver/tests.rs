@@ -2817,32 +2817,53 @@ async fn policy_regression_another_ips_idle_socket_does_not_disable_fallback() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn policy_regression_busy_a_does_not_refresh_idle_b() {
-    let server = DualAddressServer::start(Duration::from_millis(150)).await;
+    let server = DualAddressServer::start(Duration::from_millis(600)).await;
     let driver = DriverHandle::spawn(DriverConfig {
         max_idle_per_host: 8,
-        pool_idle_timeout: Duration::from_millis(400),
+        pool_idle_timeout: Duration::from_millis(250),
         max_age_conn: None,
     });
     let url = server.url("/idle");
-    // B is older. All later traffic is pinned to A, including several reuses.
-    for index in [1, 0, 0, 0, 0, 0] {
-        let mut transfer = driver
-            .get(
-                policy_options(
-                    &url,
-                    server.candidates(&[server.address(index)], Duration::from_secs(60)),
-                ),
-                1024,
-            )
+
+    // Cache B first, then keep A unambiguously in flight across B's idle
+    // deadline. A sequence of short requests can leave the pool briefly empty
+    // between submissions and exercise whole-pool reclamation instead.
+    let mut warm = driver
+        .get(
+            policy_options(
+                &url,
+                server.candidates(&[server.address(1)], Duration::from_secs(60)),
+            ),
+            1024,
+        )
+        .await
+        .unwrap();
+    assert_eq!(collect_body(&mut warm, Duration::from_secs(2)).await, b"b0");
+    drop(warm);
+
+    let busy_driver = driver.clone();
+    let busy_url = url.clone();
+    let busy_candidates = server.candidates(&[server.address(0)], Duration::from_secs(60));
+    let busy = tokio::spawn(async move {
+        let mut transfer = busy_driver
+            .get(policy_options(&busy_url, busy_candidates), 1024)
             .await
             .unwrap();
-        collect_body(&mut transfer, Duration::from_secs(2)).await;
-    }
+        collect_body(&mut transfer, Duration::from_secs(2)).await
+    });
+
     assert_eq!(
-        server.wait_for_live(1, 0, Duration::from_millis(100)).await,
-        0
+        server.wait_for_live(0, 1, Duration::from_secs(2)).await,
+        1,
+        "A must be in flight before observing B's idle deadline"
+    );
+    assert_eq!(
+        server.wait_for_live(1, 0, Duration::from_secs(2)).await,
+        0,
+        "busy traffic on A must not refresh B's idle deadline"
     );
     assert!(driver.stats().idle_clears > 0);
+    assert_eq!(busy.await.expect("busy transfer task"), b"a0");
     server.stop().await;
 }
 
