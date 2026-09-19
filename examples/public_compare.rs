@@ -9,7 +9,10 @@ fn usage_error(message: impl Into<String>) -> Box<dyn std::error::Error> {
 fn usage() -> &'static str {
     "usage: public_compare URL OUTPUT CONNECTIONS [--range-scheduling-mode fixed|dynamic] \
      [--request-batch-size BYTES] [--dynamic-min-split-size BYTES] \
-     [--dynamic-max-request-size BYTES] [--log-level off|error|warn|info|debug|trace]"
+     [--dynamic-max-request-size BYTES] [--multi-ip] \
+     [--connect-timeout-secs SEC] [--read-timeout-secs SEC] \
+     [--headers-timeout-secs SEC] [--dns-server IP:PORT] \
+     [--log-level off|error|warn|info|debug|trace]"
 }
 
 #[tokio::main]
@@ -27,10 +30,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut request_batch_size = None;
     let mut dynamic_min_split_size = None;
     let mut dynamic_max_request_size = None;
+    let mut multi_ip = false;
+    let mut dns_servers = Vec::new();
     let mut log_level = LogLevel::Off;
+    let mut connect_timeout_secs = 15;
+    let mut read_timeout_secs = 30;
+    let mut headers_timeout_secs = 30;
     let mut index = 4;
     while index < args.len() {
         let flag = args[index].as_str();
+        if flag == "--multi-ip" {
+            multi_ip = true;
+            index += 1;
+            continue;
+        }
         index += 1;
         let value = args
             .get(index)
@@ -44,6 +57,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--request-batch-size" => request_batch_size = Some(value.parse()?),
             "--dynamic-min-split-size" => dynamic_min_split_size = Some(value.parse()?),
             "--dynamic-max-request-size" => dynamic_max_request_size = Some(value.parse()?),
+            "--connect-timeout-secs" => connect_timeout_secs = value.parse()?,
+            "--read-timeout-secs" => read_timeout_secs = value.parse()?,
+            "--headers-timeout-secs" => headers_timeout_secs = value.parse()?,
+            "--dns-server" => dns_servers.push(value.parse::<std::net::SocketAddr>()?),
             "--log-level" => {
                 log_level = value
                     .parse()
@@ -63,6 +80,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let downloader = Downloader::builder()
         .enable_ipv6(false)
+        .multi_ip(multi_ip)
+        .dns_servers(dns_servers)
         .log_level(log_level)
         .build()?;
     let mut spec = DownloadSpec::new(&args[1])
@@ -71,9 +90,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .piece_size(1024 * 1024)
         .min_split_size(1024 * 1024)
         .file_allocation(FileAllocation::None)
-        .connect_timeout(Duration::from_secs(15))
-        .read_timeout(Duration::from_secs(30))
-        .request_headers_timeout(Duration::from_secs(30))
+        .connect_timeout(Duration::from_secs(connect_timeout_secs))
+        .read_timeout(Duration::from_secs(read_timeout_secs))
+        .request_headers_timeout(Duration::from_secs(headers_timeout_secs))
         .max_retries(2)
         .headers(HashMap::from([(
             "User-Agent".into(),
@@ -95,7 +114,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         RangeSchedulingMode::Dynamic => "ignored (dynamic)".into(),
     };
     eprintln!(
-        "EFFECTIVE_CONFIG range_scheduling_mode={} request_batch_size_configured={} request_batch_size_effective={} dynamic_min_split_size_configured={} dynamic_min_split_size_effective={} dynamic_max_request_size_configured={} dynamic_max_request_size_effective={} max_request_leases={} log_level={}",
+        "EFFECTIVE_CONFIG multi_ip={} range_scheduling_mode={} request_batch_size_configured={} request_batch_size_effective={} dynamic_min_split_size_configured={} dynamic_min_split_size_effective={} dynamic_max_request_size_configured={} dynamic_max_request_size_effective={} max_request_leases={} connect_timeout_secs={} read_timeout_secs={} headers_timeout_secs={} log_level={}",
+        multi_ip,
         spec.get_range_scheduling_mode(),
         spec.get_request_batch_size(),
         effective_batch,
@@ -104,6 +124,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         spec.get_dynamic_max_request_size(),
         spec.get_effective_dynamic_max_request_size(),
         64,
+        connect_timeout_secs,
+        read_timeout_secs,
+        headers_timeout_secs,
         log_level,
     );
     let handle = downloader.download(spec);

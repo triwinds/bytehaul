@@ -144,6 +144,10 @@ pub(super) async fn primary(
             .extensions()
             .get::<crate::http::worker::RequestDiagnostics>()
             .map(|d| d.id);
+        ctx.observation.lock().ip = response
+            .extensions()
+            .get::<crate::http::PinnedOriginIp>()
+            .map(|peer| peer.0);
         let body = response.into_body();
         *stream = Some(RequestStream {
             body,

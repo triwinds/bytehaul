@@ -27,6 +27,11 @@ impl HttpRequestBody {
 /// the backend-owned streaming body.
 pub(crate) type HttpResponse = http::Response<HttpBody>;
 
+/// Direct multi-IP routing identity pinned by the transport. Absent for
+/// proxies and unpinned requests; never inferred from a server header.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PinnedOriginIp(pub std::net::IpAddr);
+
 /// Request extension: how many body bytes the transport may buffer for this
 /// transfer before it has to stop reading from the network.
 ///
@@ -36,6 +41,11 @@ pub(crate) type HttpResponse = http::Response<HttpBody>;
 /// to bound. The libcurl transport uses the hint to bound its callback queue.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct BodyBudget(pub(crate) usize);
+
+/// Request identifier copied into transport diagnostics so a completed
+/// libcurl transfer can be joined back to the worker's Range request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RequestTraceId(pub(crate) u64);
 
 /// Largest byte budget a transport may buffer for one transfer.
 ///

@@ -7,14 +7,333 @@ const PIECE: u64 = 32;
 const TOTAL: u64 = PIECE * 12;
 type Requests = Arc<parking_lot::Mutex<Vec<(u64, u64, Option<String>)>>>;
 
+/// Hold the first eight bodies until all requests have reached the origin.
+/// Only the actual probe may take the single-piece path; the other workers
+/// must divide the untouched run even while that probe body is still pending.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn fresh_probe_does_not_disable_sibling_dynamic_planning() {
+    const PIECE_BYTES: u64 = 64 * 1024;
+    const FILE_BYTES: u64 = 64 * PIECE_BYTES;
+    for _ in 0..8 {
+        let requests = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let recorded = requests.clone();
+        let first_wave = Arc::new(tokio::sync::Barrier::new(8));
+        let route = warp::header::<String>("range").map(move |range: String| {
+            let (start, end) = range
+                .strip_prefix("bytes=")
+                .unwrap()
+                .split_once('-')
+                .unwrap();
+            let start = start.parse::<u64>().unwrap();
+            let end = end.parse::<u64>().unwrap() + 1;
+            let index = {
+                let mut requests = recorded.lock();
+                let index = requests.len();
+                requests.push((start, end));
+                index
+            };
+            let barrier = first_wave.clone();
+            let (mut sender, body) = warp::hyper::Body::channel();
+            tokio::spawn(async move {
+                if index < 8 {
+                    barrier.wait().await;
+                }
+                let _ = sender.send_data(bytes(start, end).into()).await;
+            });
+            warp::http::Response::builder()
+                .status(206)
+                .header(
+                    "content-range",
+                    format!("bytes {start}-{}/{FILE_BYTES}", end - 1),
+                )
+                .header("content-length", end - start)
+                .header("accept-ranges", "bytes")
+                .header("etag", "\"v1\"")
+                .body(body)
+                .unwrap()
+        });
+        let (address, server) = warp::serve(route).bind_ephemeral(([127, 0, 0, 1], 0));
+        let server = tokio::spawn(server);
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("file");
+        let downloader = crate::Downloader::builder().build().unwrap();
+        let spec = DownloadSpec::new(format!("http://{address}/file"))
+            .output_path(&output)
+            .max_connections(8)
+            .piece_size(PIECE_BYTES)
+            .min_split_size(PIECE_BYTES)
+            .range_scheduling_mode(RangeSchedulingMode::Dynamic)
+            .dynamic_min_split_size(PIECE_BYTES)
+            .dynamic_max_request_size(FILE_BYTES)
+            .slow_transfer_mode(SlowTransferMode::Disabled)
+            .file_allocation(FileAllocation::None);
+        let result =
+            tokio::time::timeout(Duration::from_secs(10), downloader.download(spec).wait()).await;
+        server.abort();
+        result.expect("eight workers must make progress").unwrap();
+        assert_eq!(tokio::fs::read(output).await.unwrap(), bytes(0, FILE_BYTES));
+        let mut ranges = requests.lock().clone();
+        ranges.sort_unstable();
+        assert_eq!(
+            ranges.len(),
+            8,
+            "one probe and seven balanced requests: {ranges:?}"
+        );
+        assert_eq!(
+            ranges[0],
+            (0, PIECE_BYTES),
+            "reuse the probe without fetching it twice"
+        );
+        for (index, &(start, end)) in ranges.iter().enumerate().skip(1) {
+            assert_eq!(start, ranges[index - 1].1, "no gaps or overlap");
+            assert_eq!(
+                end - start,
+                9 * PIECE_BYTES,
+                "each sibling gets one seventh of the remaining file: {ranges:?}"
+            );
+        }
+        assert_eq!(ranges.last().unwrap().1, FILE_BYTES);
+    }
+}
+
 fn bytes(start: u64, end: u64) -> Vec<u8> {
     (start..end).map(|i| (i % 251) as u8).collect()
+}
+
+/// A slow request has almost finished its current piece, but still owns a
+/// large suffix. Recovery must consider that suffix before the piece ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn slow_batch_releases_suffix_before_current_piece_finishes() {
+    const P: u64 = 64 * 1024;
+    const SIZE: u64 = 16 * P;
+    let requests = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let recorded = requests.clone();
+    let wave = Arc::new(tokio::sync::Barrier::new(4));
+    let route = warp::header::<String>("range").map(move |range: String| {
+        let (start, end) = range
+            .strip_prefix("bytes=")
+            .unwrap()
+            .split_once('-')
+            .unwrap();
+        let start = start.parse::<u64>().unwrap();
+        let end = end.parse::<u64>().unwrap() + 1;
+        let index = {
+            let mut log = recorded.lock();
+            let index = log.len();
+            log.push((start, end));
+            index
+        };
+        let wave = wave.clone();
+        let (mut sender, body) = warp::hyper::Body::channel();
+        tokio::spawn(async move {
+            if index < 4 {
+                wave.wait().await;
+            }
+            if index == 1 {
+                let mut at = start + P - 8192;
+                if sender.send_data(bytes(start, at).into()).await.is_err() {
+                    return;
+                }
+                while at < end {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    let next = (at + 512).min(end);
+                    if sender.send_data(bytes(at, next).into()).await.is_err() {
+                        return;
+                    }
+                    at = next;
+                }
+            } else {
+                let _ = sender.send_data(bytes(start, end).into()).await;
+            }
+        });
+        warp::http::Response::builder()
+            .status(206)
+            .header("content-range", format!("bytes {start}-{}/{SIZE}", end - 1))
+            .header("content-length", end - start)
+            .header("etag", "\"v1\"")
+            .body(body)
+            .unwrap()
+    });
+    let (address, server) = warp::serve(route).bind_ephemeral(([127, 0, 0, 1], 0));
+    let server = tokio::spawn(server);
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("file");
+    let downloader = crate::Downloader::builder().build().unwrap();
+    let spec = DownloadSpec::new(format!("http://{address}/file"))
+        .output_path(&output)
+        .max_connections(4)
+        .piece_size(P)
+        .min_split_size(P)
+        .range_scheduling_mode(RangeSchedulingMode::Dynamic)
+        .dynamic_min_split_size(P)
+        .dynamic_max_request_size(SIZE)
+        .slow_transfer_mode(SlowTransferMode::Adaptive)
+        .low_speed_limit(64 * 1024)
+        .slow_sample_window(Duration::from_millis(40))
+        .slow_start_grace(Duration::from_millis(40))
+        .low_speed_duration(Duration::from_millis(80))
+        .file_allocation(FileAllocation::None);
+    let result =
+        tokio::time::timeout(Duration::from_secs(5), downloader.download(spec).wait()).await;
+    server.abort();
+    result.expect("slow batch must be redistributed").unwrap();
+    assert_eq!(tokio::fs::read(output).await.unwrap(), bytes(0, SIZE));
+    let ranges = requests.lock();
+    let (slow_start, slow_end) = ranges[1];
+    assert!(slow_end - slow_start > P);
+    assert!(
+        ranges
+            .iter()
+            .skip(4)
+            .any(|&(start, _)| start > slow_start && start < slow_start + P),
+        "retain the first piece prefix and recover before it finishes: {ranges:?}"
+    );
+    assert!(
+        ranges
+            .iter()
+            .skip(4)
+            .any(|&(start, _)| start >= slow_start + P && start < slow_end),
+        "idle workers must pick up the released batch suffix: {ranges:?}"
+    );
 }
 
 struct Origin {
     url: String,
     requests: Requests,
     server: tokio::task::JoinHandle<()>,
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_batch_releases_unstarted_pieces_during_local_retry_backoff() {
+    const P: u64 = 64 * 1024;
+    const SIZE: u64 = 16 * P;
+    for (stall_until_timeout, resume_body) in [(false, false), (true, false), (true, true)] {
+        let requests = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let recorded = requests.clone();
+        let wave = Arc::new(tokio::sync::Barrier::new(4));
+        let route = warp::header::<String>("range").map(move |range: String| {
+            let (start, end) = range
+                .strip_prefix("bytes=")
+                .unwrap()
+                .split_once('-')
+                .unwrap();
+            let start = start.parse::<u64>().unwrap();
+            let end = end.parse::<u64>().unwrap() + 1;
+            let index = {
+                let mut log = recorded.lock();
+                let index = log.len();
+                log.push((start, end, std::time::Instant::now()));
+                index
+            };
+            let wave = wave.clone();
+            let (mut sender, body) = warp::hyper::Body::channel();
+            tokio::spawn(async move {
+                if index < 4 {
+                    wave.wait().await;
+                }
+                if index == 1 {
+                    let _ = sender.send_data(bytes(start, start + P / 2).into()).await;
+                    if stall_until_timeout {
+                        // Hold the body past the read deadline, then let this
+                        // test producer exit even if the receiver has gone away.
+                        tokio::time::sleep(if resume_body {
+                            Duration::from_millis(700)
+                        } else {
+                            Duration::from_secs(1)
+                        })
+                        .await;
+                    }
+                    if resume_body {
+                        let _ = sender.send_data(bytes(start + P / 2, end).into()).await;
+                    } else {
+                        sender.abort();
+                    }
+                } else {
+                    let _ = sender.send_data(bytes(start, end).into()).await;
+                }
+            });
+            warp::http::Response::builder()
+                .status(206)
+                .header("content-range", format!("bytes {start}-{}/{SIZE}", end - 1))
+                .header("content-length", end - start)
+                .header("etag", "\"v1\"")
+                .body(body)
+                .unwrap()
+        });
+        let (address, server) = warp::serve(route).bind_ephemeral(([127, 0, 0, 1], 0));
+        let server = tokio::spawn(server);
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("file");
+        let downloader = crate::Downloader::builder().build().unwrap();
+        let spec = DownloadSpec::new(format!("http://{address}/file"))
+            .output_path(&output)
+            .max_connections(4)
+            .piece_size(P)
+            .min_split_size(P)
+            .range_scheduling_mode(RangeSchedulingMode::Dynamic)
+            .dynamic_min_split_size(P)
+            .dynamic_max_request_size(SIZE)
+            .slow_transfer_mode(if stall_until_timeout {
+                SlowTransferMode::Adaptive
+            } else {
+                SlowTransferMode::Disabled
+            })
+            .retry_policy(2, Duration::from_secs(1), Duration::from_secs(2))
+            .read_timeout(Duration::from_millis(800))
+            .file_allocation(FileAllocation::None);
+        let result =
+            tokio::time::timeout(Duration::from_secs(6), downloader.download(spec).wait()).await;
+        server.abort();
+        result.expect("retry must complete").unwrap();
+        assert_eq!(tokio::fs::read(output).await.unwrap(), bytes(0, SIZE));
+        let ranges = requests.lock();
+        let (failed_start, failed_end, _) = ranges[1];
+        if resume_body {
+            assert!(
+                ranges
+                    .iter()
+                    .skip(4)
+                    .any(|&(start, _, at)| start >= failed_start + P
+                        && start < failed_end
+                        && at.duration_since(ranges[3].2) < Duration::from_millis(700)),
+                "suffix must be handed off while the current piece is still stalled: {ranges:?}"
+            );
+            assert!(
+                !ranges
+                    .iter()
+                    .skip(4)
+                    .any(|&(start, _, _)| start >= failed_start && start < failed_start + P),
+                "a resumed current piece must finish without being downloaded twice: {ranges:?}"
+            );
+            continue;
+        }
+        let retry = ranges
+            .iter()
+            .skip(4)
+            .find(|&&(start, _, _)| start >= failed_start && start < failed_start + P)
+            .expect("failed current piece must retry");
+        let suffix = ranges
+            .iter()
+            .skip(4)
+            .find(|&&(start, _, _)| start >= failed_start + P && start < failed_end)
+            .expect("unstarted suffix must be reassigned");
+        // The untouched suffix is runnable before the stalled piece times out,
+        // or during local backoff after a truncated response.
+        assert!(
+            suffix.2.duration_since(ranges[3].2) < Duration::from_millis(700),
+            "ordinary backoff must not block the released queue: {ranges:?}"
+        );
+        assert!(
+            suffix.2 < retry.2,
+            "suffix must run before the local retry wakes: {ranges:?}"
+        );
+        if stall_until_timeout {
+            assert!(
+                retry.2.duration_since(ranges[3].2) < Duration::from_millis(1500),
+                "first read timeout must not add a one-second retry delay: {ranges:?}"
+            );
+        }
+    }
 }
 impl Drop for Origin {
     fn drop(&mut self) {

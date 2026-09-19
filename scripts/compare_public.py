@@ -11,6 +11,10 @@ Run a low-log strategy matrix:
 Run a separate diagnostic matrix with TRACE allocation evidence:
 
     python scripts/compare_public.py --aria2 PATH_TO_ARIA2C --matrix --log-level trace
+
+Enable the multi-IP policy for bytehaul diagnostic runs:
+
+    python scripts/compare_public.py --aria2 PATH_TO_ARIA2C --url URL --multi-ip --log-level trace
 """
 import argparse
 import csv
@@ -35,7 +39,7 @@ DEFAULT_DYNAMIC_MIN_SPLIT_SIZE = 1 * 1024 * 1024
 DEFAULT_DYNAMIC_MAX_REQUEST_SIZE = 64 * 1024 * 1024
 MAX_REQUEST_LEASES = 64
 SOURCES = {
-    "ustc": f"https://mirrors.ustc.edu.cn/alpine/v3.22/releases/x86_64/{FILE}",
+    "tuna": f"https://mirrors.tuna.tsinghua.edu.cn/alpine/v3.22/releases/x86_64/{FILE}",
     "alpine_cdn": f"https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/x86_64/{FILE}",
 }
 STRATEGY_PRESETS = {
@@ -116,6 +120,8 @@ def main():
     parser.add_argument("--range-scheduling-mode", choices=("fixed", "dynamic"), default="dynamic")
     parser.add_argument("--log-level", choices=LOG_LEVELS, default="off",
                         help="Bytehaul log level; use trace for a diagnostic round")
+    parser.add_argument("--multi-ip", action="store_true",
+                        help="Enable bytehaul's multi-IP candidate policy")
     parser.add_argument("--request-batch-size", type=int,
                         help="Fixed-mode request cap in bytes; zero disables grouping")
     parser.add_argument("--dynamic-min-split-size", type=int,
@@ -187,6 +193,7 @@ def main():
                 "connections": args.connections, "seed": args.seed,
                 "strategies": [strategy["name"] for strategy in effective_strategies],
                 "log_level": args.log_level,
+                "multi_ip": args.multi_ip,
                 "range_scheduling": scheduling,
                 "validation": "trusted SHA-256 when supplied/available; otherwise cross-tool SHA-256 agreement plus ZIP CRC checks (not publisher authentication)",
                 "network": "IPv4, no explicit/environment proxy; system routing unchanged",
@@ -240,6 +247,8 @@ def main():
                         command = [str(binaries[tool]), url, str(output), str(connections),
                                    "--range-scheduling-mode", strategy["mode"],
                                    "--log-level", args.log_level]
+                        if args.multi_ip:
+                            command.append("--multi-ip")
                         if strategy["mode"] == "fixed":
                             command += ["--request-batch-size", str(strategy["request_batch_size"])]
                         else:

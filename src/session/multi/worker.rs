@@ -123,6 +123,7 @@ enum Phase {
 }
 
 struct Observation {
+    ip: Option<std::net::IpAddr>,
     phase: Phase,
     phase_at: Instant,
     blocked_since: Option<Instant>,
@@ -146,6 +147,7 @@ impl Observation {
     fn new(now: Instant, window: Duration) -> Self {
         Self {
             phase: Phase::Headers,
+            ip: None,
             phase_at: now,
             blocked_since: Some(now),
             reading: Duration::ZERO,
@@ -490,7 +492,8 @@ struct Recovered {
 }
 struct State {
     active: BTreeMap<LeaseKey, Arc<Mutex<Observation>>>,
-    history: VecDeque<(Instant, f64)>,
+    suffix_handoffs: BTreeMap<LeaseKey, Instant>,
+    history: VecDeque<(Instant, f64, Option<std::net::IpAddr>)>,
     recovered: Vec<Recovered>,
     pending: VecDeque<PendingRange>,
     reserved: u64,
@@ -501,6 +504,32 @@ struct State {
     hedge: bool,
     last_action: Option<Instant>,
     blocked_until: Option<Instant>,
+}
+
+/// Historical peaks alone do not disprove a global slowdown. Only a known
+/// single-IP tail with two healthy completed requests on other IPs can bypass
+/// the collective-slow guard. Unknown/proxy identities retain the old policy.
+fn isolated_ip_tail(state: &State, target: LeaseKey, baseline: f64) -> bool {
+    let Some(ip) = state
+        .active
+        .get(&target)
+        .and_then(|sample| sample.lock().ip)
+    else {
+        return false;
+    };
+    state
+        .active
+        .values()
+        .all(|sample| sample.lock().ip == Some(ip))
+        && state
+            .history
+            .iter()
+            .filter(|(_, rate, peer)| {
+                peer.is_some_and(|peer| peer != ip) && *rate >= baseline * 0.5
+            })
+            .take(2)
+            .count()
+            == 2
 }
 /// Owns exactly one in-flight cost bound. Dropping an interrupted action settles
 /// its observed cost once, including producer cancellation and writer failure.
@@ -580,6 +609,7 @@ impl Execution {
             changed: Notify::new(),
             state: Arc::new(Mutex::new(State {
                 active: BTreeMap::new(),
+                suffix_handoffs: Default::default(),
                 history: VecDeque::new(),
                 recovered: Vec::new(),
                 pending: VecDeque::new(),
@@ -627,14 +657,14 @@ impl Execution {
         self.sample_baseline(target, now, false)
     }
     fn tail_eligible(&self, len: u64, available: bool) -> bool {
-        len <= MAX_HEDGE
+        len > 0
             && !available
             && self.slots.available_permits() > 0
             && self.state.lock().pending.is_empty()
     }
     fn sample_baseline(&self, target: LeaseKey, now: Instant, tail: bool) -> Option<f64> {
         let mut state = self.state.lock();
-        // A slot also covers writer setup, discard and retry backoff, where
+        // A slot also covers writer setup and discard, where
         // no observation is registered. Those requests provide no healthy
         // network evidence and must suppress the accelerated path.
         if tail
@@ -650,7 +680,7 @@ impl Execution {
             .max(Duration::from_secs(30));
         state
             .history
-            .retain(|(at, _)| now.saturating_duration_since(*at) <= ttl);
+            .retain(|(at, _, _)| now.saturating_duration_since(*at) <= ttl);
         let mut current = Vec::new();
         for (&key, sample) in &state.active {
             if key != target {
@@ -671,7 +701,7 @@ impl Execution {
         let mut rates: Vec<_> = state
             .history
             .iter()
-            .map(|(_, rate)| *rate)
+            .map(|(_, rate, _)| *rate)
             .chain(current.iter().copied())
             .filter(|r| *r > 0.)
             .collect();
@@ -685,7 +715,10 @@ impl Execution {
         rates.sort_by(f64::total_cmp);
         let baseline = rates[rates.len() / 2];
         // Several live requests slowing together supersede historical peaks.
-        if !current.is_empty() && current.iter().all(|rate| *rate < baseline * 0.5) {
+        if !current.is_empty()
+            && current.iter().all(|rate| *rate < baseline * 0.5)
+            && !isolated_ip_tail(&state, target, baseline)
+        {
             *state.decisions.entry("baseline_all_live_slow").or_default() += 1;
             return None;
         }
@@ -739,8 +772,36 @@ impl Execution {
             cost: len,
         })
     }
+    fn schedule_ip_suffix_handoffs(&self, target: LeaseKey, baseline: f64, now: Instant) -> bool {
+        let mut state = self.state.lock();
+        if state.blocked_until.is_some_and(|until| until > now)
+            || !isolated_ip_tail(&state, target, baseline)
+        {
+            return false;
+        }
+        // Snapshot current leases only. New attempts must earn new evidence;
+        // local waits cannot turn this into an indefinitely valid instruction.
+        let keys = state
+            .active
+            .iter()
+            .filter_map(|(key, sample)| {
+                sample
+                    .lock()
+                    .tail_sample(now)
+                    .filter(|rate| *rate < baseline * 0.25)
+                    .map(|_| (*key, now + TAIL_WINDOW))
+            })
+            .collect::<Vec<_>>();
+        let scheduled = keys.iter().any(|(key, _)| *key == target);
+        if scheduled {
+            state.suffix_handoffs.extend(keys);
+        }
+        scheduled
+    }
+
     fn finish_observation(&self, key: LeaseKey, completed: bool) {
         let mut state = self.state.lock();
+        state.suffix_handoffs.remove(&key);
         if let Some(observation) = state.active.remove(&key) {
             let mut observation = observation.lock();
             observation.advance(Instant::now());
@@ -748,6 +809,7 @@ impl Execution {
                 state.history.push_back((
                     Instant::now(),
                     observation.wire as f64 / observation.reading.as_secs_f64(),
+                    observation.ip,
                 ));
                 while state.history.len() > self.history_limit {
                     state.history.pop_front();
@@ -979,9 +1041,13 @@ pub(super) async fn worker_loop(
         tokio::pin!(notified);
         notified.as_mut().enable();
         let mut backoff_deadline = None;
-        // A probe is a separately reserved response. Do not group a request
-        // before checking whether this worker can consume it exactly.
-        let probe_pending = first_response.lock().await.is_some();
+        // Keep probe inspection, lease assignment and exact-response claiming
+        // atomic across workers. Releasing this guard before claiming let
+        // siblings all see a pending probe and skip their batch planning.
+        // Lock order: probe -> scheduler -> recovery state; no await while
+        // holding the synchronous scheduler/state locks.
+        let mut probe = first_response.lock().await;
+        let probe_pending = probe.is_some();
         let assignment = {
             let mut scheduler = scheduler.lock();
             if scheduler.all_done() {
@@ -1044,10 +1110,17 @@ pub(super) async fn worker_loop(
                             log_level.enabled(tracing::Level::TRACE),
                         )
                     };
-                    assignment.map(|assignment| (assignment, permit))
+                    assignment.map(|assignment| {
+                        let response = super::take_matching_probe_response(
+                            &mut probe,
+                            &assignment.segments[0],
+                        );
+                        (assignment, permit, response)
+                    })
                 })
         };
-        let Some((assignment, permit)) = assignment else {
+        drop(probe);
+        let Some((assignment, permit, mut initial_response)) = assignment else {
             tokio::select! {
                 _ = &mut notified => {},
                 error = wait_for_stop(&mut stop) => return Err(error),
@@ -1088,15 +1161,12 @@ pub(super) async fn worker_loop(
         let mut segment = assignment_segments
             .next()
             .expect("request assignment must contain its first lease");
-        let slot = Slot {
+        let mut slot = Slot {
             permit: Some(permit),
             owner: recovery,
         };
         let lineage = recovery.lineage(&segment, &cfg);
-        // Consume an exact probe before batching, so it neither becomes an
-        // unused live response nor forces a second request for the same bytes.
-        let mut initial_response =
-            super::take_matching_probe_response(&first_response, &segment).await;
+        // The exact probe was claimed atomically with this assignment.
         // The remaining leases were signed in the same scheduler critical
         // section as the first lease. Recovered pending ranges may contain a
         // whole-piece batch; the exact probe path is still one-element.
@@ -1137,13 +1207,23 @@ pub(super) async fn worker_loop(
                 log_level,
                 download_id,
             };
-            let outcome = run_attempt(&context, response, &mut stop, &lineage, &mut stream).await;
+            let outcome = run_attempt(
+                &context,
+                response,
+                &mut stop,
+                &lineage,
+                &mut stream,
+                &mut queued,
+            )
+            .await;
             // run_attempt's futures have been dropped: no producer can enqueue
             // old generation data after this point.
             if matches!(outcome, Outcome::Complete) && !queued.is_empty() {
                 // Move one request observation across piece identities without
                 // fabricating several independent healthy history samples.
-                recovery.state.lock().active.remove(&segment.lease_key());
+                let mut state = recovery.state.lock();
+                state.active.remove(&segment.lease_key());
+                state.suffix_handoffs.remove(&segment.lease_key());
             } else {
                 recovery
                     .finish_observation(segment.lease_key(), matches!(outcome, Outcome::Complete));
@@ -1182,6 +1262,14 @@ pub(super) async fn worker_loop(
                         segment = next;
                         continue;
                     }
+                    // A handed-off suffix must never be consumed by this
+                    // request. Account for body-layer read-ahead before cancel.
+                    if let Some(body) = stream.take() {
+                        recovery
+                            .duplicate
+                            .fetch_add(body.wire.saturating_sub(body.consumed), Ordering::Relaxed);
+                        drop(body);
+                    }
                     break;
                 }
                 Outcome::Recover(_) | Outcome::Staged(_) | Outcome::Failed(_) => {
@@ -1195,7 +1283,12 @@ pub(super) async fn worker_loop(
                     let forwarded = observation.lock().forwarded;
                     let (outcome, mut retry_decision) = match outcome {
                         Outcome::Failed(error) => {
-                            (None, Some(lineage.lock().retries.decide(error)))
+                            let decision = if observation.lock().phase == Phase::Reading {
+                                lineage.lock().retries.decide_body_failure(error)
+                            } else {
+                                lineage.lock().retries.decide(error)
+                            };
+                            (None, Some(decision))
                         }
                         outcome => (Some(outcome), None),
                     };
@@ -1238,8 +1331,13 @@ pub(super) async fn worker_loop(
                     // The producer is gone and FIFO acknowledgement completed.
                     // Released batch leases inherit action/retry history, rather
                     // than becoming fresh work with a reset lineage.
-                    if let Some(RetryDecision::Retry { backoff, .. }) = &retry_decision {
-                        recovery.backoff(*backoff);
+                    if let Some(RetryDecision::Retry { error, .. }) = &retry_decision {
+                        // Only an explicit server directive blocks siblings.
+                        // Transport backoff belongs to this failed attempt;
+                        // unstarted batch pieces can run on healthy workers.
+                        if let Some(seconds) = error.retry_after_secs() {
+                            recovery.backoff(Duration::from_secs(seconds));
+                        }
                     }
                     let released = queued.drain(..).collect::<Vec<_>>();
                     let request_cap = recovery_request_cap(&cfg);
@@ -1381,7 +1479,7 @@ pub(super) async fn worker_loop(
                                         cfg.min_segment_size,
                                     );
                                     recovery.state.lock().retries += 1;
-                                    recovery.backoff(backoff);
+                                    recovery.changed.notify_waiters();
                                     log_warn!(log_level, download_id, worker_id, attempt = segment.attempt, error = %error, backoff_ms = backoff.as_millis() as u64, "adaptive segment failed, retrying");
                                     segment = scheduler
                                         .lock()
@@ -1391,6 +1489,8 @@ pub(super) async fn worker_loop(
                                                 "cannot renew adaptive retry lease".into(),
                                             )
                                         })?;
+                                    drop(slot.permit.take());
+                                    recovery.changed.notify_waiters();
                                     if let Err(error) = sleep_with_backoff(backoff, &mut stop).await
                                     {
                                         // This renewed lease has no running producer and
@@ -1399,6 +1499,15 @@ pub(super) async fn worker_loop(
                                         scheduler.lock().reclaim(segment.lease_key());
                                         return Err(error);
                                     }
+                                    slot.permit = Some(tokio::select! {
+                                        biased;
+                                        error = wait_for_stop(&mut stop) => {
+                                            scheduler.lock().reclaim(segment.lease_key());
+                                            return Err(error);
+                                        }
+                                        permit = recovery.slots.clone().acquire_owned() =>
+                                            permit.map_err(|_| DownloadError::ChannelClosed)?,
+                                    });
                                     observation = Arc::new(Mutex::new(Observation::new(
                                         Instant::now(),
                                         recovery.policy.window,
@@ -1466,9 +1575,7 @@ impl AttemptContext<'_> {
             .entry(reason)
             .or_default() += 1;
         let has_available = self.scheduler.lock().has_available();
-        let tail_block = if self.segment.end - self.segment.start > MAX_HEDGE {
-            "range_too_large"
-        } else if has_available {
+        let tail_block = if has_available {
             "unclaimed_work"
         } else if self.recovery.slots.available_permits() == 0 {
             "no_idle_slot"
@@ -1510,12 +1617,53 @@ enum Outcome {
     Staged(Staged),
     Failed(DownloadError),
 }
+
+fn apply_ip_suffix_handoff(
+    ctx: &AttemptContext<'_>,
+    queued: &mut VecDeque<Segment>,
+    lineage: &SharedLineage,
+    now: Instant,
+) {
+    if matches!(ctx.speed, SpeedLimit::Limited(_)) || ctx.observation.lock().phase != Phase::Reading
+    {
+        return;
+    }
+    {
+        let mut state = ctx.recovery.state.lock();
+        if state.blocked_until.is_some_and(|until| until > now)
+            || state
+                .suffix_handoffs
+                .remove(&ctx.segment.lease_key())
+                .is_none_or(|until| now > until)
+        {
+            return;
+        }
+    }
+    if queued.is_empty() {
+        return;
+    }
+    let released = queued.drain(..).collect::<Vec<_>>();
+    recover_segments(
+        ctx.recovery,
+        ctx.scheduler,
+        &released,
+        lineage,
+        recovery_request_cap(ctx.cfg),
+        ctx.cfg.min_segment_size,
+    );
+    ctx.recovery.changed.notify_waiters();
+    log_info!(ctx.log_level, download_id = ctx.download_id,
+        ip = ?ctx.observation.lock().ip, pieces = released.len(),
+        "idle workers take over slow IP request suffix");
+}
+
 async fn run_attempt(
     ctx: &AttemptContext<'_>,
     response: Option<(HttpResponse, ResponseMeta)>,
     stop: &mut watch::Receiver<StopSignal>,
     lineage: &SharedLineage,
     stream: &mut Option<RequestStream>,
+    queued: &mut VecDeque<Segment>,
 ) -> Outcome {
     let mut primary_stop = stop.clone();
     let request_context = ctx.request_context();
@@ -1526,6 +1674,8 @@ async fn run_attempt(
     let mut challenger: Option<futures::future::BoxFuture<'_, Result<Staged, CandidateFailure>>> =
         None;
     let mut hedge_guard = None;
+    let mut last_wire = ctx.observation.lock().wire;
+    let mut last_progress = Instant::now();
     loop {
         tokio::select! {
             biased;
@@ -1548,12 +1698,56 @@ async fn run_attempt(
             },
             _ = ticker.tick(), if ctx.recovery.policy.mode != SlowTransferMode::Disabled => {
                 let now = Instant::now();
-                let (baseline, tail, hedge_eligible) = match recovery::recommend(ctx, challenger.is_some(), now) {
+                apply_ip_suffix_handoff(ctx, queued, lineage, now);
+                let stalled = {
+                    let sample = ctx.observation.lock();
+                    if sample.phase != Phase::Reading || sample.wire != last_wire {
+                        last_wire = sample.wire;
+                        last_progress = now;
+                    }
+                    sample.phase == Phase::Reading
+                        && now.saturating_duration_since(last_progress) >= Duration::from_millis(300)
+                };
+                // Only the final stalled request hands off untouched leases.
+                // The primary reads at most the current piece; draining this
+                // queue makes the caller cancel its body at that boundary.
+                let handoff = !queued.is_empty()
+                    && stalled
+                    && !matches!(ctx.speed, SpeedLimit::Limited(_))
+                    && ctx.observation.lock().phase == Phase::Reading
+                    && ctx.recovery.slots.available_permits() > 0
+                    && !ctx.scheduler.lock().has_available()
+                    && {
+                        let state = ctx.recovery.state.lock();
+                        state.active.len() == 1 && state.pending.is_empty()
+                            && state.blocked_until.is_none_or(|until| until <= now)
+                    };
+                if handoff {
+                    let released = queued.drain(..).collect::<Vec<_>>();
+                    recover_segments(ctx.recovery, ctx.scheduler, &released, lineage,
+                        recovery_request_cap(ctx.cfg), ctx.cfg.min_segment_size);
+                    ctx.recovery.changed.notify_waiters();
+                    log_debug!(ctx.log_level, download_id = ctx.download_id,
+                        pieces = released.len(), "idle workers take over unstarted request suffix");
+                }
+                let remaining_end = queued.back().map_or(ctx.segment.end, |last| last.end);
+                let (baseline, tail, hedge_eligible) = match recovery::recommend(ctx, challenger.is_some(), now, remaining_end) {
                     recovery::Advice::Continue { reason, baseline } => {
                         ctx.decision(reason, baseline);
                         continue;
                     }
-                    recovery::Advice::Recover { baseline, tail, hedge_eligible } => (baseline, tail, hedge_eligible),
+                    recovery::Advice::Recover { baseline, tail, hedge_eligible } => {
+                        // A localized slow IP may own several active requests.
+                        // Hand off only untouched leases; each primary remains
+                        // authoritative for its current piece until its boundary.
+                        if tail && !queued.is_empty() && baseline.is_some_and(|rate|
+                            ctx.recovery.schedule_ip_suffix_handoffs(ctx.segment.lease_key(), rate, now))
+                        {
+                            apply_ip_suffix_handoff(ctx, queued, lineage, now);
+                            continue;
+                        }
+                        (baseline, tail, hedge_eligible)
+                    },
                 };
                 // The executor, never the policy, acquires slots and charges
                 // lineage/action/traffic budgets. A declined hedge can still
@@ -2054,7 +2248,8 @@ mod tests {
         let (stop_tx, mut stop) = watch::channel(StopSignal::Running);
         let mut stream = None;
         let lineage = lineage();
-        let attempt = run_attempt(&ctx, None, &mut stop, &lineage, &mut stream);
+        let mut queued = VecDeque::new();
+        let attempt = run_attempt(&ctx, None, &mut stop, &lineage, &mut stream, &mut queued);
         tokio::pin!(attempt);
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
@@ -2330,7 +2525,8 @@ mod tests {
             lease_id: 1,
         };
         assert!(recovery.tail_eligible(MAX_HEDGE, false));
-        assert!(!recovery.tail_eligible(MAX_HEDGE + 1, false));
+        assert!(recovery.tail_eligible(MAX_HEDGE + 1, false));
+        assert!(!recovery.tail_eligible(0, false));
         assert!(!recovery.tail_eligible(MAX_HEDGE, true));
         let permits = recovery.slots.try_acquire_many(4).unwrap();
         assert!(!recovery.tail_eligible(MAX_HEDGE, false));
@@ -2353,7 +2549,7 @@ mod tests {
             .state
             .lock()
             .history
-            .extend([(now, 2000.), (now, 2000.)]);
+            .extend([(now, 2000., None), (now, 2000., None)]);
         assert_eq!(recovery.sample_baseline(key, now, true), Some(2000.));
         let peer_key = LeaseKey {
             piece_id: 1,
@@ -2483,9 +2679,9 @@ mod tests {
             lease_id: 1,
         };
         assert_eq!(recovery.baseline(key, now), None);
-        recovery.state.lock().history.push_back((now, 1000.));
+        recovery.state.lock().history.push_back((now, 1000., None));
         assert_eq!(recovery.baseline(key, now), None);
-        recovery.state.lock().history.push_back((now, 2000.));
+        recovery.state.lock().history.push_back((now, 2000., None));
         assert_eq!(recovery.baseline(key, now), Some(2000.));
         let mut peer = reading(now - Duration::from_secs(10));
         peer.window = Duration::from_secs(1);
@@ -2504,6 +2700,75 @@ mod tests {
         );
         recovery.state.lock().active.clear();
         assert_eq!(recovery.baseline(key, now + Duration::from_secs(61)), None);
+    }
+
+    #[test]
+    fn ip_local_tail_requires_known_peers_and_recent_foreign_health() {
+        let slow = "127.0.0.2".parse::<std::net::IpAddr>().unwrap();
+        let healthy = "127.0.0.3".parse::<std::net::IpAddr>().unwrap();
+        for (peer_ip, history_ip, history_count, age, expected) in [
+            (Some(slow), Some(healthy), 2, 0, Some(2000.)),
+            (Some(healthy), Some(healthy), 2, 0, None),
+            (None, Some(healthy), 2, 0, None),
+            (Some(slow), None, 2, 0, None),
+            (Some(slow), Some(slow), 2, 0, None),
+            (Some(slow), Some(healthy), 1, 0, None),
+            (Some(slow), Some(healthy), 2, 61, None),
+        ] {
+            let recovery = coordinator(1_000_000);
+            let _slots = recovery.slots.try_acquire_many(2).unwrap();
+            let now = Instant::now();
+            let target = LeaseKey {
+                piece_id: 0,
+                lease_id: 1,
+            };
+            for (key, ip) in [
+                (target, Some(slow)),
+                (
+                    LeaseKey {
+                        piece_id: 1,
+                        lease_id: 2,
+                    },
+                    peer_ip,
+                ),
+            ] {
+                let mut sample = reading(now - Duration::from_secs(2));
+                sample.ip = ip;
+                sample.window = Duration::from_secs(1);
+                sample.wire = 10;
+                recovery
+                    .state
+                    .lock()
+                    .active
+                    .insert(key, Arc::new(Mutex::new(sample)));
+            }
+            recovery.state.lock().history.extend(
+                (0..history_count).map(|_| (now - Duration::from_secs(age), 2000., history_ip)),
+            );
+            assert_eq!(
+                recovery.sample_baseline(target, now, true),
+                expected,
+                "peer={peer_ip:?}, history={history_ip:?}, count={history_count}, age={age}"
+            );
+            assert_eq!(
+                recovery.schedule_ip_suffix_handoffs(target, 2000., now),
+                expected.is_some()
+            );
+            if expected.is_some() {
+                assert_eq!(recovery.state.lock().suffix_handoffs.len(), 2);
+                assert_eq!(
+                    recovery.state.lock().suffix_handoffs[&target],
+                    now + TAIL_WINDOW
+                );
+                assert_eq!(
+                    recovery.state.lock().actions,
+                    0,
+                    "handoff does not cancel a primary"
+                );
+                recovery.finish_observation(target, false);
+                assert!(!recovery.state.lock().suffix_handoffs.contains_key(&target));
+            }
+        }
     }
     #[test]
     fn performance_budget_cooldown_backoff_and_lineage_caps_are_shared() {

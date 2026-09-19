@@ -291,6 +291,9 @@ struct ResolvePlan {
 #[derive(Clone, Debug)]
 pub(crate) struct RequestOptions {
     pub url: String,
+    /// Worker request identifier used to correlate transfer diagnostics with
+    /// the Range that created the request.
+    pub request_id: Option<u64>,
     pub headers: Vec<(String, String)>,
     pub range: Option<String>,
     pub connect_timeout: Duration,
@@ -323,6 +326,7 @@ impl RequestOptions {
     pub(crate) fn new(url: impl Into<String>) -> Self {
         Self {
             url: url.into(),
+            request_id: None,
             headers: Vec::new(),
             range: None,
             connect_timeout: Duration::from_secs(10),
@@ -348,6 +352,7 @@ impl RequestOptions {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ResponseHead {
     pub status: u16,
+    pub pinned_ip: Option<std::net::IpAddr>,
     /// Duplicate-preserving header list, in wire order.
     pub headers: Vec<(String, String)>,
 }
@@ -1353,6 +1358,7 @@ struct HeaderBlock {
 /// Only the origin response is published, and only once. Trailers are ignored
 /// because publication already happened when the body started.
 struct HeadParser {
+    pinned_ip: Option<std::net::IpAddr>,
     /// HTTPS through a proxy makes libcurl emit a `CONNECT` block first.
     expect_connect: bool,
     connect_seen: bool,
@@ -1368,6 +1374,7 @@ impl HeadParser {
     ) -> Self {
         Self {
             expect_connect,
+            pinned_ip: None,
             connect_seen: false,
             block: None,
             published: false,
@@ -1454,6 +1461,7 @@ impl HeadParser {
         self.published = true;
         let _ = sender.send(Ok(ResponseHead {
             status,
+            pinned_ip: self.pinned_ip,
             headers: block.headers,
         }));
     }
@@ -1564,6 +1572,7 @@ enum TransferExit {
 
 struct ActiveTransfer {
     handle: Easy2Handle<TransferHandler>,
+    request_id: Option<u64>,
     /// Estimated cache claim for the non-policy path. Policy transfers use
     /// actual connection IDs after curl has assigned a socket instead.
     claim: Option<IdleClaim>,
@@ -1644,12 +1653,16 @@ struct Pool {
     clear_generation: u64,
     /// Answers injected into this multi's DNS cache, keyed by `host:port`.
     resolve: HashMap<String, InjectedResolve>,
+    /// Last total cache bound applied to libcurl (active plus idle sockets).
+    cache_bound: usize,
+    /// Conservative ceiling: lowering MAXCONNECTS does not immediately evict.
+    cache_high_water: usize,
 }
 
 impl Pool {
     fn new(config: &DriverConfig) -> Self {
         let mut multi = Multi::new();
-        if let Err(error) = apply_cache_bound(&mut multi, config) {
+        if let Err(error) = apply_cache_bound(&mut multi, config, 0) {
             // Never fatal: without the bound the pool still works, it just
             // keeps libcurl's default cache size.
             tracing::debug!(%error, "could not set the libcurl connection cache bound");
@@ -1665,6 +1678,8 @@ impl Pool {
             pinned_unknown_idle: None,
             clear_generation: 0,
             resolve: HashMap::new(),
+            cache_bound: config.max_idle_per_host,
+            cache_high_water: config.max_idle_per_host,
         }
     }
 
@@ -1769,7 +1784,6 @@ impl Pool {
 
     /// The number of cached connections no transfer is using, as far as the
     /// driver can tell from `CURLINFO_NUM_CONNECTS`.
-    #[cfg(test)]
     fn idle_connections(&self) -> usize {
         self.idle.len() + self.pinned_idle.len() + usize::from(self.pinned_unknown_idle.is_some())
     }
@@ -1932,35 +1946,37 @@ impl Pool {
 const CURLMOPT_NETWORK_CHANGED: curl_sys::CURLMoption = curl_sys::CURLOPTTYPE_LONG + 17;
 const CURLMNWC_CLEAR_CONNS: std::ffi::c_long = 1 << 1;
 
-/// Applies `pool_max_idle_per_host` to one pool through `CURLMOPT_MAXCONNECTS`.
+/// Allows active sockets in addition to the configured idle cache.
 ///
 /// libcurl counts every connection it keeps in a multi handle's cache - the
 /// ones carrying a transfer *and* the idle ones - and checks the bound every
-/// time a connection becomes idle, that is, whenever a transfer finishes:
-/// while the cache is larger than the bound it closes the oldest connection
-/// that no transfer is using. Putting `pool_max_idle_per_host` there is what
-/// makes the bound mean "cache at most this many idle connections per pool":
-///
-/// * a connection in use is never closed by it, so it cannot limit
-///   concurrency, unlike `CURLMOPT_MAX_HOST_CONNECTIONS` (which serializes
-///   transfers) or `CURLMOPT_MAX_TOTAL_CONNECTIONS` (which caps simultaneously
-///   open connections and makes further transfers wait);
-/// * the shrink happens at transfer completion, because that is when a
-///   connection becomes idle.
-///
-/// Lowering the bound alone does not close anything, which is why a pool that
-/// keeps a long transfer and idle connections is reclaimed by
-/// [`Pool::clear_idle_connections`] instead.
+/// time a connection becomes idle. A fixed bound of four therefore closes
+/// each newly idle socket during an eight-transfer download. Reserve space
+/// for the other active transfers when the next one completes. This does not
+/// limit concurrency. Multiple completions within one perform may leave a
+/// transient surplus; fully idle oversized pools are dropped by reclamation.
+/// Busy pools retain the existing idle-timeout reclamation.
 ///
 /// `0` means "pick a default" to libcurl, so `pool_max_idle_per_host == 0`
 /// must never be passed here; that case is expressed with
 /// `CURLOPT_FRESH_CONNECT`/`CURLOPT_FORBID_REUSE` per transfer plus dropping
 /// the pool as soon as it is idle.
-fn apply_cache_bound(multi: &mut Multi, config: &DriverConfig) -> Result<(), curl::MultiError> {
+fn apply_cache_bound(
+    multi: &mut Multi,
+    config: &DriverConfig,
+    active: usize,
+) -> Result<(), curl::MultiError> {
     if config.max_idle_per_host == 0 {
         return Ok(());
     }
-    multi.set_max_connects(config.max_idle_per_host)
+    multi.set_max_connects(cache_bound(config, active))
+}
+
+fn cache_bound(config: &DriverConfig, active: usize) -> usize {
+    config
+        .max_idle_per_host
+        .saturating_add(active.saturating_sub(1))
+        .min(u32::MAX as usize)
 }
 
 fn run_driver(queue: Arc<CommandQueue>, shared: Arc<DriverShared>, config: DriverConfig) {
@@ -2029,6 +2045,18 @@ fn run_driver(queue: Arc<CommandQueue>, shared: Arc<DriverShared>, config: Drive
         let mut completions: Vec<(PoolKey, TransferId, CurlResult)> = Vec::new();
         let mut broken: Vec<(PoolKey, String)> = Vec::new();
         for (key, pool) in pools.iter_mut() {
+            let bound = cache_bound(&config, pool.active.len());
+            if config.max_idle_per_host != 0 && pool.cache_bound != bound {
+                if let Err(error) = apply_cache_bound(&mut pool.multi, &config, pool.active.len()) {
+                    broken.push((
+                        key.clone(),
+                        format!("could not update cache bound: {error}"),
+                    ));
+                    continue;
+                }
+                pool.cache_bound = bound;
+                pool.cache_high_water = pool.cache_high_water.max(bound);
+            }
             if let Err(error) = pool.multi.perform() {
                 broken.push((
                     key.clone(),
@@ -2249,6 +2277,20 @@ fn reclaim_idle_pools(pools: &mut HashMap<PoolKey, Pool>, config: &DriverConfig)
     let reuse_disabled = config.max_idle_per_host == 0;
     let now = Instant::now();
     pools.retain(|_, pool| {
+        // MAXCONNECTS only evicts on transfer completion; lowering it cannot
+        // trim a completed burst. Drop an oversized quiescent pool rather
+        // than keep excess idle sockets until the timeout. No active request
+        // is interrupted or marked non-reusable by this capacity cleanup.
+        if pool.active.is_empty()
+            && pool.cache_high_water > config.max_idle_per_host
+            && pool.idle_connections() > config.max_idle_per_host
+        {
+            tracing::debug!(
+                idle_connections = pool.idle_connections(),
+                "closing an oversized idle libcurl pool"
+            );
+            return false;
+        }
         let Some(deadline) = pool.idle_deadline(config.pool_idle_timeout, reuse_disabled) else {
             return true;
         };
@@ -2640,13 +2682,14 @@ fn attach_transfer(
     policy: &mut IpPolicy,
     attempts: &mut HashMap<TransferId, AttemptRecord>,
     id: TransferId,
-    easy: Easy2<TransferHandler>,
+    mut easy: Easy2<TransferHandler>,
     pinned: Option<Pinned>,
     retry: Option<Box<RetryState>>,
     options: &RequestOptions,
     plan: &ResolvePlan,
     sink: &Arc<BodySink>,
 ) -> bool {
+    easy.get_mut().head.pinned_ip = pinned.as_ref().map(|pin| pin.claim.address);
     match pool.multi.add2(easy) {
         Ok(mut handle) => {
             if let Err(error) = handle.set_token(id.raw()) {
@@ -2675,6 +2718,7 @@ fn attach_transfer(
                 id,
                 ActiveTransfer {
                     handle,
+                    request_id: options.request_id,
                     claim,
                     generation,
                     candidate: pinned.map(|pinned| pinned.claim),
@@ -2801,6 +2845,7 @@ fn complete_transfer(
         return Completion::Done;
     };
     let sink = transfer.handle.get_ref().sink.clone();
+    let request_id = transfer.request_id;
     let head_published = transfer.handle.get_ref().head.published();
     let phase = if head_published {
         TransferPhase::AfterHeaders
@@ -2975,6 +3020,7 @@ fn complete_transfer(
     }
     tracing::debug!(
         transfer = id.0,
+        request_id = ?request_id,
         phase = %phase,
         connections,
         connection_id = ?connection_id,

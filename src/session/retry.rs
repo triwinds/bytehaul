@@ -52,7 +52,15 @@ impl RetryState {
 
     /// Apply the normal retry policy to an error.
     pub(crate) fn decide(&mut self, error: DownloadError) -> RetryDecision {
-        self.decide_inner(error, false)
+        self.decide_inner(error, false, false)
+    }
+
+    /// A body timeout has already waited for the read deadline. Allow one
+    /// immediate reconnect per lineage, retaining count and elapsed limits.
+    pub(crate) fn decide_body_failure(&mut self, error: DownloadError) -> RetryDecision {
+        let immediate = matches!(&error, DownloadError::Transport(error)
+            if error.kind() == crate::error::TransportErrorKind::Timeout);
+        self.decide_inner(error, false, immediate)
     }
 
     /// Apply retry count and elapsed-budget checks for a safe restart.
@@ -63,14 +71,19 @@ impl RetryState {
     /// to its existing retry scope.  This method is that explicit, local
     /// escape hatch; it does not alter error classification anywhere else.
     pub(crate) fn decide_restart(&mut self, error: DownloadError) -> RetryDecision {
-        self.decide_inner(error, true)
+        self.decide_inner(error, true, false)
     }
 
     pub(crate) fn max_retries(&self) -> u32 {
         self.max_retries
     }
 
-    fn decide_inner(&mut self, error: DownloadError, force_retry: bool) -> RetryDecision {
+    fn decide_inner(
+        &mut self,
+        error: DownloadError,
+        force_retry: bool,
+        immediate: bool,
+    ) -> RetryDecision {
         if (!force_retry && !error.is_retryable()) || self.retries_started >= self.max_retries {
             return RetryDecision::Stop(error);
         }
@@ -83,7 +96,11 @@ impl RetryState {
         }
 
         let retry_count = self.retries_started.saturating_add(1);
-        let backoff = retry_backoff(&error, retry_count, self.base_delay, self.max_delay);
+        let backoff = if immediate && retry_count == 1 && error.retry_after_secs().is_none() {
+            Duration::ZERO
+        } else {
+            retry_backoff(&error, retry_count, self.base_delay, self.max_delay)
+        };
 
         let elapsed = self.started_at.elapsed();
         if let Some(limit) = self.max_retry_elapsed {
@@ -259,6 +276,39 @@ mod tests {
             status: 503,
             message: "Service Unavailable".into(),
         }
+    }
+
+    #[test]
+    fn body_timeout_reconnects_once_without_bypassing_retry_limits() {
+        let timeout = || DownloadError::Transport(crate::error::TransportError::timeout("body"));
+        let mut state = RetryState::new(2, Duration::from_secs(1), Duration::from_secs(8), None);
+        assert!(
+            matches!(state.decide_body_failure(timeout()), RetryDecision::Retry { retry_count: 1, backoff, .. } if backoff.is_zero())
+        );
+        assert!(
+            matches!(state.decide_body_failure(timeout()), RetryDecision::Retry { retry_count: 2, backoff, .. } if backoff >= Duration::from_secs(2))
+        );
+        assert!(matches!(
+            state.decide_body_failure(timeout()),
+            RetryDecision::Stop(_)
+        ));
+        let mut exhausted = RetryState::new(
+            2,
+            Duration::from_secs(1),
+            Duration::from_secs(8),
+            Some(Duration::ZERO),
+        );
+        assert!(matches!(
+            exhausted.decide_body_failure(timeout()),
+            RetryDecision::Stop(DownloadError::RetryBudgetExceeded { .. })
+        ));
+        let mut normal = RetryState::new(2, Duration::from_secs(1), Duration::from_secs(8), None);
+        assert!(
+            matches!(normal.decide(timeout()), RetryDecision::Retry { backoff, .. } if backoff >= Duration::from_secs(1))
+        );
+        assert!(
+            matches!(normal.decide_body_failure(DownloadError::HttpStatus { status: 503, message: "retry-after:7".into() }), RetryDecision::Retry { backoff, .. } if backoff == Duration::from_secs(7))
+        );
     }
 
     #[test]

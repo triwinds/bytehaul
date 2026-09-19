@@ -14,14 +14,22 @@ pub(super) enum Advice {
     },
 }
 
-pub(super) fn recommend(ctx: &AttemptContext<'_>, challenger_active: bool, now: Instant) -> Advice {
+pub(super) fn recommend(
+    ctx: &AttemptContext<'_>,
+    challenger_active: bool,
+    now: Instant,
+    remaining_end: u64,
+) -> Advice {
     let baseline = ctx.recovery.baseline(ctx.segment.lease_key(), now);
     let len = ctx.segment.end - ctx.segment.start;
+    // The connection owns the queued suffix too. A nearly finished piece
+    // must not hide many more pieces trapped behind the same slow body.
+    let request_len = remaining_end - ctx.segment.start;
     let rate_limited = matches!(ctx.speed, SpeedLimit::Limited(_));
     let tail_baseline = if !rate_limited
         && ctx
             .recovery
-            .tail_eligible(len, ctx.scheduler.lock().has_available())
+            .tail_eligible(request_len, ctx.scheduler.lock().has_available())
     {
         ctx.recovery
             .sample_baseline(ctx.segment.lease_key(), now, true)
@@ -31,8 +39,8 @@ pub(super) fn recommend(ctx: &AttemptContext<'_>, challenger_active: bool, now: 
     let (ordinary, tail) = {
         let mut observation = ctx.observation.lock();
         (
-            observation.should_recover(now, baseline, &ctx.recovery.policy, len),
-            observation.should_recover_tail(now, tail_baseline, &ctx.recovery.policy, len),
+            observation.should_recover(now, baseline, &ctx.recovery.policy, request_len),
+            observation.should_recover_tail(now, tail_baseline, &ctx.recovery.policy, request_len),
         )
     };
     // A user cap couples request rates; local throttling cannot justify

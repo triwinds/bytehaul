@@ -117,6 +117,8 @@ impl HttpWorker {
         req.extensions_mut()
             .insert(crate::network::ConnectTimeout(self.connect_timeout));
         let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+        req.extensions_mut()
+            .insert(crate::http::RequestTraceId(request_id));
         let started = Instant::now();
         self.counters.started.fetch_add(1, Ordering::Relaxed);
         // Only log our numeric Range, never URLs or arbitrary user headers.

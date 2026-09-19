@@ -633,11 +633,10 @@ async fn settle_prefix(
     }
 }
 
-async fn take_matching_probe_response(
-    first_response: &SharedProbeResponse,
+fn take_matching_probe_response(
+    first_response: &mut Option<(HttpResponse, ResponseMeta, usize)>,
     segment: &Segment,
 ) -> Option<(HttpResponse, ResponseMeta)> {
-    let mut first_response = first_response.lock().await;
     if first_response.as_ref().is_some_and(|(_, meta, piece_id)| {
         *piece_id == segment.piece_id && probe_response_matches_segment(meta, segment)
     }) {

@@ -2299,12 +2299,98 @@ async fn the_connection_cache_keeps_at_most_the_configured_idle_connections() {
         8,
         "eight concurrent transfers need eight connections"
     );
-    assert_eq!(
-        server.wait_for_live(1, Duration::from_secs(2)).await,
-        1,
-        "the pool must cache at most pool_max_idle_per_host idle connections"
-    );
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while server.live() > 1 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the pool must cache at most pool_max_idle_per_host idle connections");
+    // A completion burst can drop the whole oversized idle pool. It must
+    // still accept new requests, and sequential requests must then reuse.
+    let before = server.accepted();
+    for _ in 0..3 {
+        let mut transfer = driver
+            .get(RequestOptions::new(server.url("/cache")), 4096)
+            .await
+            .unwrap();
+        assert_eq!(
+            collect_body(&mut transfer, Duration::from_secs(5)).await,
+            b"cached"
+        );
+    }
+    assert!(server.accepted() <= before + 1);
     server.stop().await;
+}
+
+/// Seven paused responses hold active sockets while the eighth worker issues
+/// successive ranges. An idle limit of four must not evict that worker's
+/// connection on every completion. Exercise both DNS and pinned-IP paths.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn eight_active_connections_reuse_with_four_idle_slots() {
+    for pinned in [false, true] {
+        let server = TestServer::start_with(Arc::new(|path| {
+            if path.contains("/held") {
+                ResponsePlan::body(vec![b'h'; 256 * 1024])
+            } else {
+                ResponsePlan::body(b"range".to_vec())
+            }
+        }))
+        .await;
+        let driver = DriverHandle::spawn(DriverConfig {
+            max_idle_per_host: 4,
+            pool_idle_timeout: Duration::from_secs(30),
+            max_age_conn: None,
+        });
+        let options = |path: &str| {
+            if pinned {
+                policy_options(
+                    &format!("http://reuse.test:{}{path}", server.addr.port()),
+                    candidates("reuse.test", server.addr.port(), &[[127, 0, 0, 1]]),
+                )
+            } else {
+                RequestOptions::new(server.url(path))
+            }
+        };
+        let mut held = Vec::new();
+        for _ in 0..7 {
+            held.push(
+                driver
+                    .get(options("/held"), MIN_BODY_BUDGET_BYTES)
+                    .await
+                    .unwrap(),
+            );
+        }
+        for _ in 0..16 {
+            let mut transfer = driver.get(options("/range"), 4096).await.unwrap();
+            assert_eq!(
+                collect_body(&mut transfer, Duration::from_secs(5)).await,
+                b"range"
+            );
+        }
+        assert_eq!(
+            server.accepted(),
+            8,
+            "the eighth socket must be reused (pinned={pinned})"
+        );
+        for mut transfer in held {
+            assert_eq!(
+                collect_body(&mut transfer, Duration::from_secs(5))
+                    .await
+                    .len(),
+                256 * 1024
+            );
+        }
+        assert!(wait_for_idle(&driver, Duration::from_secs(2)).await);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while server.live() > 4 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("idle capacity must be reclaimed after the busy period");
+        server.stop().await;
+    }
 }
 
 /// A pool that keeps running a long transfer still has to close the
@@ -3010,6 +3096,11 @@ async fn a_refused_candidate_is_retried_without_a_second_request() {
     let body = collect_body(&mut transfer, Duration::from_secs(5)).await;
 
     assert_eq!(body, b"a0", "the retry reached the healthy address");
+    assert_eq!(
+        transfer.head.pinned_ip,
+        Some("127.0.0.1".parse().unwrap()),
+        "response identity must follow the successful fallback, not the first candidate"
+    );
     let stats = driver.stats();
     assert_eq!(
         stats.submitted, 1,
@@ -3054,6 +3145,15 @@ async fn a_single_dead_candidate_reports_a_retryable_transport_failure() {
         }
         other => panic!("expected a transport error, got {other:?}"),
     }
+    // The error head wakes get() before the driver finishes teardown and
+    // publishes accounting. Wait for that boundary before reading counters.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while driver.stats().completed == 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("failed transfer accounting must settle");
     let stats = driver.stats();
     assert_eq!(
         stats.connect_retries, 0,

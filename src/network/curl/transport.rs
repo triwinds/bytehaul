@@ -198,6 +198,10 @@ impl CurlTransport {
         }
 
         let mut options = RequestOptions::new(uri.to_string());
+        options.request_id = req
+            .extensions()
+            .get::<crate::http::RequestTraceId>()
+            .map(|trace| trace.0);
         options.connect_timeout = req
             .extensions()
             .get::<crate::network::ConnectTimeout>()
@@ -413,6 +417,11 @@ fn response_from_transfer(transfer: Transfer) -> Result<HttpResponse, DownloadEr
     })?;
 
     let mut response = http::Response::new(HttpBody::new(body));
+    if let Some(ip) = head.pinned_ip {
+        response
+            .extensions_mut()
+            .insert(crate::http::PinnedOriginIp(ip));
+    }
     *response.status_mut() = status;
     *response.version_mut() = http::Version::HTTP_11;
     let headers = response.headers_mut();
