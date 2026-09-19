@@ -1,6 +1,6 @@
 # bytehaul Python 使用文档
 
-本文介绍已发布的 **bytehaul 0.2.6** Python 绑定，以及从源码构建的方法。
+本文介绍已发布的 **bytehaul 0.2.7** Python 绑定，以及从源码构建的方法。
 
 [English Python Guide](../bindings/python/README.md)
 
@@ -12,10 +12,10 @@
 ## 安装发布版本
 
 ```bash
-pip install "bytehaul==0.2.6"
+pip install "bytehaul==0.2.7"
 ```
 
-参阅 [0.2.6 发布说明](https://github.com/triwinds/bytehaul/releases/tag/v0.2.6)。下面的源码构建命令均假定从仓库根目录开始执行。
+参阅 [0.2.7 发布说明](https://github.com/triwinds/bytehaul/releases/tag/v0.2.7)。下面的源码构建命令均假定从仓库根目录开始执行。
 
 ## 初始化开发环境
 

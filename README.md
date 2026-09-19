@@ -9,9 +9,9 @@
 
 A Rust async HTTP download library with Python bindings (also available on PyPI), supporting resume, multi-connection downloads, write-back cache, rate limiting, and checksum verification.
 
-These examples target **0.2.6**, which ships self-contained wheels with a statically linked OpenSSL, restoring macOS 11+ and glibc 2.17 wheel coverage, while preserving existing resume-file compatibility. See the [0.2.6 release notes](https://github.com/triwinds/bytehaul/releases/tag/v0.2.6).
+These examples target **0.2.7**, which ships self-contained wheels with a statically linked OpenSSL, restoring macOS 11+ and glibc 2.17 wheel coverage, while preserving existing resume-file compatibility. See the [0.2.7 release notes](https://github.com/triwinds/bytehaul/releases/tag/v0.2.7).
 
-Version 0.2.6 no longer depends on build-host OpenSSL for the Python wheels and verifies every wheel in a clean environment with an HTTPS smoke test; see [advanced usage](docs/advanced.md).
+Version 0.2.7 no longer depends on build-host OpenSSL for the Python wheels and verifies every wheel in a clean environment with an HTTPS smoke test; see [advanced usage](docs/advanced.md).
 
 The Rust and Python builds use the vendored libcurl transport, which is the
 sole production transport and is enabled by default.
@@ -42,20 +42,20 @@ sole production transport and is enabled by default.
 Add `bytehaul` to your project via Cargo:
 
 ```bash
-cargo add bytehaul@0.2.6
+cargo add bytehaul@0.2.7
 ```
 
 Or add it manually to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-bytehaul = "0.2.6"
+bytehaul = "0.2.7"
 ```
 
 ### Python
 
 ```bash
-pip install "bytehaul==0.2.6"
+pip install "bytehaul==0.2.7"
 ```
 
 Requires Python 3.9+. A single wheel per platform covers all supported Python versions (abi3).
