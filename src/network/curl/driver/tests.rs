@@ -2624,6 +2624,152 @@ fn policy_regression_pre_head_failures_release_attempt_records() {
     }
 }
 
+#[test]
+fn policy_regression_expired_retry_releases_everything() {
+    let shared = Arc::new(DriverShared {
+        sinks: Mutex::new(HashMap::new()),
+        active: AtomicUsize::new(0),
+        counters: DriverCounters::default(),
+        alive: AtomicBool::new(true),
+        pools: AtomicUsize::new(0),
+        idle_clear_unsupported: AtomicBool::new(false),
+    });
+    let queue = CommandQueue::new();
+    let id = TransferId::next();
+    let sink = BodySink::new(id, 1024, Arc::downgrade(&queue));
+    shared.sinks.lock().insert(id, sink.clone());
+    let options = policy_options(
+        "http://dual.test:9/file",
+        candidates("dual.test", 9, &[DEAD_ADDRESS]),
+    );
+    let key = options.pool_key();
+    let mut policy = IpPolicy::new();
+    let pinned = reserve_candidate(&mut policy, &options, &key, Instant::now(), None)
+        .unwrap()
+        .unwrap();
+    let mut attempts = HashMap::from([(
+        id,
+        AttemptRecord {
+            pool: key.clone(),
+            claim: pinned.claim,
+            outcome: None,
+            consumed: None,
+            sample: None,
+        },
+    )]);
+    let (head, mut receiver) = oneshot::channel();
+
+    start_retry(
+        &mut HashMap::new(),
+        &shared,
+        &mut policy,
+        &mut attempts,
+        &DriverConfig::default(),
+        RetryRequest {
+            id,
+            pool: key,
+            state: Box::new(RetryState {
+                options,
+                attempts: 1,
+                max_attempts: 2,
+                deadline: Instant::now(),
+            }),
+            sink,
+            head,
+            error: DownloadError::Cancelled,
+        },
+    );
+
+    assert!(matches!(
+        receiver.try_recv(),
+        Ok(Err(DownloadError::Cancelled))
+    ));
+    assert!(attempts.is_empty());
+    assert!(!shared.sinks.lock().contains_key(&id));
+}
+
+#[test]
+fn policy_regression_releasing_an_unattached_candidate_settles_its_claim() {
+    let options = policy_options(
+        "http://dual.test:9/file",
+        candidates("dual.test", 9, &[DEAD_ADDRESS]),
+    );
+    let key = options.pool_key();
+    let mut policy = IpPolicy::new();
+    let pinned = reserve_candidate(&mut policy, &options, &key, Instant::now(), None)
+        .unwrap()
+        .unwrap();
+    let id = TransferId::next();
+    let mut attempts = HashMap::from([(
+        id,
+        AttemptRecord {
+            pool: key,
+            claim: pinned.claim,
+            outcome: None,
+            consumed: None,
+            sample: None,
+        },
+    )]);
+
+    release_candidate(&mut policy, &mut attempts, id);
+
+    assert!(attempts.is_empty());
+}
+
+#[test]
+fn policy_regression_retry_can_restore_a_missing_attempt_record() {
+    let shared = Arc::new(DriverShared {
+        sinks: Mutex::new(HashMap::new()),
+        active: AtomicUsize::new(0),
+        counters: DriverCounters::default(),
+        alive: AtomicBool::new(true),
+        pools: AtomicUsize::new(0),
+        idle_clear_unsupported: AtomicBool::new(false),
+    });
+    let queue = CommandQueue::new();
+    let id = TransferId::next();
+    let sink = BodySink::new(id, 1024, Arc::downgrade(&queue));
+    shared.sinks.lock().insert(id, sink.clone());
+    let options = policy_options(
+        "http://dual.test:9/file",
+        candidates("dual.test", 9, &[DEAD_ADDRESS]),
+    );
+    let key = options.pool_key();
+    let mut pools = HashMap::new();
+    let mut policy = IpPolicy::new();
+    let mut attempts = HashMap::new();
+    let (head, mut receiver) = oneshot::channel();
+
+    start_retry(
+        &mut pools,
+        &shared,
+        &mut policy,
+        &mut attempts,
+        &DriverConfig::default(),
+        RetryRequest {
+            id,
+            pool: key,
+            state: Box::new(RetryState {
+                options,
+                attempts: 0,
+                max_attempts: 1,
+                deadline: Instant::now() + Duration::from_secs(5),
+            }),
+            sink,
+            head,
+            error: DownloadError::Cancelled,
+        },
+    );
+
+    assert!(attempts.contains_key(&id));
+    cancel_transfer(&mut pools, &shared, &mut policy, &mut attempts, id);
+    assert!(matches!(
+        receiver.try_recv(),
+        Ok(Err(DownloadError::Cancelled))
+    ));
+    assert!(attempts.is_empty());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn policy_regression_another_ips_idle_socket_does_not_disable_fallback() {
     let server = DualAddressServer::start(Duration::ZERO).await;
@@ -2860,7 +3006,7 @@ async fn a_refused_candidate_is_retried_without_a_second_request() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_single_dead_candidate_reports_a_connect_failure() {
+async fn a_single_dead_candidate_reports_a_retryable_transport_failure() {
     let driver = DriverHandle::spawn(DriverConfig::default());
     let set = candidates("dual.test", 9, &[DEAD_ADDRESS]);
     let mut options = policy_options("http://dual.test:9/file", set);
@@ -2873,7 +3019,13 @@ async fn a_single_dead_candidate_reports_a_connect_failure() {
 
     match error {
         DownloadError::Transport(transport) => {
-            assert_eq!(transport.kind(), TransportErrorKind::Connect);
+            assert!(
+                matches!(
+                    transport.kind(),
+                    TransportErrorKind::Connect | TransportErrorKind::Timeout
+                ),
+                "an unbound loopback address may be refused or exhaust its connect budget"
+            );
             assert!(
                 DownloadError::Transport(transport).is_retryable(),
                 "a refused connection is the caller's to retry"
@@ -2929,10 +3081,10 @@ async fn an_internal_retry_never_resets_the_callers_deadline() {
         elapsed < Duration::from_secs(2),
         "the deadline must not be extended by the retry, took {elapsed:?}"
     );
-    assert_eq!(
-        driver.stats().connect_retries,
-        1,
-        "the refused candidate was retried before the deadline ran out"
+    let retries = driver.stats().connect_retries;
+    assert!(
+        retries == 1 || (cfg!(windows) && retries == 0),
+        "the dead target should be retried when the platform reports its failure before the deadline; got {retries} retries"
     );
     assert!(wait_for_idle(&driver, Duration::from_secs(3)).await);
     server.stop().await;

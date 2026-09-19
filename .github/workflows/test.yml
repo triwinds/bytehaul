@@ -43,6 +43,15 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
+      # Darwin only configures 127.0.0.1 on lo0 by default. The multi-IP
+      # integration tests need two loopback listeners on one port, plus one
+      # configured-but-unbound address that fails immediately.
+      - name: Configure macOS loopback test addresses
+        if: matrix.os == 'macos-latest'
+        run: |
+          sudo ifconfig lo0 alias 127.0.0.2 up
+          sudo ifconfig lo0 alias 127.0.0.3 up
+
       - name: Run unit tests
         run: cargo test -p bytehaul --all-targets
 

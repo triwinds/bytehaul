@@ -208,8 +208,8 @@ async fn read_lowercased_head(stream: &mut tokio::net::TcpStream) -> Option<Stri
 /// host is `dual.test`, which nothing resolves, so a request reaches a listener
 /// only through the connect target its driver picked.
 ///
-/// Both addresses live in `127.0.0.0/8`, which every supported platform routes
-/// back to the local host, so no interface alias is needed.
+/// Both addresses live in `127.0.0.0/8`. macOS only configures `127.0.0.1` by
+/// default, so its CI job adds the second address to `lo0` before running tests.
 /// One loopback address of a [`DualAddressServer`]: what this address alone
 /// accepted, kept open, and served.
 pub(crate) struct AddressObserver {
@@ -251,8 +251,8 @@ impl AddressObserver {
 /// connect target, so a broken entry shows up as a DNS failure instead of a
 /// silent connection to the wrong place.
 ///
-/// Both addresses are in `127.0.0.0/8`, which every supported platform routes
-/// back to the local host, so no interface alias is needed.
+/// Both addresses are in `127.0.0.0/8`. macOS only configures `127.0.0.1` by
+/// default, so its CI job adds the second address to `lo0` before running tests.
 pub(crate) struct DualAddressServer {
     port: u16,
     addresses: [std::net::IpAddr; 2],
