@@ -3182,7 +3182,26 @@ async fn two_addresses_share_one_cache_bound() {
         collect_body(&mut transfer, Duration::from_secs(5)).await;
     }
 
+    // Socket shutdown is observed by the server task asynchronously after
+    // libcurl evicts the connection, so wait for that observation instead of
+    // racing it with an immediate counter read.
+    let eviction_observed = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if (live.0.load(Ordering::SeqCst), live.1.load(Ordering::SeqCst)) == (0, 1) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+
     // §6: the bound is the origin's, not one per address.
+    assert!(
+        eviction_observed.is_ok(),
+        "the first address's socket is evicted when the second goes idle; live counts: ({}, {})",
+        live.0.load(Ordering::SeqCst),
+        live.1.load(Ordering::SeqCst)
+    );
     assert_eq!(
         live.0.load(Ordering::SeqCst),
         0,
