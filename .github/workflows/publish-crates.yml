@@ -1,9 +1,15 @@
 name: Publish Rust Crate
 
-on:
+"on":
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish (must match the v<version> tag)"
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -37,6 +43,8 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Ensure tag matches crate version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
           python - <<'PY'
           import os
@@ -60,11 +68,18 @@ jobs:
 
             raise SystemExit(f"Could not determine version for {manifest_name}")
 
-          tag = os.environ["GITHUB_REF_NAME"]
-          if not tag.startswith("v"):
-              raise SystemExit(f"Expected a v-prefixed tag, got {tag!r}")
+          input_version = os.environ.get("INPUT_VERSION", "").strip()
+          if input_version:
+              version = input_version
+              if version.startswith("v"):
+                  raise SystemExit(f"Pass the version without a leading 'v', got {version!r}")
+              tag = f"v{version}"
+          else:
+              tag = os.environ["GITHUB_REF_NAME"]
+              if not tag.startswith("v"):
+                  raise SystemExit(f"Expected a v-prefixed tag, got {tag!r}")
+              version = tag[1:]
 
-          version = tag[1:]
           manifest = tomllib.loads(pathlib.Path("Cargo.toml").read_text("utf-8"))
           actual = resolve_package_version(manifest, "Cargo.toml")
           if actual != version:
@@ -72,6 +87,21 @@ jobs:
 
           print(f"Validated release tag v{version} for crate bytehaul.")
           PY
+
+      - name: Verify backfill ref matches the release tag
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          TAG="v${INPUT_VERSION}"
+          git rev-parse -q --verify "refs/tags/${TAG}" > /dev/null || { echo "::error::tag ${TAG} not found in this checkout"; exit 1; }
+          if git diff --quiet "${TAG}^{commit}" HEAD -- ':(exclude).github'; then
+            echo "HEAD matches ${TAG} outside .github; backfill is source-equivalent to the tag."
+          else
+            echo "::error::backfill refused: code differs from ${TAG} outside .github"
+            git --no-pager diff --stat "${TAG}^{commit}" HEAD -- ':(exclude).github'
+            exit 1
+          fi
 
       - name: Verify package contents
         run: cargo package --list -p bytehaul

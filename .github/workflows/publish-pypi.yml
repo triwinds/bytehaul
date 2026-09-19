@@ -20,7 +20,7 @@
 # publishing.
 name: Publish Python Package
 
-on:
+"on":
   push:
     tags:
       - "v*"
