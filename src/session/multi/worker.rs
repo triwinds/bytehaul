@@ -1019,6 +1019,17 @@ async fn reacquire_slot(
     }
 }
 
+fn renew_adaptive_retry(
+    scheduler: &Scheduler,
+    key: LeaseKey,
+    worker_id: usize,
+) -> Result<Segment, DownloadError> {
+    scheduler
+        .lock()
+        .renew(key, worker_id)
+        .ok_or_else(|| DownloadError::Internal("cannot renew adaptive retry lease".into()))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn worker_loop(
     worker_id: usize,
@@ -1498,14 +1509,11 @@ pub(super) async fn worker_loop(
                                     recovery.state.lock().retries += 1;
                                     recovery.changed.notify_waiters();
                                     log_warn!(log_level, download_id, worker_id, attempt = segment.attempt, error = %error, backoff_ms = backoff.as_millis() as u64, "adaptive segment failed, retrying");
-                                    segment = scheduler
-                                        .lock()
-                                        .renew(segment.lease_key(), worker_id)
-                                        .ok_or_else(|| {
-                                            DownloadError::Internal(
-                                                "cannot renew adaptive retry lease".into(),
-                                            )
-                                        })?;
+                                    segment = renew_adaptive_retry(
+                                        &scheduler,
+                                        segment.lease_key(),
+                                        worker_id,
+                                    )?;
                                     drop(slot.permit.take());
                                     recovery.changed.notify_waiters();
                                     if let Err(error) = sleep_with_backoff(backoff, &mut stop).await
@@ -2171,6 +2179,25 @@ mod tests {
             Err(DownloadError::Cancelled)
         ));
         assert!(scheduler.lock().has_available());
+    }
+
+    #[test]
+    fn adaptive_retry_renew_reports_missing_lease() {
+        let scheduler: Scheduler = Arc::new(Mutex::new(SchedulerState::new(PieceMap::new(32, 32))));
+        let error = renew_adaptive_retry(
+            &scheduler,
+            LeaseKey {
+                piece_id: 0,
+                lease_id: 1,
+            },
+            0,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            DownloadError::Internal(message) if message == "cannot renew adaptive retry lease"
+        ));
     }
 
     fn lineage() -> SharedLineage {
