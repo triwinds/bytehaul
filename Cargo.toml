@@ -40,7 +40,7 @@ curl-backend = ["dep:curl", "dep:curl-sys"]
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-hickory-resolver = { version = "0.25", default-features = false, features = ["tokio", "system-config", "https-ring", "rustls-platform-verifier"] }
+hickory-resolver = { version = "0.26", default-features = false, features = ["tokio", "system-config", "https-ring", "rustls-platform-verifier"] }
 # Neutral HTTP types: the worker, the sessions and the transport adapters all
 # speak `http::{Request, Response, HeaderMap, StatusCode}` (see src/http/mod.rs).
 http = "1"
