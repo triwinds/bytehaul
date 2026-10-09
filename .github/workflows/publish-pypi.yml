@@ -206,7 +206,7 @@ jobs:
             perl -v | head -2
 
       - name: Upload wheel
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v6
         with:
           name: python-package-distributions-${{ matrix.label }}
           path: dist/*
@@ -230,7 +230,7 @@ jobs:
           args: --manifest-path bindings/python/Cargo.toml --out dist
 
       - name: Upload sdist
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v6
         with:
           name: python-package-distributions-sdist
           path: dist/*
